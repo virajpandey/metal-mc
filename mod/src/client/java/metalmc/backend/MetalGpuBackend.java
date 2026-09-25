@@ -4,15 +4,16 @@ import com.mojang.renderpearl.api.device.BackendCreationException;
 import com.mojang.renderpearl.api.device.GpuBackend;
 import com.mojang.renderpearl.api.device.GpuDebugOptions;
 import com.mojang.renderpearl.api.device.GpuDevice;
+import com.mojang.renderpearl.frontend.FrontendGpuDevice;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.sdl.SDLEvents;
 import org.lwjgl.sdl.SDLMetal;
 import org.lwjgl.sdl.SDLVideo;
 
 /**
- * M3 spike, step 1a: a backend that Minecraft tries before OpenGL/Vulkan. It loads the native bridge
- * and creates a real Metal device, then declines (BackendCreationException), so the game falls back
- * to the next backend. Each later step replaces a piece of the "decline" with a real implementation.
+ * A backend that Minecraft tries before OpenGL/Vulkan (see PreferredGraphicsApiMixin). It loads the
+ * native bridge and returns a Metal device; if anything fails it declines with a
+ * BackendCreationException and the game falls back to the next backend.
  */
 public final class MetalGpuBackend implements GpuBackend {
     /** SDL3 SDL_WINDOW_METAL. */
@@ -62,8 +63,19 @@ public final class MetalGpuBackend implements GpuBackend {
             presentRateTest(nativeLib, true);
             presentRateTest(nativeLib, false);
         }
-        throw new BackendCreationException("MetalMC backend: device \"" + name + "\" OK, rendering not implemented yet (spike step 1b)",
-            BackendCreationException.Reason.OTHER);
+        if ("0".equals(System.getProperty("metalmc.backend.render", "1"))) {
+            throw new BackendCreationException("MetalMC backend: device \"" + name + "\" OK, rendering disabled (-Dmetalmc.backend.render=0)",
+                BackendCreationException.Reason.OTHER);
+        }
+        try {
+            if (Mtl.init() != 1) {
+                throw new BackendCreationException("MetalMC: Metal enum values don't match the Java side", BackendCreationException.Reason.OTHER);
+            }
+            boolean debug = "1".equals(System.getProperty("metalmc.backend.debug"));
+            return new FrontendGpuDevice(new MetalDevice(name, debug));
+        } catch (RuntimeException | LinkageError e) {
+            throw new BackendCreationException("MetalMC device creation failed: " + e, BackendCreationException.Reason.OTHER);
+        }
     }
 
     /** SDL3 SDL_WINDOW_HIGH_PIXEL_DENSITY (Retina-resolution drawables). */

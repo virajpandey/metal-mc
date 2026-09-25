@@ -33,6 +33,11 @@ loom {
 			property "metalmc.backend", (project.findProperty("metalBackend") ?: "off").toString()
 			property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
 			property "metalmc.backend.presentTest", (project.findProperty("presentTest") ?: "0").toString()
+			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
+			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
+			if (project.hasProperty("metalValidation")) {
+				environmentVariable "MTL_DEBUG_LAYER", "1"
+			}
 			vmArg "--enable-native-access=ALL-UNNAMED"
 		}
 	}

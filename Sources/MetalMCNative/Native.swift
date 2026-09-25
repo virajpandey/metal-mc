@@ -8,7 +8,7 @@ import QuartzCore
 
 /// Bumped whenever the ABI changes, so Java can refuse a stale dylib.
 @_cdecl("mmc_abi_version")
-public func mmc_abi_version() -> Int32 { 2 }
+public func mmc_abi_version() -> Int32 { 3 }
 
 /// Writes the default Metal device's name (UTF-8, NUL-terminated) into `buf`.
 @_cdecl("mmc_device_name")

@@ -33,6 +33,9 @@ public final class Bench {
     static final double RADIUS = Double.parseDouble(System.getProperty("metalmc.bench.radius", "140"));
     static final double HEIGHT = Double.parseDouble(System.getProperty("metalmc.bench.y", "140"));
 
+    /** Screenshots at the start and middle of the run (tests readback too); off with -Dmetalmc.bench.screenshots=0. */
+    static final boolean SCREENSHOTS = !"0".equals(System.getProperty("metalmc.bench.screenshots", "1"));
+
     private enum State { WAITING, WARMUP, RUNNING, DONE }
 
     private static State state = State.WAITING;
@@ -79,10 +82,12 @@ public final class Bench {
                     frameCount = 0;
                     lastFrameNs = 0;
                     log("running for " + RUN_TICKS + " ticks");
+                    screenshot(mc, "start");
                 }
             }
             case RUNNING -> {
                 place(player, tick);
+                if (tick == RUN_TICKS / 2) screenshot(mc, "mid");
                 if (++tick >= RUN_TICKS) {
                     state = State.DONE;
                     finish(mc);
@@ -90,6 +95,13 @@ public final class Bench {
             }
             default -> { }
         }
+    }
+
+    private static void screenshot(Minecraft mc, String tag) {
+        if (!SCREENSHOTS) return;
+        String name = LABEL + "-" + tag + ".png";
+        net.minecraft.client.Screenshot.grab(mc.gameDirectory, name, mc.gameRenderer.mainRenderTarget(), 1,
+            message -> log("screenshot " + name + ": " + message.getString()));
     }
 
     /** Orbit pose at tick t: radius RADIUS around (CENTER_X, CENTER_Z), looking at the center, 25 degrees down. */
