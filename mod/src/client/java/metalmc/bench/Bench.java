@@ -36,7 +36,10 @@ public final class Bench {
     /** Screenshots at the start and middle of the run (tests readback too); off with -Dmetalmc.bench.screenshots=0. */
     static final boolean SCREENSHOTS = !"0".equals(System.getProperty("metalmc.bench.screenshots", "1"));
 
-    private enum State { WAITING, WARMUP, RUNNING, DONE }
+    /** Rendering coverage tour instead of the timed orbit (see Tour). */
+    static final boolean TOUR = "1".equals(System.getProperty("metalmc.tour"));
+
+    private enum State { WAITING, WARMUP, RUNNING, TOUR, DONE }
 
     private static State state = State.WAITING;
     private static int tick;
@@ -76,7 +79,11 @@ public final class Bench {
             }
             case WARMUP -> {
                 place(player, 0);
-                if (++tick >= WARMUP_TICKS) {
+                if (++tick >= WARMUP_TICKS && TOUR) {
+                    state = State.TOUR;
+                    tick = 0;
+                    log("starting rendering tour (" + Tour.STEPS.size() + " steps)");
+                } else if (tick >= WARMUP_TICKS) {
                     state = State.RUNNING;
                     tick = 0;
                     frameCount = 0;
@@ -94,12 +101,23 @@ public final class Bench {
                     finish(mc);
                 }
             }
+            case TOUR -> {
+                // After the last step, give the screenshot readbacks and file writes a moment, then quit.
+                if (Tour.onTick(mc, player) && ++tick > 60) {
+                    state = State.DONE;
+                    log("tour done; quitting");
+                    mc.stop();
+                }
+            }
             default -> { }
         }
     }
 
     private static void screenshot(Minecraft mc, String tag) {
-        if (!SCREENSHOTS) return;
+        if (SCREENSHOTS) screenshotNow(mc, tag);
+    }
+
+    static void screenshotNow(Minecraft mc, String tag) {
         String name = LABEL + "-" + tag + ".png";
         net.minecraft.client.Screenshot.grab(mc.gameDirectory, name, mc.gameRenderer.mainRenderTarget(), 1,
             message -> log("screenshot " + name + ": " + message.getString()));
@@ -212,7 +230,7 @@ public final class Bench {
         return sorted[i] / 1e6;
     }
 
-    private static void log(String msg) {
+    static void log(String msg) {
         System.out.println("[metalmc-bench] " + msg);
     }
 }

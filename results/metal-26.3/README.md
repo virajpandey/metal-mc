@@ -28,6 +28,28 @@ The relative stutter metric (`stutters_gt2x_median` in the .txt files) is higher
 
 No pipeline failed to translate or compile (errors would be logged as `Couldn't compile Metal pipeline` or `Couldn't translate`), and the native side logged no GPU errors.
 
+## Rendering coverage tour
+
+`-PbenchTour=1` runs a scripted tour (`mod/src/client/java/metalmc/bench/Tour.java`) and takes a screenshot at the end of each step. I ran it once on Metal and once on Vulkan, windowed (1708×960), then diffed the screenshots pairwise at 854×480. The composites in `tour/` are Metal | Vulkan | mask, with differences over 24/255 in red.
+
+| Step | What it exercises | Pixels differing >24/255 | Cause of the difference |
+|---|---|---|---|
+| 00 day | terrain, water, clouds, sky, fog, hand | 4.33% | arm (random skin, animation phase) |
+| 01 sunset | sunrise/sunset triangle fan (emulated on Metal), sky colors | 3.76% | arm |
+| 02 night | stars, moon, night lighting | 0.93% | arm |
+| 03 rain | rain and splash particles | 6.47% | random rain streaks, arm |
+| 04 scene | glass, stained glass, water, lava, torch, chest, enchanting table, leaves, flower, end portal, bed, banner, sign text, pig, charged creeper, zombie with glinting helmet, villager, glowing sheep (outline post effect), armor stand | 4.40% | arm, idle animations |
+| 05 particles | flame and villager particles | 5.97% | random particles, arm |
+| 06 f3 | debug overlay text, chunk-border and hitbox lines | 5.98% | FPS and backend-name text, particles, arm |
+| 07 pause | pause menu with blur post effect | 4.43% | arm |
+| 08 inventory | inventory screen, item rendering, glint on items | 1.31% | player model pose |
+| 09 nether | Nether terrain, fog, lava | 0.57% | — |
+| 10 end | End sky, obsidian pillars, crystals, boss bar, held glinting sword | 0.46% | — |
+
+Every difference traces to something that isn't deterministic between runs. None looks like a rendering error. The crops `tour/crop_scene_metal.png` and `tour/crop_scene_vulkan.png` show the scene at full resolution, and they are indistinguishable.
+
+A first version of the tour showed chunk borders in Vulkan's pause and End screenshots but not in Metal's. That was a bug in the tour script, not in the renderer. Debug-overlay statuses persist in `debug-profile.json`, and `toggleStatus` is a 3-state machine, so the same toggles gave different end states depending on the previous run. The tour now sets the statuses explicitly, and runs use a fixed `--username` so the skin is the same each time.
+
 ## Windowed
 
 `metal_first` (windowed, 1708×960 drawable) runs at 119.9 fps. That is the macOS compositor's 120 Hz cap, the same one Vulkan hits and the same one a bare `CAMetalLayer` clear/present loop hits (see `docs/backend-design.md`). Windowed numbers don't compare backends on this machine.
@@ -35,5 +57,5 @@ No pipeline failed to translate or compile (errors would be logged as `Couldn't 
 ## What is not covered yet
 
 - Timestamp queries (vanilla's GPU-utilization line) read as unavailable on Metal.
-- Only this route was tested (overworld, daytime, render distance 12, no weather). The Nether and End, rain and snow, menus with blur, and chunk-heavy flight haven't been exercised under the Metal backend yet.
+- Performance was measured on only this route (overworld, daytime, render distance 12). The tour checks correctness, not speed, in the other scenes. Snow, chunk-heavy flight, and long sessions haven't been exercised yet.
 - Four runs from one session on one machine. This is a strong result for this workload, not a general claim.

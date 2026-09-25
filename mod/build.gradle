@@ -24,7 +24,7 @@ loom {
 	runs {
 		// ./gradlew runClient -PbenchLabel=opengl  (graphics backend itself is set in run/options.txt)
 		client {
-			programArgs "--quickPlaySingleplayer", "claudeworld"
+			programArgs "--quickPlaySingleplayer", "claudeworld", "--username", "MetalMCBench"
 			property "metalmc.bench", "1"
 			property "metalmc.bench.label", (project.findProperty("benchLabel") ?: "unlabeled").toString()
 			property "metalmc.bench.y", (project.findProperty("benchY") ?: "150").toString()
@@ -33,6 +33,7 @@ loom {
 			property "metalmc.backend", (project.findProperty("metalBackend") ?: "off").toString()
 			property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
 			property "metalmc.backend.presentTest", (project.findProperty("presentTest") ?: "0").toString()
+			property "metalmc.tour", (project.findProperty("benchTour") ?: "0").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
 			if (project.hasProperty("metalValidation")) {
