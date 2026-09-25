@@ -2,7 +2,10 @@ package metalmc.bench;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.renderpearl.api.device.DeviceInfo;
+import com.mojang.renderpearl.api.device.GpuSurface;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.debug.DebugScreenEntries;
+import net.minecraft.client.gui.components.debug.DebugScreenEntryStatus;
 import net.minecraft.client.player.LocalPlayer;
 
 import java.io.IOException;
@@ -23,6 +26,8 @@ public final class Bench {
     static final String LABEL = System.getProperty("metalmc.bench.label", "unlabeled");
     static final int WARMUP_TICKS = Integer.getInteger("metalmc.bench.warmupTicks", 400);   // 20 s
     static final int RUN_TICKS = Integer.getInteger("metalmc.bench.runTicks", 1200);        // 60 s
+    /** Vanilla's GPU timer needs its debug-screen line enabled, which itself costs frame time; opt-in. */
+    static final boolean GPU_TIMER = "1".equals(System.getProperty("metalmc.bench.gpuTimer", "0"));
     static final double CENTER_X = Double.parseDouble(System.getProperty("metalmc.bench.cx", "8"));
     static final double CENTER_Z = Double.parseDouble(System.getProperty("metalmc.bench.cz", "8"));
     static final double RADIUS = Double.parseDouble(System.getProperty("metalmc.bench.radius", "140"));
@@ -34,6 +39,8 @@ public final class Bench {
     private static int tick;
     private static long lastFrameNs;
     private static final long[] frameNs = new long[400_000];
+    /** Vanilla's GPU utilization (% of the profiled frame's CPU duration), sampled every frame. */
+    private static final double[] gpuUtil = new double[400_000];
     private static int frameCount;
 
     private Bench() {}
@@ -42,7 +49,10 @@ public final class Bench {
     public static void onFrame() {
         if (state != State.RUNNING) return;
         long now = System.nanoTime();
-        if (lastFrameNs != 0 && frameCount < frameNs.length) frameNs[frameCount++] = now - lastFrameNs;
+        if (lastFrameNs != 0 && frameCount < frameNs.length) {
+            gpuUtil[frameCount] = Minecraft.getInstance().getGpuUtilization();
+            frameNs[frameCount++] = now - lastFrameNs;
+        }
         lastFrameNs = now;
     }
 
@@ -55,7 +65,11 @@ public final class Bench {
             case WAITING -> {
                 state = State.WARMUP;
                 tick = 0;
-                log("world loaded; warming up for " + WARMUP_TICKS + " ticks");
+                // Vanilla only runs its GPU timer query while this debug entry is enabled. The status is saved
+                // to disk, so set it explicitly either way.
+                mc.debugEntries.setStatus(DebugScreenEntries.GPU_UTILIZATION,
+                    GPU_TIMER ? DebugScreenEntryStatus.ALWAYS_ON : DebugScreenEntryStatus.NEVER);
+                log("world loaded; warming up for " + WARMUP_TICKS + " ticks; " + presentInfo(mc));
             }
             case WARMUP -> {
                 place(player, 0);
@@ -103,22 +117,41 @@ public final class Bench {
         int stutters = 0;
         for (long v : f) if (v / 1e6 > 2 * p50) stutters++;
         double seconds = sumMs / 1000;
+        // GPU time estimate per frame = utilization% x frame time (utilization is relative to CPU frame duration).
+        double[] gpuMs = new double[f.length];
+        double utilSum = 0;
+        for (int i = 0; i < f.length; i++) {
+            utilSum += gpuUtil[i];
+            gpuMs[i] = gpuUtil[i] / 100.0 * (f[i] / 1e6);
+        }
+        double[] gpuSorted = gpuMs.clone();
+        Arrays.sort(gpuSorted);
+        double gpuMean = 0;
+        for (double v : gpuMs) gpuMean += v;
+        gpuMean = f.length == 0 ? 0 : gpuMean / f.length;
+        double utilMean = f.length == 0 ? 0 : utilSum / f.length;
+        double gpuP95 = gpuSorted.length == 0 ? 0 : gpuSorted[(int) Math.round(0.95 * (gpuSorted.length - 1))];
 
         DeviceInfo info = RenderSystem.getDevice().getDeviceInfo();
         String summary = String.format(Locale.ROOT,
             "METALMC_BENCH label=%s backend=%s gpu=\"%s\" driver=\"%s\" frames=%d seconds=%.1f fps_mean=%.1f "
-                + "ms_mean=%.3f ms_p50=%.3f ms_p95=%.3f ms_p99=%.3f ms_max=%.3f stutters_gt2x_median=%d render_distance=%d",
+                + "ms_mean=%.3f ms_p50=%.3f ms_p95=%.3f ms_p99=%.3f ms_max=%.3f stutters_gt2x_median=%d "
+                + "gpu_timer=%s gpu_util_mean=%.1f gpu_ms_est_mean=%.3f gpu_ms_est_p95=%.3f render_distance=%d "
+                + "fullscreen=%s window=%dx%d %s",
             LABEL, info.backendName(), info.name(), info.driverInfo(), f.length, seconds,
             seconds > 0 ? f.length / seconds : 0, meanMs, p50, p95, p99, maxMs, stutters,
-            mc.options.renderDistance().get());
+            GPU_TIMER, utilMean, gpuMean, gpuP95, mc.options.renderDistance().get(),
+            mc.options.fullscreen().get(), mc.getWindow().getWidth(), mc.getWindow().getHeight(), presentInfo(mc));
 
         try {
             Path dir = mc.gameDirectory.toPath().resolve("metalmc-bench");
             Files.createDirectories(dir);
             String stem = LABEL + "-" + System.currentTimeMillis();
             try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(dir.resolve(stem + ".csv"), StandardCharsets.UTF_8))) {
-                w.println("frame,ms");
-                for (int i = 0; i < f.length; i++) w.printf(Locale.ROOT, "%d,%.4f%n", i, f[i] / 1e6);
+                w.println("frame,ms,gpu_util_pct,gpu_ms_est");
+                for (int i = 0; i < f.length; i++) {
+                    w.printf(Locale.ROOT, "%d,%.4f,%.2f,%.4f%n", i, f[i] / 1e6, gpuUtil[i], gpuMs[i]);
+                }
             }
             Files.writeString(dir.resolve(stem + ".txt"), summary + "\n", StandardCharsets.UTF_8);
         } catch (IOException e) {
@@ -127,6 +160,17 @@ public final class Bench {
         System.out.println(summary);
         log("done; quitting");
         mc.stop();
+    }
+
+    /** The swapchain present mode Minecraft picks: the first of its preference list that the surface supports. */
+    private static String presentInfo(Minecraft mc) {
+        try {
+            var modes = mc.windowSurface().supportedPresentModes();
+            var chosen = GpuSurface.PresentMode.getSupportedVsyncMode(modes, mc.options.enableVsync().get());
+            return "present_supported=" + modes.toString().replace(" ", "") + " present=" + chosen;
+        } catch (RuntimeException e) {
+            return "present=unknown(" + e.getClass().getSimpleName() + ")";
+        }
     }
 
     private static double pct(long[] sorted, double p) {

@@ -1,0 +1,1 @@
+METALMC_BENCH label=vulkan_try2 backend=Vulkan gpu="Apple M3 Pro" driver="1.2.350 MoltenVK 1.4.2" frames=7190 seconds=60.0 fps_mean=119.9 ms_mean=8.343 ms_p50=8.265 ms_p95=9.768 ms_p99=10.413 ms_max=51.884 stutters_gt2x_median=2 render_distance=12 present_supported=[IMMEDIATE,FIFO] present=IMMEDIATE

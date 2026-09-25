@@ -28,6 +28,7 @@ loom {
 			property "metalmc.bench", "1"
 			property "metalmc.bench.label", (project.findProperty("benchLabel") ?: "unlabeled").toString()
 			property "metalmc.bench.y", (project.findProperty("benchY") ?: "150").toString()
+			property "metalmc.bench.gpuTimer", (project.findProperty("benchGpu") ?: "0").toString()
 		}
 	}
 }

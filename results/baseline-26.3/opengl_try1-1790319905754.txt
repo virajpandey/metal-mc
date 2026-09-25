@@ -1,0 +1,1 @@
+METALMC_BENCH label=opengl_try1 backend=OpenGL gpu="Apple M3 Pro" driver="4.1 Metal - 90.5" frames=13846 seconds=60.0 fps_mean=230.8 ms_mean=4.333 ms_p50=4.418 ms_p95=6.679 ms_p99=8.342 ms_max=14.227 stutters_gt2x_median=82 render_distance=12
