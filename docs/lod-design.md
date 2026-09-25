@@ -26,6 +26,12 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 - **Selection.** A quadtree per frame on the CPU: a node splits into its four children when the camera is within 2 × the child size and all four children exist.
 - **Seam.** Quads whose center lies within `(renderDistance − 1) × 16` blocks horizontally are collapsed in the vertex shader. There's no fragment `discard`, which would turn off Apple GPUs' hidden-surface removal for the whole pipeline.
 - **Far plane and fog.** The camera's far plane is pushed to 1.5 × the LOD distance; reverse-Z float depth keeps precision. Vanilla's render-distance fog moves from the chunk edge to the LOD edge. The LOD shader reproduces vanilla's fog formula, so it blends into the same sky.
+- **Environmental haze.** The overworld's clear-weather haze (`FOG_END_DISTANCE`) defaults to a linear 0 → 1,024 blocks, which fully hides anything past 1 km; vanilla never draws that far, so it never shows. With LOD active, that default haze is stretched to the LOD distance. Shorter fogs (rain, water, lava, blindness, the Nether's 96 blocks) are unchanged.
+
+## Ingestion speed and memory
+
+- **Chunk decoding.** `ChunkScan` walks each chunk's NBT once and reads only position, status, block palettes and data, and the surface biome grid; everything else is skipped by length. It inflates with the Compression framework straight into a reusable per-region buffer. It is verified identical to the general NBT decoder (0 mismatches on 3,072 chunks) and takes 0.14–0.21 s per region versus 1.6–2.3 s.
+- **Cache memory.** The cached level-2 quadrants are run-length encoded per column: 31 MB instead of 157 MB for 100 regions.
 
 ## Streaming (v2, `LodWorld.swift`)
 

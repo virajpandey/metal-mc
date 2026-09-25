@@ -53,7 +53,7 @@ loom {
 				environmentVariable "MTL_DEBUG_LAYER_WARNING_MODE", "nslog"
 			}
 			if (project.hasProperty("benchPregen")) {
-				vmArg "-Xmx8G"
+				vmArg "-Xmx4G"
 			}
 			if (project.hasProperty("jfr")) {
 				// CPU profile of the timed part of the run: warm-up is 20 s, so start at 30 s and record 30 s.
