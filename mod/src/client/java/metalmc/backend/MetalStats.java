@@ -8,13 +8,16 @@ public final class MetalStats {
     private MetalStats() {
     }
 
-    /** {passes, draws, blit encoders, clear passes, submits, attachment pixels} since the last call. */
+    /**
+     * {passes, draws, blit encoders, clear passes, submits, attachment pixels, LOD draws, LOD quads, LOD CPU ns}
+     * since the last call.
+     */
     public static long[] takeCounters() {
-        java.nio.LongBuffer buf = MemoryUtil.memAllocLong(6);
+        java.nio.LongBuffer buf = MemoryUtil.memAllocLong(9);
         try {
             Mtl.statsTake(MemoryUtil.memAddress(buf));
-            long[] out = new long[6];
-            for (int i = 0; i < 6; i++) out[i] = buf.get(i);
+            long[] out = new long[9];
+            for (int i = 0; i < 9; i++) out[i] = buf.get(i);
             return out;
         } finally {
             MemoryUtil.memFree(buf);

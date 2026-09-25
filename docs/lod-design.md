@@ -10,7 +10,8 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 - **Nodes.** A node is a 256 × 256-voxel column spanning the full world height (y −64 to 320). A level-1 node is exactly one region file (512 × 512 blocks). A level-(L+1) node merges 2 × 2 level-L nodes at half resolution.
 - **Voxels.** Each voxel is one byte, a material id from `MetalMCCore.Mat`, the same flat-color material table the standalone engine uses.
 - **Downsampling keeps the top layer.** In each 2 × 2 × 2 group, the highest non-air child wins, so grass, sand and snow survive at a distance and thin features such as trees stay as blobs.
-- **Unreachable air is filled.** Before meshing, air and water that can't be reached from the sky or the node's sides is filled with stone. Sealed caves are invisible from LOD distances, and their walls were half the mesh. Cave entrances stay open.
+- **Deep air is filled.** Before meshing, air and water more than 4 voxels below the lowest open ground within 8 voxels is filled with stone. "Open ground" is the height from which a column is open to the sky, and the lowest one in the neighborhood is taken. This removes cave networks under hills even when they connect to a surface entrance somewhere. They were 49% of all quads, measured on six level-1 regions of the 8 km world (`mmc_debug_lod_mesh_stats`). Entrances stay open to that depth, and arches and overhangs stay open because the ground beside them is open. `METALMC_EXP=nodeepfill` turns it off for comparisons.
+- **Unreachable air is filled.** Then air and water that can't be reached from the sky or the node's sides is filled with stone as well (sealed caves).
 
 ## Mesh
 
@@ -47,5 +48,14 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 - **Base materials** use the average color of each material's block texture (`LodColors.swift`, from `tools/lod_colors.py`).
 - **Grass, leaves and water are biome-tinted** (`LodBiomes.swift`). The chunk decoder reads each chunk's 4 × 4 surface biome grid (y 96–111, above cave biomes). Tinted voxels use material ids 64 + t, 96 + t and 128 + t for 20 tint classes (vanilla's grass/foliage/water colors), so the tint survives downsampling. `results/lod-v1/far-orbit-biome-tints.png` shows savanna hills matching vanilla's yellow-olive grass across the seam.
 
+## Where the time goes
+
+Per-frame counters from `-PbenchTrace=1` runs: `per_frame_lod_draws`, `per_frame_lod_kquads` and `per_frame_lod_cpu_ms`.
+
+- **The CPU side is cheap.** Selection, culling and encoding take 0.06–0.08 ms per frame for 420–570 draws. GPU-driven selection with indirect command buffers would save almost nothing, so it isn't a priority.
+- **The GPU cost is quads.** At 8 km, the LOD submitted 896 K quads per frame and added 0.95 ms of vertex time and 0.55 ms of fragment time to the main pass (1.05 → 2.55 ms). On a tile-based GPU, vertex shading and tiling scale with primitive count, and fragment cost includes per-tile primitive processing. Cutting the quads drawn is what pays.
+- **Deep-cave filling** took the 8 km LOD from 896 K to 567 K quads per frame and 267 to 320 fps. It also cut total quads from 11.8 M to 7.7 M and GPU memory from 95 to 62 MB. The screenshots are pixel-identical apart from moving animals.
+
 ## Known gaps
-- Everything is drawn one call per node with CPU selection. GPU-driven selection with indirect command buffers is next, and possible because this pipeline binds no textures.
+- **Occlusion culling.** LOD behind hills and behind vanilla terrain is still drawn. On Apple GPUs, hidden-surface removal makes the hidden fragments cheap, but their vertices and tiling are not. Voxy uses a hierarchical depth test. `~/research_notes/voxy-techniques.md` §8–9 covers how to fit it to Metal's tile-based pipeline.
+- **Screen-size selection.** Levels switch by distance: a node splits when the camera is closer than its size. That gives voxels of about 4–8 px at 4K. Voxy switches by projected size, 64 px per 32-voxel section. That's finer than ours, so ours already trades detail for speed.

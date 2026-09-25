@@ -45,6 +45,22 @@ That's 16× vanilla RD 32's view distance at 45% more FPS. `rd12-lod8192-start.p
 
 **Showcase tour** (`-PbenchTour=lod`, `tour-8k/`): horizontal views from 3 blocks above the ground and from y = 260 in four directions. These are the hardest views for LOD, since the seam and the horizon are at eye level. At ground level the vanilla-to-LOD transition behind hills and villages isn't noticeable. From y = 260 the terrain runs to an 8 km horizon, with vanilla's clouds correctly layered above it. The ground shots still show the last rain streaks, because the tour switches the weather to clear when it starts.
 
+## Deep-cave filling (2026-09-25)
+
+New counters showed where LOD time goes. The CPU side takes 0.06–0.08 ms per frame. The GPU cost is the quads: 786–896 K per frame. A mesh audit (`mmc_debug_lod_mesh_stats`) found that 49% of level-1 quads were cave walls more than 16 blocks underground. They sit in cave networks connected to a surface entrance somewhere, so the sealed-cave fill kept them. The LOD now also fills air more than 4 voxels below the lowest open ground within 8 voxels (see `docs/lod-design.md`).
+
+A/B runs use the same build, fullscreen, RD 12, noon and clear weather. The baseline is `METALMC_EXP=nodeepfill`.
+
+| Run | FPS | LOD quads/frame | Metal GPU ms/frame |
+|---|---|---|---|
+| 4 km world, LOD 2048, before (`lodm_2k_old`) | 276.4 | 786 K | 5.52 |
+| 4 km world, LOD 2048, deep fill (`lodm_2k_deep`) | **325.5** | 455 K | 4.30 |
+| 8 km world, LOD 8192, before (`lodm_8k`) | 267.2 | 896 K | 5.82 |
+| 8 km world, LOD 8192, deep fill (`lodm_8k_deep`) | **319.5** | 567 K | 4.69 |
+| 4 km world, vanilla RD 32, no LOD (`van_rd32_noon`) | 184.9 | none | 6.45 |
+
+At 8 km, total LOD quads dropped from 11.8 M to 7.7 M and GPU memory from 95 to 62 MB. The main pass went from 2.55 to 2.00 ms (vanilla alone is 1.05 ms). All 8 showcase-tour views and the bench screenshots match the baseline. The only differing pixels (0.01–0.4%) are animals near the player that moved between runs.
+
 ## Build cost
 
 The LOD is built in the background when the world opens: 81 non-empty regions in 26 s in-game (18 s standalone). The result is 74 nodes on 3 levels, 7.7 M quads, 61 MB of GPU memory. Filling sealed caves and not emitting faces under water halved the quad count.

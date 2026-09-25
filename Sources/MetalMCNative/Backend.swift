@@ -111,6 +111,8 @@ final class MetalContext: @unchecked Sendable {
     var profLabels: [String] = []
     var profNext = 0
     var statPasses = 0, statDraws = 0, statBlits = 0, statClears = 0, statSubmits = 0, statPassPixels = 0
+    // LOD: draw calls, quads submitted, CPU nanoseconds spent in mmc_lod_draw.
+    var statLodDraws = 0, statLodQuads = 0, statLodNanos: UInt64 = 0
 
     // Utility pipelines, built on first use.
     let utilLock = NSLock()
@@ -1189,12 +1191,15 @@ public func mmc_trace_frames(_ n: Int32) {
     ctx.traceFrames = Int(n)
 }
 
-/// out: passes, draws, blit encoders, clear passes, submits, attachment pixels over all passes; resets them.
+/// out: passes, draws, blit encoders, clear passes, submits, attachment pixels over all passes, then LOD draws,
+/// LOD quads and LOD CPU nanoseconds; resets them.
 @_cdecl("mmc_stats_take")
 public func mmc_stats_take(_ out: UnsafeMutablePointer<Int64>) {
     out[0] = Int64(ctx.statPasses); out[1] = Int64(ctx.statDraws); out[2] = Int64(ctx.statBlits)
     out[3] = Int64(ctx.statClears); out[4] = Int64(ctx.statSubmits); out[5] = Int64(ctx.statPassPixels)
+    out[6] = Int64(ctx.statLodDraws); out[7] = Int64(ctx.statLodQuads); out[8] = Int64(ctx.statLodNanos)
     ctx.statPasses = 0; ctx.statDraws = 0; ctx.statBlits = 0; ctx.statClears = 0; ctx.statSubmits = 0; ctx.statPassPixels = 0
+    ctx.statLodDraws = 0; ctx.statLodQuads = 0; ctx.statLodNanos = 0
 }
 
 @_cdecl("mmc_completed_submit")

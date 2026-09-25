@@ -260,6 +260,8 @@ public func mmc_lod_status(_ out: UnsafeMutablePointer<Int64>) {
 /// Returns the number of draws. Leaves ctx.pipe nil so Java re-applies Minecraft's pipeline state.
 @_cdecl("mmc_lod_draw")
 public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>) -> Int32 {
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    defer { ctx.statLodNanos += DispatchTime.now().uptimeNanoseconds - t0 }
     let r = LodRenderer.shared
     guard let enc = ctx.pass, !ctx.scissorEmpty else { return 0 }
     r.lock.lock(); let w = r.world; r.lock.unlock()
@@ -351,7 +353,9 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     }
     enc.setVertexBuffer(r.colorBuffer!, offset: 0, index: 21)
     var bound: ObjectIdentifier?
+    ctx.statLodDraws += draws.count
     for d in draws {
+        ctx.statLodQuads += d.count
         let id = ObjectIdentifier(d.node)
         if bound != id {
             enc.setVertexBuffer(d.node.buffer, offset: 0, index: 18)

@@ -15,6 +15,8 @@ let lodTileVoxels = 64
 let lodTilesPerSide = lodNodeVoxels / lodTileVoxels   // 4 x 4 tiles per node
 let lodWorldMinY = -64
 let lodWorldHeight = 384
+/// METALMC_EXP=nodeepfill turns off deep-cave filling (for A/B comparisons).
+let lodDeepFill = !(ProcessInfo.processInfo.environment["METALMC_EXP"] ?? "").contains("nodeepfill")
 
 /// A node's voxel grid: x fastest, then z, then y. Material ids from MetalMCCore.Mat.
 struct LodGrid {
@@ -30,11 +32,51 @@ struct LodGrid {
 
     @inline(__always) func index(_ x: Int, _ y: Int, _ z: Int) -> Int { (y * lodNodeVoxels + z) * lodNodeVoxels + x }
 
-    /// Fills air (and water) that can't be reached from the sky or the node's sides with stone. Sealed
-    /// caves can't be seen from LOD distances, and their walls would otherwise dominate the mesh.
-    /// Cave entrances stay open because they connect to reachable air.
-    mutating func fillUnreachable() {
+    /// Fills air (and water) that can't be seen from LOD distances with stone, in two steps:
+    ///
+    /// 1. Deep air: air more than `deepDepth` voxels below the lowest open ground within `deepRadius`
+    ///    voxels (the lowest height from which a nearby column is open to the sky). This removes cave
+    ///    networks under hills and mountains even when they connect to a surface entrance somewhere; they
+    ///    were half of all LOD quads. Entrances stay open to that depth, and arches and overhangs stay
+    ///    open because the ground beside them is open.
+    /// 2. Unreachable air: air that can't be reached from the sky or the node's sides (sealed caves).
+    mutating func fillUnreachable(seedSides: Bool = true, deepRadius: Int = lodDeepFill ? 8 : -1, deepDepth: Int = 4) {
         let n = lodNodeVoxels, h = height
+        if deepRadius >= 0 {
+            let stone = Mat.stone.rawValue
+            v.withUnsafeMutableBufferPointer { g in
+                // Height from which each column is open to the sky (one above its highest non-water solid).
+                var open = [Int32](repeating: 0, count: n * n)
+                for i in 0..<(n * n) {
+                    var y = h - 1
+                    while y >= 0 { let m = g[y * n * n + i]; if m != 0 && !lodIsWater(m) { break }; y -= 1 }
+                    open[i] = Int32(y + 1)
+                }
+                // Lowest open height within the square neighborhood (separable min filter).
+                var rows = open
+                for z in 0..<n {
+                    for x in 0..<n {
+                        var m = Int32.max
+                        for k in max(0, x - deepRadius)...min(n - 1, x + deepRadius) { m = min(m, open[z * n + k]) }
+                        rows[z * n + x] = m
+                    }
+                }
+                for z in 0..<n {
+                    for x in 0..<n {
+                        var m = Int32.max
+                        for k in max(0, z - deepRadius)...min(n - 1, z + deepRadius) { m = min(m, rows[k * n + x]) }
+                        let limit = Int(m) - deepDepth
+                        let i = z * n + x
+                        var y = 0
+                        while y < limit {
+                            let c = g[y * n * n + i]
+                            if c == 0 || lodIsWater(c) { g[y * n * n + i] = stone }
+                            y += 1
+                        }
+                    }
+                }
+            }
+        }
         var seen = [Bool](repeating: false, count: v.count)
         var stack: [Int32] = []
         stack.reserveCapacity(1 << 16)
@@ -46,7 +88,7 @@ struct LodGrid {
                 }
                 // Seeds: the top layer and the four side walls.
                 for z in 0..<n { for x in 0..<n { push(((h - 1) * n + z) * n + x) } }
-                for y in 0..<h {
+                for y in 0..<h where seedSides {
                     for k in 0..<n {
                         push((y * n + 0) * n + k); push((y * n + (n - 1)) * n + k)
                         push((y * n + k) * n + 0); push((y * n + k) * n + (n - 1))
@@ -356,4 +398,51 @@ public func mmc_debug_compare_decoders(_ path: UnsafePointer<CChar>, _ out: Unsa
         if !same { mismatches += 1 }
     }
     out[0] = compared; out[1] = mismatches; out[2] = Int64(tOld * 1e6); out[3] = Int64(tNew * 1e6)
+}
+
+/// Debug: meshes one region at level 1 (or downsampled to `level`) and counts quads.
+/// out[0] = quads, out[1] = quads whose front air voxel has solid somewhere above it (not open to the sky),
+/// out[2..7] = quads per face (+X -X +Y -Y +Z -Z), out[8] = milliseconds for fill + mesh,
+/// out[9] = buried quads whose covering voxel is leaves, out[10] = buried more than 8 voxels deep.
+@_cdecl("mmc_debug_lod_mesh_stats")
+public func mmc_debug_lod_mesh_stats(_ path: UnsafePointer<CChar>, _ level: Int32, _ mode: Int32, _ out: UnsafeMutablePointer<Int64>) {
+    guard var g = LodBuild.regionGrid(path: String(cString: path)) else { return }
+    while g.level < Int(level) {
+        var p = LodGrid(level: g.level + 1)
+        g.downsample(into: &p, qx: 0, qz: 0)
+        g = p
+    }
+    let t0 = Date()
+    switch mode {
+    case 0: g.fillUnreachable(deepRadius: -1)
+    case 1: g.fillUnreachable()
+    case 2: g.fillUnreachable(deepRadius: 4, deepDepth: 8)
+    default: g.fillUnreachable(deepRadius: 16, deepDepth: 4)
+    }
+    let m = LodBuild.mesh(g, maxMerge: g.level == 1 ? 16 : 64)
+    out[8] = Int64(Date().timeIntervalSince(t0) * 1000)
+    let n = lodNodeVoxels, h = g.height
+    // Highest solid voxel per column (-1 if none).
+    var top = [Int](repeating: -1, count: n * n)
+    for y in 0..<h { for i in 0..<(n * n) where g.v[y * n * n + i] != 0 { top[i] = y } }
+    var buried: Int64 = 0
+    let total = m.quads.count / 2
+    for q in 0..<total {
+        let w0 = m.quads[2 * q]
+        let x = Int(w0 & 255), z = Int((w0 >> 8) & 255), y = Int((w0 >> 16) & 255), face = Int((w0 >> 24) & 7)
+        out[2 + face] += 1
+        let (sx, sy, sz) = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)][face]
+        let fx = x + sx, fy = y + sy, fz = z + sz
+        if fx < 0 || fz < 0 || fx >= n || fz >= n { continue }   // skirt faces: counted as open
+        if top[fz * n + fx] > fy {
+            buried += 1
+            // First solid voxel above the front cell: leaves means "under a tree canopy".
+            var yy = fy + 1
+            while yy < h && g.v[(yy * n + fz) * n + fx] == 0 { yy += 1 }
+            let above = yy < h ? g.v[(yy * n + fz) * n + fx] : 0
+            if above == Mat.leaves.rawValue || (above >= lodLeavesBase && above < lodLeavesBase + 32) { out[9] += 1 }
+            if top[fz * n + fx] - fy > 8 { out[10] += 1 }
+        }
+    }
+    out[0] = Int64(total); out[1] = buried
 }
