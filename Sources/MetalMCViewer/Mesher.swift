@@ -1,42 +1,49 @@
 import simd
 
-/// 16 bytes per vertex; matches `VertexIn` in the Metal shader (packed_float3 + uint).
-struct PackedVertex {
-    var x: Float
-    var y: Float
-    var z: Float
-    var color: UInt32
+/// One quad = one 32-bit word, expanded to 6 vertices by the vertex shader (vertex pulling).
+///
+///   bits  0-3   x within section        bits 12-14  face (0..5, order of `Mesher.faces`)
+///   bits  4-7   y within section        bits 15-22  material ID
+///   bits  8-11  z within section        bits 23-26  width - 1  (greedy extent along U)
+///                                        bits 27-30  height - 1 (greedy extent along V)
+///
+/// The section origin comes from a per-draw `[[base_instance]]` lookup, so quads never
+/// store world positions. 4 bytes per quad, down from 88 (4 x 16-byte vertices + 6 x 4-byte indices).
+enum QuadFormat {
+    @inline(__always)
+    static func pack(x: Int, y: Int, z: Int, face: Int, material: Int, w: Int = 1, h: Int = 1) -> UInt32 {
+        UInt32(x) | UInt32(y) << 4 | UInt32(z) << 8 | UInt32(face) << 12 | UInt32(material) << 15
+            | UInt32(w - 1) << 23 | UInt32(h - 1) << 27
+    }
 }
 
 struct SectionMesh {
     var minB: SIMD3<Float>
     var maxB: SIMD3<Float>
-    var opaqueVerts: [PackedVertex] = []
-    var opaqueIdx: [UInt32] = []
-    var waterVerts: [PackedVertex] = []
-    var waterIdx: [UInt32] = []
+    /// Opaque quads sorted by face direction (+X, -X, +Y, -Y, +Z, -Z).
+    var opaque: [UInt32] = []
+    /// Cumulative start offsets of each face bucket within `opaque`; lane 6 = total count.
+    var faceOffsets = SIMD8<Int32>(repeating: 0)
+    var water: [UInt32] = []
 }
 
-/// Naive face-culling mesher: emits a quad for every opaque face that touches air or water,
-/// and every water face that touches air. Greedy meshing and a compact format come in milestone 2.
-///
-/// All lookup tables are read through raw pointers: shared Swift arrays in the inner loop cause
-/// atomic refcount traffic that serializes the worker threads.
+/// Face-culling mesher: emits a quad for every opaque face that touches air or water,
+/// and every water face that touches air. All lookup tables are read through raw pointers;
+/// shared Swift arrays in the inner loop cause atomic refcount traffic that serializes threads.
 enum Mesher {
-    /// Plain-old-data face description (no arrays, so no refcounting).
+    /// Face order is shared with the shader's corner table: +X, -X, +Y, -Y, +Z, -Z.
     struct Face {
         let dx: Int32, dy: Int32, dz: Int32
-        let c0: SIMD3<Float>, c1: SIMD3<Float>, c2: SIMD3<Float>, c3: SIMD3<Float>
         let shade: Float
     }
 
     static let faces: [Face] = [
-        Face(dx: 1, dy: 0, dz: 0, c0: SIMD3(1, 0, 0), c1: SIMD3(1, 1, 0), c2: SIMD3(1, 1, 1), c3: SIMD3(1, 0, 1), shade: 0.80),
-        Face(dx: -1, dy: 0, dz: 0, c0: SIMD3(0, 0, 1), c1: SIMD3(0, 1, 1), c2: SIMD3(0, 1, 0), c3: SIMD3(0, 0, 0), shade: 0.80),
-        Face(dx: 0, dy: 1, dz: 0, c0: SIMD3(0, 1, 0), c1: SIMD3(0, 1, 1), c2: SIMD3(1, 1, 1), c3: SIMD3(1, 1, 0), shade: 1.00),
-        Face(dx: 0, dy: -1, dz: 0, c0: SIMD3(0, 0, 0), c1: SIMD3(1, 0, 0), c2: SIMD3(1, 0, 1), c3: SIMD3(0, 0, 1), shade: 0.50),
-        Face(dx: 0, dy: 0, dz: 1, c0: SIMD3(1, 0, 1), c1: SIMD3(1, 1, 1), c2: SIMD3(0, 1, 1), c3: SIMD3(0, 0, 1), shade: 0.70),
-        Face(dx: 0, dy: 0, dz: -1, c0: SIMD3(0, 0, 0), c1: SIMD3(0, 1, 0), c2: SIMD3(1, 1, 0), c3: SIMD3(1, 0, 0), shade: 0.70),
+        Face(dx: 1, dy: 0, dz: 0, shade: 0.80),
+        Face(dx: -1, dy: 0, dz: 0, shade: 0.80),
+        Face(dx: 0, dy: 1, dz: 0, shade: 1.00),
+        Face(dx: 0, dy: -1, dz: 0, shade: 0.50),
+        Face(dx: 0, dy: 0, dz: 1, shade: 0.70),
+        Face(dx: 0, dy: 0, dz: -1, shade: 0.70),
     ]
 
     static func pack(_ c: SIMD4<Float>) -> UInt32 {
@@ -44,7 +51,7 @@ enum Mesher {
         return q(c.x) | (q(c.y) << 8) | (q(c.z) << 16) | (q(c.w) << 24)
     }
 
-    /// Packed color per (material * 6 + face), so the inner loop does no float math.
+    /// Packed color per (material * 6 + face). Uploaded to the GPU as a lookup table.
     static let faceColors: [UInt32] = Materials.colors.flatMap { base in
         faces.map { f in pack(SIMD4(base.x * f.shade, base.y * f.shade, base.z * f.shade, base.w)) }
     }
@@ -61,48 +68,36 @@ enum Mesher {
         let air = MaterialKind.air.rawValue
         let water = MaterialKind.water.rawValue
         let opaque = MaterialKind.opaque.rawValue
+        var buckets: [[UInt32]] = [[], [], [], [], [], []]
 
         faces.withUnsafeBufferPointer { fp in
-            faceColors.withUnsafeBufferPointer { cp in
-                kinds.withUnsafeBufferPointer { kp in
-                    for y in y0..<(y0 + 16) {
-                        for z in z0..<(z0 + 16) {
-                            for x in x0..<(x0 + 16) {
-                                let b = Int(view.block(x, y, z))
-                                if b == 0 { continue }
-                                let isWater = kp[b] == water
-                                for fi in 0..<6 {
-                                    let f = fp[fi]
-                                    let nk = kp[Int(view.block(x + Int(f.dx), y + Int(f.dy), z + Int(f.dz)))]
-                                    let visible = isWater ? (nk == air) : (nk != opaque)
-                                    if !visible { continue }
-                                    let c = cp[b * 6 + fi]
-                                    if isWater {
-                                        emit(&mesh.waterVerts, &mesh.waterIdx, x, y, z, f, c)
-                                    } else {
-                                        emit(&mesh.opaqueVerts, &mesh.opaqueIdx, x, y, z, f, c)
-                                    }
-                                }
+            kinds.withUnsafeBufferPointer { kp in
+                for y in y0..<(y0 + 16) {
+                    for z in z0..<(z0 + 16) {
+                        for x in x0..<(x0 + 16) {
+                            let b = Int(view.block(x, y, z))
+                            if b == 0 { continue }
+                            let isWater = kp[b] == water
+                            for fi in 0..<6 {
+                                let f = fp[fi]
+                                let nk = kp[Int(view.block(x + Int(f.dx), y + Int(f.dy), z + Int(f.dz)))]
+                                let visible = isWater ? (nk == air) : (nk != opaque)
+                                if !visible { continue }
+                                let q = QuadFormat.pack(x: x - x0, y: y - y0, z: z - z0, face: fi, material: b)
+                                if isWater { mesh.water.append(q) } else { buckets[fi].append(q) }
                             }
                         }
                     }
                 }
             }
         }
+        var offset: Int32 = 0
+        for fi in 0..<6 {
+            mesh.faceOffsets[fi] = offset
+            mesh.opaque.append(contentsOf: buckets[fi])
+            offset += Int32(buckets[fi].count)
+        }
+        mesh.faceOffsets[6] = offset
         return mesh
-    }
-
-    @inline(__always)
-    private static func emit(_ v: inout [PackedVertex], _ i: inout [UInt32],
-                             _ x: Int, _ y: Int, _ z: Int, _ f: Face, _ c: UInt32) {
-        let b = UInt32(v.count)
-        let o = SIMD3<Float>(Float(x), Float(y), Float(z))
-        let q0 = o + f.c0, q1 = o + f.c1, q2 = o + f.c2, q3 = o + f.c3
-        v.append(PackedVertex(x: q0.x, y: q0.y, z: q0.z, color: c))
-        v.append(PackedVertex(x: q1.x, y: q1.y, z: q1.z, color: c))
-        v.append(PackedVertex(x: q2.x, y: q2.y, z: q2.z, color: c))
-        v.append(PackedVertex(x: q3.x, y: q3.y, z: q3.z, color: c))
-        i.append(b); i.append(b + 1); i.append(b + 2)
-        i.append(b); i.append(b + 2); i.append(b + 3)
     }
 }

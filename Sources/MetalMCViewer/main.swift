@@ -37,6 +37,7 @@ do {
     renderer.cullBackfaces = !args.contains("--no-cull")
     renderer.frontFacing = args.contains("--cw") ? .clockwise : .counterClockwise
     renderer.reverseZ = !args.contains("--standard-z")
+    renderer.faceBuckets = !args.contains("--no-buckets")
     renderer.upload(world: world)
     let t2 = CACurrentMediaTime()
 
