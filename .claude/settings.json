@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(swift build:*)",
+      "Bash(swift test:*)",
+      "Bash(swift package:*)",
+      "Bash(./.build/release/MetalMCViewer:*)",
+      "Bash(.build/release/MetalMCViewer:*)",
+      "Bash(./.build/debug/MetalMCViewer:*)",
+      "Bash(.build/debug/MetalMCViewer:*)",
+      "Bash(git init:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(ls:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(du:*)",
+      "Edit(~/Projects/metal-mc/**)"
+    ]
+  }
+}

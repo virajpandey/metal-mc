@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+bench_out/
+*.gputrace
+.DS_Store
+fixtures/
