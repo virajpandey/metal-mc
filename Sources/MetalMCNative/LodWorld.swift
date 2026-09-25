@@ -2,10 +2,11 @@ import Foundation
 import Metal
 import MetalMCCore
 
-// Keeps the LOD current while playing (single-player). The integrated server writes chunks to region files
-// when they unload (the player moved away) and on autosave. A background thread notices changed region
-// files and rebuilds only the affected nodes and their parents, and meshes the finest level around the
-// player's current position.
+// Keeps the LOD current while playing. Two sources feed it: region files (single-player; the integrated
+// server writes chunks when they unload and on autosave) and live chunks handed over by the mod as the
+// client loads and unloads them (LodLive.swift; the only source in multiplayer). A background thread
+// notices changed regions and rebuilds only the affected nodes and their parents, and meshes the finest
+// level around the player's current position. Live chunks replace the region file's version of a chunk.
 //
 // Per region it caches the level-2 quadrant (128 x 128 x 96 voxels), so parents can be rebuilt without
 // re-reading sibling regions from disk.
@@ -103,7 +104,8 @@ struct LodNodeKey: Hashable {
 }
 
 final class LodWorld: @unchecked Sendable {
-    let regionDir: URL
+    let regionDir: URL?
+    let live: LodLiveStore
     let maxLevel: Int
     let fineRadius: Int
 
@@ -118,13 +120,14 @@ final class LodWorld: @unchecked Sendable {
     private var meshedCenter: (x: Int, z: Int)?
     private var requestedCenter: (x: Int, z: Int)
     private var vanillaRadius = 0                      // blocks; regions this close to the player are drawn by vanilla
-    private var deferred: [Int64: String] = [:]        // changed regions waiting until the player leaves them
+    private var deferred = Set<Int64>()                // changed regions waiting until the player leaves them
     private let queue = DispatchQueue(label: "metalmc.lod.update", qos: .utility)
     private var running = true
     var status = "starting"
 
-    init(regionDir: URL, maxLevel: Int, fineRadius: Int, centerX: Int, centerZ: Int) {
+    init(regionDir: URL?, storeDir: URL?, maxLevel: Int, fineRadius: Int, centerX: Int, centerZ: Int) {
         self.regionDir = regionDir
+        live = LodLiveStore(saveDir: storeDir)
         self.maxLevel = maxLevel
         self.fineRadius = fineRadius
         center = (centerX, centerZ)
@@ -154,6 +157,7 @@ final class LodWorld: @unchecked Sendable {
 
     func start() {
         queue.async { [self] in
+            if live.saveDir != nil { log("LOD: loaded \(live.load()) saved regions from \(live.saveDir!.path)") }
             while true {
                 lock.lock(); let go = running; lock.unlock()
                 if !go { return }
@@ -193,39 +197,45 @@ final class LodWorld: @unchecked Sendable {
 
     /// One update pass. Returns true if anything was rebuilt.
     private func poll() -> Bool {
-        let files = ((try? FileManager.default.contentsOfDirectory(atPath: regionDir.path)) ?? []).filter { $0.hasSuffix(".mca") }
-        var changed: [(Int, Int, String)] = []
+        var changed: [(Int, Int)] = []
         var seen = Set<Int64>()
-        for f in files {
-            let parts = f.split(separator: ".")
-            guard parts.count == 4, let x = Int(parts[1]), let z = Int(parts[2]) else { continue }
-            let path = regionDir.appendingPathComponent(f).path
-            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-                  let mtime = attrs[.modificationDate] as? Date, let size = attrs[.size] as? Int else { continue }
-            let k = LodBuild.key(x, z)
-            seen.insert(k)
-            if let old = fileStamps[k], old.0 == mtime, old.1 == size { continue }
-            fileStamps[k] = (mtime, size)
-            changed.append((x, z, path))
+        if let regionDir {
+            let files = ((try? FileManager.default.contentsOfDirectory(atPath: regionDir.path)) ?? []).filter { $0.hasSuffix(".mca") }
+            for f in files {
+                let parts = f.split(separator: ".")
+                guard parts.count == 4, let x = Int(parts[1]), let z = Int(parts[2]) else { continue }
+                let path = regionDir.appendingPathComponent(f).path
+                guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                      let mtime = attrs[.modificationDate] as? Date, let size = attrs[.size] as? Int else { continue }
+                let k = LodBuild.key(x, z)
+                seen.insert(k)
+                if let old = fileStamps[k], old.0 == mtime, old.1 == size { continue }
+                fileStamps[k] = (mtime, size)
+                changed.append((x, z))
+            }
         }
+        // Regions that received live chunks.
+        let changedSet = Set(changed.map { LodBuild.key($0.0, $0.1) })
+        for k in live.takeDirty() where !changedSet.contains(k) { changed.append(LodBuild.unkey(k)) }
+        for k in live.regionKeys { seen.insert(k) }
 
         lock.lock(); let want = requestedCenter; let near = vanillaRadius; lock.unlock()
         // Regions vanilla is drawing around the player change constantly (autosave). Rebuild them only once
         // the player has moved away; the first pass (no mesh yet) builds everything.
         if meshedCenter != nil && near > 0 {
-            var keep: [(Int, Int, String)] = []
+            var keep: [(Int, Int)] = []
             for c in changed {
                 if regionNear(c.0, c.1, cx: want.x, cz: want.z, radius: near + 64) {
-                    deferred[LodBuild.key(c.0, c.1)] = c.2
+                    deferred.insert(LodBuild.key(c.0, c.1))
                 } else {
                     keep.append(c)
                 }
             }
-            for (k, path) in deferred {
+            for k in deferred {
                 let (x, z) = LodBuild.unkey(k)
                 if !regionNear(x, z, cx: want.x, cz: want.z, radius: near + 64) {
-                    keep.append((x, z, path))
-                    deferred[k] = nil
+                    keep.append((x, z))
+                    deferred.remove(k)
                 }
             }
             changed = keep
@@ -246,16 +256,14 @@ final class LodWorld: @unchecked Sendable {
 
         // 2. The player moved: mesh level-1 nodes that came into range (from disk), drop the ones that left.
         if moved {
-            var need: [(Int, Int, String)] = []
+            var need: [(Int, Int)] = []
             snapshotLock: do {
                 lock.lock()
                 let have = Set(meshes.keys.filter { $0.level == 1 }.map { LodBuild.key($0.x, $0.z) })
                 lock.unlock()
                 for k in seen where !have.contains(k) && !changedKeys.contains(k) {
                     let (x, z) = LodBuild.unkey(k)
-                    if withinFine(regionX: x, regionZ: z, cx: center.x, cz: center.z) {
-                        need.append((x, z, regionDir.appendingPathComponent("r.\(x).\(z).mca").path))
-                    }
+                    if withinFine(regionX: x, regionZ: z, cx: center.x, cz: center.z) { need.append((x, z)) }
                 }
             }
             for (k, _, node) in rebuildRegions(need, meshFine: true) {
@@ -286,24 +294,29 @@ final class LodWorld: @unchecked Sendable {
             dirty = Set(parents)
             level += 1
         }
+        live.saveUnsaved()
         lock.lock()
         let count = meshes.count
         let quads = meshes.values.reduce(0) { $0 + $1.quadCount }
         lock.unlock()
         let cacheMB = quadrants.values.reduce(0) { $0 + $1.bytes } / 1_000_000
-        status = "\(changed.count) changed regions, moved \(moved): \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB"
+        status = "\(changed.count) changed regions, moved \(moved): \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB, \(live.chunkCount) live chunks"
         return true
     }
 
-    /// Reads regions in parallel: returns (key, level-2 quadrant, level-1 node if within the fine radius).
-    private func rebuildRegions(_ list: [(Int, Int, String)], meshFine: Bool) -> [(Int64, LodQuadrant, LodNode?)] {
+    /// Reads regions in parallel (region file, then live chunks on top): returns (key, level-2 quadrant,
+    /// level-1 node if within the fine radius).
+    private func rebuildRegions(_ list: [(Int, Int)], meshFine: Bool) -> [(Int64, LodQuadrant, LodNode?)] {
         var out = [(Int64, LodQuadrant, LodNode?)?](repeating: nil, count: list.count)
         let c = center
         out.withUnsafeMutableBufferPointer { buf in
             let outp = buf.baseAddress!
             DispatchQueue.concurrentPerform(iterations: list.count) { i in
-                let (x, z, path) = list[i]
-                guard let g = LodBuild.regionGrid(path: path) else {
+                let (x, z) = list[i]
+                let fromFile = self.regionDir.flatMap { LodBuild.regionGrid(path: $0.appendingPathComponent("r.\(x).\(z).mca").path) }
+                var g = fromFile ?? LodGrid(level: 1)
+                let hasLive = self.live.overlay(regionX: x, regionZ: z, into: &g)
+                guard fromFile != nil || hasLive else {
                     outp[i] = (LodBuild.key(x, z), LodQuadrant(grid: LodGrid(level: 2)), nil)
                     return
                 }

@@ -15,7 +15,7 @@ import java.nio.file.Path;
  * called through the java.lang.foreign API. See NativeLibrary for where the dylib is found.
  */
 public final class MetalNative {
-    public static final int EXPECTED_ABI = 3;
+    public static final int EXPECTED_ABI = 4;
 
     private final MethodHandle abiVersion;
     private final MethodHandle deviceName;

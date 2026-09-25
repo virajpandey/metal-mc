@@ -22,9 +22,19 @@ loom {
 	}
 
 	runs {
+		// Local dedicated server for multiplayer LOD tests (offline mode; set up by tools/mpserver_setup.py).
+		server {
+			runDir "run-server"
+			programArgs "--nogui"
+		}
 		// ./gradlew runClient -PbenchLabel=opengl  (graphics backend itself is set in run/options.txt)
 		client {
-			programArgs "--quickPlaySingleplayer", "claudeworld", "--username", "MetalMCBench"
+			// -PmpServer=localhost:25565 joins a server (the local test server: ./gradlew runServer) instead.
+			if (project.hasProperty("mpServer")) {
+				programArgs "--quickPlayMultiplayer", project.findProperty("mpServer").toString(), "--username", "MetalMCBench"
+			} else {
+				programArgs "--quickPlaySingleplayer", "claudeworld", "--username", "MetalMCBench"
+			}
 			property "metalmc.bench", "1"
 			property "metalmc.bench.label", (project.findProperty("benchLabel") ?: "unlabeled").toString()
 			property "metalmc.bench.y", (project.findProperty("benchY") ?: "150").toString()
@@ -48,6 +58,7 @@ loom {
 			property "metalmc.pregen", (project.findProperty("benchPregen") ?: "0").toString()
 			property "metalmc.lod", (project.findProperty("lod") ?: "0").toString()
 			property "metalmc.lod.far", (project.findProperty("lodFar") ?: "2048").toString()
+			property "metalmc.lod.live", (project.findProperty("lodLive") ?: "1").toString()
 			property "metalmc.tour", (project.findProperty("benchTour") ?: "0").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()

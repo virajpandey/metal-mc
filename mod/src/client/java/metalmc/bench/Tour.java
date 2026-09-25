@@ -34,7 +34,11 @@ final class Tour {
 
     private static void cmd(Minecraft mc, String... commands) {
         MinecraftServer server = mc.getSingleplayerServer();
-        if (server == null) return;
+        if (server == null) {
+            // Multiplayer: send them as chat commands (the bench player is op on the test server).
+            if (mc.player != null) for (String c : commands) mc.player.connection.sendCommand(c);
+            return;
+        }
         server.execute(() -> {
             for (String c : commands) server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), c);
         });
@@ -123,7 +127,28 @@ final class Tour {
 
     static final boolean LOD_TOUR = "lod".equals(System.getProperty("metalmc.tour"));
 
+    /**
+     * Multiplayer LOD test (-PbenchTour=mp, against a local server): the server moves the player with /tp
+     * (a server rejects the bench's client-side moves), east across the world so the client loads those
+     * chunks, then back to a high pose looking east over them. "mp2" only takes the final pose, to check
+     * that the LOD comes back from its saved store after reconnecting.
+     */
+    static final boolean MP_TOUR = "mp".equals(System.getProperty("metalmc.tour")) || "mp2".equals(System.getProperty("metalmc.tour"));
+    private static final String OVERVIEW = "tp @s 8 260 8 270 12";
+    static final List<Step> MP_STEPS = List.of(
+        new Step("mp-start", null, 200, mc -> cmd(mc, "gamemode creative", "time set 6000", "weather clear",
+            "gamerule advance_time false", "gamerule advance_weather false", "tp @s 8 200 8 270 12")),
+        new Step("mp-500", null, 200, mc -> cmd(mc, "tp @s 500 200 8 270 12")),
+        new Step("mp-1000", null, 200, mc -> cmd(mc, "tp @s 1000 200 8 270 12")),
+        new Step("mp-1500", null, 200, mc -> cmd(mc, "tp @s 1500 200 8 270 12")),
+        new Step("mp-overview", null, 400, mc -> cmd(mc, OVERVIEW))
+    );
+    static final List<Step> MP2_STEPS = List.of(
+        new Step("mp-overview", null, 300, mc -> cmd(mc, "gamemode creative", "time set 6000", "weather clear", OVERVIEW))
+    );
+
     static List<Step> steps() {
+        if (MP_TOUR) return "mp2".equals(System.getProperty("metalmc.tour")) ? MP2_STEPS : MP_STEPS;
         return LOD_TOUR ? LOD_STEPS : STEPS;
     }
 
@@ -147,6 +172,7 @@ final class Tour {
             steps.get(step).setup().accept(mc);
         }
         Pose p = steps.get(step).pose();
+        if (p == null) return false;   // the server places the player
         if (Double.isNaN(p.y()) && mc.level != null) {
             // Ground pose: 3 blocks above the highest block at the center column.
             int top = mc.level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, (int) Math.floor(p.x()), (int) Math.floor(p.z()));

@@ -292,20 +292,40 @@ final class LodRenderer: @unchecked Sendable {
 
 @_cdecl("mmc_lod_open")
 public func mmc_lod_open(_ worldDir: UnsafePointer<CChar>, _ far: Int32, _ centerX: Int32, _ centerZ: Int32) -> Int32 {
-    let r = LodRenderer.shared
     let dir = String(cString: worldDir)
     guard let regionDir = Anvil.regionDirectory(URL(fileURLWithPath: dir)) else {
         log("LOD: no region directory under \(dir)")
         return 0
     }
+    return lodOpen(regionDir: regionDir, storeDir: nil, far: Int(far), centerX: Int(centerX), centerZ: Int(centerZ))
+}
+
+/// Opens the LOD with either source or both: `worldDir` is a single-player save ("" in multiplayer) and
+/// `storeDir` is where live chunks are saved between sessions ("" to keep them in memory only).
+@_cdecl("mmc_lod_open2")
+public func mmc_lod_open2(_ worldDir: UnsafePointer<CChar>, _ storeDir: UnsafePointer<CChar>, _ far: Int32,
+                          _ centerX: Int32, _ centerZ: Int32) -> Int32 {
+    let dir = String(cString: worldDir), store = String(cString: storeDir)
+    var regionDir: URL?
+    if !dir.isEmpty {
+        regionDir = Anvil.regionDirectory(URL(fileURLWithPath: dir))
+        if regionDir == nil { log("LOD: no region directory under \(dir)") }
+    }
+    let storeURL = store.isEmpty ? nil : URL(fileURLWithPath: store)
+    if regionDir == nil && storeURL == nil { return 0 }
+    return lodOpen(regionDir: regionDir, storeDir: storeURL, far: Int(far), centerX: Int(centerX), centerZ: Int(centerZ))
+}
+
+private func lodOpen(regionDir: URL?, storeDir: URL?, far: Int, centerX: Int, centerZ: Int) -> Int32 {
+    let r = LodRenderer.shared
     var maxLevel = 1
-    while (lodNodeVoxels << maxLevel) < Int(far) && maxLevel < 8 { maxLevel += 1 }
-    let w = LodWorld(regionDir: regionDir, maxLevel: maxLevel, fineRadius: 1536, centerX: Int(centerX), centerZ: Int(centerZ))
+    while (lodNodeVoxels << maxLevel) < far && maxLevel < 8 { maxLevel += 1 }
+    let w = LodWorld(regionDir: regionDir, storeDir: storeDir, maxLevel: maxLevel, fineRadius: 1536, centerX: centerX, centerZ: centerZ)
     r.lock.lock()
     r.world?.stop()
     r.world = w
     r.lock.unlock()
-    log("LOD: streaming \(regionDir.path) far=\(far) levels 1...\(maxLevel) around (\(centerX), \(centerZ))")
+    log("LOD: streaming \(regionDir?.path ?? "no region files") + live chunks\(storeDir.map { " (saved to \($0.path))" } ?? "") far=\(far) levels 1...\(maxLevel) around (\(centerX), \(centerZ))")
     w.start()
     return 1
 }

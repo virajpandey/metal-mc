@@ -28,11 +28,15 @@ public final class MetalMCConfig {
         # Skip block faces that point away from the camera (identical image, less GPU work).
         facingCulling=true
 
-        # Far-terrain LOD beyond the render distance (Metal backend, single-player). It shows terrain
-        # the world has already generated and saved, and follows the player.
+        # Far-terrain LOD beyond the render distance (Metal backend). In single-player it shows terrain the
+        # world has already generated; on servers, terrain you've already seen there. It follows the player.
         lod=true
         # How far the LOD reaches, in blocks.
         lod.far=4096
+        # Also build the LOD from chunks as the game loads them (keeps it current without waiting for saves).
+        lod.live=true
+        # LOD on servers, built from the chunks you've seen there and saved under metalmc/lod/ (needs lod.live).
+        lod.multiplayer=true
         """;
 
     private static final Properties FILE = load();
@@ -83,6 +87,14 @@ public final class MetalMCConfig {
 
     public static boolean lod() {
         return flag("lod", true);
+    }
+
+    public static boolean lodLive() {
+        return flag("lod.live", true);
+    }
+
+    public static boolean lodMultiplayer() {
+        return flag("lod.multiplayer", true);
     }
 
     public static int lodFar() {

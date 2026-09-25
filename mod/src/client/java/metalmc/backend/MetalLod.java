@@ -26,6 +26,42 @@ public final class MetalLod {
         }
     }
 
+    /**
+     * Opens the LOD with a single-player save's region files ("" for none) and/or a directory where live
+     * chunks are saved between sessions ("" to keep them in memory only).
+     */
+    public static boolean open2(String worldDir, String storeDir, int farBlocks, int centerX, int centerZ) {
+        if (!available()) return false;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            ByteBuffer world = stack.UTF8(worldDir);
+            ByteBuffer store = stack.UTF8(storeDir);
+            return Mtl.lodOpen2(MemoryUtil.memAddress(world), MemoryUtil.memAddress(store), farBlocks, centerX, centerZ) == 1;
+        }
+    }
+
+    /** LOD material id for a block name such as "minecraft:stone". Any thread. */
+    public static int classify(String blockName) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            return Mtl.lodClassify(MemoryUtil.memAddress(stack.UTF8(blockName)));
+        }
+    }
+
+    /** Biome tint class for a biome name such as "minecraft:savanna". Any thread. */
+    public static int tintIndex(String biomeName) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            return Mtl.lodTintIndex(MemoryUtil.memAddress(stack.UTF8(biomeName)));
+        }
+    }
+
+    /**
+     * Hands one chunk to the LOD: {@code blocks} holds 16 x 16 x 384 material ids (y from the world bottom,
+     * then z, then x) and {@code tints} the 4 x 4 surface biome tint classes (z * 4 + x). Both are native
+     * addresses. Any thread.
+     */
+    public static void ingest(int chunkX, int chunkZ, long blocks, long tints) {
+        Mtl.lodIngest(chunkX, chunkZ, blocks, tints);
+    }
+
     /** Stops streaming and releases the LOD (the player left the world). */
     public static void close() {
         if (available()) Mtl.lodClose();

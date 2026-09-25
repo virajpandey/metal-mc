@@ -85,6 +85,10 @@ final class Mtl {
     private static final MethodHandle LOD_CENTER = h("mmc_lod_center", false, null, JAVA_INT, JAVA_INT, JAVA_INT);
     private static final MethodHandle LOD_STATUS = h("mmc_lod_status", false, null, JAVA_LONG);
     private static final MethodHandle LOD_DRAW = h("mmc_lod_draw", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle LOD_OPEN2 = h("mmc_lod_open2", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
+    private static final MethodHandle LOD_CLASSIFY = h("mmc_lod_classify", false, JAVA_INT, JAVA_LONG);
+    private static final MethodHandle LOD_TINT_INDEX = h("mmc_lod_tint_index", false, JAVA_INT, JAVA_LONG);
+    private static final MethodHandle LOD_INGEST = h("mmc_lod_ingest", false, null, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle COMPLETED_SUBMIT = h("mmc_completed_submit", true, JAVA_LONG);
     private static final MethodHandle SURFACE_CREATE = h("mmc_surface2_create", false, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle SURFACE_CONFIGURE = h("mmc_surface2_configure", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -291,6 +295,22 @@ final class Mtl {
 
     static int lodDraw(long params, long cam) {
         try { return (int) LOD_DRAW.invokeExact(params, cam); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int lodOpen2(long worldDir, long storeDir, int far, int centerX, int centerZ) {
+        try { return (int) LOD_OPEN2.invokeExact(worldDir, storeDir, far, centerX, centerZ); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int lodClassify(long name) {
+        try { return (int) LOD_CLASSIFY.invokeExact(name); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int lodTintIndex(long name) {
+        try { return (int) LOD_TINT_INDEX.invokeExact(name); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void lodIngest(int cx, int cz, long blocks, long tints) {
+        try { LOD_INGEST.invokeExact(cx, cz, blocks, tints); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static long completedSubmit() {

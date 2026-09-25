@@ -83,6 +83,22 @@ Each candidate tile's bounding box is rasterized right after the LOD draws, in t
   - Shrinking the LOD vertex outputs (half-precision color, fog distances instead of positions) changed nothing (316.6 fps) and was reverted. Vertex count, not vertex size, is what costs.
 - **Correctness:** all 8 showcase-tour views match the no-occlusion run. The high views are pixel-identical. The ground views differ on 0.06–0.32% of pixels, all of them animals near the player. The moving-camera bench screenshots match too.
 
+## Live chunks and multiplayer (2026-09-25)
+
+The LOD now also takes chunks as the client loads and unloads them. On a server that's its only source, saved per server so it survives restarts (see `docs/lod-design.md`). Checks:
+
+- **Conversion matches the region reader.** With `METALMC_EXP=livecheck`, each live chunk is compared voxel by voxel with the same chunk decoded from the region file. The first 200 chunks, compared before any game ticks, matched exactly: 2,457,600 voxels. Later ones differ on about 1 voxel in 100,000 (218 of 22.1 M after 1,800 chunks). Each difference is a 2 × 2 × 2 group where the file has water on top and the live copy shows the rock below it: generated water that flowed away once the chunks ticked. So the live copy is newer, not wrong.
+- **Server path without a server** (`mptest.py`, 4 km world, LOD 2048):
+  1. From region files: 78 nodes, 4,531,403 quads.
+  2. From live ingest only (all 66,049 chunks through `mmc_lod_ingest`, no region files): 78 nodes, 4,531,403 quads.
+  3. Reopened from the saved store: 78 nodes, 4,531,403 quads.
+
+  The store is 52 MB for 81 regions with LZFSE, 131 MB uncompressed.
+- **Real local server** (`./gradlew runServer`, offline mode, the same world; `-PmpServer=127.0.0.1:25565 -PbenchTour=mp`):
+  - **Session 1:** the server teleports the player east to x = 1,500. The LOD takes in 2,712 chunks and builds 20 nodes (442,407 quads) from them, then shows the explored strip from above (`multiplayer-explored-strip.jpg`).
+  - **Session 2** (`-PbenchTour=mp2`): after reconnecting, the LOD loaded 10 saved regions and was drawing 2 s after joining. It rebuilt to the same 442,407 quads without the player moving.
+- **Single-player is unchanged:** 318.1 fps at LOD 8192, the same as before. The showcase tour matches, apart from animals and 0.02% of pixels in the high views. Those come from near regions rebuilt with slightly newer live data (water flow).
+
 ## Build cost
 
 The LOD is built in the background when the world opens: 81 non-empty regions in 26 s in-game (18 s standalone). The result is 74 nodes on 3 levels, 7.7 M quads, 61 MB of GPU memory. Filling sealed caves and not emitting faces under water halved the quad count.
