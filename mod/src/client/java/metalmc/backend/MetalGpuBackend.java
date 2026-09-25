@@ -5,6 +5,8 @@ import com.mojang.renderpearl.api.device.GpuBackend;
 import com.mojang.renderpearl.api.device.GpuDebugOptions;
 import com.mojang.renderpearl.api.device.GpuDevice;
 import org.jspecify.annotations.Nullable;
+import org.lwjgl.sdl.SDLEvents;
+import org.lwjgl.sdl.SDLMetal;
 import org.lwjgl.sdl.SDLVideo;
 
 /**
@@ -55,9 +57,57 @@ public final class MetalGpuBackend implements GpuBackend {
         if (nativeLib == null) throw new BackendCreationException("MetalMC library not loaded", BackendCreationException.Reason.OTHER);
         String name = nativeLib.deviceName();
         boolean apple9 = nativeLib.supportsApple9();
-        System.out.println("[metalmc-backend] Metal device via native bridge: name=\"" + name + "\" apple9=" + apple9
-            + " (step 1a: declining so the game falls back)");
-        throw new BackendCreationException("MetalMC backend: device \"" + name + "\" OK, rendering not implemented yet (spike step 1a)",
+        System.out.println("[metalmc-backend] Metal device via native bridge: name=\"" + name + "\" apple9=" + apple9);
+        if ("1".equals(System.getProperty("metalmc.backend.presentTest"))) {
+            presentRateTest(nativeLib, true);
+            presentRateTest(nativeLib, false);
+        }
+        throw new BackendCreationException("MetalMC backend: device \"" + name + "\" OK, rendering not implemented yet (spike step 1b)",
             BackendCreationException.Reason.OTHER);
+    }
+
+    /** SDL3 SDL_WINDOW_HIGH_PIXEL_DENSITY (Retina-resolution drawables). */
+    static final long SDL_WINDOW_HIGH_PIXEL_DENSITY = 0x2000L;
+
+    /**
+     * Opens a 854x480-point window with a native CAMetalLayer, clears and presents frames as fast as
+     * presentation allows, and logs the rate. Compares with MoltenVK's windowed 120 Hz pacing.
+     */
+    private static void presentRateTest(MetalNative lib, boolean displaySync) {
+        long window = SDLVideo.SDL_CreateWindow("MetalMC present test", 854, 480, SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        if (window == 0) {
+            System.out.println("[metalmc-backend] present test: SDL_CreateWindow failed");
+            return;
+        }
+        long view = 0, surface = 0;
+        try {
+            SDLVideo.SDL_ShowWindow(window);
+            SDLEvents.SDL_PumpEvents();
+            view = SDLMetal.SDL_Metal_CreateView(window);
+            long layer = view == 0 ? 0 : SDLMetal.SDL_Metal_GetLayer(view);
+            surface = layer == 0 ? 0 : lib.surfaceCreate(layer, displaySync);
+            if (surface == 0) {
+                System.out.println("[metalmc-backend] present test: no CAMetalLayer surface");
+                return;
+            }
+            int[] size = lib.surfaceSize(surface);
+            // Warm up, then measure 1200 frames in chunks, pumping window events between chunks.
+            lib.surfaceRunFrames(surface, 60, 0);
+            SDLEvents.SDL_PumpEvents();
+            double seconds = 0;
+            int frames = 0;
+            for (int chunk = 0; chunk < 20; chunk++) {
+                seconds += lib.surfaceRunFrames(surface, 60, 60 + frames);
+                frames += 60;
+                SDLEvents.SDL_PumpEvents();
+            }
+            System.out.printf(java.util.Locale.ROOT,
+                "METALMC_PRESENT displaySync=%s drawable=%dx%d frames=%d seconds=%.3f fps=%.1f%n",
+                displaySync, size[0], size[1], frames, seconds, frames / seconds);
+        } finally {
+            if (surface != 0) lib.release(surface);
+            if (view != 0) SDLMetal.SDL_Metal_DestroyView(view);
+            SDLVideo.SDL_DestroyWindow(window);
+        }
     }
 }

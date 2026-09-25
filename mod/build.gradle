@@ -32,6 +32,7 @@ loom {
 			// ./gradlew runClient -PmetalBackend=metal  tries the MetalMC backend first (falls back if it declines)
 			property "metalmc.backend", (project.findProperty("metalBackend") ?: "off").toString()
 			property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
+			property "metalmc.backend.presentTest", (project.findProperty("presentTest") ?: "0").toString()
 			vmArg "--enable-native-access=ALL-UNNAMED"
 		}
 	}

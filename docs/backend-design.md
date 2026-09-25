@@ -12,6 +12,7 @@
 4. **Shaders go SPIR-V → MSL in Java, compile in Swift.** Use the bundled `lwjgl-spvc` (`CompilerMSL` confirmed) with explicit resource bindings, then `MTLDevice.makeLibrary(source:)` asynchronously, mapped onto `BackendRenderPipeline.Pending`. Cache the translated MSL on disk, keyed by a SPIR-V hash.
 5. **Clip-space and winding fixes live in the translator,** not scattered through code: Y flip, depth range (the frontend already reports `isZZeroToOne`, so Metal gets true), and front-face winding.
 6. **Surface: SDL3 window with `SDL_WINDOW_METAL`,** `SDL_Metal_CreateView`, and `SDL_Metal_GetLayer` producing a `CAMetalLayer`. IMMEDIATE sets `displaySyncEnabled = false`. Test in a window whether native Metal escapes the 120 Hz pacing MoltenVK shows.
+   - **Measured (2026-09-25, spike 1b):** native `CAMetalLayer` clear+present in an 854×480 SDL window (drawable 1708×960) gives 119.1 fps with `displaySyncEnabled=true` and 120.0 fps with `false`. So the windowed 120 Hz cap is the macOS compositor, not MoltenVK. Windowed comparisons between backends are therefore capped; use fullscreen for all backend benchmarks.
 7. **Terrain `drawIndexedIndirect` maps to indirect draws, with ICBs later.** Vanilla already issues 20-byte indirect records per section, so this can reuse the M2 path.
 
 ## Order of work (each step boots the game or falls back cleanly)
