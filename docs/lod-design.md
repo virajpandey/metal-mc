@@ -22,6 +22,7 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 ## Rendering
 
 - **Where it draws.** In Minecraft's main world pass, right after solid terrain (`LevelRendererLodMixin`), encoded natively into the same `MTLRenderCommandEncoder`. It uses the game's projection and reverse-Z depth, so it depth-tests against vanilla. Afterwards Minecraft's pipeline state is re-applied.
+- **Tiles.** Each node is meshed as 4 × 4 tiles of 64 voxels, and greedy merges don't cross tile edges along x and z. The quads are stored tile-major, then by face direction, with each tile's vertical range. The draw culls per tile: view frustum, "entirely inside vanilla's range", and face directions that can't face the camera. Adjacent visible face ranges merge into one draw.
 - **Selection.** A quadtree per frame on the CPU: a node splits into its four children when the camera is within 2 × the child size and all four children exist.
 - **Seam.** Quads whose center lies within `(renderDistance − 1) × 16` blocks horizontally are collapsed in the vertex shader. There's no fragment `discard`, which would turn off Apple GPUs' hidden-surface removal for the whole pipeline.
 - **Far plane and fog.** The camera's far plane is pushed to 1.5 × the LOD distance; reverse-Z float depth keeps precision. Vanilla's render-distance fog moves from the chunk edge to the LOD edge. The LOD shader reproduces vanilla's fog formula, so it blends into the same sky.

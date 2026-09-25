@@ -11,6 +11,8 @@ import MetalMCCore
 // the last one visited), so surfaces keep their material from far away.
 
 let lodNodeVoxels = 256
+let lodTileVoxels = 64
+let lodTilesPerSide = lodNodeVoxels / lodTileVoxels   // 4 x 4 tiles per node
 let lodWorldMinY = -64
 let lodWorldHeight = 384
 
@@ -95,7 +97,8 @@ struct LodNode {
     let level: Int
     let x0: Int, z0: Int        // world block coordinates of the node's corner
     var quads: [UInt32]         // pairs: word0 = x | z<<8 | y<<16 | face<<24, word1 = mat | (w-1)<<8 | (h-1)<<16
-    var faceCounts: [Int]       // quads per face direction, in mesh order +X -X +Y -Y +Z -Z
+    var counts: [Int]           // quads per (tile, face), tile-major: tile = tz * 4 + tx, face +X -X +Y -Y +Z -Z
+    var tileY: [Int]            // per tile: min and max voxel y of its quads (min > max if empty)
     var size: Int { lodNodeVoxels << level }
 }
 
@@ -140,14 +143,15 @@ enum LodBuild {
     /// Outside the node counts as air on the sides (skirt walls that hide cracks between levels) and
     /// as solid below the world. Merged quads are capped at `maxMerge` voxels per side, so each quad
     /// stays small enough to be dropped individually where vanilla chunks are drawn.
-    static func mesh(_ grid: LodGrid, maxMerge: Int = 16) -> (quads: [UInt32], faceCounts: [Int]) {
+    static func mesh(_ grid: LodGrid, maxMerge: Int = 16) -> (quads: [UInt32], counts: [Int], tileY: [Int]) {
         let n = lodNodeVoxels, h = grid.height
         let kinds = lodKinds
         let airK = MaterialKind.air.rawValue, waterK = MaterialKind.water.rawValue
-        var out: [UInt32] = []
-        out.reserveCapacity(1 << 16)
+        let tiles = lodTilesPerSide * lodTilesPerSide
+        var buckets = [[UInt32]](repeating: [], count: tiles * 6)
+        var tileY = [Int](repeating: 0, count: tiles * 2)
+        for t in 0..<tiles { tileY[2 * t] = Int.max; tileY[2 * t + 1] = Int.min }
         var mask = [UInt8](repeating: 0, count: n * max(n, h))
-        var faceCounts = [Int](repeating: 0, count: 6)
 
         grid.v.withUnsafeBufferPointer { g in
             @inline(__always) func at(_ x: Int, _ y: Int, _ z: Int) -> UInt8 {
@@ -158,8 +162,6 @@ enum LodBuild {
             // Face order +X -X +Y -Y +Z -Z. For each face: normal axis, and the (u, v) axes whose extents
             // the shader scales by (w, h): X faces u = y, v = z; Y faces u = x, v = z; Z faces u = x, v = y.
             for face in 0..<6 {
-                let before = out.count
-                defer { faceCounts[face] = (out.count - before) / 2 }
                 let axis = face / 2
                 let dir = face % 2 == 0 ? 1 : -1
                 // (d, u, v) -> (x, y, z): X faces u = y, v = z; Y faces u = x, v = z; Z faces u = x, v = y.
@@ -198,24 +200,39 @@ enum LodBuild {
                         while uu < du {
                             let m = mask[vv * du + uu]
                             if m == 0 { uu += 1; continue }
+                            // Merges stay inside a tile along x and z (u is y for X faces; v is y for Z faces).
+                            let uLimit = axis == 0 ? du : min(du, (uu / lodTileVoxels + 1) * lodTileVoxels)
+                            let vLimit = axis == 2 ? dv : min(dv, (vv / lodTileVoxels + 1) * lodTileVoxels)
                             var w = 1
-                            while w < maxMerge && uu + w < du && mask[vv * du + uu + w] == m { w += 1 }
+                            while w < maxMerge && uu + w < uLimit && mask[vv * du + uu + w] == m { w += 1 }
                             var ht = 1
-                            grow: while ht < maxMerge && vv + ht < dv {
+                            grow: while ht < maxMerge && vv + ht < vLimit {
                                 for k in 0..<w where mask[(vv + ht) * du + uu + k] != m { break grow }
                                 ht += 1
                             }
                             for a in 0..<ht { for k in 0..<w { mask[(vv + a) * du + uu + k] = 0 } }
                             let (x, y, z) = xyz(d, uu, vv)
-                            out.append(UInt32(x) | UInt32(z) << 8 | UInt32(y) << 16 | UInt32(face) << 24)
-                            out.append(UInt32(m) | UInt32(w - 1) << 8 | UInt32(ht - 1) << 16)
+                            let t = (z / lodTileVoxels) * lodTilesPerSide + x / lodTileVoxels
+                            buckets[t * 6 + face].append(UInt32(x) | UInt32(z) << 8 | UInt32(y) << 16 | UInt32(face) << 24)
+                            buckets[t * 6 + face].append(UInt32(m) | UInt32(w - 1) << 8 | UInt32(ht - 1) << 16)
+                            // Vertical extent of this quad in voxels (X and Z faces extend along y by w or h).
+                            let top = y + (axis == 0 ? w : (axis == 2 ? ht : 1))
+                            tileY[2 * t] = min(tileY[2 * t], y)
+                            tileY[2 * t + 1] = max(tileY[2 * t + 1], top)
                             uu += w
                         }
                     }
                 }
             }
         }
-        return (out, faceCounts)
+        var out: [UInt32] = []
+        out.reserveCapacity(buckets.reduce(0) { $0 + $1.count })
+        var counts = [Int](repeating: 0, count: tiles * 6)
+        for (i, b) in buckets.enumerated() {
+            out.append(contentsOf: b)
+            counts[i] = b.count / 2
+        }
+        return (out, counts, tileY)
     }
 
     /// Builds every level from the save's overworld region files. Level-1 nodes are only meshed within
@@ -265,7 +282,7 @@ enum LodBuild {
                     filled.fillUnreachable()
                     // Level-1 quads stay small so they can be dropped one by one where vanilla draws.
                     let m = mesh(filled, maxMerge: lvl == 1 ? 16 : 64)
-                    outp[i] = LodNode(level: lvl, x0: x0, z0: z0, quads: m.quads, faceCounts: m.faceCounts)
+                    outp[i] = LodNode(level: lvl, x0: x0, z0: z0, quads: m.quads, counts: m.counts, tileY: m.tileY)
                 }
             }
             let made = meshed.compactMap { $0 }

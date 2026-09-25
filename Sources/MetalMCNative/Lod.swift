@@ -273,22 +273,40 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     var draws: [Draw] = []
     var xforms = [SIMD4<Float>]()
     xforms.reserveCapacity(chosen.count)
+    let discard = u.discardRadius
     for n in chosen {
-        let lo = SIMD3(Float(Double(n.x0) - cx), Float(Double(lodWorldMinY) - cy), Float(Double(n.z0) - cz))
-        let hi = lo + SIMD3(Float(n.size), Float(lodWorldHeight), Float(n.size))
-        if !visible(lo, hi) { continue }
-        // Face buckets that can face the camera (conservative: the camera is past the node's nearest plane).
-        let s = Float(n.size), top = Float(lodWorldHeight)
-        let faceVisible = [-lo.x > 0, -lo.x < s, -lo.y > 0, -lo.y < top, -lo.z > 0, -lo.z < s]
-        let slot = xforms.count
-        xforms.append(SIMD4(lo.x, lo.y, lo.z, Float(1 << n.level)))
-        var f = 0
-        while f < 6 {
-            if !faceVisible[f] || n.faceStart[f + 1] == n.faceStart[f] { f += 1; continue }
-            var e = f + 1
-            while e < 6 && (faceVisible[e] || n.faceStart[e + 1] == n.faceStart[e]) { e += 1 }
-            draws.append(Draw(node: n, slot: slot, first: n.faceStart[f], count: n.faceStart[e] - n.faceStart[f]))
-            f = e
+        let voxel = Float(1 << n.level)
+        let nodeLo = SIMD3(Float(Double(n.x0) - cx), Float(Double(lodWorldMinY) - cy), Float(Double(n.z0) - cz))
+        let nodeHi = nodeLo + SIMD3(Float(n.size), Float(lodWorldHeight), Float(n.size))
+        if !visible(nodeLo, nodeHi) { continue }
+        var slot = -1
+        let tileSize = Float(lodTileVoxels) * voxel
+        for t in 0..<(lodTilesPerSide * lodTilesPerSide) {
+            let yMin = n.tileY[2 * t], yMax = n.tileY[2 * t + 1]
+            if yMin > yMax { continue }
+            let tx = t % lodTilesPerSide, tz = t / lodTilesPerSide
+            let lo = SIMD3(nodeLo.x + Float(tx) * tileSize, nodeLo.y + Float(yMin) * voxel, nodeLo.z + Float(tz) * tileSize)
+            let hi = SIMD3(lo.x + tileSize, nodeLo.y + Float(yMax) * voxel, lo.z + tileSize)
+            // Tiles entirely inside the range vanilla draws: every point of the tile's footprint is closer
+            // than the discard radius (its farthest corner is).
+            let fx = max(abs(lo.x), abs(hi.x)), fz = max(abs(lo.z), abs(hi.z))
+            if fx * fx + fz * fz < discard * discard { continue }
+            if !visible(lo, hi) { continue }
+            // Face buckets that can face the camera (camera past the tile's nearest plane on that axis).
+            let faceVisible = [0 > lo.x, 0 < hi.x, 0 > lo.y, 0 < hi.y, 0 > lo.z, 0 < hi.z]
+            if slot < 0 {
+                slot = xforms.count
+                xforms.append(SIMD4(nodeLo.x, nodeLo.y, nodeLo.z, voxel))
+            }
+            let base = t * 6
+            var f = 0
+            while f < 6 {
+                if !faceVisible[f] || n.start[base + f + 1] == n.start[base + f] { f += 1; continue }
+                var e = f + 1
+                while e < 6 && (faceVisible[e] || n.start[base + e + 1] == n.start[base + e]) { e += 1 }
+                draws.append(Draw(node: n, slot: slot, first: n.start[base + f], count: n.start[base + e] - n.start[base + f]))
+                f = e
+            }
         }
     }
     guard !draws.isEmpty else { return 0 }

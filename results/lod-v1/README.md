@@ -20,7 +20,11 @@ First in-game results for the far-terrain LOD (`docs/lod-design.md`), 2026-09-25
 | RD 12 + LOD, first version (`lod_rd12`) | 2,048 blocks | 162.0 | 6.17 | 8.16 | 10.58 |
 | **RD 12 + LOD, with node frustum culling and face buckets (`lod2_rd12`)** | **2,048 blocks** | **245.3** | **4.08** | — | **6.56** |
 
-**Result:** RD 12 plus LOD draws terrain out to 2 km, 4× vanilla RD 32's distance and 16× the area, and runs **32% faster than RD 32** (245 fps vs 186).
+| **RD 12 + LOD, per-tile culling (`lod_tiles`)** | **2,048 blocks** | **281.7** | **3.55** | — | **5.54** |
+
+**Per-tile culling** (later the same day): each node is split into 4 × 4 tiles of 64 voxels, with greedy merges kept inside tiles and per-tile height ranges. Each tile is culled against the frustum, by facing, and when it lies entirely inside vanilla's range. That took LOD from 244 to 282 fps (GPU 6.6 → 5.5 ms/frame), again pixel-identical (0.04% of pixels differ).
+
+**Result:** RD 12 plus LOD draws terrain out to 2 km, 4× vanilla RD 32's distance and 16× the area, and, with per-tile culling, runs **51% faster than RD 32** (282 fps vs 186).
 
 The culling step (skipping nodes outside the view frustum and face directions that face away from the camera) took the LOD from 162 to 245 fps. The screenshot is pixel-identical to the unculled version: 0.01% of pixels differ, all on the animated arm.
 

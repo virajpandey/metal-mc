@@ -18,7 +18,8 @@ final class LodMeshNode {
     let x0: Int, z0: Int
     let buffer: MTLBuffer
     let quadCount: Int
-    let faceStart: [Int]        // 7 prefix offsets of the face buckets +X -X +Y -Y +Z -Z
+    let start: [Int]            // prefix offsets of the (tile, face) buckets, 16 * 6 + 1 entries
+    let tileY: [Int]            // per tile: min and max voxel y (min > max if the tile is empty)
     var size: Int { lodNodeVoxels << level }
 
     init?(node: LodNode) {
@@ -30,8 +31,9 @@ final class LodMeshNode {
         buffer = b
         quadCount = node.quads.count / 2
         var starts = [0]
-        for c in node.faceCounts { starts.append(starts.last! + c) }
-        faceStart = starts
+        for c in node.counts { starts.append(starts.last! + c) }
+        start = starts
+        tileY = node.tileY
     }
 }
 
@@ -218,7 +220,7 @@ final class LodWorld: @unchecked Sendable {
                     g.fillUnreachable()
                     let m = LodBuild.mesh(g, maxMerge: 64)
                     let size = lodNodeVoxels << parents[i].level
-                    outp[i] = LodNode(level: parents[i].level, x0: parents[i].x * size, z0: parents[i].z * size, quads: m.quads, faceCounts: m.faceCounts)
+                    outp[i] = LodNode(level: parents[i].level, x0: parents[i].x * size, z0: parents[i].z * size, quads: m.quads, counts: m.counts, tileY: m.tileY)
                 }
             }
             for (i, p) in parents.enumerated() { install(p, built[i]) }
@@ -254,7 +256,7 @@ final class LodWorld: @unchecked Sendable {
                     filled.fillUnreachable()
                     let m = LodBuild.mesh(filled, maxMerge: 16)
                     let size = lodNodeVoxels << 1
-                    node = LodNode(level: 1, x0: x * size, z0: z * size, quads: m.quads, faceCounts: m.faceCounts)
+                    node = LodNode(level: 1, x0: x * size, z0: z * size, quads: m.quads, counts: m.counts, tileY: m.tileY)
                 }
                 outp[i] = (LodBuild.key(x, z), quadrant, node)
             }
