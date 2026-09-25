@@ -73,7 +73,7 @@ enum Bench {
 
             let t0 = CACurrentMediaTime()
             guard let cb = renderer.queue.makeCommandBuffer() else { continue }
-            let st = renderer.encode(into: cb, pass: renderer.makePass(color: color, depth: depth),
+            var st = renderer.encode(into: cb, pass: renderer.makePass(color: color, depth: depth),
                                      viewProj: viewProj, cameraPos: pose.eye)
             let capture = captureFrames.contains(f)
             if capture, let blit = cb.makeBlitCommandEncoder() {
@@ -88,6 +88,12 @@ enum Bench {
             let cpuMs = (CACurrentMediaTime() - t0) * 1000
             cb.waitUntilCompleted()
             let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+            if st.drawn < 0 {
+                let g = renderer.readGPUStats()
+                st.drawn = g.drawn
+                st.culled = renderer.sections.count - g.drawn
+                st.triangles = g.triangles
+            }
 
             if f >= cfg.warmup {
                 rows.append(String(format: "%d,%.4f,%.4f,%d,%d,%d", f, cpuMs, gpuMs, st.drawn, st.culled, st.triangles))

@@ -39,6 +39,7 @@ do {
     renderer.reverseZ = !args.contains("--standard-z")
     renderer.faceBuckets = !args.contains("--no-buckets")
     Mesher.greedy = !args.contains("--no-greedy")
+    renderer.gpuCulling = args.contains("--gpu-cull")
     renderer.upload(world: world)
     let t2 = CACurrentMediaTime()
 
@@ -52,7 +53,7 @@ do {
         if let g = argValue("--golden") { cfg.golden = URL(fileURLWithPath: g) }
         cfg.writeGolden = args.contains("--write-golden")
         if let c = argValue("--compare") { cfg.compareDir = URL(fileURLWithPath: c) }
-        print("MODE cull=\(renderer.cullBackfaces) front=\(renderer.frontFacing == .clockwise ? "cw" : "ccw") reverse_z=\(renderer.reverseZ)")
+        print("MODE cull=\(renderer.cullBackfaces) front=\(renderer.frontFacing == .clockwise ? "cw" : "ccw") reverse_z=\(renderer.reverseZ) buckets=\(renderer.faceBuckets) greedy=\(Mesher.greedy) gpu_cull=\(renderer.gpuCulling)")
         try Bench.run(renderer: renderer, world: world, cfg: cfg)
         exit(0)
     }

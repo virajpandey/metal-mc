@@ -20,6 +20,27 @@ struct SectionDraw {
     var waterCount: Int
 }
 
+/// Must match `CullUniforms` in the shader (6 x 16 + 16 + 16 = 128 bytes).
+struct CullUniforms {
+    var planes: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
+    var cameraPos: SIMD4<Float>
+    var fogEnd: Float
+    var sectionCount: UInt32
+    var waterBase: UInt32
+    var bucketsOn: UInt32
+}
+
+/// Must match `SectionGPU` in the shader (80 bytes). A tuple keeps faceOffsets 4-byte aligned.
+struct SectionGPU {
+    var minB: SIMD4<Float>
+    var maxB: SIMD4<Float>
+    var opaqueStart: UInt32
+    var waterStart: UInt32
+    var waterCount: UInt32
+    var pad: UInt32 = 0
+    var faceOffsets: (Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32)
+}
+
 struct EncodeStats {
     var drawn = 0
     var culled = 0
@@ -68,6 +89,21 @@ final class Renderer {
     var reverseZ = true
     /// Skip whole face-direction buckets that cannot face the camera (before any vertex shading).
     var faceBuckets = true
+    /// Cull sections and build draw commands on the GPU (compute kernel -> indirect command buffer).
+    var gpuCulling = false
+
+    private let cullPipeline: MTLComputePipelineState
+    private let icbArgEncoder: MTLArgumentEncoder
+    private var icb: MTLIndirectCommandBuffer?
+    private var icbArgBuffer: MTLBuffer?
+    private var sectionBuffer: MTLBuffer?
+    private let statsBuffer: MTLBuffer
+
+    /// Sections drawn and triangles submitted by the last GPU-culled frame (valid after it completes).
+    func readGPUStats() -> (drawn: Int, triangles: Int) {
+        let p = statsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+        return (Int(p[0]), Int(p[1]))
+    }
 
     func projection(aspect: Float) -> float4x4 {
         reverseZ
@@ -91,6 +127,7 @@ final class Renderer {
         desc.fragmentFunction = ffn
         desc.colorAttachments[0].pixelFormat = colorFormat
         desc.depthAttachmentPixelFormat = depthFormat
+        desc.supportIndirectCommandBuffers = true
         opaquePipeline = try device.makeRenderPipelineState(descriptor: desc)
 
         let blend = desc.colorAttachments[0]!
@@ -117,6 +154,12 @@ final class Renderer {
         guard let cb = device.makeBuffer(bytes: colors, length: colors.count * 4, options: .storageModeShared)
         else { throw RendererError.allocation("colors") }
         colorBuffer = cb
+
+        guard let cfn = lib.makeFunction(name: "cullSections") else { throw RendererError.missingFunction("cullSections") }
+        cullPipeline = try device.makeComputePipelineState(function: cfn)
+        icbArgEncoder = cfn.makeArgumentEncoder(bufferIndex: 2)
+        guard let sb = device.makeBuffer(length: 16, options: .storageModeShared) else { throw RendererError.allocation("stats") }
+        statsBuffer = sb
     }
 
     /// Meshes every section in parallel and packs the quads into one buffer; section origins go
@@ -166,6 +209,31 @@ final class Renderer {
         }
         quadIndexBuffer = device.makeBuffer(bytes: pattern, length: pattern.count * 4, options: .storageModeShared)
         gpuBytes = quads.count * 4 + origins.count * MemoryLayout<SIMD4<Float>>.stride + pattern.count * 4
+
+        // GPU-driven path: per-section records plus an ICB with 3 opaque slots and 1 water slot per section.
+        let gpuSections = sections.map { s -> SectionGPU in
+            let o = s.faceOffsets
+            return SectionGPU(minB: SIMD4(s.minB, 0), maxB: SIMD4(s.maxB, 0),
+                              opaqueStart: UInt32(s.opaqueStart), waterStart: UInt32(s.waterStart),
+                              waterCount: UInt32(s.waterCount),
+                              faceOffsets: (o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]))
+        }
+        if !gpuSections.isEmpty {
+            sectionBuffer = device.makeBuffer(bytes: gpuSections,
+                                              length: gpuSections.count * MemoryLayout<SectionGPU>.stride,
+                                              options: .storageModeShared)
+            let d = MTLIndirectCommandBufferDescriptor()
+            d.commandTypes = .drawIndexed
+            d.inheritBuffers = true
+            d.inheritPipelineState = true
+            icb = device.makeIndirectCommandBuffer(descriptor: d, maxCommandCount: gpuSections.count * 4, options: [])
+            icbArgBuffer = device.makeBuffer(length: icbArgEncoder.encodedLength, options: .storageModeShared)
+            if let icb, let ab = icbArgBuffer {
+                icbArgEncoder.setArgumentBuffer(ab, offset: 0)
+                icbArgEncoder.setIndirectCommandBuffer(icb, index: 0)
+            }
+            gpuBytes += gpuSections.count * MemoryLayout<SectionGPU>.stride
+        }
     }
 
     func makePass(color: MTLTexture, depth: MTLTexture) -> MTLRenderPassDescriptor {
@@ -187,6 +255,9 @@ final class Renderer {
 
     func encode(into cb: MTLCommandBuffer, pass: MTLRenderPassDescriptor,
                 viewProj: float4x4, cameraPos: SIMD3<Float>) -> EncodeStats {
+        if gpuCulling, icb != nil {
+            return encodeGPUDriven(into: cb, pass: pass, viewProj: viewProj, cameraPos: cameraPos)
+        }
         var stats = EncodeStats()
         guard let qb = quadBuffer, let ob = originBuffer, let ib = quadIndexBuffer,
               let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return stats }
@@ -255,6 +326,65 @@ final class Renderer {
         }
 
         enc.endEncoding()
+        return stats
+    }
+
+    /// GPU-driven frame: reset the ICB, let one compute thread per section cull it and write its draws,
+    /// then execute the opaque and water ranges. The CPU records a constant handful of commands.
+    private func encodeGPUDriven(into cb: MTLCommandBuffer, pass: MTLRenderPassDescriptor,
+                                 viewProj: float4x4, cameraPos: SIMD3<Float>) -> EncodeStats {
+        var stats = EncodeStats()
+        guard let icb, let argBuf = icbArgBuffer, let secBuf = sectionBuffer,
+              let qb = quadBuffer, let ob = originBuffer, let ib = quadIndexBuffer else { return stats }
+        let n = sections.count
+        let fr = Frustum(viewProj: viewProj).planes
+
+        if let blit = cb.makeBlitCommandEncoder() {
+            blit.resetCommandsInBuffer(icb, range: 0..<(n * 4))
+            blit.fill(buffer: statsBuffer, range: 0..<8, value: 0)
+            blit.endEncoding()
+        }
+
+        if let ce = cb.makeComputeCommandEncoder() {
+            var cu = CullUniforms(planes: (fr[0], fr[1], fr[2], fr[3], fr[4], fr[5]),
+                                  cameraPos: SIMD4(cameraPos, 1), fogEnd: fogEnd,
+                                  sectionCount: UInt32(n), waterBase: UInt32(n * 3), bucketsOn: faceBuckets ? 1 : 0)
+            ce.setComputePipelineState(cullPipeline)
+            ce.setBytes(&cu, length: MemoryLayout<CullUniforms>.stride, index: 0)
+            ce.setBuffer(secBuf, offset: 0, index: 1)
+            ce.setBuffer(argBuf, offset: 0, index: 2)
+            ce.setBuffer(ib, offset: 0, index: 3)
+            ce.setBuffer(statsBuffer, offset: 0, index: 4)
+            ce.useResource(icb, usage: .write)
+            let tg = min(64, cullPipeline.maxTotalThreadsPerThreadgroup)
+            ce.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
+            ce.endEncoding()
+        }
+
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return stats }
+        var u = Uniforms(viewProj: viewProj, cameraPos: SIMD4(cameraPos, 1),
+                         fog: SIMD4(fogStart, fogEnd, 0, 0), sky: sky)
+        enc.setFrontFacing(frontFacing)
+        enc.setCullMode(cullBackfaces ? .back : .none)
+        enc.setVertexBuffer(qb, offset: 0, index: 0)
+        enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.setVertexBuffer(ob, offset: 0, index: 2)
+        enc.setVertexBuffer(colorBuffer, offset: 0, index: 3)
+        enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
+        enc.useResource(ib, usage: .read, stages: .vertex)
+
+        enc.setRenderPipelineState(opaquePipeline)
+        enc.setDepthStencilState(reverseZ ? depthWriteGreater : depthWriteLess)
+        enc.executeCommandsInBuffer(icb, range: 0..<(n * 3))
+
+        enc.setRenderPipelineState(waterPipeline)
+        enc.setDepthStencilState(reverseZ ? depthNoWriteGreater : depthNoWriteLess)
+        enc.setCullMode(.none)
+        enc.executeCommandsInBuffer(icb, range: (n * 3)..<(n * 4))
+        enc.endEncoding()
+
+        stats.drawn = -1   // filled in from readGPUStats() after the frame completes
         return stats
     }
 }

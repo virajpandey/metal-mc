@@ -19,6 +19,9 @@ Results on `claudeworld` (841 chunks, M3 Pro, 1280×720, 600-frame camera path):
 | + 4-byte pulled quads | 2.48M | 9.6 MB | 2.61 |
 | + face buckets | 2.48M | 9.6 MB | 1.81 |
 | + greedy meshing | 0.95M | 3.7 MB | 1.07 |
+| + GPU-driven culling (`--gpu-cull`, opt-in) | 0.95M | 4.2 MB | 1.37 (CPU 0.49 → 0.025 ms) |
+
+GPU-driven culling is bit-identical to the golden references. Its extra GPU time comes from resetting and walking one indirect-command-buffer slot per section. Compacting those slots is planned for milestone 4.
 
 Procedural 64×64 chunks: 534K quads, 2.2 MB, GPU 0.37 ms mean / 0.97 ms p99.
 

@@ -40,7 +40,7 @@ func lookAtRH(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> floa
 
 /// Six clip planes extracted from a view-projection matrix (Metal depth range 0..1).
 struct Frustum {
-    private let planes: [SIMD4<Float>]
+    let planes: [SIMD4<Float>]
 
     init(viewProj m: float4x4) {
         func row(_ i: Int) -> SIMD4<Float> {
