@@ -26,6 +26,10 @@
 		{
 			"config": "metalmc_backend.client.mixins.json",
 			"environment": "client"
+		},
+		{
+			"config": "metalmc_terrain.client.mixins.json",
+			"environment": "client"
 		}
 	],
 	"depends": {

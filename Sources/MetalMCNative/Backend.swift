@@ -90,6 +90,12 @@ final class MetalContext: @unchecked Sendable {
 
     var pendingDrawables: [CAMetalDrawable] = []
 
+    // Indirect command buffers for multi-draw-indirect: free list, and the ones used by the current submit
+    // (returned to the free list when that submit completes).
+    var icbFree: [MTLIndirectCommandBuffer] = []
+    var icbUsed: [MTLIndirectCommandBuffer] = []
+    let icbLock = NSLock()
+
     // Submit completion, for fences and frame pacing.
     let cond = NSCondition()
     var completed: Int64 = 1
@@ -218,25 +224,25 @@ func profBuffer() -> MTLCounterSampleBuffer? {
 
 /// Attaches start/end timestamps to a render pass when tracing. Returns the label index or -1.
 func profAttach(_ d: MTLRenderPassDescriptor, _ label: String) {
-    guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 2 <= 512 else { return }
+    guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 4 <= 512 else { return }
     let a = d.sampleBufferAttachments[0]!
     a.sampleBuffer = sb
     a.startOfVertexSampleIndex = ctx.profNext
-    a.endOfVertexSampleIndex = MTLCounterDontSample
-    a.startOfFragmentSampleIndex = MTLCounterDontSample
-    a.endOfFragmentSampleIndex = ctx.profNext + 1
-    ctx.profNext += 2
-    ctx.profLabels.append(label)
+    a.endOfVertexSampleIndex = ctx.profNext + 1
+    a.startOfFragmentSampleIndex = ctx.profNext + 2
+    a.endOfFragmentSampleIndex = ctx.profNext + 3
+    ctx.profNext += 4
+    ctx.profLabels.append("R" + label)
 }
 
 func profAttachBlit(_ d: MTLBlitPassDescriptor, _ label: String) {
-    guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 2 <= 512 else { return }
+    guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 4 <= 512 else { return }
     let a = d.sampleBufferAttachments[0]!
     a.sampleBuffer = sb
     a.startOfEncoderSampleIndex = ctx.profNext
     a.endOfEncoderSampleIndex = ctx.profNext + 1
-    ctx.profNext += 2
-    ctx.profLabels.append(label)
+    ctx.profNext += 4
+    ctx.profLabels.append("B" + label)
 }
 
 @_cdecl("mmc_ctx_init")
@@ -355,11 +361,13 @@ final class PipelineBox {
     let vsMask: UInt32
     let fsMask: UInt32
     let name: String
+    /// Built with supportIndirectCommandBuffers (pipelines with per-instance vertex data: chunk terrain).
+    let icbCapable: Bool
     private var variants: [UInt: MTLRenderPipelineState] = [:]
     private let lock = NSLock()
 
     init(base: MTLRenderPipelineDescriptor, depthState: MTLDepthStencilState, cull: MTLCullMode, fill: MTLTriangleFillMode,
-         prim: MTLPrimitiveType, fan: Bool, depthBias: Float, depthSlope: Float, vsMask: UInt32, fsMask: UInt32, name: String) {
+         prim: MTLPrimitiveType, fan: Bool, depthBias: Float, depthSlope: Float, vsMask: UInt32, fsMask: UInt32, name: String, icbCapable: Bool) {
         self.base = base
         self.depthState = depthState
         self.cull = cull
@@ -371,6 +379,7 @@ final class PipelineBox {
         self.vsMask = vsMask
         self.fsMask = fsMask
         self.name = name
+        self.icbCapable = icbCapable
     }
 
     /// The pipeline state for a render pass with the given depth attachment format (.invalid = none).
@@ -463,11 +472,13 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
             }
             let vd = MTLVertexDescriptor()
             let bufferCount = Int(next())
+            var instanced = false
             for _ in 0..<bufferCount {
                 let slot = Int(next()), stride = Int(next()), step = Int(next())
                 let layout = vd.layouts[vertexBufferIndex(slot)]!
                 layout.stride = stride
                 if step > 0 {
+                    instanced = true
                     layout.stepFunction = .perInstance
                     layout.stepRate = step
                 } else {
@@ -484,6 +495,12 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
             }
             precondition(i <= Int(count), "pipeline params overrun")
             if bufferCount > 0 { d.vertexDescriptor = vd }
+            // Off by default: Metal rejects ICB support for pipelines whose shaders take directly bound
+            // textures/samplers ("Vertex/Fragment shader cannot be used with indirect command buffers"),
+            // and vanilla terrain samples the lightmap (vertex) and block atlas (fragment). Needs textures
+            // in argument buffers first.
+            let icbCapable = instanced && experiments.contains("icb")
+            if icbCapable { d.supportIndirectCommandBuffers = true }
 
             let prim: MTLPrimitiveType
             switch topo {
@@ -500,7 +517,7 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
                 fill: wire ? .lines : .fill,
                 prim: prim, fan: topo == 5,
                 depthBias: hasDepth ? bias : 0, depthSlope: hasDepth ? slope : 0,
-                vsMask: vsMask, fsMask: fsMask, name: pipeName)
+                vsMask: vsMask, fsMask: fsMask, name: pipeName, icbCapable: icbCapable)
             // Warm the variants the game will use so the render thread doesn't compile.
             if box.state(depthFormat: .depth32Float) == nil {
                 throw NSError(domain: "metalmc", code: 2, userInfo: [NSLocalizedDescriptionKey: "pipeline state creation failed"])
@@ -781,14 +798,57 @@ public func mmc_rp_multi_draw_indexed(_ params: UnsafePointer<Int32>, _ instance
 }
 
 /// Indirect records are MTLDrawIndexedPrimitivesIndirectArguments (20 bytes), same as Vulkan's.
+func acquireICB(_ count: Int) -> MTLIndirectCommandBuffer? {
+    ctx.icbLock.lock()
+    if let k = ctx.icbFree.firstIndex(where: { $0.size >= count }) {
+        let icb = ctx.icbFree.remove(at: k)
+        ctx.icbLock.unlock()
+        return icb
+    }
+    ctx.icbLock.unlock()
+    let d = MTLIndirectCommandBufferDescriptor()
+    d.commandTypes = [.drawIndexed]
+    d.inheritPipelineState = true
+    d.inheritBuffers = true
+    var cap = 1024
+    while cap < count { cap *= 2 }
+    return ctx.device.makeIndirectCommandBuffer(descriptor: d, maxCommandCount: cap, options: [.storageModeShared])
+}
+
+/// Indirect records are MTLDrawIndexedPrimitivesIndirectArguments (20 bytes), same layout as Vulkan's.
+/// Minecraft writes them through a CPU-mapped buffer, so on unified memory they are final when this
+/// runs: encode them straight into an indirect command buffer and execute it with one call, instead of
+/// one encoder call per chunk section.
 @_cdecl("mmc_rp_draw_indexed_indirect")
 public func mmc_rp_draw_indexed_indirect(_ h: Int64, _ offset: Int64, _ drawCount: Int32) {
     guard let r = drawReady(), let ib = ctx.indexBuffer else { return }
     let (enc, p) = r
     let buf = (from(h) as BufferBox).buffer
     let prim = p.fan ? MTLPrimitiveType.triangle : p.prim
-    ctx.statDraws += Int(drawCount)
-    for i in 0..<Int(drawCount) {
+    let n = Int(drawCount)
+    ctx.statDraws += n
+    if p.icbCapable && n >= 16, let icb = acquireICB(n) {
+        let args = (buf.contents() + Int(offset)).assumingMemoryBound(to: UInt32.self)
+        let isize = ctx.indexSize, itype = ctx.indexType
+        autoreleasepool {
+            for i in 0..<n {
+                let a = args + 5 * i
+                let cmd = icb.indirectRenderCommandAt(i)
+                if a[0] == 0 || a[1] == 0 {
+                    cmd.reset()
+                    continue
+                }
+                cmd.drawIndexedPrimitives(prim, indexCount: Int(a[0]), indexType: itype, indexBuffer: ib,
+                                          indexBufferOffset: Int(a[2]) * isize, instanceCount: Int(a[1]),
+                                          baseVertex: Int(Int32(bitPattern: a[3])), baseInstance: Int(a[4]))
+            }
+        }
+        enc.useResource(ib, usage: .read, stages: .vertex)
+        enc.executeCommandsInBuffer(icb, range: 0..<n)
+        ctx.icbUsed.append(icb)
+        return
+    }
+    for i in 0..<n {
         enc.drawIndexedPrimitives(type: prim, indexType: ctx.indexType, indexBuffer: ib, indexBufferOffset: 0,
                                   indirectBuffer: buf, indirectBufferOffset: Int(offset) + i * 20)
     }
@@ -1039,6 +1099,8 @@ public func mmc_submit(_ index: Int64) {
         let cb = ctx.ensureCB()
         for d in ctx.pendingDrawables { cb.present(d) }
         ctx.pendingDrawables.removeAll()
+        let icbs = ctx.icbUsed
+        ctx.icbUsed = []
         let traced = ctx.traceFrames > 0 && ctx.profNext > 0
         let labels = ctx.profLabels
         let samples = ctx.profNext
@@ -1055,10 +1117,15 @@ public func mmc_submit(_ index: Int64) {
                 let seconds = cb.gpuEndTime - cb.gpuStartTime
                 let scale = span > 0 ? seconds / span : 0
                 var lines: [String] = []
+                // GPU timestamps on Apple silicon are nanoseconds (checked against gpuStart/EndTime).
+                func ms(_ a: UInt64, _ b: UInt64) -> Double { (a == 0 || b == 0 || b < a || a == UInt64.max || b == UInt64.max) ? -1 : Double(b - a) / 1e6 }
                 for (k, label) in labels.enumerated() {
-                    let a = ts[2 * k], b = ts[2 * k + 1]
-                    let ms = (a == 0 || b == 0 || b < a) ? -1 : Double(b - a) * scale * 1000
-                    lines.append(String(format: "  %6.3f ms  %@", ms, label))
+                    let t = Array(ts[(4 * k)..<(4 * k + 4)])
+                    if label.hasPrefix("B") {
+                        lines.append(String(format: "  total %6.3f ms                                  %@", ms(t[0], t[1]), String(label.dropFirst())))
+                    } else {
+                        lines.append(String(format: "  total %6.3f ms  vertex %6.3f  fragment %6.3f  %@", ms(t[0], t[3]), ms(t[0], t[1]), ms(t[2], t[3]), String(label.dropFirst())))
+                    }
                 }
                 log("profile submit \(index): cb gpu \(String(format: "%.3f", seconds * 1000)) ms, ticks->s scale \(scale)\n" + lines.joined(separator: "\n"))
             }
@@ -1068,6 +1135,11 @@ public func mmc_submit(_ index: Int64) {
                 ctx.gpuErrorsLogged += 1
                 ctx.cond.unlock()
                 if n < 20 { log("GPU error in submit \(index): \(cb.error.map { "\($0)" } ?? "unknown")") }
+            }
+            if !icbs.isEmpty {
+                ctx.icbLock.lock()
+                ctx.icbFree.append(contentsOf: icbs)
+                ctx.icbLock.unlock()
             }
             let gpu = cb.gpuEndTime - cb.gpuStartTime
             ctx.cond.lock()

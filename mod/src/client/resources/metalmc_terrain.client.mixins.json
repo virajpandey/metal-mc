@@ -1,0 +1,17 @@
+{
+	"required": true,
+	"package": "metalmc.terrain.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"CompiledSectionMeshMixin",
+		"LevelRendererFacingMixin",
+		"SectionCompilerMixin",
+		"SectionCompilerResultsMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

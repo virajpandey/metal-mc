@@ -28,6 +28,31 @@ The relative stutter metric (`stutters_gt2x_median` in the .txt files) is higher
 
 No pipeline failed to translate or compile (errors would be logged as `Couldn't compile Metal pipeline` or `Couldn't translate`), and the native side logged no GPU errors.
 
+## Render distance scaling (fullscreen, same session, vanilla terrain path)
+
+| Render distance | OpenGL | Vulkan (MoltenVK) | Metal (MetalMC) | Metal vs Vulkan | Metal draws/frame |
+|---|---|---|---|---|---|
+| 12 | 179 fps | 250 fps | 402 fps | +61% | 1,129 |
+| 24 | 112 fps | 214 fps | 238 fps | +11% | 3,655 |
+| 32 | 74 fps | 154 fps | 170 fps | +10% | 5,640 |
+
+At RD 12 the frame is split roughly evenly between CPU and GPU work, so Metal's lower overhead shows fully. At RD 24–32 both modern backends are GPU-bound on vanilla's terrain. Per-pass timing at RD 32 (`-PbenchTrace=1`): the main world pass takes 4.7 ms, of which **3.2 ms is the vertex/tiling stage and 1.5 ms is fragments**. Far terrain is geometry-bound: most far triangles cover few pixels, so vertex work dominates. The fixes are fewer and smaller vertices (face culling, compact formats, LOD), not faster pixels.
+
+## Face-direction culling (Sodium's idea, in `metalmc.terrain`)
+
+At mesh-build time each opaque/cutout section layer's quads are sorted into 7 buckets (±X, ±Y, ±Z, and unaligned). At draw time only buckets that can face the camera are drawn, with adjacent visible buckets merged into one draw. Back faces were already culled by the rasterizer, so the image is unchanged, but the GPU no longer transforms them. It's implemented as mixins on vanilla's `SectionCompiler`, `CompiledSectionMesh`, and `LevelRenderer.extractSectionDrawGroups`, so it helps every backend.
+
+| RD 32, fullscreen | Before | With face culling | Change |
+|---|---|---|---|
+| Metal fps | 170.0 | 187.9 | +10.5% |
+| Metal GPU ms per frame (command buffer) | 8.27 | 6.57 | −21% |
+| Vulkan fps | 154.0 | 168.2 | +9.2% |
+| Metal draws per frame | 5,640 | 8,248 | +46% |
+
+At RD 12 (CPU-bound) fps is unchanged (395), with GPU time down 10%. The rendering tour with face culling on matches the tour without it in all 11 scenes (only animated or random content differs), and the RD 12 benchmark frame shows no holes. The mod now enables it by default; `-PfacingCulling=0` turns it off for vanilla comparisons.
+
+**Tried and parked: indirect command buffers.** Encoding the per-section indirect draws into a Metal ICB (one `executeCommandsInBuffer` instead of one encoder call per section) fails for vanilla terrain. Metal refuses ICB support for pipelines whose shaders take directly bound textures or samplers ("Vertex/Fragment shader cannot be used with indirect command buffers"), and the terrain samples the lightmap in the vertex stage and the atlas in the fragment stage. Doing this needs textures in argument buffers. It's behind `-PmetalExp=icb` and off by default. It would cut CPU time, not GPU time, so it matters at low render distances.
+
 ## Rendering coverage tour
 
 `-PbenchTour=1` runs a scripted tour (`mod/src/client/java/metalmc/bench/Tour.java`) and takes a screenshot at the end of each step. I ran it once on Metal and once on Vulkan, windowed (1708×960), then diffed the screenshots pairwise at 854×480. The composites in `tour/` are Metal | Vulkan | mask, with differences over 24/255 in red.
