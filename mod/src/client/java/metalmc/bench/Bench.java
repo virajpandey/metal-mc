@@ -31,7 +31,9 @@ public final class Bench {
     static final double CENTER_X = Double.parseDouble(System.getProperty("metalmc.bench.cx", "8"));
     static final double CENTER_Z = Double.parseDouble(System.getProperty("metalmc.bench.cz", "8"));
     static final double RADIUS = Double.parseDouble(System.getProperty("metalmc.bench.radius", "140"));
-    static final double HEIGHT = Double.parseDouble(System.getProperty("metalmc.bench.y", "140"));
+    // "ground" (-PbenchY=ground) flies the orbit 2 blocks above the terrain, looking nearly level.
+    static final boolean GROUND = "ground".equals(System.getProperty("metalmc.bench.y"));
+    static final double HEIGHT = GROUND ? Double.NaN : Double.parseDouble(System.getProperty("metalmc.bench.y", "140"));
 
     /** Screenshots at the start and middle of the run (tests readback too); off with -Dmetalmc.bench.screenshots=0. */
     static final boolean SCREENSHOTS = !"0".equals(System.getProperty("metalmc.bench.screenshots", "1"));
@@ -160,7 +162,12 @@ public final class Bench {
         float yaw = (float) Math.toDegrees(Math.atan2(-(CENTER_X - x), CENTER_Z - z));
         p.getAbilities().mayfly = true;
         p.getAbilities().flying = true;
-        p.snapTo(x, HEIGHT, z, yaw, 25f);
+        if (GROUND) {
+            int top = p.level().getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, (int) Math.floor(x), (int) Math.floor(z));
+            p.snapTo(x, top + 2, z, yaw, 3f);
+        } else {
+            p.snapTo(x, HEIGHT, z, yaw, 25f);
+        }
         p.setDeltaMovement(0, 0, 0);
     }
 

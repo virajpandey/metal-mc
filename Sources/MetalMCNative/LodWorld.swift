@@ -75,6 +75,10 @@ final class LodMeshNode {
     let quadCount: Int
     let start: [Int]            // prefix offsets of the (tile, face) buckets, 16 * 6 + 1 entries
     let tileY: [Int]            // per tile: min and max voxel y (min > max if the tile is empty)
+    // Occlusion results, render thread only: the last frame each tile's box was tested, and the last
+    // frame it was found visible.
+    var tileTested = [UInt64](repeating: 0, count: 16)
+    var tileVisible = [UInt64](repeating: 0, count: 16)
     var size: Int { lodNodeVoxels << level }
 
     init?(node: LodNode) {

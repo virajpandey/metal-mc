@@ -61,6 +61,28 @@ A/B runs use the same build, fullscreen, RD 12, noon and clear weather. The base
 
 At 8 km, total LOD quads dropped from 11.8 M to 7.7 M and GPU memory from 95 to 62 MB. The main pass went from 2.55 to 2.00 ms (vanilla alone is 1.05 ms). All 8 showcase-tour views and the bench screenshots match the baseline. The only differing pixels (0.01–0.4%) are animals near the player that moved between runs.
 
+## Occlusion culling (2026-09-25)
+
+Each candidate tile's bounding box is rasterized right after the LOD draws, in the same pass, with depth test and no writes. Tiles whose box was fully hidden are skipped on the next frames (see `docs/lod-design.md`). `-PbenchY=ground` flies the same orbit 2 blocks above the terrain, looking nearly level. That's the usual in-game view, and there hills hide most far terrain.
+
+8 km world, LOD 8192, RD 12, noon, fullscreen:
+
+| Run | FPS | LOD quads/frame | LOD draws/frame | Metal GPU ms/frame |
+|---|---|---|---|---|
+| Ground, no LOD (`lodg_off`) | 381.8 | none | none | 2.48 |
+| Ground, LOD, no occlusion (`lodg_8k_noocc`) | 336.9 | 579 K | 430 | 4.00 |
+| Ground, LOD, occlusion (`lodg_8k_final`) | **362.1** | 170 K | 79 | 2.95 |
+| High orbit, LOD, no occlusion (`lodm_8k_deep`) | 319.5 | 567 K | 552 | 4.69 |
+| High orbit, LOD, occlusion (`lodm_8k_final`) | 318.1 | 424 K | 377 | 4.44 |
+
+- **At ground level** the 8 km LOD now costs 5% of frame rate relative to no LOD at all.
+- **From the high orbit** (150 blocks up, looking 25° down) only about a quarter of the LOD is hidden, and the test roughly pays for itself: repeat runs gave 318–325 fps.
+- **Variants measured along the way:**
+  - Running the test without skipping any tiles (`occnocull`) costs 11 fps.
+  - Drawing every box face, rather than only the faces toward the camera, was 4% slower than no occlusion from the high orbit.
+  - Shrinking the LOD vertex outputs (half-precision color, fog distances instead of positions) changed nothing (316.6 fps) and was reverted. Vertex count, not vertex size, is what costs.
+- **Correctness:** all 8 showcase-tour views match the no-occlusion run. The high views are pixel-identical. The ground views differ on 0.06–0.32% of pixels, all of them animals near the player. The moving-camera bench screenshots match too.
+
 ## Build cost
 
 The LOD is built in the background when the world opens: 81 non-empty regions in 26 s in-game (18 s standalone). The result is 74 nodes on 3 levels, 7.7 M quads, 61 MB of GPU memory. Filling sealed caves and not emitting faces under water halved the quad count.

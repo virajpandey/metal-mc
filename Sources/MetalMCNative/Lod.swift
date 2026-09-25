@@ -94,6 +94,37 @@ fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19
     float fog = max(linearFog(spherical, u.envStart, u.envEnd), linearFog(cylindrical, u.rdStart, u.rdEnd));
     return float4(mix(in.color, u.fogColor.rgb, fog * u.fogColor.a), 1.0);
 }
+
+// Occlusion test. After the LOD is drawn, every candidate tile's bounding box is rasterized in the same
+// pass with depth testing and no writes. At that point the depth buffer holds vanilla's solid terrain and
+// the LOD. Fragments that survive mark the tile visible; the CPU reads the marks once the frame completes.
+struct BoxOut {
+    float4 pos [[position]];
+    uint slot [[flat]];
+};
+// 12 triangles over the 8 box corners (bit 0 = x, bit 1 = y, bit 2 = z), counter-clockwise seen from
+// outside like the LOD quads, so back-face culling keeps the faces toward the camera.
+constant ushort kBoxIndex[36] = {
+    0, 4, 6, 0, 6, 2,   1, 3, 7, 1, 7, 5,   0, 1, 5, 0, 5, 4,
+    2, 6, 7, 2, 7, 3,   0, 2, 3, 0, 3, 1,   4, 5, 7, 4, 7, 6,
+};
+vertex BoxOut lod_box_vs(uint vid [[vertex_id]], uint iid [[instance_id]],
+                         constant LodUniforms& u [[buffer(19)]],
+                         const device float4* boxes [[buffer(22)]]) {
+    float3 lo = boxes[2 * iid].xyz, hi = boxes[2 * iid + 1].xyz;
+    uint c = kBoxIndex[vid];
+    float3 p = float3((c & 1) ? hi.x : lo.x, (c & 2) ? hi.y : lo.y, (c & 4) ? hi.z : lo.z);
+    float4 clip = u.proj * (u.view * float4(p, 1.0));
+    clip.y = -clip.y;
+    BoxOut o;
+    o.pos = clip;
+    o.slot = iid;
+    return o;
+}
+[[early_fragment_tests]]
+fragment void lod_box_fs(BoxOut in [[stage_in]], device uint* visible [[buffer(23)]]) {
+    visible[in.slot] = 1;
+}
 """
 
 /// Uniform block layout shared with the shader (must match LodUniforms).
@@ -107,6 +138,31 @@ struct LodUniforms {
     var pad: SIMD2<Float> = .zero
 }
 
+/// One frame's occlusion test: the boxes drawn and the GPU-written visibility marks, one per slot.
+final class LodVisSet {
+    static let capacity = 8192
+    let marks: MTLBuffer        // UInt32 per slot, written by lod_box_fs
+    let boxes: MTLBuffer        // two float4 per slot (lo, hi), camera-relative
+    var slots: [(LodMeshNode, Int)] = []
+    var frame: UInt64 = 0
+    var pending = false         // encoded, not yet harvested (render thread)
+    var done = false            // command buffer completed (set on the completion thread, under visLock)
+
+    init?() {
+        guard let m = ctx.device.makeBuffer(length: Self.capacity * 4, options: [.storageModeShared]),
+              let b = ctx.device.makeBuffer(length: Self.capacity * 32, options: [.storageModeShared]) else { return nil }
+        m.label = "MetalMC LOD visibility"
+        b.label = "MetalMC LOD boxes"
+        marks = m
+        boxes = b
+    }
+}
+
+/// METALMC_EXP=noocc turns off LOD occlusion culling (for A/B comparisons).
+let lodOcclusion = !experiments.contains("noocc")
+/// METALMC_EXP=occnocull tests boxes but never skips tiles (measures the test's own cost).
+let lodOccNoCull = experiments.contains("occnocull")
+
 final class LodRenderer: @unchecked Sendable {
     static let shared = LodRenderer()
 
@@ -117,20 +173,28 @@ final class LodRenderer: @unchecked Sendable {
     var indexQuads = 0
     var pipelines: [String: MTLRenderPipelineState] = [:]
     var library: MTLLibrary?
+    // Occlusion culling (render thread, except LodVisSet.done).
+    let visLock = NSLock()
+    var visSets: [LodVisSet] = []
+    var frame: UInt64 = 0
+    var latestResult: UInt64 = 0       // newest frame whose occlusion results have been read
+    var lastCamera = SIMD3<Double>(repeating: .nan)
+    var jumpFrame: UInt64 = 0          // last frame the camera jumped; results tested before it are stale
 
-    func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat) -> MTLRenderPipelineState? {
-        let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)"
+    func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false) -> MTLRenderPipelineState? {
+        let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
         if let p = pipelines[key] { return p }
         do {
             if library == nil { library = try ctx.device.makeLibrary(source: lodShaderSource, options: nil) }
             let d = MTLRenderPipelineDescriptor()
-            d.label = "MetalMC LOD"
-            d.vertexFunction = library!.makeFunction(name: "lod_vs")
-            d.fragmentFunction = library!.makeFunction(name: "lod_fs")
+            d.label = box ? "MetalMC LOD occlusion boxes" : "MetalMC LOD"
+            d.vertexFunction = library!.makeFunction(name: box ? "lod_box_vs" : "lod_vs")
+            d.fragmentFunction = library!.makeFunction(name: box ? "lod_box_fs" : "lod_fs")
             for (i, f) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = f
                 // Only the main color target gets LOD color; extra targets (OIT) are left untouched.
-                if i > 0 { d.colorAttachments[i].writeMask = [] }
+                // The occlusion boxes write no color at all.
+                if i > 0 || box { d.colorAttachments[i].writeMask = [] }
             }
             d.depthAttachmentPixelFormat = depth
             let p = try ctx.device.makeRenderPipelineState(descriptor: d)
@@ -140,6 +204,27 @@ final class LodRenderer: @unchecked Sendable {
             log("LOD pipeline failed: \(error)")
             return nil
         }
+    }
+
+    /// Reads the marks of every completed occlusion test (oldest first) into the nodes' tile state, then
+    /// returns a free set for this frame (nil if all are still in flight).
+    func harvestAndAcquire() -> LodVisSet? {
+        visLock.lock()
+        let ready = visSets.filter { $0.pending && $0.done }.sorted { $0.frame < $1.frame }
+        visLock.unlock()
+        for s in ready {
+            let marks = s.marks.contents().bindMemory(to: UInt32.self, capacity: LodVisSet.capacity)
+            for (i, (node, t)) in s.slots.enumerated() {
+                node.tileTested[t] = s.frame
+                if marks[i] != 0 { node.tileVisible[t] = s.frame }
+            }
+            latestResult = max(latestResult, s.frame)
+            s.slots.removeAll(keepingCapacity: true)
+            visLock.lock(); s.pending = false; s.done = false; visLock.unlock()
+        }
+        if let free = visSets.first(where: { !$0.pending }) { return free }
+        if visSets.count < 4, let s = LodVisSet() { visSets.append(s); return s }
+        return nil
     }
 
     func ensureIndexBuffer(quads: Int) {
@@ -297,6 +382,18 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         return true
     }
 
+    // Occlusion: tiles whose box was hidden in the newest completed test are skipped. Every candidate
+    // tile's box is tested again this frame, so a tile that comes into view reappears within 2-3 frames.
+    r.frame += 1
+    let vis = lodOcclusion ? r.harvestAndAcquire() : nil
+    let camera = SIMD3(cx, cy, cz)
+    let jumped = simd_distance(camera, r.lastCamera)
+    if !(jumped < 16) { r.jumpFrame = r.frame }   // teleports, respawns (and NaN on the first frame)
+    r.lastCamera = camera
+    let latest = r.latestResult >= r.jumpFrame ? r.latestResult : 0
+    let boxOut = vis.map { $0.boxes.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2 * LodVisSet.capacity) }
+    let markOut = vis.map { $0.marks.contents().bindMemory(to: UInt32.self, capacity: LodVisSet.capacity) }
+
     struct Draw { var node: LodMeshNode; var slot: Int; var first: Int; var count: Int }
     var draws: [Draw] = []
     var xforms = [SIMD4<Float>]()
@@ -320,6 +417,19 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             let fx = max(abs(lo.x), abs(hi.x)), fz = max(abs(lo.z), abs(hi.z))
             if fx * fx + fz * fz < discard * discard { continue }
             if !visible(lo, hi) { continue }
+            // Only box faces toward the camera are rasterized, so a camera inside a box would see nothing
+            // of it: such tiles are left untested, which keeps them drawn.
+            let inside = lo.x - voxel < 0 && hi.x + voxel > 0 && lo.y - voxel < 0 && hi.y + voxel > 0
+                && lo.z - voxel < 0 && hi.z + voxel > 0
+            if !inside, let vis, let boxOut, let markOut, vis.slots.count < LodVisSet.capacity {
+                // Box grown by one voxel so the tile's own surfaces never hide it.
+                let i = vis.slots.count
+                boxOut[2 * i] = SIMD4(lo - voxel, 0)
+                boxOut[2 * i + 1] = SIMD4(hi + voxel, 0)
+                markOut[i] = 0
+                vis.slots.append((n, t))
+            }
+            if latest > 0 && !lodOccNoCull && n.tileTested[t] == latest && n.tileVisible[t] != latest { continue }
             // Face buckets that can face the camera (camera past the tile's nearest plane on that axis).
             let faceVisible = [0 > lo.x, 0 < hi.x, 0 > lo.y, 0 < hi.y, 0 > lo.z, 0 < hi.z]
             if slot < 0 {
@@ -337,7 +447,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             }
         }
     }
-    guard !draws.isEmpty else { return 0 }
+    let testBoxes = vis.map { !$0.slots.isEmpty } ?? false
+    guard !draws.isEmpty || testBoxes else { return 0 }
 
     enc.setRenderPipelineState(pipe)
     enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: true))
@@ -363,6 +474,22 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         }
         enc.drawIndexedPrimitives(type: .triangle, indexCount: d.count * 6, indexType: .uint32, indexBuffer: ib,
                                   indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * d.first, baseInstance: d.slot)
+    }
+    if let vis, testBoxes, let boxPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, box: true),
+       let cb = ctx.cb {
+        enc.setRenderPipelineState(boxPipe)
+        enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
+        enc.setCullMode(.back)   // front faces only: half the fragments of drawing every face
+        enc.setVertexBuffer(vis.boxes, offset: 0, index: 22)
+        enc.setFragmentBuffer(vis.marks, offset: 0, index: 23)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 36, instanceCount: vis.slots.count)
+        vis.frame = r.frame
+        vis.pending = true
+        cb.addCompletedHandler { _ in
+            r.visLock.lock(); vis.done = true; r.visLock.unlock()
+        }
+    } else {
+        vis?.slots.removeAll(keepingCapacity: true)
     }
     // Minecraft's pipeline, depth, cull and bias state must be re-applied by the next setPipeline.
     ctx.pipe = nil
