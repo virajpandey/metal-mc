@@ -43,6 +43,8 @@ That's 16× vanilla RD 32's view distance at 45% more FPS. `rd12-lod8192-start.p
 
 `-PbenchNoon=1` sets clear weather and noon, frozen, because the pregenerated fixture was saved during a rainstorm.
 
+**Showcase tour** (`-PbenchTour=lod`, `tour-8k/`): horizontal views from 3 blocks above the ground and from y = 260 in four directions. These are the hardest views for LOD, since the seam and the horizon are at eye level. At ground level the vanilla-to-LOD transition behind hills and villages isn't noticeable. From y = 260 the terrain runs to an 8 km horizon, with vanilla's clouds correctly layered above it. The ground shots still show the last rain streaks, because the tour switches the weather to clear when it starts.
+
 ## Build cost
 
 The LOD is built in the background when the world opens: 81 non-empty regions in 26 s in-game (18 s standalone). The result is 74 nodes on 3 levels, 7.7 M quads, 61 MB of GPU memory. Filling sealed caves and not emitting faces under water halved the quad count.
