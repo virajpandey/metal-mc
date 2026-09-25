@@ -16,15 +16,28 @@ do {
     }
     let chunks = Int(argValue("--chunks") ?? "") ?? 32
 
+    if let path = argValue("--dump") {
+        try Anvil.dump(path: path)
+        exit(0)
+    }
+
     let t0 = CACurrentMediaTime()
-    let world = World(chunksX: chunks, chunksZ: chunks)
+    let world: World
+    let label: String
+    if let path = argValue("--world") {
+        world = try Anvil.load(path: path)
+        label = URL(fileURLWithPath: path).lastPathComponent
+    } else {
+        world = World.procedural(chunksX: chunks, chunksZ: chunks)
+        label = "procedural"
+    }
     let t1 = CACurrentMediaTime()
     let renderer = try Renderer(device: device)
     renderer.upload(world: world)
     let t2 = CACurrentMediaTime()
 
-    print(String(format: "SETUP gpu=\"%@\" world=%dx%d_chunks gen_ms=%.0f mesh_upload_ms=%.0f sections=%d quads=%d gpu_mb=%.1f",
-                 device.name, chunks, chunks, (t1 - t0) * 1000, (t2 - t1) * 1000,
+    print(String(format: "SETUP gpu=\"%@\" world=%@ size=%dx%dx%d_blocks load_ms=%.0f mesh_upload_ms=%.0f sections=%d quads=%d gpu_mb=%.1f",
+                 device.name, label, world.sizeX, world.sizeY, world.sizeZ, (t1 - t0) * 1000, (t2 - t1) * 1000,
                  renderer.sections.count, renderer.totalQuads, Double(renderer.gpuBytes) / 1_048_576))
 
     if args.contains("--bench") {

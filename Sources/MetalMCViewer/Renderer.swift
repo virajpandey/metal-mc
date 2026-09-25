@@ -89,14 +89,16 @@ final class Renderer {
 
     /// Meshes every 16^3 section in parallel and packs the results into one vertex and one index buffer.
     func upload(world: World) {
-        let cx = world.sizeX / 16, cy = world.sizeY / 16, cz = world.sizeZ / 16
+        let cx = world.secX, cy = world.secY, cz = world.secZ
         let count = cx * cy * cz
         var meshes = [SectionMesh?](repeating: nil, count: count)
-        meshes.withUnsafeMutableBufferPointer { buf in
-            let p = buf.baseAddress!
-            DispatchQueue.concurrentPerform(iterations: count) { i in
-                let sx = i % cx, sy = (i / cx) % cy, sz = i / (cx * cy)
-                p[i] = Mesher.meshSection(world: world, sx: sx, sy: sy, sz: sz)
+        world.withView { view in
+            meshes.withUnsafeMutableBufferPointer { buf in
+                let p = buf.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: count) { i in
+                    let sx = i % cx, sy = (i / cx) % cy, sz = i / (cx * cy)
+                    p[i] = Mesher.meshSection(view: view, sx: sx, sy: sy, sz: sz)
+                }
             }
         }
 

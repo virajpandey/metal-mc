@@ -28,7 +28,7 @@ final class ViewController: NSObject, MTKViewDelegate {
     init(renderer: Renderer, view: InputView, world: World) {
         self.renderer = renderer
         self.view = view
-        pos = SIMD3(Float(world.sizeX) / 2, 110, Float(world.sizeZ) / 2 + 60)
+        pos = SIMD3(Float(world.sizeX) / 2, Float(world.referenceY + 50), Float(world.sizeZ) / 2 + 60)
     }
 
     private var forward: SIMD3<Float> {

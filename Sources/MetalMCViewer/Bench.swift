@@ -1,4 +1,5 @@
 import CoreGraphics
+import CryptoKit
 import Foundation
 import ImageIO
 import Metal
@@ -28,8 +29,9 @@ enum Bench {
         let t = Float(frame % 60) / 60
         let angle = Float(segment) * 2.39996 + t * 0.5
         let radius = min(cx, cz) * (0.3 + 0.5 * Float((segment * 7) % 5) / 4)
-        let eye = SIMD3<Float>(cx + radius * cos(angle), 100 + 20 * sin(Float(segment)), cz + radius * sin(angle))
-        return (eye, SIMD3<Float>(cx, 60, cz))
+        let ref = Float(world.referenceY)
+        let eye = SIMD3<Float>(cx + radius * cos(angle), ref + 40 + 20 * sin(Float(segment)), cz + radius * sin(angle))
+        return (eye, SIMD3<Float>(cx, ref, cz))
     }
 
     static func run(renderer: Renderer, world: World, cfg: BenchConfig) throws {
@@ -58,6 +60,7 @@ enum Bench {
         var rows = ["frame,cpu_ms,gpu_ms,sections_drawn,sections_culled,triangles"]
         var cpu: [Double] = [], gpu: [Double] = [], tris: [Double] = [], culledPct: [Double] = []
         var holes: [Double] = []
+        var hashes: [String] = []
 
         for f in 0..<total {
             let pose = cameraPose(frame: f, world: world)
@@ -91,6 +94,8 @@ enum Bench {
             }
             if capture {
                 holes.append(100 * holeFraction(buffer: readback, width: cfg.width, height: cfg.height, sky: renderer.sky))
+                let digest = SHA256.hash(data: Data(bytes: readback.contents(), count: bytesPerRow * cfg.height))
+                hashes.append(String(digest.map { String(format: "%02x", $0) }.joined().prefix(12)))
                 let url = cfg.outDir.appendingPathComponent(String(format: "frame_%04d.png", f))
                 try writePNG(buffer: readback, width: cfg.width, height: cfg.height, url: url)
             }
@@ -104,6 +109,7 @@ enum Bench {
             cfg.frames, cfg.width, cfg.height,
             mean(cpu), percentile(cpu, 99), mean(gpu), percentile(gpu, 99), gpu.max() ?? 0,
             mean(tris), mean(culledPct), holes.max() ?? 0, holes.count, cfg.outDir.path)
+            + " hashes=" + hashes.joined(separator: ",")
         print(summary)
         try (summary + "\n").write(to: cfg.outDir.appendingPathComponent("summary.txt"), atomically: true, encoding: .utf8)
     }
