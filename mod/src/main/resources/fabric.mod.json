@@ -22,6 +22,10 @@
 		{
 			"config": "metalmc_bench.client.mixins.json",
 			"environment": "client"
+		},
+		{
+			"config": "metalmc_backend.client.mixins.json",
+			"environment": "client"
 		}
 	],
 	"depends": {

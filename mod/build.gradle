@@ -29,6 +29,10 @@ loom {
 			property "metalmc.bench.label", (project.findProperty("benchLabel") ?: "unlabeled").toString()
 			property "metalmc.bench.y", (project.findProperty("benchY") ?: "150").toString()
 			property "metalmc.bench.gpuTimer", (project.findProperty("benchGpu") ?: "0").toString()
+			// ./gradlew runClient -PmetalBackend=metal  tries the MetalMC backend first (falls back if it declines)
+			property "metalmc.backend", (project.findProperty("metalBackend") ?: "off").toString()
+			property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
+			vmArg "--enable-native-access=ALL-UNNAMED"
 		}
 	}
 }
