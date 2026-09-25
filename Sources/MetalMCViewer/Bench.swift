@@ -48,8 +48,21 @@ enum Bench {
         return (eye, SIMD3<Float>(cx, ref, cz))
     }
 
+    static func thermalName(_ s: ProcessInfo.ThermalState) -> String {
+        switch s {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
+    }
+
     static func run(renderer: Renderer, world: World, cfg: BenchConfig) throws {
         let dev = renderer.device
+        // Run conditions are recorded, never used to silently drop results (see README: benchmark protocol).
+        let thermalStart = thermalName(ProcessInfo.processInfo.thermalState)
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
         let cd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: renderer.colorFormat,
                                                           width: cfg.width, height: cfg.height, mipmapped: false)
         cd.usage = [.renderTarget]
@@ -138,7 +151,9 @@ enum Bench {
             mean(tris), mean(culledPct), holes.max() ?? 0, holes.count, cfg.outDir.path)
             + " hashes=" + hashes.joined(separator: ",")
             + (diffs.isEmpty ? "" : " diff_pct=" + diffs.joined(separator: ","))
+        let conditions = "CONDITIONS thermal_start=\(thermalStart) thermal_end=\(thermalName(ProcessInfo.processInfo.thermalState)) low_power=\(lowPower) gpu_ms_stddev=" + String(format: "%.3f", stddev(gpu))
         print(summary)
+        print(conditions)
 
         if let golden = cfg.golden {
             if cfg.writeGolden {
@@ -154,7 +169,7 @@ enum Bench {
                 print("GOLDEN missing=\(golden.lastPathComponent)")
             }
         }
-        try (summary + "\n").write(to: cfg.outDir.appendingPathComponent("summary.txt"), atomically: true, encoding: .utf8)
+        try (summary + "\n" + conditions + "\n").write(to: cfg.outDir.appendingPathComponent("summary.txt"), atomically: true, encoding: .utf8)
     }
 
     /// Share of lower-half pixels that still match the sky clear color. The camera always looks

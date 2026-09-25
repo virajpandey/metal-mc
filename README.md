@@ -82,6 +82,13 @@ A/B switches: `--no-cull`, `--cw`, `--standard-z`, `--no-buckets`, `--no-greedy`
 
 Backface culling stays off until an image test checks face winding.
 
+## Benchmark protocol
+
+- Every run records its conditions (a `CONDITIONS` line in `summary.txt`: thermal state at start and end, Low Power Mode, GPU frame-time standard deviation). Runs are never deleted.
+- A run may be excluded only for interference identified in advance: Low Power Mode on, thermal state `serious` or `critical`, or another GPU-heavy process running. Every exclusion is recorded with its reason.
+- High variance is not grounds for exclusion. It may be the stutter we are looking for, so it gets investigated.
+- Standalone numbers (procedural worlds, the LOD prototype, `fixtures/`) describe that workload only. In-game claims need in-game measurements against the Minecraft 26.3 OpenGL and Vulkan baselines.
+
 ## Target
 
 Minecraft Java 26.3, the current release. We'll port when 26.4 ships. In 26.x, overworld region files are at `dimensions/minecraft/overworld/region/`. Test worlds go in `fixtures/`, which git ignores.
