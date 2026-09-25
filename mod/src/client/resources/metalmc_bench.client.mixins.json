@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "metalmc.bench.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"FrameHookMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

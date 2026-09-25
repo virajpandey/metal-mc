@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "metalmc_bench",
+	"version": "${version}",
+	"name": "MetalMC Bench",
+	"description": "Automated in-game frame-time benchmark for the MetalMC renderer project.",
+	"authors": [
+		"virajpandey"
+	],
+	"contact": {
+		"sources": "https://github.com/virajpandey/metal-mc"
+	},
+	"license": "LGPL-3.0-only",
+	"icon": "assets/modid/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"metalmc.bench.BenchClient"
+		]
+	},
+	"mixins": [
+		{
+			"config": "metalmc_bench.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
