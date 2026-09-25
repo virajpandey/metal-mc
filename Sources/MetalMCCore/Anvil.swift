@@ -23,6 +23,9 @@ public enum Anvil {
         public var unknown: [String: Int] = [:]
         public var unparsed = 0
         public var unparsedSample = ""
+        /// Surface biome names on the chunk's 4 x 4 biome grid (index z * 4 + x), sampled at y 96-111 where
+        /// cave biomes don't reach. Empty if the chunk has no biome data.
+        public var surfaceBiomes: [String] = []
     }
 
     public static func regionDirectory(_ world: URL) -> URL? {
@@ -85,6 +88,28 @@ public enum Anvil {
         guard res.status.hasSuffix("full") else { return res }
         guard let secs = root["sections"]?.listValue else {
             throw AnvilError.badChunk("no sections; keys=\(root.keys.prefix(15))")
+        }
+
+        // Surface biomes: section Y = 6 (world y 96-111), or the nearest section that has biome data.
+        let biomeSection = secs.min { a, b in
+            abs((a["Y"]?.intValue ?? 99) - 6) < abs((b["Y"]?.intValue ?? 99) - 6)
+        }
+        if let bs = biomeSection?["biomes"], let pal = bs["palette"]?.listValue, !pal.isEmpty {
+            let names = pal.map { paletteName($0) ?? "" }
+            if names.count == 1 {
+                res.surfaceBiomes = [String](repeating: names[0], count: 16)
+            } else if let longs = bs["data"]?.longArrayValue, !longs.isEmpty {
+                let bits = bitsNeeded(names.count)
+                let perLong = 64 / bits
+                let mask = (UInt64(1) << UInt64(bits)) - 1
+                // 4 x 4 x 4 cells indexed y * 16 + z * 4 + x; take the bottom layer.
+                res.surfaceBiomes = (0..<16).map { idx in
+                    let li = idx / perLong
+                    guard li < longs.count else { return names[0] }
+                    let v = Int((UInt64(bitPattern: longs[li]) >> UInt64((idx % perLong) * bits)) & mask)
+                    return v < names.count ? names[v] : names[0]
+                }
+            }
         }
 
         var cache: [String: UInt8] = [:]

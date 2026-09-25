@@ -159,8 +159,7 @@ final class LodRenderer: @unchecked Sendable {
     /// Material colors from the texture averages in LodColors.swift, indexed by material id.
     func ensureColors() {
         if colorBuffer != nil { return }
-        var c = [SIMD4<Float>](repeating: SIMD4(1, 0, 1, 1), count: 256)
-        for (i, color) in lodMaterialColors.enumerated() { c[i] = color }
+        let c = lodColorTable()
         colorBuffer = ctx.device.makeBuffer(bytes: c, length: c.count * 16, options: [.storageModeShared])
     }
 

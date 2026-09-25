@@ -35,8 +35,10 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 - **Swapping nodes.** Each node owns its Metal buffer, so updates replace nodes atomically while the render thread draws.
 - **Single-player only.** Multiplayer would need to ingest chunks as the client receives them (Voxy's approach).
 
-## Known gaps
+## Colors
 
-- Grass, foliage, and water use the plains tint everywhere, so biomes like savanna and swamp don't match at the seam.
-- Colors come from a flat 31-material table, not block textures or biome tint.
+- **Base materials** use the average color of each material's block texture (`LodColors.swift`, from `tools/lod_colors.py`).
+- **Grass, leaves and water are biome-tinted** (`LodBiomes.swift`). The chunk decoder reads each chunk's 4 × 4 surface biome grid (y 96–111, above cave biomes). Tinted voxels use material ids 64 + t, 96 + t and 128 + t for 20 tint classes (vanilla's grass/foliage/water colors), so the tint survives downsampling. `results/lod-v1/far-orbit-biome-tints.png` shows savanna hills matching vanilla's yellow-olive grass across the seam.
+
+## Known gaps
 - Everything is drawn one call per node with CPU selection. GPU-driven selection with indirect command buffers is next, and possible because this pipeline binds no textures.

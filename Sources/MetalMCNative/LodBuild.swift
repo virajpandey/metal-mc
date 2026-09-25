@@ -36,10 +36,9 @@ struct LodGrid {
         var seen = [Bool](repeating: false, count: v.count)
         var stack: [Int32] = []
         stack.reserveCapacity(1 << 16)
-        let waterRaw = Mat.water.rawValue
         v.withUnsafeMutableBufferPointer { g in
             seen.withUnsafeMutableBufferPointer { s in
-                @inline(__always) func passable(_ i: Int) -> Bool { let m = g[i]; return m == 0 || m == waterRaw }
+                @inline(__always) func passable(_ i: Int) -> Bool { let m = g[i]; return m == 0 || lodIsWater(m) }
                 @inline(__always) func push(_ i: Int) {
                     if !s[i] && passable(i) { s[i] = true; stack.append(Int32(i)) }
                 }
@@ -113,6 +112,9 @@ enum LodBuild {
                       !chunk.sections.isEmpty else { continue }
                 any = true
                 let lx0 = ((chunk.cx & 31) * 16) >> 1, lz0 = ((chunk.cz & 31) * 16) >> 1
+                // Biome tint class per 4 x 4-block cell (index z * 4 + x).
+                var tint = [UInt8](repeating: 0, count: 16)
+                if chunk.surfaceBiomes.count == 16 { for i in 0..<16 { tint[i] = lodTintIndex(chunk.surfaceBiomes[i]) } }
                 for (sy, blocks) in chunk.sections.sorted(by: { $0.sy < $1.sy }) {
                     blocks.withUnsafeBufferPointer { b in
                         for by in 0..<16 {
@@ -120,9 +122,10 @@ enum LodBuild {
                             for bz in 0..<16 {
                                 let row = (vy * lodNodeVoxels + lz0 + (bz >> 1)) * lodNodeVoxels + lx0
                                 let brow = (by << 8) | (bz << 4)
+                                let trow = (bz >> 2) * 4
                                 for bx in 0..<16 {
                                     let m = b[brow | bx]
-                                    if m != 0 { g[row + (bx >> 1)] = m }
+                                    if m != 0 { g[row + (bx >> 1)] = lodTinted(m, tint[trow + (bx >> 2)]) }
                                 }
                             }
                         }
@@ -139,7 +142,7 @@ enum LodBuild {
     /// stays small enough to be dropped individually where vanilla chunks are drawn.
     static func mesh(_ grid: LodGrid, maxMerge: Int = 16) -> (quads: [UInt32], faceCounts: [Int]) {
         let n = lodNodeVoxels, h = grid.height
-        let kinds = Materials.kinds.map(\.rawValue)
+        let kinds = lodKinds
         let airK = MaterialKind.air.rawValue, waterK = MaterialKind.water.rawValue
         var out: [UInt32] = []
         out.reserveCapacity(1 << 16)
