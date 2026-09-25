@@ -33,6 +33,10 @@ do {
     }
     let t1 = CACurrentMediaTime()
     let renderer = try Renderer(device: device)
+    // Defaults verified by the image harness: CCW front faces with culling, reverse-Z depth.
+    renderer.cullBackfaces = !args.contains("--no-cull")
+    renderer.frontFacing = args.contains("--cw") ? .clockwise : .counterClockwise
+    renderer.reverseZ = !args.contains("--standard-z")
     renderer.upload(world: world)
     let t2 = CACurrentMediaTime()
 
@@ -43,6 +47,10 @@ do {
     if args.contains("--bench") {
         var cfg = BenchConfig(outDir: URL(fileURLWithPath: argValue("--out") ?? "bench_out"))
         if let n = Int(argValue("--frames") ?? "") { cfg.frames = n }
+        if let g = argValue("--golden") { cfg.golden = URL(fileURLWithPath: g) }
+        cfg.writeGolden = args.contains("--write-golden")
+        if let c = argValue("--compare") { cfg.compareDir = URL(fileURLWithPath: c) }
+        print("MODE cull=\(renderer.cullBackfaces) front=\(renderer.frontFacing == .clockwise ? "cw" : "ccw") reverse_z=\(renderer.reverseZ)")
         try Bench.run(renderer: renderer, world: world, cfg: cfg)
         exit(0)
     }

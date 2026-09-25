@@ -14,6 +14,11 @@ struct BenchConfig {
     var warmup = 30
     var captures = 5
     var outDir: URL
+    /// Reference hash file: compared against if it exists; written if `writeGolden` is set.
+    var golden: URL? = nil
+    var writeGolden = false
+    /// Reference run directory: each capture is diffed against the PNG with the same name.
+    var compareDir: URL? = nil
 }
 
 enum BenchError: Error {
@@ -54,13 +59,13 @@ enum Bench {
 
         let total = cfg.warmup + cfg.frames
         let captureFrames = Set((0..<cfg.captures).map { cfg.warmup + 30 + ($0 * cfg.frames) / max(1, cfg.captures) })
-        let proj = perspectiveRH(fovyRadians: 70 * .pi / 180,
-                                 aspect: Float(cfg.width) / Float(cfg.height), near: 0.1, far: 1000)
+        let proj = renderer.projection(aspect: Float(cfg.width) / Float(cfg.height))
 
         var rows = ["frame,cpu_ms,gpu_ms,sections_drawn,sections_culled,triangles"]
         var cpu: [Double] = [], gpu: [Double] = [], tris: [Double] = [], culledPct: [Double] = []
         var holes: [Double] = []
         var hashes: [String] = []
+        var diffs: [String] = []
 
         for f in 0..<total {
             let pose = cameraPose(frame: f, world: world)
@@ -96,8 +101,15 @@ enum Bench {
                 holes.append(100 * holeFraction(buffer: readback, width: cfg.width, height: cfg.height, sky: renderer.sky))
                 let digest = SHA256.hash(data: Data(bytes: readback.contents(), count: bytesPerRow * cfg.height))
                 hashes.append(String(digest.map { String(format: "%02x", $0) }.joined().prefix(12)))
-                let url = cfg.outDir.appendingPathComponent(String(format: "frame_%04d.png", f))
-                try writePNG(buffer: readback, width: cfg.width, height: cfg.height, url: url)
+                let name = String(format: "frame_%04d.png", f)
+                try writePNG(buffer: readback, width: cfg.width, height: cfg.height, url: cfg.outDir.appendingPathComponent(name))
+                if let ref = cfg.compareDir?.appendingPathComponent(name) {
+                    if let d = diff(buffer: readback, width: cfg.width, height: cfg.height, reference: ref) {
+                        diffs.append(String(format: "%.3f", d))
+                    } else {
+                        diffs.append("na")
+                    }
+                }
             }
         }
 
@@ -110,7 +122,23 @@ enum Bench {
             mean(cpu), percentile(cpu, 99), mean(gpu), percentile(gpu, 99), gpu.max() ?? 0,
             mean(tris), mean(culledPct), holes.max() ?? 0, holes.count, cfg.outDir.path)
             + " hashes=" + hashes.joined(separator: ",")
+            + (diffs.isEmpty ? "" : " diff_pct=" + diffs.joined(separator: ","))
         print(summary)
+
+        if let golden = cfg.golden {
+            if cfg.writeGolden {
+                try (hashes.joined(separator: "\n") + "\n").write(to: golden, atomically: true, encoding: .utf8)
+                print("GOLDEN wrote=\(golden.lastPathComponent) captures=\(hashes.count)")
+            } else if let text = try? String(contentsOf: golden, encoding: .utf8) {
+                let expected = text.split(separator: "\n").map(String.init)
+                let matches = zip(expected, hashes).filter { $0 == $1 }.count
+                let mismatched = zip(expected, hashes).enumerated().filter { $0.element.0 != $0.element.1 }.map { "\($0.offset)" }
+                print("GOLDEN file=\(golden.lastPathComponent) match=\(matches)/\(max(expected.count, hashes.count))"
+                      + (mismatched.isEmpty ? "" : " mismatched_captures=\(mismatched.joined(separator: ","))"))
+            } else {
+                print("GOLDEN missing=\(golden.lastPathComponent)")
+            }
+        }
         try (summary + "\n").write(to: cfg.outDir.appendingPathComponent("summary.txt"), atomically: true, encoding: .utf8)
     }
 
@@ -129,6 +157,31 @@ enum Bench {
             }
         }
         return Double(hits) / Double(max(1, total))
+    }
+
+    /// Percent of pixels whose max channel difference from the reference PNG exceeds 8/255.
+    static func diff(buffer: MTLBuffer, width: Int, height: Int, reference: URL) -> Double? {
+        guard let src = CGImageSourceCreateWithURL(reference as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              img.width == width, img.height == height else { return nil }
+        var ref = [UInt8](repeating: 0, count: width * height * 4)
+        let info = CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        let drawn: Bool = ref.withUnsafeMutableBytes { raw in
+            guard let ctx = CGContext(data: raw.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info)
+            else { return false }
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+        let cur = buffer.contents().assumingMemoryBound(to: UInt8.self)
+        var differing = 0
+        for i in 0..<(width * height) {
+            let o = i * 4
+            let d = max(abs(Int(cur[o]) - Int(ref[o])), abs(Int(cur[o + 1]) - Int(ref[o + 1])), abs(Int(cur[o + 2]) - Int(ref[o + 2])))
+            if d > 8 { differing += 1 }
+        }
+        return 100 * Double(differing) / Double(width * height)
     }
 
     static func writePNG(buffer: MTLBuffer, width: Int, height: Int, url: URL) throws {

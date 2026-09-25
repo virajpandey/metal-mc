@@ -66,8 +66,7 @@ final class ViewController: NSObject, MTKViewDelegate {
               let cb = renderer.queue.makeCommandBuffer() else { return }
 
         let size = view.drawableSize
-        let proj = perspectiveRH(fovyRadians: 70 * .pi / 180,
-                                 aspect: Float(size.width / max(1, size.height)), near: 0.1, far: 1000)
+        let proj = renderer.projection(aspect: Float(size.width / max(1, size.height)))
         let viewM = lookAtRH(eye: pos, center: pos + forward, up: SIMD3(0, 1, 0))
 
         let t0 = CACurrentMediaTime()
@@ -117,6 +116,7 @@ func runInteractive(renderer: Renderer, world: World) {
     view.colorPixelFormat = renderer.colorFormat
     view.depthStencilPixelFormat = renderer.depthFormat
     view.clearColor = renderer.clearColor
+    view.clearDepth = renderer.clearDepth
     view.preferredFramesPerSecond = 120
 
     let controller = ViewController(renderer: renderer, view: view, world: world)

@@ -42,8 +42,24 @@ final class Renderer {
 
     private let opaquePipeline: MTLRenderPipelineState
     private let waterPipeline: MTLRenderPipelineState
-    private let depthWrite: MTLDepthStencilState
-    private let depthNoWrite: MTLDepthStencilState
+    private let depthWriteLess: MTLDepthStencilState
+    private let depthNoWriteLess: MTLDepthStencilState
+    private let depthWriteGreater: MTLDepthStencilState
+    private let depthNoWriteGreater: MTLDepthStencilState
+
+    /// Backface culling for opaque geometry. Water stays double-sided.
+    var cullBackfaces = false
+    var frontFacing: MTLWinding = .counterClockwise
+    /// Reverse-Z with an infinite far plane (see `perspectiveReverseZ`).
+    var reverseZ = false
+
+    func projection(aspect: Float) -> float4x4 {
+        reverseZ
+            ? perspectiveReverseZ(fovyRadians: 70 * .pi / 180, aspect: aspect, near: 0.1)
+            : perspectiveRH(fovyRadians: 70 * .pi / 180, aspect: aspect, near: 0.1, far: 1000)
+    }
+
+    var clearDepth: Double { reverseZ ? 0 : 1 }
 
     private var vertexBuffer: MTLBuffer?
     private var indexBuffer: MTLBuffer?
@@ -82,9 +98,14 @@ final class Renderer {
         let dd = MTLDepthStencilDescriptor()
         dd.depthCompareFunction = .less
         dd.isDepthWriteEnabled = true
-        depthWrite = device.makeDepthStencilState(descriptor: dd)!
+        depthWriteLess = device.makeDepthStencilState(descriptor: dd)!
         dd.isDepthWriteEnabled = false
-        depthNoWrite = device.makeDepthStencilState(descriptor: dd)!
+        depthNoWriteLess = device.makeDepthStencilState(descriptor: dd)!
+        dd.depthCompareFunction = .greater
+        dd.isDepthWriteEnabled = true
+        depthWriteGreater = device.makeDepthStencilState(descriptor: dd)!
+        dd.isDepthWriteEnabled = false
+        depthNoWriteGreater = device.makeDepthStencilState(descriptor: dd)!
     }
 
     /// Meshes every 16^3 section in parallel and packs the results into one vertex and one index buffer.
@@ -139,7 +160,7 @@ final class Renderer {
         p.colorAttachments[0].clearColor = clearColor
         p.depthAttachment.texture = depth
         p.depthAttachment.loadAction = .clear
-        p.depthAttachment.clearDepth = 1.0
+        p.depthAttachment.clearDepth = clearDepth
         p.depthAttachment.storeAction = .dontCare
         return p
     }
@@ -168,14 +189,14 @@ final class Renderer {
         stats.drawn = visible.count
         stats.culled = sections.count - visible.count
 
-        // Culling stays off until winding is verified by the image tests (see README).
-        enc.setCullMode(.none)
+        enc.setFrontFacing(frontFacing)
+        enc.setCullMode(cullBackfaces ? .back : .none)
         enc.setVertexBuffer(vb, offset: 0, index: 0)
         enc.setVertexBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
         enc.setFragmentBytes(&u, length: MemoryLayout<Uniforms>.stride, index: 1)
 
         enc.setRenderPipelineState(opaquePipeline)
-        enc.setDepthStencilState(depthWrite)
+        enc.setDepthStencilState(reverseZ ? depthWriteGreater : depthWriteLess)
         for i in visible {
             let s = sections[i]
             guard s.opaqueIndexCount > 0 else { continue }
@@ -186,7 +207,8 @@ final class Renderer {
         }
 
         enc.setRenderPipelineState(waterPipeline)
-        enc.setDepthStencilState(depthNoWrite)
+        enc.setDepthStencilState(reverseZ ? depthNoWriteGreater : depthNoWriteLess)
+        enc.setCullMode(.none)
         for i in visible {
             let s = sections[i]
             guard s.waterIndexCount > 0 else { continue }

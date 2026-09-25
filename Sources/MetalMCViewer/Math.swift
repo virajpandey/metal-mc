@@ -13,6 +13,19 @@ func perspectiveRH(fovyRadians: Float, aspect: Float, near: Float, far: Float) -
     ))
 }
 
+/// Right-handed, reverse-Z, infinite-far projection: depth 1 at the near plane, approaching 0 at infinity.
+/// Pair with a `.greater` depth test and a clear depth of 0. Much better precision at long view distances.
+func perspectiveReverseZ(fovyRadians: Float, aspect: Float, near: Float) -> float4x4 {
+    let ys = 1 / tan(fovyRadians * 0.5)
+    let xs = ys / aspect
+    return float4x4(columns: (
+        SIMD4<Float>(xs, 0, 0, 0),
+        SIMD4<Float>(0, ys, 0, 0),
+        SIMD4<Float>(0, 0, 0, -1),
+        SIMD4<Float>(0, 0, near, 0)
+    ))
+}
+
 func lookAtRH(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> float4x4 {
     let f = simd_normalize(center - eye)
     let s = simd_normalize(simd_cross(f, up))
