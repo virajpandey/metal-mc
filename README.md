@@ -16,6 +16,19 @@ Fullscreen 4112×2580 on an M3 Pro, same route and world, all runs from one sess
 
 Screenshots of the same pose match Vulkan's (95% of pixels within 15/255; the rest is the player's arm mid-animation). The backend is currently GPU-bound at this resolution. Run it with `./gradlew runClient -PmetalBackend=metal` from `mod/`, after `swift build -c release`.
 
+### Far-terrain LOD (Voxy-style, clean-room)
+
+With `-Plod=1`, the mod draws far terrain past vanilla's render distance: voxel levels built from the world's region files, streamed as the save changes, and drawn inside Minecraft's main pass with the game's own projection and fog ([design](docs/lod-design.md), [results](results/lod-v1/README.md)). On a pregenerated 4 km world, fullscreen M3 Pro:
+
+| Setup | Terrain visible to | FPS |
+|---|---|---|
+| Vanilla, render distance 32 | 512 blocks | 186 |
+| **Render distance 12 + LOD** | **2,048 blocks** | **282** |
+
+That is 4× the view distance at 51% higher FPS. LOD colors come from Minecraft's block textures with per-biome grass, foliage and water tints, so the seam with vanilla chunks is hard to see.
+
+![Render distance 12 with LOD to 2 km](results/lod-v1/rd12-lod2048-texture-colors.png)
+
 ## Standalone engine status: milestone 2 (near engine), mostly done
 
 - **Milestone 1:** loads Minecraft 26.x worlds from Anvil region files. That includes 26.x's palette changes: plain-string entries, `{"": name}` wrappers, and `{id, properties}`.
