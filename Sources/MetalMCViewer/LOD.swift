@@ -1,4 +1,5 @@
 import Foundation
+import MetalMCCore
 
 /// One far-terrain ring: a voxel grid where each cell covers `scale` x `scale` x `scale` blocks.
 /// Cells inside the next-finer ring are left empty, so every ring emits skirt walls on both its

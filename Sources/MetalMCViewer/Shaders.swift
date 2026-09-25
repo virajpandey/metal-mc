@@ -1,3 +1,4 @@
+import MetalMCCore
 /// Metal Shading Language source, compiled at runtime so SwiftPM needs no metallib build step.
 let shaderSource = """
 #include <metal_stdlib>

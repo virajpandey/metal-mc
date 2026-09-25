@@ -1,4 +1,5 @@
 import simd
+import MetalMCCore
 
 /// One quad = one 32-bit word, expanded to 4 vertices by the vertex shader (vertex pulling).
 ///

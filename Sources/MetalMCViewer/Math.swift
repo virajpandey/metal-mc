@@ -1,4 +1,5 @@
 import simd
+import MetalMCCore
 
 /// Right-handed perspective projection with Metal's clip-space depth range [0, 1].
 func perspectiveRH(fovyRadians: Float, aspect: Float, near: Float, far: Float) -> float4x4 {

@@ -6,6 +6,7 @@ import Metal
 import QuartzCore
 import simd
 import UniformTypeIdentifiers
+import MetalMCCore
 
 struct BenchConfig {
     var width = 1280

@@ -1,4 +1,5 @@
 import Foundation
+import MetalMCCore
 
 /// Sparse sectioned voxel world. Each 16^3 section is either absent (all air) or
 /// 4,096 material IDs stored contiguously in `storage`, indexed y*256 + z*16 + x

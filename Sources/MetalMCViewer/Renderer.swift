@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import simd
+import MetalMCCore
 
 /// Must match `Uniforms` in the shader: 64 + 16 + 16 + 16 = 112 bytes.
 struct Uniforms {

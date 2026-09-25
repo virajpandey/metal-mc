@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import QuartzCore
+import MetalMCCore
 
 let args = CommandLine.arguments
 

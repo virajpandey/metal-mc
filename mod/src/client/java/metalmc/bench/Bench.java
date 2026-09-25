@@ -39,7 +39,7 @@ public final class Bench {
     /** Rendering coverage tour instead of the timed orbit (see Tour). */
     static final boolean TOUR = "1".equals(System.getProperty("metalmc.tour"));
 
-    private enum State { WAITING, WARMUP, RUNNING, TOUR, DONE }
+    private enum State { WAITING, WARMUP, RUNNING, TOUR, PREGEN, DONE }
 
     private static State state = State.WAITING;
     private static int tick;
@@ -69,6 +69,11 @@ public final class Bench {
         if (mc.level == null || player == null) return;
         switch (state) {
             case WAITING -> {
+                if (Pregen.RADIUS > 0) {
+                    state = State.PREGEN;
+                    Pregen.start(mc);
+                    return;
+                }
                 state = State.WARMUP;
                 tick = 0;
                 // Vanilla only runs its GPU timer query while this debug entry is enabled. The status is saved
@@ -105,6 +110,14 @@ public final class Bench {
                 if (++tick >= RUN_TICKS) {
                     state = State.DONE;
                     finish(mc);
+                }
+            }
+            case PREGEN -> {
+                place(player, 0);
+                if (Pregen.done()) {
+                    state = State.DONE;
+                    log("pregen done; quitting");
+                    mc.stop();
                 }
             }
             case TOUR -> {

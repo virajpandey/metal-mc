@@ -10,14 +10,23 @@ let package = Package(
         .library(name: "MetalMCNative", type: .dynamic, targets: ["MetalMCNative"]),
     ],
     targets: [
+        // World-format decoding and materials, shared by the standalone viewer and the in-game library.
+        .target(
+            name: "MetalMCCore",
+            path: "Sources/MetalMCCore",
+            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
+        ),
         .executableTarget(
             name: "MetalMCViewer",
+            dependencies: ["MetalMCCore"],
             path: "Sources/MetalMCViewer",
             swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
         ),
         .target(
             name: "MetalMCNative",
-            path: "Sources/MetalMCNative"
+            dependencies: ["MetalMCCore"],
+            path: "Sources/MetalMCNative",
+            swiftSettings: [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
         ),
     ]
 )

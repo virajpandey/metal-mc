@@ -1,18 +1,18 @@
 import simd
 
-enum MaterialKind: UInt8 {
+public enum MaterialKind: UInt8 {
     case air, opaque, water
 }
 
 /// Flat-colored render materials. Milestone 1 stand-in for real block models and textures:
 /// every block state maps to one of these by name.
-enum Mat: UInt8, CaseIterable {
+public enum Mat: UInt8, CaseIterable {
     case air, stone, dirt, grass, sand, water, unknown
     case deepslate, gravel, log, planks, leaves, cherryLeaves, snow, ice, clay, terracotta, lava
     case cobblestone, bricks, path, farmland, hay, wool, moss, cherryWood, lightStone, granite, sandstone, mud
     case amethyst, pumpkin
 
-    var kind: MaterialKind {
+    public var kind: MaterialKind {
         switch self {
         case .air: return .air
         case .water: return .water
@@ -20,7 +20,7 @@ enum Mat: UInt8, CaseIterable {
         }
     }
 
-    var color: SIMD4<Float> {
+    public var color: SIMD4<Float> {
         switch self {
         case .air: return SIMD4(0, 0, 0, 0)
         case .stone: return SIMD4(0.50, 0.50, 0.53, 1)
@@ -58,9 +58,9 @@ enum Mat: UInt8, CaseIterable {
     }
 }
 
-enum Materials {
-    static let kinds: [MaterialKind] = Mat.allCases.map(\.kind)
-    static let colors: [SIMD4<Float>] = Mat.allCases.map(\.color)
+public enum Materials {
+    public static let kinds: [MaterialKind] = Mat.allCases.map(\.kind)
+    public static let colors: [SIMD4<Float>] = Mat.allCases.map(\.color)
 
     /// Thin or decorative blocks (plants, torches, rails, glass, fences, ...) are skipped for now.
     private static let decorative = [
@@ -75,7 +75,7 @@ enum Materials {
         "brewing_stand",
     ]
 
-    static func classify(_ fullName: String) -> Mat {
+    public static func classify(_ fullName: String) -> Mat {
         let n = fullName.hasPrefix("minecraft:") ? String(fullName.dropFirst(10)) : fullName
         switch n {
         case "air", "cave_air", "void_air", "structure_void", "light", "barrier":

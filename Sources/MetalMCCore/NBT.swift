@@ -2,7 +2,7 @@ import Foundation
 
 /// Minecraft's Named Binary Tag format (big-endian). Byte arrays keep only their length,
 /// since nothing in the renderer reads them.
-indirect enum NBT {
+public indirect enum NBT {
     case byte(Int8)
     case short(Int16)
     case int(Int32)
@@ -16,12 +16,12 @@ indirect enum NBT {
     case intArray([Int32])
     case longArray([Int64])
 
-    subscript(key: String) -> NBT? {
+    public subscript(key: String) -> NBT? {
         if case .compound(let d) = self { return d[key] }
         return nil
     }
 
-    var intValue: Int? {
+    public var intValue: Int? {
         switch self {
         case .byte(let v): return Int(v)
         case .short(let v): return Int(v)
@@ -31,40 +31,40 @@ indirect enum NBT {
         }
     }
 
-    var stringValue: String? {
+    public var stringValue: String? {
         if case .string(let s) = self { return s }
         return nil
     }
 
-    var listValue: [NBT]? {
+    public var listValue: [NBT]? {
         if case .list(let l) = self { return l }
         return nil
     }
 
-    var longArrayValue: [Int64]? {
+    public var longArrayValue: [Int64]? {
         if case .longArray(let a) = self { return a }
         return nil
     }
 
-    var keys: [String] {
+    public var keys: [String] {
         if case .compound(let d) = self { return d.keys.sorted() }
         return []
     }
 }
 
-enum NBTError: Error {
+public enum NBTError: Error {
     case truncated
     case badRoot(UInt8)
     case badTag(UInt8)
 }
 
-struct NBTReader {
+public struct NBTReader {
     private let b: [UInt8]
     private var p = 0
 
     private init(_ bytes: [UInt8]) { b = bytes }
 
-    static func parse(_ bytes: [UInt8]) throws -> NBT {
+    public static func parse(_ bytes: [UInt8]) throws -> NBT {
         var r = NBTReader(bytes)
         let t = try r.u8()
         guard t == 10 else { throw NBTError.badRoot(t) }

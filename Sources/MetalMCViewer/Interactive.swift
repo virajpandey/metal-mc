@@ -2,6 +2,7 @@ import AppKit
 import MetalKit
 import QuartzCore
 import simd
+import MetalMCCore
 
 /// MTKView that tracks held keys (macOS virtual key codes).
 final class InputView: MTKView {
