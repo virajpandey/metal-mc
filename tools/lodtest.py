@@ -17,7 +17,7 @@ t0 = time.time()
 print("open:", lib.mmc_lod_open(world.encode(), far, cx, cz), flush=True)
 out = (ctypes.c_int64 * 3)()
 last, stable = -1, 0
-while stable < 8:   # streaming never "finishes": wait until the quad count holds for 2 s
+while stable < 32:   # streaming never "finishes": wait until the quad count holds for 8 s
     lib.mmc_lod_status(out)
     stable = stable + 1 if out[0] == 2 and out[2] == last else 0
     last = out[2]

@@ -104,6 +104,29 @@ final class Tour {
         new Step("end", END, 200, mc -> cmd(mc, "execute in minecraft:the_end run tp @a 60.5 80 0.5"))
     );
 
+    /** LOD showcase (-Dmetalmc.tour=lod): horizontal views at ground level and from high up, four directions each. */
+    static final List<Step> LOD_STEPS = List.of(
+        new Step("ground-north", ground(180f), 60, mc -> cmd(mc, "time set 6000", "weather clear", "gamerule advance_time false", "gamerule advance_weather false")),
+        new Step("ground-east", ground(270f), 40, mc -> {}),
+        new Step("ground-south", ground(0f), 40, mc -> {}),
+        new Step("ground-west", ground(90f), 40, mc -> {}),
+        new Step("high-north", new Pose(Bench.CENTER_X, 260, Bench.CENTER_Z, 180f, 12f), 60, mc -> {}),
+        new Step("high-east", new Pose(Bench.CENTER_X, 260, Bench.CENTER_Z, 270f, 12f), 40, mc -> {}),
+        new Step("high-south", new Pose(Bench.CENTER_X, 260, Bench.CENTER_Z, 0f, 12f), 40, mc -> {}),
+        new Step("high-west", new Pose(Bench.CENTER_X, 260, Bench.CENTER_Z, 90f, 12f), 40, mc -> {})
+    );
+
+    /** A pose 3 blocks above the terrain at the tour center, looking horizontally (a little down). */
+    private static Pose ground(float yaw) {
+        return new Pose(Bench.CENTER_X, Double.NaN, Bench.CENTER_Z, yaw, 3f);
+    }
+
+    static final boolean LOD_TOUR = "lod".equals(System.getProperty("metalmc.tour"));
+
+    static List<Step> steps() {
+        return LOD_TOUR ? LOD_STEPS : STEPS;
+    }
+
     private static int step = -1;
     private static int tick;
     private static boolean done;
@@ -111,18 +134,24 @@ final class Tour {
     /** Returns true once the tour has finished. */
     static boolean onTick(Minecraft mc, LocalPlayer player) {
         if (done) return true;
-        if (step < 0 || ++tick >= STEPS.get(step).ticks()) {
-            if (step >= 0) Bench.screenshotNow(mc, "tour-" + String.format("%02d", step) + "-" + STEPS.get(step).name());
+        List<Step> steps = steps();
+        if (step < 0 || ++tick >= steps.get(step).ticks()) {
+            if (step >= 0) Bench.screenshotNow(mc, "tour-" + String.format("%02d", step) + "-" + steps.get(step).name());
             step++;
             tick = 0;
-            if (step >= STEPS.size()) {
+            if (step >= steps.size()) {
                 done = true;
                 return false;
             }
-            Bench.log("tour step " + step + ": " + STEPS.get(step).name());
-            STEPS.get(step).setup().accept(mc);
+            Bench.log("tour step " + step + ": " + steps.get(step).name());
+            steps.get(step).setup().accept(mc);
         }
-        Pose p = STEPS.get(step).pose();
+        Pose p = steps.get(step).pose();
+        if (Double.isNaN(p.y()) && mc.level != null) {
+            // Ground pose: 3 blocks above the highest block at the center column.
+            int top = mc.level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, (int) Math.floor(p.x()), (int) Math.floor(p.z()));
+            p = new Pose(p.x(), top + 3, p.z(), p.yaw(), p.pitch());
+        }
         player.getAbilities().mayfly = true;
         player.getAbilities().flying = true;
         player.snapTo(p.x(), p.y(), p.z(), p.yaw(), p.pitch());

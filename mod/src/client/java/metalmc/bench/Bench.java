@@ -37,7 +37,7 @@ public final class Bench {
     static final boolean SCREENSHOTS = !"0".equals(System.getProperty("metalmc.bench.screenshots", "1"));
 
     /** Rendering coverage tour instead of the timed orbit (see Tour). */
-    static final boolean TOUR = "1".equals(System.getProperty("metalmc.tour"));
+    static final boolean TOUR = "1".equals(System.getProperty("metalmc.tour")) || "lod".equals(System.getProperty("metalmc.tour"));
 
     private enum State { WAITING, WARMUP, RUNNING, TOUR, PREGEN, DONE }
 
@@ -87,7 +87,7 @@ public final class Bench {
                 if (++tick >= WARMUP_TICKS && TOUR) {
                     state = State.TOUR;
                     tick = 0;
-                    log("starting rendering tour (" + Tour.STEPS.size() + " steps)");
+                    log("starting rendering tour (" + Tour.steps().size() + " steps)");
                 } else if (tick >= WARMUP_TICKS) {
                     state = State.RUNNING;
                     tick = 0;

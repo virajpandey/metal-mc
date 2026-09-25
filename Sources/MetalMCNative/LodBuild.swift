@@ -109,9 +109,10 @@ enum LodBuild {
         let r = [UInt8](data)
         var grid = LodGrid(level: 1)
         var any = false
+        var cache: [String: UInt8] = [:]
         grid.v.withUnsafeMutableBufferPointer { g in
             for i in 0..<1024 {
-                guard Anvil.be32(r, i * 4) != 0, let chunk = try? Anvil.decodeChunk(region: r, index: i),
+                guard Anvil.be32(r, i * 4) != 0, let chunk = try? ChunkScan.decodeChunk(region: r, index: i, cache: &cache),
                       !chunk.sections.isEmpty else { continue }
                 any = true
                 let lx0 = ((chunk.cx & 31) * 16) >> 1, lz0 = ((chunk.cz & 31) * 16) >> 1
@@ -324,4 +325,30 @@ public func mmc_debug_unknown_blocks(_ path: UnsafePointer<CChar>, _ out: Unsafe
     for (i, b) in bytes.enumerated() { out[i] = CChar(bitPattern: b) }
     out[bytes.count] = 0
     return Int32(counts.count)
+}
+
+/// Debug: decodes every chunk of a region with both decoders and counts chunks whose results differ.
+/// out[0] = chunks compared, out[1] = mismatches, out[2] = old decoder µs, out[3] = new decoder µs.
+@_cdecl("mmc_debug_compare_decoders")
+public func mmc_debug_compare_decoders(_ path: UnsafePointer<CChar>, _ out: UnsafeMutablePointer<Int64>) {
+    guard let data = FileManager.default.contents(atPath: String(cString: path)) else { return }
+    let r = [UInt8](data)
+    var compared: Int64 = 0, mismatches: Int64 = 0
+    var tOld = 0.0, tNew = 0.0
+    var cache: [String: UInt8] = [:]
+    for i in 0..<1024 where Anvil.be32(r, i * 4) != 0 {
+        let t0 = Date()
+        let a = try? Anvil.decodeChunk(region: r, index: i)
+        let t1 = Date()
+        let b = try? ChunkScan.decodeChunk(region: r, index: i, cache: &cache)
+        let t2 = Date()
+        tOld += t1.timeIntervalSince(t0); tNew += t2.timeIntervalSince(t1)
+        compared += 1
+        guard let a, let b else { if (a == nil) != (b == nil) { mismatches += 1 }; continue }
+        let same = a.cx == b.cx && a.cz == b.cz && a.status == b.status && a.surfaceBiomes == b.surfaceBiomes
+            && a.sections.count == b.sections.count
+            && zip(a.sections, b.sections).allSatisfy { $0.sy == $1.sy && $0.data == $1.data }
+        if !same { mismatches += 1 }
+    }
+    out[0] = compared; out[1] = mismatches; out[2] = Int64(tOld * 1e6); out[3] = Int64(tNew * 1e6)
 }
