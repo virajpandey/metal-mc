@@ -87,6 +87,8 @@ final class MetalContext: @unchecked Sendable {
     let cond = NSCondition()
     var completed: Int64 = 1
     var gpuErrorsLogged = 0
+    // GPU time per submit (command buffer gpuStartTime..gpuEndTime), for the benchmark.
+    var gpuSeconds: [Double] = []
 
     // Utility pipelines, built on first use.
     let utilLock = NSLock()
@@ -899,7 +901,9 @@ public func mmc_submit(_ index: Int64) {
                 ctx.cond.unlock()
                 if n < 20 { log("GPU error in submit \(index): \(cb.error.map { "\($0)" } ?? "unknown")") }
             }
+            let gpu = cb.gpuEndTime - cb.gpuStartTime
             ctx.cond.lock()
+            if ctx.gpuSeconds.count < 1_000_000 { ctx.gpuSeconds.append(gpu) }
             if index > ctx.completed { ctx.completed = index }
             ctx.cond.broadcast()
             ctx.cond.unlock()
@@ -920,6 +924,17 @@ public func mmc_wait_submit(_ index: Int64, _ timeoutNs: Int64) -> Int32 {
         if !ctx.cond.wait(until: deadline) { return ctx.completed >= index ? 1 : 0 }
     }
     return 1
+}
+
+/// Copies up to `max` recorded per-submit GPU times (seconds) into `out`, clears the record, and
+/// returns how many were copied.
+@_cdecl("mmc_gpu_times_take")
+public func mmc_gpu_times_take(_ out: UnsafeMutablePointer<Double>, _ max: Int32) -> Int32 {
+    ctx.cond.lock(); defer { ctx.cond.unlock() }
+    let n = min(Int(max), ctx.gpuSeconds.count)
+    for i in 0..<n { out[i] = ctx.gpuSeconds[i] }
+    ctx.gpuSeconds.removeAll(keepingCapacity: true)
+    return Int32(n)
 }
 
 @_cdecl("mmc_completed_submit")

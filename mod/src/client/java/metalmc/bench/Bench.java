@@ -82,6 +82,7 @@ public final class Bench {
                     frameCount = 0;
                     lastFrameNs = 0;
                     log("running for " + RUN_TICKS + " ticks");
+                    if (isMetal()) metalmc.backend.MetalStats.takeGpuMillis();
                     screenshot(mc, "start");
                 }
             }
@@ -117,6 +118,14 @@ public final class Bench {
         p.setDeltaMovement(0, 0, 0);
     }
 
+    private static boolean isMetal() {
+        return "Metal".equals(RenderSystem.getDevice().getDeviceInfo().backendName());
+    }
+
+    private static double pctD(double[] sorted, int p) {
+        return sorted.length == 0 ? 0 : sorted[(int) Math.round(p / 100.0 * (sorted.length - 1))];
+    }
+
     private static void finish(Minecraft mc) {
         long[] f = Arrays.copyOf(frameNs, frameCount);
         long[] sorted = f.clone();
@@ -145,6 +154,18 @@ public final class Bench {
         double gpuP95 = gpuSorted.length == 0 ? 0 : gpuSorted[(int) Math.round(0.95 * (gpuSorted.length - 1))];
 
         DeviceInfo info = RenderSystem.getDevice().getDeviceInfo();
+        String metalGpu = "";
+        if (isMetal()) {
+            // Measured GPU time per submit (one submit per frame): Metal command buffer gpuStart..gpuEnd.
+            double[] g = metalmc.backend.MetalStats.takeGpuMillis();
+            double[] gs = g.clone();
+            Arrays.sort(gs);
+            double gm = 0;
+            for (double v : g) gm += v;
+            gm = g.length == 0 ? 0 : gm / g.length;
+            metalGpu = String.format(Locale.ROOT, " metal_gpu_submits=%d metal_gpu_ms_mean=%.3f metal_gpu_ms_p50=%.3f metal_gpu_ms_p95=%.3f metal_gpu_ms_p99=%.3f",
+                g.length, gm, pctD(gs, 50), pctD(gs, 95), pctD(gs, 99));
+        }
         String summary = String.format(Locale.ROOT,
             "METALMC_BENCH label=%s backend=%s gpu=\"%s\" driver=\"%s\" frames=%d seconds=%.1f fps_mean=%.1f "
                 + "ms_mean=%.3f ms_p50=%.3f ms_p95=%.3f ms_p99=%.3f ms_max=%.3f stutters_gt2x_median=%d "
@@ -153,7 +174,7 @@ public final class Bench {
             LABEL, info.backendName(), info.name(), info.driverInfo(), f.length, seconds,
             seconds > 0 ? f.length / seconds : 0, meanMs, p50, p95, p99, maxMs, stutters,
             GPU_TIMER, utilMean, gpuMean, gpuP95, mc.options.renderDistance().get(),
-            mc.options.fullscreen().get(), mc.getWindow().getWidth(), mc.getWindow().getHeight(), presentInfo(mc));
+            mc.options.fullscreen().get(), mc.getWindow().getWidth(), mc.getWindow().getHeight(), presentInfo(mc)) + metalGpu;
 
         try {
             Path dir = mc.gameDirectory.toPath().resolve("metalmc-bench");

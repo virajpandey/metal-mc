@@ -78,6 +78,7 @@ final class Mtl {
         JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_FLOAT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
     private static final MethodHandle SUBMIT = h("mmc_submit", false, null, JAVA_LONG);
     private static final MethodHandle WAIT_SUBMIT = h("mmc_wait_submit", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle GPU_TIMES_TAKE = h("mmc_gpu_times_take", false, JAVA_INT, JAVA_LONG, JAVA_INT);
     private static final MethodHandle COMPLETED_SUBMIT = h("mmc_completed_submit", true, JAVA_LONG);
     private static final MethodHandle SURFACE_CREATE = h("mmc_surface2_create", false, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle SURFACE_CONFIGURE = h("mmc_surface2_configure", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -252,6 +253,10 @@ final class Mtl {
 
     static boolean waitSubmit(long index, long timeoutNs) {
         try { return (int) WAIT_SUBMIT.invokeExact(index, timeoutNs) == 1; } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int gpuTimesTake(long out, int max) {
+        try { return (int) GPU_TIMES_TAKE.invokeExact(out, max); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static long completedSubmit() {

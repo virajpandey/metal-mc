@@ -2,7 +2,21 @@
 
 An experimental Metal terrain renderer for Minecraft-style worlds on Apple Silicon. The goal is to cover the near-terrain work of Sodium and Nvidium and the far-terrain LOD work of Voxy in one engine.
 
-## Status: milestone 2 (near engine), mostly done
+## In-game: a native Metal backend for Minecraft 26.3
+
+Minecraft 26.x renders through a backend interface (OpenGL, and Vulkan via MoltenVK on Macs). The `mod/` Fabric mod adds a third backend that talks to Metal directly: Java 25's FFM API calls into a Swift library (`Sources/MetalMCNative/Backend.swift`), and the game's SPIR-V shaders are translated to MSL with the SPIRV-Cross that ships with the game. It renders the vanilla game unmodified, with no shader or content changes.
+
+Fullscreen 4112×2580 on an M3 Pro, same route and world, all runs from one session ([details](results/metal-26.3/README.md)):
+
+| Backend | FPS (mean of runs) | Mean frame ms | p99 ms | Frames >8 ms per 60 s |
+|---|---|---|---|---|
+| OpenGL (vanilla) | 179 | 5.58 | 7.8 | 79 |
+| Vulkan via MoltenVK (vanilla) | 250 | 3.99 | 7.2 | 55–58 |
+| **Metal (MetalMC)** | **402** | **2.49** | **4.1** | **13–20** |
+
+Screenshots of the same pose match Vulkan's (95% of pixels within 15/255; the rest is the player's arm mid-animation). The backend is currently GPU-bound at this resolution. Run it with `./gradlew runClient -PmetalBackend=metal` from `mod/`, after `swift build -c release`.
+
+## Standalone engine status: milestone 2 (near engine), mostly done
 
 - **Milestone 1:** loads Minecraft 26.x worlds from Anvil region files. That includes 26.x's palette changes: plain-string entries, `{"": name}` wrappers, and `{id, properties}`.
 - **Milestone 2:**
