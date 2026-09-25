@@ -83,9 +83,10 @@ final class ViewController: NSObject, MTKViewDelegate {
         frames += 1
         if now - lastTitle > 0.5 {
             let fps = Double(frames) / (now - lastTitle)
-            view.window?.title = String(format: "MetalMC  %.0f fps  cpu %.2f ms  gpu %.2f ms  sections %d/%d  tris %.1fM",
-                                        fps, lastCpuMs, lastGpuMs, st.drawn, st.drawn + st.culled,
-                                        Double(st.triangles) / 1e6)
+            let g = st.drawn < 0 ? renderer.readGPUStats() : (drawn: st.drawn, triangles: st.triangles)
+            view.window?.title = String(format: "MetalMC  %.0f fps  cpu %.2f ms  gpu %.2f ms  sections %d/%d  tris %.2fM%@",
+                                        fps, lastCpuMs, lastGpuMs, g.drawn, renderer.sections.count,
+                                        Double(g.triangles) / 1e6, st.drawn < 0 ? "  (gpu-cull)" : "")
             frames = 0
             lastTitle = now
         }
