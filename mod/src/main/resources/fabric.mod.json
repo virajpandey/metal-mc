@@ -2,8 +2,8 @@
 	"schemaVersion": 1,
 	"id": "metalmc_bench",
 	"version": "${version}",
-	"name": "MetalMC Bench",
-	"description": "Automated in-game frame-time benchmark for the MetalMC renderer project.",
+	"name": "MetalMC",
+	"description": "A native Metal graphics backend for Minecraft on Apple Silicon, Sodium-style face culling, and Voxy-style far-terrain LOD. Settings: config/metalmc.properties.",
 	"authors": [
 		"virajpandey"
 	],
@@ -11,7 +11,7 @@
 		"sources": "https://github.com/virajpandey/metal-mc"
 	},
 	"license": "LGPL-3.0-only",
-	"icon": "assets/modid/icon.png",
+	"icon": "assets/metalmc/icon.png",
 	"environment": "client",
 	"entrypoints": {
 		"client": [

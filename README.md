@@ -30,6 +30,14 @@ That is 4–16× the view distance at 45–51% higher FPS. LOD colors come from 
 
 ![Render distance 12 with LOD to 8 km](results/lod-v1/rd12-lod8192-start.png)
 
+### Install (Minecraft 26.3, Apple Silicon)
+
+1. Install [Fabric Loader](https://fabricmc.net/use/installer/) 0.19.5+ for Minecraft 26.3, and put [Fabric API](https://modrinth.com/mod/fabric-api) in your `mods` folder.
+2. Build the mod: `cd mod && ./gradlew build` (needs Xcode's Swift toolchain and JDK 25). Copy `mod/build/libs/metalmc-0.1.0.jar` into `mods`. The jar bundles the Metal library, which is extracted to `<game dir>/metalmc/natives/` on first launch.
+3. Settings are in `config/metalmc.properties`, created on first launch: `backend=metal|off`, `facingCulling`, `lod`, and `lod.far` (blocks). If Metal can't start, Minecraft falls back to its own backends.
+
+It's experimental. It has only been tested in single-player on one M3 Pro, and it isn't compatible with other rendering mods (Sodium, Iris).
+
 ## Standalone engine status: milestone 2 (near engine), mostly done
 
 - **Milestone 1:** loads Minecraft 26.x worlds from Anvil region files. That includes 26.x's palette changes: plain-string entries, `{"": name}` wrappers, and `{id, properties}`.

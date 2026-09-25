@@ -8,14 +8,14 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.storage.LevelResource;
 
 /**
- * Far-terrain LOD (Voxy-style, clean-room) for the Metal backend. Off unless -Dmetalmc.lod=1.
+ * Far-terrain LOD (Voxy-style, clean-room) for the Metal backend. Controlled by config/metalmc.properties (lod, lod.far).
  * On single-player world join it starts the native LOD build from the save's region files. While
  * the LOD is ready, the mixins push the far plane and render-distance fog out to FAR and draw the LOD
  * after solid terrain.
  */
 public final class Lod implements ClientModInitializer {
-    public static final boolean ENABLED = "1".equals(System.getProperty("metalmc.lod", "0"));
-    public static final int FAR = Integer.getInteger("metalmc.lod.far", 2048);
+    public static final boolean ENABLED = metalmc.MetalMCConfig.lod();
+    public static final int FAR = metalmc.MetalMCConfig.lodFar();
 
     private static boolean opened;
     private static volatile boolean ready;

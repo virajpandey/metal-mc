@@ -15,7 +15,7 @@ public final class FacingSorter {
     private FacingSorter() {
     }
 
-    public static final boolean ENABLED = !"0".equals(System.getProperty("metalmc.facingCulling", "1"));
+    public static final boolean ENABLED = metalmc.MetalMCConfig.facingCulling();
 
     // Draw order: buckets that are usually visible together are adjacent, so they merge into one draw.
     public static final int UNASSIGNED = 0, POS_Y = 1, NEG_X = 2, NEG_Z = 3, POS_X = 4, POS_Z = 5, NEG_Y = 6;

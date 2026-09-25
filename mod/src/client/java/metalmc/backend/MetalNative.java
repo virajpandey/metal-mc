@@ -12,7 +12,7 @@ import java.nio.file.Path;
 
 /**
  * Java side of the native bridge (libMetalMCNative.dylib, built from Sources/MetalMCNative by SwiftPM),
- * called through the java.lang.foreign API. The dylib path comes from -Dmetalmc.native.
+ * called through the java.lang.foreign API. See NativeLibrary for where the dylib is found.
  */
 public final class MetalNative {
     public static final int EXPECTED_ABI = 3;
@@ -82,9 +82,7 @@ public final class MetalNative {
 
     /** Loads the dylib, or throws with a readable reason. */
     public static MetalNative load() {
-        String path = System.getProperty("metalmc.native");
-        if (path == null || path.isEmpty()) throw new IllegalStateException("-Dmetalmc.native is not set");
-        Path p = Path.of(path);
+        Path p = NativeLibrary.path();
         if (!Files.isRegularFile(p)) throw new IllegalStateException("native library not found: " + p);
         return new MetalNative(SymbolLookup.libraryLookup(p, Arena.global()));
     }

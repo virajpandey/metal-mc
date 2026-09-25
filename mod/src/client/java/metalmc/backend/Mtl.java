@@ -6,7 +6,6 @@ import java.lang.foreign.Linker;
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
-import java.nio.file.Path;
 
 import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
@@ -23,7 +22,7 @@ final class Mtl {
     }
 
     private static final Linker LINKER = Linker.nativeLinker();
-    private static final SymbolLookup LIB = SymbolLookup.libraryLookup(Path.of(System.getProperty("metalmc.native")), Arena.global());
+    private static final SymbolLookup LIB = SymbolLookup.libraryLookup(NativeLibrary.path(), Arena.global());
 
     private static MethodHandle h(String name, boolean critical, MemoryLayout ret, MemoryLayout... args) {
         FunctionDescriptor fd = ret == null ? FunctionDescriptor.ofVoid(args) : FunctionDescriptor.of(ret, args);

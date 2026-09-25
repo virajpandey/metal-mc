@@ -30,8 +30,14 @@ loom {
 			property "metalmc.bench.y", (project.findProperty("benchY") ?: "150").toString()
 			property "metalmc.bench.gpuTimer", (project.findProperty("benchGpu") ?: "0").toString()
 			// ./gradlew runClient -PmetalBackend=metal  tries the MetalMC backend first (falls back if it declines)
-			property "metalmc.backend", (project.findProperty("metalBackend") ?: "off").toString()
-			property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
+			// -PmetalBackend=config uses config/metalmc.properties (the release behavior).
+			if ((project.findProperty("metalBackend") ?: "off").toString() != "config") {
+				property "metalmc.backend", (project.findProperty("metalBackend") ?: "off").toString()
+			}
+			// -PbundledNative=1 tests the release path: the dylib is extracted from the mod's resources.
+			if (!project.hasProperty("bundledNative")) {
+				property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
+			}
 			property "metalmc.backend.presentTest", (project.findProperty("presentTest") ?: "0").toString()
 			property "metalmc.bench.warmupTicks", (project.findProperty("benchWarmup") ?: "400").toString()
 			property "metalmc.bench.cx", (project.findProperty("benchCx") ?: "8").toString()
@@ -120,5 +126,18 @@ publishing {
 		// Notice: This block does NOT have the same function as the block in the top level.
 		// The repositories here will be used for publishing your artifact, not for
 		// retrieving dependencies.
+	}
+}
+
+// The Swift half of the backend (Sources/MetalMCNative), built with SwiftPM and bundled in the jar.
+tasks.register('buildNative', Exec) {
+	workingDir = file('..')
+	commandLine 'swift', 'build', '-c', 'release', '--product', 'MetalMCNative'
+}
+
+processClientResources {
+	dependsOn 'buildNative'
+	from(file('../.build/release/libMetalMCNative.dylib')) {
+		into 'natives/macos-arm64'
 	}
 }
