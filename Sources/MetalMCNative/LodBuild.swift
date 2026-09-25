@@ -110,9 +110,11 @@ enum LodBuild {
         var grid = LodGrid(level: 1)
         var any = false
         var cache: [String: UInt8] = [:]
+        let scratch = ChunkScan.Scratch()
+        r.withUnsafeBufferPointer { rb in
         grid.v.withUnsafeMutableBufferPointer { g in
             for i in 0..<1024 {
-                guard Anvil.be32(r, i * 4) != 0, let chunk = try? ChunkScan.decodeChunk(region: r, index: i, cache: &cache),
+                guard Anvil.be32(r, i * 4) != 0, let chunk = try? ChunkScan.decodeChunk(region: rb, index: i, cache: &cache, scratch: scratch),
                       !chunk.sections.isEmpty else { continue }
                 any = true
                 let lx0 = ((chunk.cx & 31) * 16) >> 1, lz0 = ((chunk.cz & 31) * 16) >> 1
@@ -136,6 +138,7 @@ enum LodBuild {
                     }
                 }
             }
+        }
         }
         return any ? grid : nil
     }
@@ -327,6 +330,8 @@ public func mmc_debug_unknown_blocks(_ path: UnsafePointer<CChar>, _ out: Unsafe
     return Int32(counts.count)
 }
 
+private let debugScratch = ChunkScan.Scratch()
+
 /// Debug: decodes every chunk of a region with both decoders and counts chunks whose results differ.
 /// out[0] = chunks compared, out[1] = mismatches, out[2] = old decoder µs, out[3] = new decoder µs.
 @_cdecl("mmc_debug_compare_decoders")
@@ -340,7 +345,7 @@ public func mmc_debug_compare_decoders(_ path: UnsafePointer<CChar>, _ out: Unsa
         let t0 = Date()
         let a = try? Anvil.decodeChunk(region: r, index: i)
         let t1 = Date()
-        let b = try? ChunkScan.decodeChunk(region: r, index: i, cache: &cache)
+        let b = r.withUnsafeBufferPointer { try? ChunkScan.decodeChunk(region: $0, index: i, cache: &cache, scratch: debugScratch) }
         let t2 = Date()
         tOld += t1.timeIntervalSince(t0); tNew += t2.timeIntervalSince(t1)
         compared += 1

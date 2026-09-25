@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 
 /// Fast chunk decoding for LOD ingestion: walks the NBT bytes once, reading only position, status,
@@ -124,7 +125,11 @@ public enum ChunkScan {
     /// Decodes one chunk's NBT (already decompressed). `cache` maps block names to material ids and can
     /// be shared across the chunks of a region.
     public static func decode(_ raw: [UInt8], cache: inout [String: UInt8]) throws -> Anvil.ChunkResult {
-        try raw.withUnsafeBufferPointer { buf -> Anvil.ChunkResult in
+        try raw.withUnsafeBufferPointer { try decode($0, cache: &cache) }
+    }
+
+    public static func decode(_ buf: UnsafeBufferPointer<UInt8>, cache: inout [String: UInt8]) throws -> Anvil.ChunkResult {
+        do {
             var c = Cursor(p: buf.baseAddress!, n: buf.count)
             guard try c.u8() == 10 else { throw NBTError.badRoot(buf[0]) }
             _ = try c.str()
@@ -216,6 +221,52 @@ public enum ChunkScan {
                 res.sections.append((sy, out))
             }
             return res
+        }
+    }
+
+    /// Reusable decompression buffer for one thread (grows as needed).
+    public final class Scratch {
+        var buffer: UnsafeMutablePointer<UInt8>
+        var capacity: Int
+        public init(capacity: Int = 1 << 20) {
+            self.capacity = capacity
+            buffer = .allocate(capacity: capacity)
+        }
+        deinit { buffer.deallocate() }
+        func grow() {
+            buffer.deallocate()
+            capacity *= 2
+            buffer = .allocate(capacity: capacity)
+        }
+    }
+
+    /// Like `decodeChunk(region:index:cache:)`, but inflates with the Compression framework straight into
+    /// `scratch` and scans in place (no intermediate Data or array copies).
+    public static func decodeChunk(region r: UnsafeBufferPointer<UInt8>, index i: Int, cache: inout [String: UInt8],
+                                   scratch: Scratch) throws -> Anvil.ChunkResult {
+        func be32(_ o: Int) -> Int { Int(UInt32(r[o]) << 24 | UInt32(r[o + 1]) << 16 | UInt32(r[o + 2]) << 8 | UInt32(r[o + 3])) }
+        let offset = (be32(i * 4) >> 8) * 4096
+        guard offset >= 8192, offset + 5 <= r.count else { throw AnvilError.badChunk("offset \(offset)") }
+        let length = be32(offset)
+        let ctype = r[offset + 4]
+        let start = offset + 5, end = offset + 4 + length
+        guard length > 1, end <= r.count else { throw AnvilError.badChunk("length \(length)") }
+        switch ctype {
+        case 2:
+            // zlib = 2-byte header + raw deflate + 4-byte Adler-32; COMPRESSION_ZLIB wants raw deflate.
+            guard end - start > 6 else { throw AnvilError.badChunk("short zlib") }
+            let src = r.baseAddress! + start + 2
+            let srcLen = end - start - 6
+            while true {
+                let n = compression_decode_buffer(scratch.buffer, scratch.capacity, src, srcLen, nil, COMPRESSION_ZLIB)
+                if n == 0 { throw AnvilError.badChunk("inflate failed") }
+                if n < scratch.capacity { return try decode(UnsafeBufferPointer(start: scratch.buffer, count: n), cache: &cache) }
+                scratch.grow()   // output may have been truncated
+            }
+        case 3:
+            return try decode(UnsafeBufferPointer(start: r.baseAddress! + start, count: end - start), cache: &cache)
+        default:
+            throw AnvilError.unsupportedCompression(ctype)
         }
     }
 
