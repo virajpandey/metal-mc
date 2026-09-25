@@ -1,6 +1,6 @@
 import simd
 
-/// One quad = one 32-bit word, expanded to 6 vertices by the vertex shader (vertex pulling).
+/// One quad = one 32-bit word, expanded to 4 vertices by the vertex shader (vertex pulling).
 ///
 ///   bits  0-3   x within section        bits 12-14  face (0..5, order of `Mesher.faces`)
 ///   bits  4-7   y within section        bits 15-22  material ID
@@ -27,24 +27,30 @@ struct SectionMesh {
     var water: [UInt32] = []
 }
 
-/// Face-culling mesher: emits a quad for every opaque face that touches air or water,
-/// and every water face that touches air. All lookup tables are read through raw pointers;
+/// Face-culling mesher with optional greedy merging. For each face direction and each of the 16
+/// slices along its normal, it builds a 16x16 mask of visible faces (by material), then merges runs
+/// of equal material into rectangles up to 16x16. Lookup tables are read through raw pointers;
 /// shared Swift arrays in the inner loop cause atomic refcount traffic that serializes threads.
 enum Mesher {
     /// Face order is shared with the shader's corner table: +X, -X, +Y, -Y, +Z, -Z.
+    /// `n`, `u`, `v` are the normal and tangent axes (0 = x, 1 = y, 2 = z); U/V match the shader's extentScale.
     struct Face {
         let dx: Int32, dy: Int32, dz: Int32
+        let n: Int32, u: Int32, v: Int32
         let shade: Float
     }
 
     static let faces: [Face] = [
-        Face(dx: 1, dy: 0, dz: 0, shade: 0.80),
-        Face(dx: -1, dy: 0, dz: 0, shade: 0.80),
-        Face(dx: 0, dy: 1, dz: 0, shade: 1.00),
-        Face(dx: 0, dy: -1, dz: 0, shade: 0.50),
-        Face(dx: 0, dy: 0, dz: 1, shade: 0.70),
-        Face(dx: 0, dy: 0, dz: -1, shade: 0.70),
+        Face(dx: 1, dy: 0, dz: 0, n: 0, u: 1, v: 2, shade: 0.80),
+        Face(dx: -1, dy: 0, dz: 0, n: 0, u: 1, v: 2, shade: 0.80),
+        Face(dx: 0, dy: 1, dz: 0, n: 1, u: 0, v: 2, shade: 1.00),
+        Face(dx: 0, dy: -1, dz: 0, n: 1, u: 0, v: 2, shade: 0.50),
+        Face(dx: 0, dy: 0, dz: 1, n: 2, u: 0, v: 1, shade: 0.70),
+        Face(dx: 0, dy: 0, dz: -1, n: 2, u: 0, v: 1, shade: 0.70),
     ]
+
+    /// Set to false to emit one quad per block face (for A/B comparisons).
+    nonisolated(unsafe) static var greedy = true
 
     static func pack(_ c: SIMD4<Float>) -> UInt32 {
         func q(_ v: Float) -> UInt32 { UInt32(max(0, min(255, (v * 255).rounded()))) }
@@ -60,37 +66,53 @@ enum Mesher {
     static let kinds: [UInt8] = Materials.kinds.map(\.rawValue)
 
     static func meshSection(view: WorldView, sx: Int, sy: Int, sz: Int) -> SectionMesh {
-        let x0 = sx * 16, y0 = sy * 16, z0 = sz * 16
-        var mesh = SectionMesh(minB: SIMD3(Float(x0), Float(y0), Float(z0)),
-                               maxB: SIMD3(Float(x0 + 16), Float(y0 + 16), Float(z0 + 16)))
+        let origin = SIMD3<Int>(sx * 16, sy * 16, sz * 16)
+        var mesh = SectionMesh(minB: SIMD3<Float>(origin), maxB: SIMD3<Float>(origin &+ 16))
         guard view.hasSection(sx, sy, sz) else { return mesh }
 
         let air = MaterialKind.air.rawValue
         let water = MaterialKind.water.rawValue
         let opaque = MaterialKind.opaque.rawValue
+        let merge = greedy
         var buckets: [[UInt32]] = [[], [], [], [], [], []]
+        var maskO = [UInt8](repeating: 0, count: 256)
+        var maskW = [UInt8](repeating: 0, count: 256)
 
         faces.withUnsafeBufferPointer { fp in
             kinds.withUnsafeBufferPointer { kp in
-                for y in y0..<(y0 + 16) {
-                    for z in z0..<(z0 + 16) {
-                        for x in x0..<(x0 + 16) {
-                            let b = Int(view.block(x, y, z))
-                            if b == 0 { continue }
-                            let isWater = kp[b] == water
-                            for fi in 0..<6 {
-                                let f = fp[fi]
-                                let nk = kp[Int(view.block(x + Int(f.dx), y + Int(f.dy), z + Int(f.dz)))]
-                                let visible = isWater ? (nk == air) : (nk != opaque)
-                                if !visible { continue }
-                                let q = QuadFormat.pack(x: x - x0, y: y - y0, z: z - z0, face: fi, material: b)
-                                if isWater { mesh.water.append(q) } else { buckets[fi].append(q) }
+                for fi in 0..<6 {
+                    let f = fp[fi]
+                    let n = Int(f.n), ua = Int(f.u), va = Int(f.v)
+                    for d in 0..<16 {
+                        var anyO = false, anyW = false
+                        for v in 0..<16 {
+                            for u in 0..<16 {
+                                var l = SIMD3<Int>(0, 0, 0)
+                                l[n] = d; l[ua] = u; l[va] = v
+                                let p = origin &+ l
+                                let b = Int(view.block(p.x, p.y, p.z))
+                                var mo: UInt8 = 0, mw: UInt8 = 0
+                                if b != 0 {
+                                    let nk = kp[Int(view.block(p.x + Int(f.dx), p.y + Int(f.dy), p.z + Int(f.dz)))]
+                                    if kp[b] == water {
+                                        if nk == air { mw = UInt8(b) }
+                                    } else if nk != opaque {
+                                        mo = UInt8(b)
+                                    }
+                                }
+                                maskO[v * 16 + u] = mo
+                                maskW[v * 16 + u] = mw
+                                anyO = anyO || mo != 0
+                                anyW = anyW || mw != 0
                             }
                         }
+                        if anyO { emitMask(&maskO, fi: fi, f: f, d: d, merge: merge, into: &buckets[fi]) }
+                        if anyW { emitMask(&maskW, fi: fi, f: f, d: d, merge: merge, into: &mesh.water) }
                     }
                 }
             }
         }
+
         var offset: Int32 = 0
         for fi in 0..<6 {
             mesh.faceOffsets[fi] = offset
@@ -99,5 +121,34 @@ enum Mesher {
         }
         mesh.faceOffsets[6] = offset
         return mesh
+    }
+
+    /// Turns one 16x16 slice mask into quads, merging equal-material rectangles when `merge` is set.
+    /// Consumes (zeroes) the mask.
+    private static func emitMask(_ mask: inout [UInt8], fi: Int, f: Face, d: Int, merge: Bool,
+                                 into out: inout [UInt32]) {
+        let n = Int(f.n), ua = Int(f.u), va = Int(f.v)
+        for v in 0..<16 {
+            var u = 0
+            while u < 16 {
+                let m = mask[v * 16 + u]
+                if m == 0 { u += 1; continue }
+                var w = 1, h = 1
+                if merge {
+                    while u + w < 16 && mask[v * 16 + u + w] == m { w += 1 }
+                    grow: while v + h < 16 {
+                        for k in 0..<w where mask[(v + h) * 16 + u + k] != m { break grow }
+                        h += 1
+                    }
+                }
+                for dv in 0..<h {
+                    for k in 0..<w { mask[(v + dv) * 16 + u + k] = 0 }
+                }
+                var l = SIMD3<Int>(0, 0, 0)
+                l[n] = d; l[ua] = u; l[va] = v
+                out.append(QuadFormat.pack(x: l.x, y: l.y, z: l.z, face: fi, material: Int(m), w: w, h: h))
+                u += w
+            }
+        }
     }
 }

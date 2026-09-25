@@ -2,9 +2,25 @@
 
 An experimental Metal terrain renderer for Minecraft-style worlds on Apple Silicon. The goal is to cover the near-terrain work of Sodium and Nvidium and the far-terrain LOD work of Voxy in one engine.
 
-## Status: milestone 0
+## Status: milestone 2 (near engine), mostly done
 
-This milestone has a procedural voxel world, parallel meshing with face culling, and one Metal pipeline (opaque pass, then translucent water, with distance fog). Culling is CPU frustum plus fog-distance culling. There's also a headless benchmark harness.
+- **Milestone 1:** loads Minecraft 26.x worlds from Anvil region files. That includes 26.x's palette changes: plain-string entries, `{"": name}` wrappers, and `{id, properties}`.
+- **Milestone 2:**
+  - Quads are 4 bytes each, expanded by the vertex shader.
+  - Greedy meshing, face-direction buckets, backface culling, and reverse-Z depth.
+  - Golden-hash and fuzzy image-diff checks.
+
+Results on `claudeworld` (841 chunks, M3 Pro, 1280×720, 600-frame camera path):
+
+| Step | Quads | GPU memory | GPU ms (mean) |
+|---|---|---|---|
+| M1: 16-byte vertices + indices | 2.48M | 208.4 MB | 2.42 |
+| + backface culling, reverse-Z | 2.48M | 208.4 MB | 1.82 |
+| + 4-byte pulled quads | 2.48M | 9.6 MB | 2.61 |
+| + face buckets | 2.48M | 9.6 MB | 1.81 |
+| + greedy meshing | 0.95M | 3.7 MB | 1.07 |
+
+Procedural 64×64 chunks: 534K quads, 2.2 MB, GPU 0.37 ms mean / 0.97 ms p99.
 
 ## Build
 
@@ -25,6 +41,14 @@ Benchmark (offscreen). It writes `frames.csv`, PNG captures, and `summary.txt`, 
 ```bash
 .build/release/MetalMCViewer --bench --chunks 32 --frames 600 --out bench_out
 ```
+
+Load a real world save, then check it against golden hashes or a reference run:
+
+```bash
+.build/release/MetalMCViewer --bench --world fixtures/claudeworld --golden goldens/claudeworld.txt --compare bench_out/ref_m2d
+```
+
+A/B switches: `--no-cull`, `--cw`, `--standard-z`, `--no-buckets`, `--no-greedy`.
 
 ## Telemetry
 

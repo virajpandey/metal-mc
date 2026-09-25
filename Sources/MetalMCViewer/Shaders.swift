@@ -4,7 +4,7 @@ let shaderSource = """
 using namespace metal;
 
 struct Uniforms { float4x4 viewProj; float4 cameraPos; float4 fog; float4 sky; };
-struct VOut { float4 position [[position]]; float4 color; float dist; };
+struct VOut { float4 position [[position]]; float4 color; float3 wpos; };
 
 // Unit-cube corners per face, CCW seen from outside. Face order matches Mesher.faces: +X -X +Y -Y +Z -Z.
 constant float3 kCorners[6][4] = {
@@ -41,12 +41,14 @@ vertex VOut vquad(uint vid [[vertex_id]],
     VOut o;
     o.position = u.viewProj * float4(p, 1.0);
     o.color = unpack_unorm4x8_to_float(colors[((q >> 15) & 255) * 6 + face]);
-    o.dist = distance(p, u.cameraPos.xyz);
+    o.wpos = p;
     return o;
 }
 
+// Fog distance is computed per pixel, so large greedy quads fog exactly like 1x1 ones.
 fragment float4 fmain(VOut in [[stage_in]], constant Uniforms& u [[buffer(1)]]) {
-    float f = saturate((in.dist - u.fog.x) / max(u.fog.y - u.fog.x, 1e-3));
+    float dist = distance(in.wpos, u.cameraPos.xyz);
+    float f = saturate((dist - u.fog.x) / max(u.fog.y - u.fog.x, 1e-3));
     float3 rgb = mix(in.color.rgb, u.sky.rgb, f);
     return float4(rgb, in.color.a);
 }

@@ -38,6 +38,7 @@ do {
     renderer.frontFacing = args.contains("--cw") ? .clockwise : .counterClockwise
     renderer.reverseZ = !args.contains("--standard-z")
     renderer.faceBuckets = !args.contains("--no-buckets")
+    Mesher.greedy = !args.contains("--no-greedy")
     renderer.upload(world: world)
     let t2 = CACurrentMediaTime()
 
