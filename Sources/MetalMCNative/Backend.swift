@@ -76,10 +76,17 @@ final class MetalContext: @unchecked Sendable {
     var passWidth = 0
     var passHeight = 0
     var pipe: PipelineBox?
+    var boundPipeState: MTLRenderPipelineState?
+    // Last object/offset bound per index and stage (0 = vertex, 1 = fragment), to skip redundant sets.
+    var boundBuffers = [[ObjectIdentifier?]](repeating: [ObjectIdentifier?](repeating: nil, count: 31), count: 2)
+    var boundOffsets = [[Int]](repeating: [Int](repeating: -1, count: 31), count: 2)
+    var boundTextures = [[ObjectIdentifier?]](repeating: [ObjectIdentifier?](repeating: nil, count: 32), count: 2)
+    var boundSamplers = [[ObjectIdentifier?]](repeating: [ObjectIdentifier?](repeating: nil, count: 16), count: 2)
     var indexBuffer: MTLBuffer?
     var indexType: MTLIndexType = .uint16
     var indexSize = 2
     var scissorEmpty = false
+    var lastScissor: MTLScissorRect?
 
     var pendingDrawables: [CAMetalDrawable] = []
 
@@ -123,6 +130,44 @@ final class MetalContext: @unchecked Sendable {
         return made
     }
 
+    func resetBindings() {
+        boundPipeState = nil
+        lastScissor = nil
+        for st in 0..<2 {
+            for i in 0..<31 { boundBuffers[st][i] = nil; boundOffsets[st][i] = -1 }
+            for i in 0..<32 { boundTextures[st][i] = nil }
+            for i in 0..<16 { boundSamplers[st][i] = nil }
+        }
+    }
+
+    /// Binds a buffer to a stage unless the same buffer/offset is already there. Same buffer with a new
+    /// offset uses the cheaper offset-only setter.
+    @inline(__always) func bindBuffer(_ enc: MTLRenderCommandEncoder, _ stage: Int, _ b: MTLBuffer, _ offset: Int, _ index: Int) {
+        let id = ObjectIdentifier(b)
+        if boundBuffers[stage][index] == id {
+            if boundOffsets[stage][index] == offset { return }
+            if stage == 0 { enc.setVertexBufferOffset(offset, index: index) } else { enc.setFragmentBufferOffset(offset, index: index) }
+        } else {
+            if stage == 0 { enc.setVertexBuffer(b, offset: offset, index: index) } else { enc.setFragmentBuffer(b, offset: offset, index: index) }
+            boundBuffers[stage][index] = id
+        }
+        boundOffsets[stage][index] = offset
+    }
+
+    @inline(__always) func bindTexture(_ enc: MTLRenderCommandEncoder, _ stage: Int, _ t: MTLTexture, _ index: Int) {
+        let id = ObjectIdentifier(t)
+        if boundTextures[stage][index] == id { return }
+        if stage == 0 { enc.setVertexTexture(t, index: index) } else { enc.setFragmentTexture(t, index: index) }
+        boundTextures[stage][index] = id
+    }
+
+    @inline(__always) func bindSampler(_ enc: MTLRenderCommandEncoder, _ stage: Int, _ s: MTLSamplerState, _ index: Int) {
+        let id = ObjectIdentifier(s)
+        if boundSamplers[stage][index] == id { return }
+        if stage == 0 { enc.setVertexSamplerState(s, index: index) } else { enc.setFragmentSamplerState(s, index: index) }
+        boundSamplers[stage][index] = id
+    }
+
     func depthState(compare: MTLCompareFunction, write: Bool) -> MTLDepthStencilState {
         let key = Int(compare.rawValue) * 2 + (write ? 1 : 0)
         utilLock.lock(); defer { utilLock.unlock() }
@@ -161,7 +206,10 @@ public func mmc_ctx_limits(_ out: UnsafeMutablePointer<Int64>) {
 
 @_cdecl("mmc_buffer_create")
 public func mmc_buffer_create(_ size: Int64) -> Int64 {
-    guard let b = ctx.device.makeBuffer(length: max(Int(size), 16), options: [.storageModeShared]) else { return 0 }
+    // Minecraft sizes uniform buffers to the std140 byte count (e.g. 40), but MSL rounds structs up to
+    // their alignment (48), so shaders may read up to 15 bytes past a slice that ends the buffer. Pad.
+    let length = (max(Int(size), 16) + 15) / 16 * 16 + 64
+    guard let b = ctx.device.makeBuffer(length: length, options: [.storageModeShared]) else { return 0 }
     return makeHandle(BufferBox(b))
 }
 
@@ -463,6 +511,7 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
         }
         guard let enc = cb.makeRenderCommandEncoder(descriptor: d) else { return 0 }
         ctx.pass = enc
+        ctx.resetBindings()
         ctx.passWidth = w
         ctx.passHeight = h
         ctx.pipe = nil
@@ -490,7 +539,10 @@ func setScissor(_ enc: MTLRenderCommandEncoder, _ x: Int, _ y: Int, _ w: Int, _ 
         return
     }
     ctx.scissorEmpty = false
-    enc.setScissorRect(MTLScissorRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0))
+    let r = MTLScissorRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    if let last = ctx.lastScissor, last.x == r.x, last.y == r.y, last.width == r.width, last.height == r.height { return }
+    enc.setScissorRect(r)
+    ctx.lastScissor = r
 }
 
 @_cdecl("mmc_rp_scissor")
@@ -503,15 +555,22 @@ public func mmc_rp_scissor(_ x: Int32, _ y: Int32, _ w: Int32, _ h: Int32) {
 public func mmc_rp_set_pipeline(_ h: Int64) -> Int32 {
     guard let enc = ctx.pass else { return 0 }
     let p: PipelineBox = from(h)
+    if ctx.pipe === p { return 1 }
     guard let st = p.state(depthFormat: ctx.passDepthFormat) else {
         ctx.pipe = nil
         return 0
     }
-    enc.setRenderPipelineState(st)
-    enc.setDepthStencilState(p.depthState)
-    enc.setCullMode(p.cull)
-    enc.setTriangleFillMode(p.fill)
-    enc.setDepthBias(p.depthBias, slopeScale: p.depthSlope, clamp: 0)
+    let prev = ctx.pipe
+    if ctx.boundPipeState !== st {
+        enc.setRenderPipelineState(st)
+        ctx.boundPipeState = st
+    }
+    if prev == nil || prev!.depthState !== p.depthState { enc.setDepthStencilState(p.depthState) }
+    if prev == nil || prev!.cull != p.cull { enc.setCullMode(p.cull) }
+    if prev == nil || prev!.fill != p.fill { enc.setTriangleFillMode(p.fill) }
+    if prev == nil || prev!.depthBias != p.depthBias || prev!.depthSlope != p.depthSlope {
+        enc.setDepthBias(p.depthBias, slopeScale: p.depthSlope, clamp: 0)
+    }
     ctx.pipe = p
     return 1
 }
@@ -521,8 +580,8 @@ public func mmc_rp_bind_buffer(_ index: Int32, _ h: Int64, _ offset: Int64) {
     guard let enc = ctx.pass, let p = ctx.pipe else { return }
     let b = (from(h) as BufferBox).buffer
     let bit = UInt32(1) << UInt32(index)
-    if p.vsMask & bit != 0 { enc.setVertexBuffer(b, offset: Int(offset), index: Int(index)) }
-    if p.fsMask & bit != 0 { enc.setFragmentBuffer(b, offset: Int(offset), index: Int(index)) }
+    if p.vsMask & bit != 0 { ctx.bindBuffer(enc, 0, b, Int(offset), Int(index)) }
+    if p.fsMask & bit != 0 { ctx.bindBuffer(enc, 1, b, Int(offset), Int(index)) }
 }
 
 @_cdecl("mmc_rp_bind_texture")
@@ -532,12 +591,12 @@ public func mmc_rp_bind_texture(_ index: Int32, _ tex: Int64, _ smp: Int64) {
     let s = (from(smp) as SamplerBox).state
     let bit = UInt32(1) << UInt32(index)
     if p.vsMask & bit != 0 {
-        enc.setVertexTexture(t, index: Int(index))
-        enc.setVertexSamplerState(s, index: Int(index))
+        ctx.bindTexture(enc, 0, t, Int(index))
+        ctx.bindSampler(enc, 0, s, Int(index))
     }
     if p.fsMask & bit != 0 {
-        enc.setFragmentTexture(t, index: Int(index))
-        enc.setFragmentSamplerState(s, index: Int(index))
+        ctx.bindTexture(enc, 1, t, Int(index))
+        ctx.bindSampler(enc, 1, s, Int(index))
     }
 }
 
@@ -570,8 +629,8 @@ public func mmc_rp_bind_texel_buffer(_ index: Int32, _ h: Int64, _ offset: Int64
         return
     }
     let bit = UInt32(1) << UInt32(index)
-    if p.vsMask & bit != 0 { enc.setVertexTexture(t, index: Int(index)) }
-    if p.fsMask & bit != 0 { enc.setFragmentTexture(t, index: Int(index)) }
+    if p.vsMask & bit != 0 { ctx.bindTexture(enc, 0, t, Int(index)) }
+    if p.fsMask & bit != 0 { ctx.bindTexture(enc, 1, t, Int(index)) }
 }
 
 @_cdecl("mmc_rp_push_constants")
@@ -579,12 +638,14 @@ public func mmc_rp_push_constants(_ ptr: UnsafeRawPointer, _ len: Int32) {
     guard let enc = ctx.pass else { return }
     enc.setVertexBytes(ptr, length: Int(len), index: pushConstantsIndex)
     enc.setFragmentBytes(ptr, length: Int(len), index: pushConstantsIndex)
+    ctx.boundBuffers[0][pushConstantsIndex] = nil
+    ctx.boundBuffers[1][pushConstantsIndex] = nil
 }
 
 @_cdecl("mmc_rp_set_vertex_buffer")
 public func mmc_rp_set_vertex_buffer(_ slot: Int32, _ h: Int64, _ offset: Int64) {
     guard let enc = ctx.pass else { return }
-    enc.setVertexBuffer((from(h) as BufferBox).buffer, offset: Int(offset), index: vertexBufferIndex(Int(slot)))
+    ctx.bindBuffer(enc, 0, (from(h) as BufferBox).buffer, Int(offset), vertexBufferIndex(Int(slot)))
 }
 
 /// type: 0 = uint16, 1 = uint32.

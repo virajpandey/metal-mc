@@ -38,6 +38,8 @@ loom {
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
+				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"
+				environmentVariable "MTL_DEBUG_LAYER_WARNING_MODE", "nslog"
 			}
 			vmArg "--enable-native-access=ALL-UNNAMED"
 		}
