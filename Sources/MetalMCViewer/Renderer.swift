@@ -162,9 +162,11 @@ final class Renderer {
         statsBuffer = sb
     }
 
-    /// Meshes every section in parallel and packs the quads into one buffer; section origins go
-    /// into a parallel buffer indexed by draw slot.
-    func upload(world: World) {
+    /// Section counts per tier from the last upload: [near, LOD ring 1, LOD ring 2, ...].
+    private(set) var sectionsPerTier: [Int] = []
+    private(set) var quadsPerTier: [Int] = []
+
+    private static func meshAll(_ world: World) -> [SectionMesh] {
         let cx = world.secX, cy = world.secY, cz = world.secZ
         let count = cx * cy * cz
         var meshes = [SectionMesh?](repeating: nil, count: count)
@@ -177,18 +179,44 @@ final class Renderer {
                 }
             }
         }
+        return meshes.compactMap { m in
+            guard let m, !(m.opaque.isEmpty && m.water.isEmpty) else { return nil }
+            return m
+        }
+    }
+
+    /// Meshes the near world and any LOD rings, and packs all quads into one buffer. Each draw slot
+    /// has a transform (world-space origin, per-axis cell scale) in a parallel buffer.
+    func upload(world: World, lods: [LODLevel] = []) {
+        var tiers: [(meshes: [SectionMesh], scale: SIMD3<Float>, offset: SIMD3<Float>)] =
+            [(Renderer.meshAll(world), SIMD3(repeating: 1), .zero)]
+        for lod in lods {
+            tiers.append((Renderer.meshAll(lod.world),
+                          SIMD3(Float(lod.scale), Float(lod.vScale), Float(lod.scale)),
+                          SIMD3(Float(lod.originX), 0, Float(lod.originZ))))
+        }
 
         var quads: [UInt32] = []
-        var origins: [SIMD4<Float>] = []
+        var origins: [SIMD4<Float>] = []   // pairs: (origin, 0), (scale, 0)
         sections = []
-        for case let m? in meshes where !(m.opaque.isEmpty && m.water.isEmpty) {
-            let d = SectionDraw(minB: m.minB, maxB: m.maxB,
-                                opaqueStart: quads.count, opaqueCount: m.opaque.count, faceOffsets: m.faceOffsets,
-                                waterStart: quads.count + m.opaque.count, waterCount: m.water.count)
-            quads.append(contentsOf: m.opaque)
-            quads.append(contentsOf: m.water)
-            origins.append(SIMD4(m.minB, 0))
-            sections.append(d)
+        sectionsPerTier = []
+        quadsPerTier = []
+        for tier in tiers {
+            let q0 = quads.count
+            for m in tier.meshes {
+                let minB = tier.offset + m.minB * tier.scale
+                let maxB = tier.offset + m.maxB * tier.scale
+                let d = SectionDraw(minB: minB, maxB: maxB,
+                                    opaqueStart: quads.count, opaqueCount: m.opaque.count, faceOffsets: m.faceOffsets,
+                                    waterStart: quads.count + m.opaque.count, waterCount: m.water.count)
+                quads.append(contentsOf: m.opaque)
+                quads.append(contentsOf: m.water)
+                origins.append(SIMD4(minB, 0))
+                origins.append(SIMD4(tier.scale, 0))
+                sections.append(d)
+            }
+            sectionsPerTier.append(tier.meshes.count)
+            quadsPerTier.append(quads.count - q0)
         }
 
         totalQuads = quads.count

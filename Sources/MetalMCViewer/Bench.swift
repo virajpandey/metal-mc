@@ -19,6 +19,8 @@ struct BenchConfig {
     var writeGolden = false
     /// Reference run directory: each capture is diffed against the PNG with the same name.
     var compareDir: URL? = nil
+    /// Stand near the world center and pan a full circle toward the horizon (for LOD tests).
+    var pan = false
 }
 
 enum BenchError: Error {
@@ -28,8 +30,15 @@ enum BenchError: Error {
 /// Offscreen benchmark: flies a fixed camera path (with a "teleport" every 60 frames),
 /// writes per-frame telemetry to frames.csv, saves a few PNG captures, and prints one summary line.
 enum Bench {
-    static func cameraPose(frame: Int, world: World) -> (eye: SIMD3<Float>, target: SIMD3<Float>) {
+    static func cameraPose(frame: Int, world: World, pan: Bool = false) -> (eye: SIMD3<Float>, target: SIMD3<Float>) {
         let cx = Float(world.sizeX) / 2, cz = Float(world.sizeZ) / 2
+        if pan {
+            let segment = Float(frame / 60)
+            let yaw = Float(frame) * (2 * .pi / 600)
+            let eye = SIMD3<Float>(cx + 40 * sin(segment), Float(world.referenceY) + 50 + 25 * sin(segment * 1.7),
+                                   cz + 40 * cos(segment))
+            return (eye, eye + SIMD3<Float>(cos(yaw), -0.18, sin(yaw)) * 100)
+        }
         let segment = frame / 60
         let t = Float(frame % 60) / 60
         let angle = Float(segment) * 2.39996 + t * 0.5
@@ -68,7 +77,7 @@ enum Bench {
         var diffs: [String] = []
 
         for f in 0..<total {
-            let pose = cameraPose(frame: f, world: world)
+            let pose = cameraPose(frame: f, world: world, pan: cfg.pan)
             let viewProj = proj * lookAtRH(eye: pose.eye, center: pose.target, up: SIMD3(0, 1, 0))
 
             let t0 = CACurrentMediaTime()

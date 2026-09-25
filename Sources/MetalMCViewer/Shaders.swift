@@ -4,6 +4,8 @@ let shaderSource = """
 using namespace metal;
 
 struct Uniforms { float4x4 viewProj; float4 cameraPos; float4 fog; float4 sky; };
+// Per-section transform: world-space origin and per-axis cell size (1 for full detail; (s, v, s) for LOD rings).
+struct Xform { float4 origin; float4 scale; };
 struct VOut { float4 position [[position]]; float4 color; float3 wpos; };
 
 // Unit-cube corners per face, CCW seen from outside. Face order matches Mesher.faces: +X -X +Y -Y +Z -Z.
@@ -29,14 +31,15 @@ vertex VOut vquad(uint vid [[vertex_id]],
                   uint section [[base_instance]],
                   const device uint* quads [[buffer(0)]],
                   constant Uniforms& u [[buffer(1)]],
-                  const device float4* origins [[buffer(2)]],
+                  const device Xform* xforms [[buffer(2)]],
                   constant uint* colors [[buffer(3)]]) {
     uint q = quads[vid >> 2];
     uint corner = vid & 3;
     uint face = (q >> 12) & 7;
     float3 local = float3(q & 15, (q >> 4) & 15, (q >> 8) & 15);
     float3 scale = extentScale(face, float(((q >> 23) & 15) + 1), float(((q >> 27) & 15) + 1));
-    float3 p = origins[section].xyz + local + kCorners[face][corner] * scale;
+    Xform xf = xforms[section];
+    float3 p = xf.origin.xyz + (local + kCorners[face][corner] * scale) * xf.scale.xyz;
 
     VOut o;
     o.position = u.viewProj * float4(p, 1.0);

@@ -40,7 +40,25 @@ do {
     renderer.faceBuckets = !args.contains("--no-buckets")
     Mesher.greedy = !args.contains("--no-greedy")
     renderer.gpuCulling = args.contains("--gpu-cull")
-    renderer.upload(world: world)
+
+    // Far-terrain LOD rings (procedural worlds only for now).
+    let lodLevels = Int(argValue("--lod") ?? "") ?? 0
+    var lods: [LODLevel] = []
+    if lodLevels > 0 && label == "procedural" {
+        let tl = CACurrentMediaTime()
+        let vmax = Int(argValue("--lod-vmax") ?? "") ?? 8
+        lods = LOD.buildProcedural(nearSize: world.sizeX, height: world.sizeY, levels: lodLevels, maxVScale: vmax)
+        let reach = (world.sizeX / 2) << lodLevels
+        renderer.fogEnd = Float(reach) * 0.95
+        renderer.fogStart = renderer.fogEnd * 0.55
+        print(String(format: "LOD levels=%d scales=%@ reach_blocks=%d build_ms=%.0f",
+                     lodLevels, lods.map { "\($0.scale)x\($0.vScale)" }.joined(separator: ","), reach,
+                     (CACurrentMediaTime() - tl) * 1000))
+    }
+    renderer.upload(world: world, lods: lods)
+    if !lods.isEmpty {
+        print("LOD sections_per_tier=\(renderer.sectionsPerTier.map(String.init).joined(separator: ",")) quads_per_tier=\(renderer.quadsPerTier.map(String.init).joined(separator: ","))")
+    }
     let t2 = CACurrentMediaTime()
 
     print(String(format: "SETUP gpu=\"%@\" world=%@ size=%dx%dx%d_blocks load_ms=%.0f mesh_upload_ms=%.0f sections=%d quads=%d gpu_mb=%.1f",
@@ -53,6 +71,7 @@ do {
         if let g = argValue("--golden") { cfg.golden = URL(fileURLWithPath: g) }
         cfg.writeGolden = args.contains("--write-golden")
         if let c = argValue("--compare") { cfg.compareDir = URL(fileURLWithPath: c) }
+        cfg.pan = args.contains("--pan") || lodLevels > 0
         print("MODE cull=\(renderer.cullBackfaces) front=\(renderer.frontFacing == .clockwise ? "cw" : "ccw") reverse_z=\(renderer.reverseZ) buckets=\(renderer.faceBuckets) greedy=\(Mesher.greedy) gpu_cull=\(renderer.gpuCulling)")
         try Bench.run(renderer: renderer, world: world, cfg: cfg)
         exit(0)

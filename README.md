@@ -21,6 +21,16 @@ Results on `claudeworld` (841 chunks, M3 Pro, 1280×720, 600-frame camera path):
 | + greedy meshing | 0.95M | 3.7 MB | 1.07 |
 | + GPU-driven culling (`--gpu-cull`, opt-in) | 0.95M | 4.2 MB | 1.37 (CPU 0.49 → 0.025 ms) |
 
+### Milestone 5 prototype: far-terrain LOD rings
+
+This builds on the procedural world (`--lod N`). Ring k uses cells 2^k blocks wide, with height detail capped at `--lod-vmax` blocks (default 8). Each ring covers radius 256·2^(k-1) to 256·2^k blocks. Heights are sampled straight from the terrain function, as Distant Horizons does. Rings are meshed by the same greedy mesher, drawn with the same 4-byte quads, and each section carries its own scale. Rings are hollow in the middle, so every edge gets skirt walls that hide cracks.
+
+| Reach (pan camera) | Quads | GPU memory | GPU ms mean / p99 |
+|---|---|---|---|
+| 480 blocks (no LOD) | 135K | 0.8 MB | 0.20 / 0.48 (terrain ends; 24% sky below the horizon) |
+| 8,192 blocks (`--lod 5`, height detail tied to ring size) | 765K | 3.7 MB | 0.63 / 1.01 |
+| 32,768 blocks (`--lod 7 --lod-vmax 8`) | 2.41M | 10.3 MB | 1.14 / 1.29 |
+
 GPU-driven culling is bit-identical to the golden references. Its extra GPU time comes from resetting and walking one indirect-command-buffer slot per section. Compacting those slots is planned for milestone 4.
 
 Procedural 64×64 chunks: 534K quads, 2.2 MB, GPU 0.37 ms mean / 0.97 ms p99.
