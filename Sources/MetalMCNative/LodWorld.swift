@@ -12,6 +12,61 @@ import MetalMCCore
 
 let lodQuadrantVoxels = lodNodeVoxels / 2
 
+/// A region's level-2 quadrant (128 x 128 columns of 96 voxels), run-length encoded per column:
+/// `offsets[c] ..< offsets[c + 1]` indexes (material, count) byte pairs from the bottom up.
+struct LodQuadrant {
+    var offsets: [UInt32]
+    var runs: [UInt8]
+
+    init(grid g: LodGrid) {
+        let q = lodQuadrantVoxels, h = g.height
+        offsets = [UInt32](repeating: 0, count: q * q + 1)
+        runs = []
+        runs.reserveCapacity(q * q * 8)
+        g.v.withUnsafeBufferPointer { src in
+            for z in 0..<q {
+                for x in 0..<q {
+                    offsets[z * q + x] = UInt32(runs.count)
+                    var y = 0
+                    while y < h {
+                        let m = src[(y * lodNodeVoxels + z) * lodNodeVoxels + x]
+                        var n = 1
+                        while y + n < h && n < 255 && src[((y + n) * lodNodeVoxels + z) * lodNodeVoxels + x] == m { n += 1 }
+                        runs.append(m); runs.append(UInt8(n))
+                        y += n
+                    }
+                }
+            }
+        }
+        offsets[q * q] = UInt32(runs.count)
+    }
+
+    /// Writes the quadrant into quadrant (qx, qz) of a level-2 grid.
+    func expand(into g: inout LodGrid, qx: Int, qz: Int) {
+        let q = lodQuadrantVoxels
+        g.v.withUnsafeMutableBufferPointer { dst in
+            runs.withUnsafeBufferPointer { r in
+                for z in 0..<q {
+                    for x in 0..<q {
+                        var y = 0
+                        var i = Int(offsets[z * q + x])
+                        let end = Int(offsets[z * q + x + 1])
+                        let col = (qz * q + z) * lodNodeVoxels + qx * q + x
+                        while i < end {
+                            let m = r[i], n = Int(r[i + 1])
+                            if m != 0 { for k in 0..<n { dst[(y + k) * lodNodeVoxels * lodNodeVoxels + col] = m } }
+                            y += n
+                            i += 2
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var bytes: Int { offsets.count * 4 + runs.count }
+}
+
 /// A meshed node on the GPU.
 final class LodMeshNode {
     let level: Int
@@ -54,7 +109,7 @@ final class LodWorld: @unchecked Sendable {
 
     // Update-thread state.
     private var fileStamps: [Int64: (Date, Int)] = [:]
-    private var quadrants: [Int64: [UInt8]] = [:]     // region -> level-2 quadrant
+    private var quadrants: [Int64: LodQuadrant] = [:]   // region -> run-length-encoded level-2 quadrant
     private var center: (x: Int, z: Int)
     private var meshedCenter: (x: Int, z: Int)?
     private var requestedCenter: (x: Int, z: Int)
@@ -231,25 +286,26 @@ final class LodWorld: @unchecked Sendable {
         let count = meshes.count
         let quads = meshes.values.reduce(0) { $0 + $1.quadCount }
         lock.unlock()
-        status = "\(changed.count) changed regions, moved \(moved): \(count) nodes, \(quads) quads"
+        let cacheMB = quadrants.values.reduce(0) { $0 + $1.bytes } / 1_000_000
+        status = "\(changed.count) changed regions, moved \(moved): \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB"
         return true
     }
 
     /// Reads regions in parallel: returns (key, level-2 quadrant, level-1 node if within the fine radius).
-    private func rebuildRegions(_ list: [(Int, Int, String)], meshFine: Bool) -> [(Int64, [UInt8], LodNode?)] {
-        var out = [(Int64, [UInt8], LodNode?)?](repeating: nil, count: list.count)
+    private func rebuildRegions(_ list: [(Int, Int, String)], meshFine: Bool) -> [(Int64, LodQuadrant, LodNode?)] {
+        var out = [(Int64, LodQuadrant, LodNode?)?](repeating: nil, count: list.count)
         let c = center
         out.withUnsafeMutableBufferPointer { buf in
             let outp = buf.baseAddress!
             DispatchQueue.concurrentPerform(iterations: list.count) { i in
                 let (x, z, path) = list[i]
                 guard let g = LodBuild.regionGrid(path: path) else {
-                    outp[i] = (LodBuild.key(x, z), [UInt8](repeating: 0, count: lodQuadrantVoxels * lodQuadrantVoxels * (lodWorldHeight >> 2)), nil)
+                    outp[i] = (LodBuild.key(x, z), LodQuadrant(grid: LodGrid(level: 2)), nil)
                     return
                 }
                 var q = LodGrid(level: 2)
                 g.downsample(into: &q, qx: 0, qz: 0)   // the quadrant occupies the low corner
-                let quadrant = Self.extractQuadrant(q)
+                let quadrant = LodQuadrant(grid: q)
                 var node: LodNode?
                 if meshFine && self.withinFine(regionX: x, regionZ: z, cx: c.x, cz: c.z) {
                     var filled = g
@@ -264,44 +320,14 @@ final class LodWorld: @unchecked Sendable {
         return out.compactMap { $0 }
     }
 
-    /// The 128 x 128 x 96 corner of a level-2 grid that one region's downsample fills.
-    static func extractQuadrant(_ g: LodGrid) -> [UInt8] {
-        let q = lodQuadrantVoxels, h = g.height
-        var out = [UInt8](repeating: 0, count: q * q * h)
-        g.v.withUnsafeBufferPointer { src in
-            out.withUnsafeMutableBufferPointer { dst in
-                for y in 0..<h {
-                    for z in 0..<q {
-                        let s = (y * lodNodeVoxels + z) * lodNodeVoxels
-                        let d = (y * q + z) * q
-                        for x in 0..<q { dst[d + x] = src[s + x] }
-                    }
-                }
-            }
-        }
-        return out
-    }
-
     /// Dense grid for a node at `level` >= 2, assembled from cached region quadrants (downsampled further
     /// for levels above 2). Missing regions are air.
     func grid(level: Int, x: Int, z: Int) -> LodGrid {
         if level == 2 {
             var g = LodGrid(level: 2)
-            let q = lodQuadrantVoxels, h = g.height
             for qz in 0...1 {
                 for qx in 0...1 {
-                    guard let quad = quadrants[LodBuild.key(2 * x + qx, 2 * z + qz)] else { continue }
-                    quad.withUnsafeBufferPointer { src in
-                        g.v.withUnsafeMutableBufferPointer { dst in
-                            for y in 0..<h {
-                                for zz in 0..<q {
-                                    let s = (y * q + zz) * q
-                                    let d = (y * lodNodeVoxels + qz * q + zz) * lodNodeVoxels + qx * q
-                                    for xx in 0..<q { dst[d + xx] = src[s + xx] }
-                                }
-                            }
-                        }
-                    }
+                    quadrants[LodBuild.key(2 * x + qx, 2 * z + qz)]?.expand(into: &g, qx: qx, qz: qz)
                 }
             }
             return g
