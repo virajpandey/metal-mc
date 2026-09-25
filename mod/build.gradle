@@ -33,13 +33,22 @@ loom {
 			property "metalmc.backend", (project.findProperty("metalBackend") ?: "off").toString()
 			property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
 			property "metalmc.backend.presentTest", (project.findProperty("presentTest") ?: "0").toString()
+			property "metalmc.bench.warmupTicks", (project.findProperty("benchWarmup") ?: "400").toString()
+			property "metalmc.bench.trace", (project.findProperty("benchTrace") ?: "0").toString()
 			property "metalmc.tour", (project.findProperty("benchTour") ?: "0").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
+			if (project.hasProperty("metalExp")) {
+				environmentVariable "METALMC_EXP", project.findProperty("metalExp").toString()
+			}
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
 				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"
 				environmentVariable "MTL_DEBUG_LAYER_WARNING_MODE", "nslog"
+			}
+			if (project.hasProperty("jfr")) {
+				// CPU profile of the timed part of the run: warm-up is 20 s, so start at 30 s and record 30 s.
+				vmArg "-XX:StartFlightRecording=delay=30s,duration=30s,settings=profile,filename=" + project.findProperty("jfr").toString()
 			}
 			vmArg "--enable-native-access=ALL-UNNAMED"
 		}

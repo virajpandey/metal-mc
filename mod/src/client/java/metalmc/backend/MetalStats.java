@@ -8,6 +8,24 @@ public final class MetalStats {
     private MetalStats() {
     }
 
+    /** {passes, draws, blit encoders, clear passes, submits, attachment pixels} since the last call. */
+    public static long[] takeCounters() {
+        java.nio.LongBuffer buf = MemoryUtil.memAllocLong(6);
+        try {
+            Mtl.statsTake(MemoryUtil.memAddress(buf));
+            long[] out = new long[6];
+            for (int i = 0; i < 6; i++) out[i] = buf.get(i);
+            return out;
+        } finally {
+            MemoryUtil.memFree(buf);
+        }
+    }
+
+    /** Logs every pass, blit encoder, and submit natively for the next n frames. */
+    public static void traceFrames(int n) {
+        Mtl.traceFrames(n);
+    }
+
     /** Per-submit GPU times in milliseconds since the last call (command buffer start to end on the GPU). */
     public static double[] takeGpuMillis() {
         int max = 400_000;

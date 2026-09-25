@@ -96,6 +96,14 @@ final class MetalContext: @unchecked Sendable {
     var gpuErrorsLogged = 0
     // GPU time per submit (command buffer gpuStartTime..gpuEndTime), for the benchmark.
     var gpuSeconds: [Double] = []
+    // Render-thread counters for the benchmark: passes, draw calls, blit encoders, clear passes, submits.
+    var traceFrames = 0
+    var traceDraws = 0
+    // Per-encoder GPU timing for traced frames (stage-boundary timestamp counters).
+    var profSampleBuffer: MTLCounterSampleBuffer?
+    var profLabels: [String] = []
+    var profNext = 0
+    var statPasses = 0, statDraws = 0, statBlits = 0, statClears = 0, statSubmits = 0, statPassPixels = 0
 
     // Utility pipelines, built on first use.
     let utilLock = NSLock()
@@ -125,7 +133,16 @@ final class MetalContext: @unchecked Sendable {
     func blitEncoder() -> MTLBlitCommandEncoder {
         if let blit { return blit }
         precondition(pass == nil, "blit while a render pass is open")
-        let made = ensureCB().makeBlitCommandEncoder()!
+        statBlits += 1
+        if traceFrames > 0 { log("trace blit encoder") }
+        let made: MTLBlitCommandEncoder
+        if traceFrames > 0 {
+            let d = MTLBlitPassDescriptor()
+            profAttachBlit(d, "blit")
+            made = ensureCB().makeBlitCommandEncoder(descriptor: d)!
+        } else {
+            made = ensureCB().makeBlitCommandEncoder()!
+        }
         blit = made
         return made
     }
@@ -182,6 +199,45 @@ final class MetalContext: @unchecked Sendable {
 }
 
 let ctx = MetalContext.shared
+
+/// Experiment switches from the METALMC_EXP environment variable (comma-separated), for A/B timing runs.
+let experiments = Set((ProcessInfo.processInfo.environment["METALMC_EXP"] ?? "").split(separator: ",").map(String.init))
+
+/// Timestamp sample buffer for traced frames, or nil if the GPU can't sample at stage boundaries.
+func profBuffer() -> MTLCounterSampleBuffer? {
+    if let b = ctx.profSampleBuffer { return b }
+    guard ctx.device.supportsCounterSampling(.atStageBoundary),
+          let set = ctx.device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else { return nil }
+    let d = MTLCounterSampleBufferDescriptor()
+    d.counterSet = set
+    d.storageMode = .shared
+    d.sampleCount = 512
+    ctx.profSampleBuffer = try? ctx.device.makeCounterSampleBuffer(descriptor: d)
+    return ctx.profSampleBuffer
+}
+
+/// Attaches start/end timestamps to a render pass when tracing. Returns the label index or -1.
+func profAttach(_ d: MTLRenderPassDescriptor, _ label: String) {
+    guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 2 <= 512 else { return }
+    let a = d.sampleBufferAttachments[0]!
+    a.sampleBuffer = sb
+    a.startOfVertexSampleIndex = ctx.profNext
+    a.endOfVertexSampleIndex = MTLCounterDontSample
+    a.startOfFragmentSampleIndex = MTLCounterDontSample
+    a.endOfFragmentSampleIndex = ctx.profNext + 1
+    ctx.profNext += 2
+    ctx.profLabels.append(label)
+}
+
+func profAttachBlit(_ d: MTLBlitPassDescriptor, _ label: String) {
+    guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 2 <= 512 else { return }
+    let a = d.sampleBufferAttachments[0]!
+    a.sampleBuffer = sb
+    a.startOfEncoderSampleIndex = ctx.profNext
+    a.endOfEncoderSampleIndex = ctx.profNext + 1
+    ctx.profNext += 2
+    ctx.profLabels.append(label)
+}
 
 @_cdecl("mmc_ctx_init")
 public func mmc_ctx_init() -> Int32 {
@@ -509,7 +565,23 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
                 h = t.height
             }
         }
+        profAttach(d, "pass \(w)x\(h) colors=\(count) depth=\(depth != 0) clear=\(clearMask)/\(depthClear)")
         guard let enc = cb.makeRenderCommandEncoder(descriptor: d) else { return 0 }
+        ctx.statPasses += 1
+        ctx.statPassPixels += w * h
+        if ctx.traceFrames > 0 {
+            var desc: [String] = []
+            for i in 0..<Int(count) where colors[i] != 0 {
+                let t = (from(colors[i]) as TextureBox).texture
+                desc.append("c\(i)=\(ObjectIdentifier(t.parent ?? t).hashValue & 0xffff):\(t.pixelFormat.rawValue)@\(t.width)x\(t.height)\(clearMask & (1 << i) != 0 ? "/clear" : "/load")")
+            }
+            if depth != 0 {
+                let t = (from(depth) as TextureBox).texture
+                desc.append("d=\(ObjectIdentifier(t.parent ?? t).hashValue & 0xffff):\(t.pixelFormat.rawValue)@\(t.width)x\(t.height)\(depthClear != 0 ? "/clear" : "/load")")
+            }
+            log("trace pass begin \(desc.joined(separator: " ")) area=\(ax),\(ay),\(aw)x\(ah)")
+            ctx.traceDraws = ctx.statDraws
+        }
         ctx.pass = enc
         ctx.resetBindings()
         ctx.passWidth = w
@@ -525,6 +597,7 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
 
 @_cdecl("mmc_pass_end")
 public func mmc_pass_end() {
+    if ctx.traceFrames > 0 { log("trace pass end draws=\(ctx.statDraws - ctx.traceDraws)") }
     ctx.pass?.endEncoding()
     ctx.pass = nil
     ctx.pipe = nil
@@ -693,6 +766,7 @@ public func mmc_rp_draw_indexed(_ indexCount: Int32, _ instanceCount: Int32, _ f
         drawFan(enc, fanIndices(first: Int(firstIndex), count: Int(indexCount)), Int(instanceCount), Int(baseVertex), Int(baseInstance))
         return
     }
+    ctx.statDraws += 1
     enc.drawIndexedPrimitives(type: p.prim, indexCount: Int(indexCount), indexType: ctx.indexType, indexBuffer: ib,
                               indexBufferOffset: Int(firstIndex) * ctx.indexSize, instanceCount: Int(instanceCount),
                               baseVertex: Int(baseVertex), baseInstance: Int(baseInstance))
@@ -713,6 +787,7 @@ public func mmc_rp_draw_indexed_indirect(_ h: Int64, _ offset: Int64, _ drawCoun
     let (enc, p) = r
     let buf = (from(h) as BufferBox).buffer
     let prim = p.fan ? MTLPrimitiveType.triangle : p.prim
+    ctx.statDraws += Int(drawCount)
     for i in 0..<Int(drawCount) {
         enc.drawIndexedPrimitives(type: prim, indexType: ctx.indexType, indexBuffer: ib, indexBufferOffset: 0,
                                   indirectBuffer: buf, indirectBufferOffset: Int(offset) + i * 20)
@@ -727,6 +802,7 @@ public func mmc_rp_draw(_ vertexCount: Int32, _ instanceCount: Int32, _ firstVer
         drawFan(enc, (0..<UInt32(vertexCount)).map { $0 + UInt32(firstVertex) }, Int(instanceCount), 0, Int(firstInstance))
         return
     }
+    ctx.statDraws += 1
     enc.drawPrimitives(type: p.prim, vertexStart: Int(firstVertex), vertexCount: Int(vertexCount),
                        instanceCount: Int(instanceCount), baseInstance: Int(firstInstance))
 }
@@ -846,7 +922,9 @@ public func mmc_clear_textures(_ color: Int64, _ rgba: UnsafePointer<Float>, _ d
                 d.colorAttachments[0].loadAction = .clear
                 d.colorAttachments[0].storeAction = .store
                 d.colorAttachments[0].clearColor = MTLClearColor(red: Double(rgba[0]), green: Double(rgba[1]), blue: Double(rgba[2]), alpha: Double(rgba[3]))
+                profAttach(d, "clear color \(t.width >> level)x\(t.height >> level) fmt=\(t.pixelFormat.rawValue)")
                 cb.makeRenderCommandEncoder(descriptor: d)?.endEncoding()
+                ctx.statClears += 1
             }
         }
         if depth != 0 {
@@ -858,7 +936,9 @@ public func mmc_clear_textures(_ color: Int64, _ rgba: UnsafePointer<Float>, _ d
                 d.depthAttachment.loadAction = .clear
                 d.depthAttachment.storeAction = .store
                 d.depthAttachment.clearDepth = Double(depthValue)
+                profAttach(d, "clear depth \(t.width >> level)x\(t.height >> level)")
                 cb.makeRenderCommandEncoder(descriptor: d)?.endEncoding()
+                ctx.statClears += 1
             }
         }
     }
@@ -887,6 +967,10 @@ fragment float4 blit_fs(VOut in [[stage_in]], texture2d<float, access::read> src
                         constant uint2& size [[buffer(0)]]) {
     uint2 p = uint2(in.pos.xy);
     return src.read(uint2(p.x, size.y - 1 - p.y));
+}
+// Timing experiment only: no flip (the picture is upside down).
+fragment float4 blit_noflip_fs(VOut in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {
+    return src.read(uint2(in.pos.xy));
 }
 """
 
@@ -928,6 +1012,7 @@ public func mmc_clear_region(_ color: Int64, _ rgba: UnsafePointer<Float>, _ dep
         d.depthAttachment.loadAction = .load
         d.depthAttachment.storeAction = .store
         guard let enc = ctx.ensureCB().makeRenderCommandEncoder(descriptor: d) else { return }
+        ctx.statClears += 1
         let tw = max(1, ct.width >> Int(mip)), th = max(1, ct.height >> Int(mip))
         let x0 = min(max(Int(x), 0), tw), y0 = min(max(Int(y), 0), th)
         let x1 = min(max(Int(x + w), 0), tw), y1 = min(max(Int(y + h), 0), th)
@@ -954,7 +1039,29 @@ public func mmc_submit(_ index: Int64) {
         let cb = ctx.ensureCB()
         for d in ctx.pendingDrawables { cb.present(d) }
         ctx.pendingDrawables.removeAll()
+        let traced = ctx.traceFrames > 0 && ctx.profNext > 0
+        let labels = ctx.profLabels
+        let samples = ctx.profNext
+        if traced {
+            ctx.profLabels = []
+            ctx.profNext = 0
+        }
         cb.addCompletedHandler { cb in
+            if traced, let sb = ctx.profSampleBuffer, let data = try? sb.resolveCounterRange(0..<samples) {
+                let ts = data.withUnsafeBytes { Array($0.bindMemory(to: UInt64.self)) }
+                // Scale GPU ticks to seconds using this command buffer's own GPU span.
+                let valid = ts.filter { $0 != 0 && $0 != UInt64.max }
+                let span = Double((valid.max() ?? 1) - (valid.min() ?? 0))
+                let seconds = cb.gpuEndTime - cb.gpuStartTime
+                let scale = span > 0 ? seconds / span : 0
+                var lines: [String] = []
+                for (k, label) in labels.enumerated() {
+                    let a = ts[2 * k], b = ts[2 * k + 1]
+                    let ms = (a == 0 || b == 0 || b < a) ? -1 : Double(b - a) * scale * 1000
+                    lines.append(String(format: "  %6.3f ms  %@", ms, label))
+                }
+                log("profile submit \(index): cb gpu \(String(format: "%.3f", seconds * 1000)) ms, ticks->s scale \(scale)\n" + lines.joined(separator: "\n"))
+            }
             if cb.status == .error {
                 ctx.cond.lock()
                 let n = ctx.gpuErrorsLogged
@@ -971,6 +1078,11 @@ public func mmc_submit(_ index: Int64) {
         }
         cb.commit()
         ctx.cb = nil
+        ctx.statSubmits += 1
+        if ctx.traceFrames > 0 {
+            log("trace submit \(index)")
+            ctx.traceFrames -= 1
+        }
     }
 }
 
@@ -996,6 +1108,19 @@ public func mmc_gpu_times_take(_ out: UnsafeMutablePointer<Double>, _ max: Int32
     for i in 0..<n { out[i] = ctx.gpuSeconds[i] }
     ctx.gpuSeconds.removeAll(keepingCapacity: true)
     return Int32(n)
+}
+
+@_cdecl("mmc_trace_frames")
+public func mmc_trace_frames(_ n: Int32) {
+    ctx.traceFrames = Int(n)
+}
+
+/// out: passes, draws, blit encoders, clear passes, submits, attachment pixels over all passes; resets them.
+@_cdecl("mmc_stats_take")
+public func mmc_stats_take(_ out: UnsafeMutablePointer<Int64>) {
+    out[0] = Int64(ctx.statPasses); out[1] = Int64(ctx.statDraws); out[2] = Int64(ctx.statBlits)
+    out[3] = Int64(ctx.statClears); out[4] = Int64(ctx.statSubmits); out[5] = Int64(ctx.statPassPixels)
+    ctx.statPasses = 0; ctx.statDraws = 0; ctx.statBlits = 0; ctx.statClears = 0; ctx.statSubmits = 0; ctx.statPassPixels = 0
 }
 
 @_cdecl("mmc_completed_submit")
@@ -1050,6 +1175,11 @@ public func mmc_surface2_acquire(_ h: Int64) -> Int32 {
 public func mmc_surface2_blit(_ h: Int64, _ srcTex: Int64) {
     let s: SurfaceBox = from(h)
     guard let drawable = s.drawable else { return }
+    if experiments.contains("noblit") {
+        // Timing experiment only: present without copying (upper bound for a zero-copy present).
+        ctx.pendingDrawables.append(drawable)
+        return
+    }
     autoreleasepool {
         ctx.endBlit()
         let src = (from(srcTex) as TextureBox).texture
@@ -1058,12 +1188,13 @@ public func mmc_surface2_blit(_ h: Int64, _ srcTex: Int64) {
         d.colorAttachments[0].loadAction = .clear
         d.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         d.colorAttachments[0].storeAction = .store
+        profAttach(d, "present blit \(drawable.texture.width)x\(drawable.texture.height)")
         guard let enc = ctx.ensureCB().makeRenderCommandEncoder(descriptor: d) else { return }
         ctx.utilLock.lock()
         if ctx.blitPipeline == nil {
             let pd = MTLRenderPipelineDescriptor()
             pd.vertexFunction = utilFunction("blit_vs")
-            pd.fragmentFunction = utilFunction("blit_fs")
+            pd.fragmentFunction = utilFunction(experiments.contains("noflip") ? "blit_noflip_fs" : "blit_fs")
             pd.colorAttachments[0].pixelFormat = s.layer.pixelFormat
             ctx.blitPipeline = try! ctx.device.makeRenderPipelineState(descriptor: pd)
         }

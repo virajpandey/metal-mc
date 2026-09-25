@@ -79,6 +79,8 @@ final class Mtl {
     private static final MethodHandle SUBMIT = h("mmc_submit", false, null, JAVA_LONG);
     private static final MethodHandle WAIT_SUBMIT = h("mmc_wait_submit", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle GPU_TIMES_TAKE = h("mmc_gpu_times_take", false, JAVA_INT, JAVA_LONG, JAVA_INT);
+    private static final MethodHandle STATS_TAKE = h("mmc_stats_take", false, null, JAVA_LONG);
+    private static final MethodHandle TRACE_FRAMES = h("mmc_trace_frames", false, null, JAVA_INT);
     private static final MethodHandle COMPLETED_SUBMIT = h("mmc_completed_submit", true, JAVA_LONG);
     private static final MethodHandle SURFACE_CREATE = h("mmc_surface2_create", false, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle SURFACE_CONFIGURE = h("mmc_surface2_configure", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -257,6 +259,14 @@ final class Mtl {
 
     static int gpuTimesTake(long out, int max) {
         try { return (int) GPU_TIMES_TAKE.invokeExact(out, max); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void statsTake(long out) {
+        try { STATS_TAKE.invokeExact(out); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void traceFrames(int n) {
+        try { TRACE_FRAMES.invokeExact(n); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static long completedSubmit() {
