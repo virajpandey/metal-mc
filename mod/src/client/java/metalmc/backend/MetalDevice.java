@@ -29,6 +29,9 @@ import org.lwjgl.system.MemoryUtil;
 
 /** Minecraft's GpuDeviceBackend on Metal. */
 public final class MetalDevice implements GpuDeviceBackend {
+    /** The live device, for features outside the backend interface (LOD). Null when Metal isn't active. */
+    static volatile MetalDevice current;
+
     private final DeviceInfo info;
     private final MetalCommandEncoder encoder;
     private final boolean debug;
@@ -59,6 +62,7 @@ public final class MetalDevice implements GpuDeviceBackend {
             new HintsAndWorkarounds(false, false, true, false),
             DeviceType.INTEGRATED);
         this.encoder = new MetalCommandEncoder(this);
+        current = this;
     }
 
     MetalCommandEncoder encoder() {

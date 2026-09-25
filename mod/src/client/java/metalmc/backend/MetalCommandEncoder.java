@@ -45,6 +45,10 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         this.transientMemory = new MetalTransientMemory(device, this);
     }
 
+    @Nullable MetalRenderPass currentRenderPass() {
+        return currentRenderPass;
+    }
+
     void queueForDestroy(Runnable r) {
         destroyQueues[destroyQueueIndex].add(r);
     }

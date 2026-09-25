@@ -37,6 +37,8 @@ loom {
 			property "metalmc.bench.trace", (project.findProperty("benchTrace") ?: "0").toString()
 			property "metalmc.facingCulling", (project.findProperty("facingCulling") ?: "1").toString()
 			property "metalmc.pregen", (project.findProperty("benchPregen") ?: "0").toString()
+			property "metalmc.lod", (project.findProperty("lod") ?: "0").toString()
+			property "metalmc.lod.far", (project.findProperty("lodFar") ?: "2048").toString()
 			property "metalmc.tour", (project.findProperty("benchTour") ?: "0").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
@@ -47,6 +49,9 @@ loom {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
 				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"
 				environmentVariable "MTL_DEBUG_LAYER_WARNING_MODE", "nslog"
+			}
+			if (project.hasProperty("benchPregen")) {
+				vmArg "-Xmx8G"
 			}
 			if (project.hasProperty("jfr")) {
 				// CPU profile of the timed part of the run: warm-up is 20 s, so start at 30 s and record 30 s.

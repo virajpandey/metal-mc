@@ -73,6 +73,7 @@ final class MetalContext: @unchecked Sendable {
 
     // Render pass state.
     var passDepthFormat: MTLPixelFormat = .invalid
+    var passColorFormats: [MTLPixelFormat] = []
     var passWidth = 0
     var passHeight = 0
     var pipe: PipelineBox?
@@ -545,6 +546,7 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
         let cb = ctx.ensureCB()
         let d = MTLRenderPassDescriptor()
         var w = 0, h = 0
+        ctx.passColorFormats = (0..<Int(count)).map { colors[$0] != 0 ? (from(colors[$0]) as TextureBox).texture.pixelFormat : .invalid }
         for i in 0..<Int(count) where colors[i] != 0 {
             let t = (from(colors[i]) as TextureBox).texture
             let att = d.colorAttachments[i]!

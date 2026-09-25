@@ -20,6 +20,7 @@ final class Pregen {
 
     static final int RADIUS = Integer.getInteger("metalmc.pregen", 0);
     private static final int IN_FLIGHT = 256;
+    private static final int MAX_LOADED = 6000;
 
     private static volatile boolean done;
     private static final AtomicInteger completed = new AtomicInteger();
@@ -48,6 +49,9 @@ final class Pregen {
                         for (int z = -r; z <= r; z++) {
                             if (Math.max(Math.abs(x), Math.abs(z)) != r) continue;
                             slots.acquire();
+                            // Let the server unload and save finished chunks before generating more; otherwise
+                            // everything stays in memory until the final save (out of memory at ~60k chunks).
+                            while (cache.getLoadedChunksCount() > MAX_LOADED) Thread.sleep(20);
                             ChunkPos pos = new ChunkPos(x, z);
                             // Hold a non-expiring ticket until the chunk is fully generated. getChunkFuture's own
                             // ticket expires after one tick, which saves most chunks half-generated.

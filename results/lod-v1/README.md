@@ -1,0 +1,40 @@
+# LOD v1: render distance 12 plus far terrain to 2 km, on Metal
+
+First in-game results for the far-terrain LOD (`docs/lod-design.md`), 2026-09-25.
+
+## Setup
+
+| Item | Value |
+|---|---|
+| World | `fixtures/claudeworld-big`: `claudeworld` pregenerated to 257 × 257 chunks (4.1 km square, 66,049 chunks, 684 MB) with `-PbenchPregen=128` |
+| Route | Baseline orbit (radius 140 blocks at y = 150, 25° down) after a 40 s warm-up, so the LOD build (about 26 s in-game) is done before timing starts |
+| Display | Fullscreen 4112 × 2580, M3 Pro |
+| Backend | Metal, face culling on |
+
+## Results
+
+| Run | Visible distance | FPS | Mean ms | p99 ms | Metal GPU ms/frame |
+|---|---|---|---|---|---|
+| Vanilla RD 12 (`big_rd12`) | 192 blocks | 391.3 | 2.56 | — | 2.45 |
+| Vanilla RD 32 (`big_rd32`) | 512 blocks | 186.4 | 5.37 | — | 6.53 |
+| RD 12 + LOD, first version (`lod_rd12`) | 2,048 blocks | 162.0 | 6.17 | 8.16 | 10.58 |
+| **RD 12 + LOD, with node frustum culling and face buckets (`lod2_rd12`)** | **2,048 blocks** | **245.3** | **4.08** | — | **6.56** |
+
+**Result:** RD 12 plus LOD draws terrain out to 2 km, 4× vanilla RD 32's distance and 16× the area, and runs **32% faster than RD 32** (245 fps vs 186).
+
+The culling step (skipping nodes outside the view frustum and face directions that face away from the camera) took the LOD from 162 to 245 fps. The screenshot is pixel-identical to the unculled version: 0.01% of pixels differ, all on the animated arm.
+
+## Build cost
+
+The LOD is built in the background when the world opens: 81 non-empty regions in 26 s in-game (18 s standalone). The result is 74 nodes on 3 levels, 7.7 M quads, 61 MB of GPU memory. Filling sealed caves and not emitting faces under water halved the quad count.
+
+## What it looks like
+
+`rd12-lod2048-start.png`: vanilla chunks near the camera (textured village, cherry trees, crater) continue into flat-colored LOD terrain (rivers, lakes, forests as tree clusters, mountains, ocean) that fades into vanilla's own fog at 2 km.
+
+## Known issues
+
+- LOD colors come from a 31-entry material table and are brighter and more saturated than vanilla's textured grass. The seam is visible as a change in texture and color, not in shape.
+- The LOD is static, built once from the save.
+- Quads within vanilla's render distance still cost vertex work (they are collapsed in the vertex shader).
+- One run per configuration so far.

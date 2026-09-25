@@ -1,0 +1,16 @@
+{
+	"required": true,
+	"package": "metalmc.lod.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"CameraMixin",
+		"FogRendererMixin",
+		"LevelRendererLodMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

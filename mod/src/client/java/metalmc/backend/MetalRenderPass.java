@@ -30,6 +30,11 @@ final class MetalRenderPass implements RenderPassBackend {
         this.area = area;
     }
 
+    /** Native code drew into this pass with its own pipeline: re-apply Minecraft's pipeline state. */
+    void restoreAfterExternalDraw() {
+        if (pipeline != null) Mtl.rpSetPipeline(pipeline.handle);
+    }
+
     @Override
     public void pushDebugGroup(Supplier<String> label) {
     }

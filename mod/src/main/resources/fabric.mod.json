@@ -15,7 +15,8 @@
 	"environment": "client",
 	"entrypoints": {
 		"client": [
-			"metalmc.bench.BenchClient"
+			"metalmc.bench.BenchClient",
+			"metalmc.lod.Lod"
 		]
 	},
 	"mixins": [
@@ -29,6 +30,10 @@
 		},
 		{
 			"config": "metalmc_terrain.client.mixins.json",
+			"environment": "client"
+		},
+		{
+			"config": "metalmc_lod.client.mixins.json",
 			"environment": "client"
 		}
 	],

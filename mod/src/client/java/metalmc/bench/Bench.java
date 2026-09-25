@@ -211,11 +211,12 @@ public final class Bench {
             "METALMC_BENCH label=%s backend=%s gpu=\"%s\" driver=\"%s\" frames=%d seconds=%.1f fps_mean=%.1f "
                 + "ms_mean=%.3f ms_p50=%.3f ms_p95=%.3f ms_p99=%.3f ms_max=%.3f stutters_gt2x_median=%d "
                 + "gpu_timer=%s gpu_util_mean=%.1f gpu_ms_est_mean=%.3f gpu_ms_est_p95=%.3f render_distance=%d "
-                + "fullscreen=%s window=%dx%d %s facing_culling=%s",
+                + "fullscreen=%s window=%dx%d %s facing_culling=%s lod=%s lod_far=%d",
             LABEL, info.backendName(), info.name(), info.driverInfo(), f.length, seconds,
             seconds > 0 ? f.length / seconds : 0, meanMs, p50, p95, p99, maxMs, stutters,
             GPU_TIMER, utilMean, gpuMean, gpuP95, mc.options.renderDistance().get(),
-            mc.options.fullscreen().get(), mc.getWindow().getWidth(), mc.getWindow().getHeight(), presentInfo(mc), metalmc.terrain.FacingSorter.ENABLED) + metalGpu;
+            mc.options.fullscreen().get(), mc.getWindow().getWidth(), mc.getWindow().getHeight(), presentInfo(mc), metalmc.terrain.FacingSorter.ENABLED,
+            metalmc.lod.Lod.active(), metalmc.lod.Lod.ENABLED ? metalmc.lod.Lod.FAR : 0) + metalGpu;
 
         try {
             Path dir = mc.gameDirectory.toPath().resolve("metalmc-bench");
