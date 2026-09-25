@@ -20,10 +20,16 @@ public final class Lod implements ClientModInitializer {
     private static boolean opened;
     private static volatile boolean ready;
     private static int statusTicks;
+    private static String openedDir;
 
-    /** True once the LOD is built and should be drawn (and the far plane and fog extended). */
+    /**
+     * True once the LOD is built and should be drawn (and the far plane and fog extended). Overworld only:
+     * the LOD reads the overworld's region files, and the Nether and End don't benefit from it.
+     */
     public static boolean active() {
-        return ENABLED && ready;
+        if (!ENABLED || !ready) return false;
+        Minecraft mc = Minecraft.getInstance();
+        return mc.level != null && mc.level.dimension() == net.minecraft.world.level.Level.OVERWORLD;
     }
 
     @Override
@@ -34,9 +40,18 @@ public final class Lod implements ClientModInitializer {
 
     private static void tick(Minecraft mc) {
         MinecraftServer server = mc.getSingleplayerServer();
+        // A different save (or none) since the LOD was opened: start over for the new world.
+        String current = server == null ? null : server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize().toString();
+        if (opened && !java.util.Objects.equals(current, openedDir)) {
+            MetalLod.close();
+            opened = false;
+            ready = false;
+            openedDir = null;
+        }
         if (!opened && server != null && mc.level != null && MetalLod.available()) {
             opened = true;
-            String dir = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize().toString();
+            String dir = current;
+            openedDir = dir;
             int cx = mc.player != null ? mc.player.getBlockX() : 0, cz = mc.player != null ? mc.player.getBlockZ() : 0;
             System.out.println("[metalmc-lod] opening " + dir + " far=" + FAR + ": " + MetalLod.open(dir, FAR, cx, cz));
         }

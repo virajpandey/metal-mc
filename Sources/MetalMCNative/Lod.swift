@@ -225,6 +225,16 @@ public func mmc_lod_open(_ worldDir: UnsafePointer<CChar>, _ far: Int32, _ cente
     return 1
 }
 
+/// Stops streaming and drops the LOD (the player left the world).
+@_cdecl("mmc_lod_close")
+public func mmc_lod_close() {
+    let r = LodRenderer.shared
+    r.lock.lock()
+    r.world?.stop()
+    r.world = nil
+    r.lock.unlock()
+}
+
 /// Tells the LOD where the player is, so the finest level follows them.
 @_cdecl("mmc_lod_center")
 public func mmc_lod_center(_ x: Int32, _ z: Int32, _ vanillaRadius: Int32) {

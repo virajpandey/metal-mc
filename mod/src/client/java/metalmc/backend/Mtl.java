@@ -81,6 +81,7 @@ final class Mtl {
     private static final MethodHandle STATS_TAKE = h("mmc_stats_take", false, null, JAVA_LONG);
     private static final MethodHandle TRACE_FRAMES = h("mmc_trace_frames", false, null, JAVA_INT);
     private static final MethodHandle LOD_OPEN = h("mmc_lod_open", false, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
+    private static final MethodHandle LOD_CLOSE = h("mmc_lod_close", false, null);
     private static final MethodHandle LOD_CENTER = h("mmc_lod_center", false, null, JAVA_INT, JAVA_INT, JAVA_INT);
     private static final MethodHandle LOD_STATUS = h("mmc_lod_status", false, null, JAVA_LONG);
     private static final MethodHandle LOD_DRAW = h("mmc_lod_draw", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
@@ -274,6 +275,10 @@ final class Mtl {
 
     static int lodOpen(long worldDir, int far, int centerX, int centerZ) {
         try { return (int) LOD_OPEN.invokeExact(worldDir, far, centerX, centerZ); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void lodClose() {
+        try { LOD_CLOSE.invokeExact(); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static void lodCenter(int x, int z, int vanillaRadius) {

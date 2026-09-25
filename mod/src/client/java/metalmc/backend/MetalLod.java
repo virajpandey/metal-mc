@@ -26,6 +26,11 @@ public final class MetalLod {
         }
     }
 
+    /** Stops streaming and releases the LOD (the player left the world). */
+    public static void close() {
+        if (available()) Mtl.lodClose();
+    }
+
     /** Where the player is: the LOD keeps its finest level around this position. */
     public static void center(int x, int z, int vanillaRadius) {
         if (available()) Mtl.lodCenter(x, z, vanillaRadius);
