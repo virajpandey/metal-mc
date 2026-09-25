@@ -287,3 +287,21 @@ enum LodBuild {
     @inline(__always) static func key(_ x: Int, _ z: Int) -> Int64 { Int64(Int32(truncatingIfNeeded: x)) << 32 | Int64(UInt32(bitPattern: Int32(truncatingIfNeeded: z))) }
     @inline(__always) static func unkey(_ k: Int64) -> (Int, Int) { (Int(Int32(truncatingIfNeeded: k >> 32)), Int(Int32(truncatingIfNeeded: k))) }
 }
+
+/// Debug: block names the material classifier doesn't know in one region file, as "name count" lines.
+@_cdecl("mmc_debug_unknown_blocks")
+public func mmc_debug_unknown_blocks(_ path: UnsafePointer<CChar>, _ out: UnsafeMutablePointer<CChar>, _ len: Int32) -> Int32 {
+    guard let data = FileManager.default.contents(atPath: String(cString: path)) else { return 0 }
+    let r = [UInt8](data)
+    var counts: [String: Int] = [:]
+    for i in 0..<1024 where Anvil.be32(r, i * 4) != 0 {
+        if let c = try? Anvil.decodeChunk(region: r, index: i) {
+            for (k, v) in c.unknown { counts[k, default: 0] += v }
+        }
+    }
+    let text = counts.sorted { $0.value > $1.value }.map { "\($0.key) \($0.value)" }.joined(separator: "\n")
+    let bytes = Array(text.utf8.prefix(Int(len) - 1))
+    for (i, b) in bytes.enumerated() { out[i] = CChar(bitPattern: b) }
+    out[bytes.count] = 0
+    return Int32(counts.count)
+}

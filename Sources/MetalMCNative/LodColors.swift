@@ -11,7 +11,7 @@ let lodMaterialColors: [SIMD4<Float>] = [
     SIMD4(0.329, 0.429, 0.202, 1),   // grass
     SIMD4(0.859, 0.813, 0.640, 1),   // sand
     SIMD4(0.172, 0.321, 0.621, 1),   // water
-    SIMD4(0.780, 0.350, 0.780, 1),   // unknown
+    SIMD4(0.492, 0.492, 0.492, 1),   // unknown (stone gray in LOD; the standalone viewer keeps magenta)
     SIMD4(0.314, 0.314, 0.324, 1),   // deepslate
     SIMD4(0.517, 0.500, 0.496, 1),   // gravel
     SIMD4(0.428, 0.334, 0.199, 1),   // log

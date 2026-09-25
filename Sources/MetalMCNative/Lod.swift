@@ -107,32 +107,16 @@ struct LodUniforms {
     var pad: SIMD2<Float> = .zero
 }
 
-/// One drawable LOD node: its range in the shared quad buffer and its placement.
-struct LodDrawNode {
-    var level: Int
-    var x0: Int, z0: Int        // world block coordinates of the node corner (y starts at the world bottom)
-    var firstQuad: Int
-    var quadCount: Int
-    var faceStart: [Int]        // 7 prefix offsets (relative to firstQuad) of the face buckets +X -X +Y -Y +Z -Z
-    var size: Int { lodNodeVoxels << level }
-}
-
 final class LodRenderer: @unchecked Sendable {
     static let shared = LodRenderer()
 
     let lock = NSLock()
-    var state = 0                      // 0 idle, 1 building, 2 ready, 3 failed
-    var message = ""
-    var nodes: [LodDrawNode] = []
-    var byLevel: [Int: [Int64: Int]] = [:]   // level -> node key -> index into nodes
-    var maxLevel = 0
-    var quadBuffer: MTLBuffer?
+    var world: LodWorld?
     var colorBuffer: MTLBuffer?
     var indexBuffer: MTLBuffer?        // shared pattern 4q + {0,1,2,0,2,3}
     var indexQuads = 0
     var pipelines: [String: MTLRenderPipelineState] = [:]
     var library: MTLLibrary?
-    var totalQuads = 0
 
     func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat) -> MTLRenderPipelineState? {
         let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)"
@@ -180,54 +164,28 @@ final class LodRenderer: @unchecked Sendable {
         colorBuffer = ctx.device.makeBuffer(bytes: c, length: c.count * 16, options: [.storageModeShared])
     }
 
-    func install(built: [LodNode]) {
-        var quads: [UInt32] = []
-        var list: [LodDrawNode] = []
-        var index: [Int: [Int64: Int]] = [:]
-        var top = 0
-        for n in built where !n.quads.isEmpty {
-            let size = n.size
-            index[n.level, default: [:]][LodBuild.key(Int((Double(n.x0) / Double(size)).rounded(.down)), Int((Double(n.z0) / Double(size)).rounded(.down)))] = list.count
-            var starts = [0]
-            for c in n.faceCounts { starts.append(starts.last! + c) }
-            list.append(LodDrawNode(level: n.level, x0: n.x0, z0: n.z0, firstQuad: quads.count / 2, quadCount: n.quads.count / 2, faceStart: starts))
-            quads.append(contentsOf: n.quads)
-            top = max(top, n.level)
-        }
-        let buf = ctx.device.makeBuffer(bytes: quads, length: max(16, quads.count * 4), options: [.storageModeShared])
-        lock.lock()
-        quadBuffer = buf
-        nodes = list
-        byLevel = index
-        maxLevel = top
-        totalQuads = quads.count / 2
-        state = 2
-        lock.unlock()
-    }
-
     /// Quadtree selection: a node is split into its four children when the camera is closer than
     /// `splitFactor` x the child size and all four children exist; otherwise the node itself is drawn.
-    func select(camX: Double, camZ: Double, splitFactor: Double) -> [Int] {
-        var out: [Int] = []
+    static func select(_ meshes: [LodNodeKey: LodMeshNode], maxLevel: Int, camX: Double, camZ: Double, splitFactor: Double) -> [LodMeshNode] {
+        var out: [LodMeshNode] = []
         func visit(_ level: Int, _ nx: Int, _ nz: Int) {
-            guard let idx = byLevel[level]?[LodBuild.key(nx, nz)] else { return }
+            guard let node = meshes[LodNodeKey(level: level, x: nx, z: nz)] else { return }
             let size = Double(lodNodeVoxels << level)
             let x0 = Double(nx) * size, z0 = Double(nz) * size
             let dx = max(x0 - camX, 0, camX - (x0 + size)), dz = max(z0 - camZ, 0, camZ - (z0 + size))
             let dist = (dx * dx + dz * dz).squareRoot()
-            if level > 1, dist < splitFactor * size / 2, let children = byLevel[level - 1],
-               children[LodBuild.key(2 * nx, 2 * nz)] != nil, children[LodBuild.key(2 * nx + 1, 2 * nz)] != nil,
-               children[LodBuild.key(2 * nx, 2 * nz + 1)] != nil, children[LodBuild.key(2 * nx + 1, 2 * nz + 1)] != nil {
+            if level > 1, dist < splitFactor * size / 2,
+               meshes[LodNodeKey(level: level - 1, x: 2 * nx, z: 2 * nz)] != nil,
+               meshes[LodNodeKey(level: level - 1, x: 2 * nx + 1, z: 2 * nz)] != nil,
+               meshes[LodNodeKey(level: level - 1, x: 2 * nx, z: 2 * nz + 1)] != nil,
+               meshes[LodNodeKey(level: level - 1, x: 2 * nx + 1, z: 2 * nz + 1)] != nil {
                 visit(level - 1, 2 * nx, 2 * nz); visit(level - 1, 2 * nx + 1, 2 * nz)
                 visit(level - 1, 2 * nx, 2 * nz + 1); visit(level - 1, 2 * nx + 1, 2 * nz + 1)
                 return
             }
-            out.append(idx)
+            out.append(node)
         }
-        for k in (byLevel[maxLevel] ?? [:]).keys {
-            let (nx, nz) = LodBuild.unkey(k)
-            visit(maxLevel, nx, nz)
-        }
+        for k in meshes.keys where k.level == maxLevel { visit(maxLevel, k.x, k.z) }
         return out
     }
 }
@@ -235,33 +193,41 @@ final class LodRenderer: @unchecked Sendable {
 @_cdecl("mmc_lod_open")
 public func mmc_lod_open(_ worldDir: UnsafePointer<CChar>, _ far: Int32, _ centerX: Int32, _ centerZ: Int32) -> Int32 {
     let r = LodRenderer.shared
-    r.lock.lock()
-    if r.state == 1 { r.lock.unlock(); return 0 }
-    r.state = 1
-    r.lock.unlock()
     let dir = String(cString: worldDir)
-    let farBlocks = Int(far), cx = Int(centerX), cz = Int(centerZ)
-    DispatchQueue.global(qos: .utility).async {
-        let t0 = Date()
-        // Levels up to the one whose nodes are at least `far` across; level 1 is meshed out to 1.5 km.
-        var maxLevel = 1
-        while (lodNodeVoxels << maxLevel) < farBlocks && maxLevel < 8 { maxLevel += 1 }
-        log("LOD: building \(dir) far=\(farBlocks) levels 1...\(maxLevel) around (\(cx), \(cz))")
-        let built = LodBuild.build(worldDir: dir, maxLevel: maxLevel, centerX: cx, centerZ: cz, fineRadius: 1536)
-        r.install(built: built)
-        log("LOD: ready in \(String(format: "%.1f", Date().timeIntervalSince(t0))) s: \(r.nodes.count) nodes, \(r.totalQuads) quads, \(r.totalQuads * 8 / 1_000_000) MB")
+    guard let regionDir = Anvil.regionDirectory(URL(fileURLWithPath: dir)) else {
+        log("LOD: no region directory under \(dir)")
+        return 0
     }
+    var maxLevel = 1
+    while (lodNodeVoxels << maxLevel) < Int(far) && maxLevel < 8 { maxLevel += 1 }
+    let w = LodWorld(regionDir: regionDir, maxLevel: maxLevel, fineRadius: 1536, centerX: Int(centerX), centerZ: Int(centerZ))
+    r.lock.lock()
+    r.world?.stop()
+    r.world = w
+    r.lock.unlock()
+    log("LOD: streaming \(regionDir.path) far=\(far) levels 1...\(maxLevel) around (\(centerX), \(centerZ))")
+    w.start()
     return 1
 }
 
-/// out: state, sections, quads.
+/// Tells the LOD where the player is, so the finest level follows them.
+@_cdecl("mmc_lod_center")
+public func mmc_lod_center(_ x: Int32, _ z: Int32, _ vanillaRadius: Int32) {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    w?.setCenter(x: Int(x), z: Int(z), vanillaRadius: Int(vanillaRadius))
+}
+
+/// out: state (0 none, 1 building, 2 has nodes), nodes, quads.
 @_cdecl("mmc_lod_status")
 public func mmc_lod_status(_ out: UnsafeMutablePointer<Int64>) {
     let r = LodRenderer.shared
-    r.lock.lock(); defer { r.lock.unlock() }
-    out[0] = Int64(r.state)
-    out[1] = Int64(r.nodes.count)
-    out[2] = Int64(r.totalQuads)
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { out[0] = 0; out[1] = 0; out[2] = 0; return }
+    let snap = w.snapshot()
+    out[0] = snap.meshes.isEmpty ? 1 : 2
+    out[1] = Int64(snap.meshes.count)
+    out[2] = Int64(snap.meshes.values.reduce(0) { $0 + $1.quadCount })
 }
 
 /// Draws the LOD into the open render pass. p: proj[16], view[16] (column-major), fog color[4],
@@ -271,17 +237,16 @@ public func mmc_lod_status(_ out: UnsafeMutablePointer<Int64>) {
 public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>) -> Int32 {
     let r = LodRenderer.shared
     guard let enc = ctx.pass, !ctx.scissorEmpty else { return 0 }
-    r.lock.lock()
-    let ready = r.state == 2
-    let quads = r.quadBuffer
-    r.lock.unlock()
-    guard ready, let quads else { return 0 }
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { return 0 }
+    let snap = w.snapshot()
+    guard !snap.meshes.isEmpty else { return 0 }
     guard let pipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat) else { return 0 }
     r.ensureColors()
     let cx = cam[0], cy = cam[1], cz = cam[2]
-    let chosen = r.select(camX: cx, camZ: cz, splitFactor: 2.0)
+    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: 2.0)
     guard !chosen.isEmpty else { return 0 }
-    r.ensureIndexBuffer(quads: chosen.map { r.nodes[$0].quadCount }.max() ?? 1)
+    r.ensureIndexBuffer(quads: chosen.map(\.quadCount).max() ?? 1)
     guard let ib = r.indexBuffer else { return 0 }
 
     func mat(_ o: Int) -> simd_float4x4 {
@@ -290,8 +255,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     }
     var u = LodUniforms(proj: mat(0), view: mat(16), fogColor: SIMD4(p[32], p[33], p[34], p[35]),
                         envStart: p[36], envEnd: p[37], rdStart: p[38], rdEnd: p[39], discardRadius: p[40], sky: p[41])
-    // Frustum planes from proj * view (camera-relative space, reverse-Z: keep only the four side planes
-    // and the near plane; the far plane is beyond the LOD).
+
+    // Frustum side planes from proj * view (camera-relative). Points behind the camera fail them too.
     let m = u.proj * u.view
     let r0 = SIMD4(m.columns.0.x, m.columns.1.x, m.columns.2.x, m.columns.3.x)
     let r1 = SIMD4(m.columns.0.y, m.columns.1.y, m.columns.2.y, m.columns.3.y)
@@ -305,19 +270,17 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         return true
     }
 
-    struct Draw { var node: Int; var first: Int; var count: Int }
+    struct Draw { var node: LodMeshNode; var slot: Int; var first: Int; var count: Int }
     var draws: [Draw] = []
     var xforms = [SIMD4<Float>]()
     xforms.reserveCapacity(chosen.count)
-    for i in chosen {
-        let n = r.nodes[i]
+    for n in chosen {
         let lo = SIMD3(Float(Double(n.x0) - cx), Float(Double(lodWorldMinY) - cy), Float(Double(n.z0) - cz))
         let hi = lo + SIMD3(Float(n.size), Float(lodWorldHeight), Float(n.size))
         if !visible(lo, hi) { continue }
         // Face buckets that can face the camera (conservative: the camera is past the node's nearest plane).
-        let camInX = -lo.x, camInY = -lo.y, camInZ = -lo.z   // camera position relative to the node corner
         let s = Float(n.size), top = Float(lodWorldHeight)
-        let faceVisible = [camInX > 0, camInX < s, camInY > 0, camInY < top, camInZ > 0, camInZ < s]
+        let faceVisible = [-lo.x > 0, -lo.x < s, -lo.y > 0, -lo.y < top, -lo.z > 0, -lo.z < s]
         let slot = xforms.count
         xforms.append(SIMD4(lo.x, lo.y, lo.z, Float(1 << n.level)))
         var f = 0
@@ -325,7 +288,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             if !faceVisible[f] || n.faceStart[f + 1] == n.faceStart[f] { f += 1; continue }
             var e = f + 1
             while e < 6 && (faceVisible[e] || n.faceStart[e + 1] == n.faceStart[e]) { e += 1 }
-            draws.append(Draw(node: slot, first: n.firstQuad + n.faceStart[f], count: n.faceStart[e] - n.faceStart[f]))
+            draws.append(Draw(node: n, slot: slot, first: n.faceStart[f], count: n.faceStart[e] - n.faceStart[f]))
             f = e
         }
     }
@@ -336,7 +299,6 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     enc.setCullMode(.back)
     enc.setTriangleFillMode(.fill)
     enc.setDepthBias(0, slopeScale: 0, clamp: 0)
-    enc.setVertexBuffer(quads, offset: 0, index: 18)
     enc.setVertexBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
     enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
     if xforms.count * 16 <= 4096 {
@@ -345,9 +307,15 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         enc.setVertexBuffer(xb, offset: 0, index: 20)
     }
     enc.setVertexBuffer(r.colorBuffer!, offset: 0, index: 21)
+    var bound: ObjectIdentifier?
     for d in draws {
+        let id = ObjectIdentifier(d.node)
+        if bound != id {
+            enc.setVertexBuffer(d.node.buffer, offset: 0, index: 18)
+            bound = id
+        }
         enc.drawIndexedPrimitives(type: .triangle, indexCount: d.count * 6, indexType: .uint32, indexBuffer: ib,
-                                  indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * d.first, baseInstance: d.node)
+                                  indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * d.first, baseInstance: d.slot)
     }
     // Minecraft's pipeline, depth, cull and bias state must be re-applied by the next setPipeline.
     ctx.pipe = nil

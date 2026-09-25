@@ -26,9 +26,17 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 - **Seam.** Quads whose center lies within `(renderDistance − 1) × 16` blocks horizontally are collapsed in the vertex shader. There's no fragment `discard`, which would turn off Apple GPUs' hidden-surface removal for the whole pipeline.
 - **Far plane and fog.** The camera's far plane is pushed to 1.5 × the LOD distance; reverse-Z float depth keeps precision. Vanilla's render-distance fog moves from the chunk edge to the LOD edge. The LOD shader reproduces vanilla's fog formula, so it blends into the same sky.
 
-## Known gaps in v1
+## Streaming (v2, `LodWorld.swift`)
 
-- The LOD is static: built once from the save when the world opens. It doesn't update on block changes or exploration.
-- Level-1 nodes are only meshed within 1.5 km of the starting position.
+- **Change detection.** A background thread polls the region files every 2 s (modification time and size). The integrated server writes chunks when they unload and on autosave, so explored and edited terrain reaches the LOD through the same path as the initial build.
+- **Parents without re-reading siblings.** Each region caches its level-2 quadrant (128 × 128 × 96 voxels, 1.5 MB). A parent node is rebuilt from the cached quadrants of its children.
+- **The finest level follows the player.** Level-1 nodes are meshed within 1.5 km of the player, re-centered when they move more than 128 blocks, and dropped when they leave that range.
+- **Deferred regions.** Regions inside vanilla's render distance (plus 64 blocks) change constantly with autosave. Rebuilding them is deferred until the player has moved away. Before this, 2–4 regions were rebuilt every 2 s; now it's zero while the player stays in the area.
+- **Swapping nodes.** Each node owns its Metal buffer, so updates replace nodes atomically while the render thread draws.
+- **Single-player only.** Multiplayer would need to ingest chunks as the client receives them (Voxy's approach).
+
+## Known gaps
+
+- Grass, foliage, and water use the plains tint everywhere, so biomes like savanna and swamp don't match at the seam.
 - Colors come from a flat 31-material table, not block textures or biome tint.
 - Everything is drawn one call per node with CPU selection. GPU-driven selection with indirect command buffers is next, and possible because this pipeline binds no textures.

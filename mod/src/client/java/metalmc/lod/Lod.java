@@ -40,14 +40,15 @@ public final class Lod implements ClientModInitializer {
             int cx = mc.player != null ? mc.player.getBlockX() : 0, cz = mc.player != null ? mc.player.getBlockZ() : 0;
             System.out.println("[metalmc-lod] opening " + dir + " far=" + FAR + ": " + MetalLod.open(dir, FAR, cx, cz));
         }
-        if (opened && !ready && ++statusTicks % 20 == 0) {
+        if (!opened || ++statusTicks % 20 != 0) return;
+        if (mc.player != null) {
+            MetalLod.center(mc.player.getBlockX(), mc.player.getBlockZ(), mc.options.getEffectiveRenderDistance() * 16);
+        }
+        if (!ready) {
             long[] s = MetalLod.status();
             if (s[0] == 2) {
                 ready = true;
-                System.out.println("[metalmc-lod] ready: " + s[1] + " sections, " + s[2] + " quads");
-            } else if (s[0] == 3) {
-                opened = true;
-                System.out.println("[metalmc-lod] build failed");
+                System.out.println("[metalmc-lod] ready: " + s[1] + " nodes, " + s[2] + " quads");
             }
         }
     }

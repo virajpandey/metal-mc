@@ -76,7 +76,7 @@ GRASS, FOLIAGE, WATER = 0x91BD59, 0x77AB2F, 0x3F76E4   # plains defaults
 colors = [
     ("air", None), ("stone", average("stone")), ("dirt", average("dirt")),
     ("grass", average("grass_block_top", GRASS)), ("sand", average("sand")),
-    ("water", average("water_still", WATER)), ("unknown", (0.78, 0.35, 0.78)),
+    ("water", average("water_still", WATER)), ("unknown", average("stone")),
     ("deepslate", average("deepslate")), ("gravel", average("gravel")), ("log", average("oak_log")),
     ("planks", average("oak_planks")), ("leaves", average("oak_leaves", FOLIAGE)),
     ("cherryLeaves", average("cherry_leaves")), ("snow", average("snow")), ("ice", average("ice")),

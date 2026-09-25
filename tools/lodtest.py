@@ -16,9 +16,10 @@ cz = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 t0 = time.time()
 print("open:", lib.mmc_lod_open(world.encode(), far, cx, cz), flush=True)
 out = (ctypes.c_int64 * 3)()
-while True:
+last, stable = -1, 0
+while stable < 8:   # streaming never "finishes": wait until the quad count holds for 2 s
     lib.mmc_lod_status(out)
-    if out[0] in (2, 3):
-        break
+    stable = stable + 1 if out[0] == 2 and out[2] == last else 0
+    last = out[2]
     time.sleep(0.25)
 print(f"state={out[0]} nodes={out[1]} quads={out[2]} ({out[2] * 8 / 1e6:.1f} MB) in {time.time() - t0:.1f} s", flush=True)

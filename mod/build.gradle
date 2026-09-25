@@ -34,6 +34,8 @@ loom {
 			property "metalmc.native", file("../.build/release/libMetalMCNative.dylib").absolutePath
 			property "metalmc.backend.presentTest", (project.findProperty("presentTest") ?: "0").toString()
 			property "metalmc.bench.warmupTicks", (project.findProperty("benchWarmup") ?: "400").toString()
+			property "metalmc.bench.cx", (project.findProperty("benchCx") ?: "8").toString()
+			property "metalmc.bench.cz", (project.findProperty("benchCz") ?: "8").toString()
 			property "metalmc.bench.trace", (project.findProperty("benchTrace") ?: "0").toString()
 			property "metalmc.facingCulling", (project.findProperty("facingCulling") ?: "1").toString()
 			property "metalmc.pregen", (project.findProperty("benchPregen") ?: "0").toString()

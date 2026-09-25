@@ -26,7 +26,12 @@ public final class MetalLod {
         }
     }
 
-    /** {state (0 idle, 1 building, 2 ready, 3 failed), sections, quads}. */
+    /** Where the player is: the LOD keeps its finest level around this position. */
+    public static void center(int x, int z, int vanillaRadius) {
+        if (available()) Mtl.lodCenter(x, z, vanillaRadius);
+    }
+
+    /** {state (0 none, 1 building, 2 has nodes), nodes, quads}. */
     public static long[] status() {
         if (!available()) return new long[3];
         try (MemoryStack stack = MemoryStack.stackPush()) {

@@ -82,7 +82,9 @@ public enum Materials {
             return .air
         case "water", "bubble_column", "seagrass", "tall_seagrass", "kelp", "kelp_plant":
             return .water
-        case "snow", "short_grass", "tall_grass", "grass", "fern", "large_fern", "brown_mushroom", "red_mushroom":
+        case "snow", "short_grass", "tall_grass", "grass", "fern", "large_fern", "brown_mushroom", "red_mushroom",
+             "short_dry_grass", "tall_dry_grass", "azalea", "flowering_azalea", "big_dripleaf", "big_dripleaf_stem",
+             "small_dripleaf", "fire", "soul_fire", "spore_blossom", "hanging_roots", "cactus_flower":
             return .air
         default:
             break
@@ -123,6 +125,11 @@ public enum Materials {
         if has("lava") { return .lava }
         if has("hay") { return .hay }
         if has("wool") || n.hasSuffix("_bed") { return .wool }
+        if has("sculk") { return .deepslate }
+        if has("copper") { return .granite }
+        if has("netherrack") { return .terracotta }
+        if any(["vault", "trial_spawner", "dispenser", "dropper", "observer", "piston", "repeater", "comparator",
+                "note_block", "target", "redstone", "lodestone", "respawn_anchor"]) { return .stone }
         return .unknown
     }
 }
