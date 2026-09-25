@@ -26,6 +26,25 @@ final class Pregen {
     private static final AtomicInteger completed = new AtomicInteger();
     private static final AtomicInteger failed = new AtomicInteger();
 
+    private static int skipped;
+    private static final java.util.Map<Long, int[]> headers = new java.util.HashMap<>();
+
+    /** True if the region file's offset table has an entry for this chunk (so it was generated before). */
+    private static boolean existsOnDisk(java.nio.file.Path regionDir, int x, int z) {
+        long key = ((long) (x >> 5) << 32) | ((z >> 5) & 0xffffffffL);
+        int[] table = headers.computeIfAbsent(key, k -> {
+            java.nio.file.Path f = regionDir.resolve("r." + (x >> 5) + "." + (z >> 5) + ".mca");
+            int[] t = new int[1024];
+            try (java.io.DataInputStream in = new java.io.DataInputStream(new java.io.BufferedInputStream(java.nio.file.Files.newInputStream(f)))) {
+                for (int i = 0; i < 1024; i++) t[i] = in.readInt();
+            } catch (java.io.IOException e) {
+                // No region file yet: nothing generated there.
+            }
+            return t;
+        });
+        return table[((z & 31) << 5) | (x & 31)] != 0;
+    }
+
     static boolean done() {
         return done;
     }
@@ -39,6 +58,8 @@ final class Pregen {
         }
         ServerChunkCache cache = server.overworld().getChunkSource();
         int total = (2 * RADIUS + 1) * (2 * RADIUS + 1);
+        java.nio.file.Path regionDir = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+            .resolve("dimensions/minecraft/overworld/region");
         Thread t = new Thread(() -> {
             long t0 = System.nanoTime();
             Semaphore slots = new Semaphore(IN_FLIGHT);
@@ -48,10 +69,18 @@ final class Pregen {
                     for (int x = -r; x <= r; x++) {
                         for (int z = -r; z <= r; z++) {
                             if (Math.max(Math.abs(x), Math.abs(z)) != r) continue;
+                            if (existsOnDisk(regionDir, x, z)) {
+                                skipped++;
+                                continue;
+                            }
                             slots.acquire();
                             // Let the server unload and save finished chunks before generating more; otherwise
                             // everything stays in memory until the final save (out of memory at ~60k chunks).
-                            while (cache.getLoadedChunksCount() > MAX_LOADED) Thread.sleep(20);
+                            // Chunks waiting to be saved aren't in the loaded count, so watch the heap too.
+                            Runtime rt = Runtime.getRuntime();
+                            while (cache.getLoadedChunksCount() > MAX_LOADED || rt.totalMemory() - rt.freeMemory() > 0.6 * rt.maxMemory()) {
+                                Thread.sleep(50);
+                            }
                             ChunkPos pos = new ChunkPos(x, z);
                             // Hold a non-expiring ticket until the chunk is fully generated. getChunkFuture's own
                             // ticket expires after one tick, which saves most chunks half-generated.
@@ -70,6 +99,7 @@ final class Pregen {
                     }
                 }
                 slots.acquire(IN_FLIGHT);
+                Bench.log("pregen: skipped " + skipped + " chunks already on disk");
                 double s = (System.nanoTime() - t0) / 1e9;
                 Bench.log(String.format(java.util.Locale.ROOT, "pregen finished: %d chunks in %.0f s (%.0f/s), %d failed; saving",
                     completed.get(), s, completed.get() / s, failed.get()));

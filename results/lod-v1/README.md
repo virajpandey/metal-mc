@@ -28,6 +28,21 @@ First in-game results for the far-terrain LOD (`docs/lod-design.md`), 2026-09-25
 
 The culling step (skipping nodes outside the view frustum and face directions that face away from the camera) took the LOD from 162 to 245 fps. The screenshot is pixel-identical to the unculled version: 0.01% of pixels differ, all on the animated arm.
 
+## 8 km
+
+`fixtures/claudeworld-huge` is the same seed pregenerated to 513 × 513 chunks (8.2 km square, 263,169 chunks, 2.3 GB, 324 region files) with `-PbenchPregen=256`, resumed after two memory-limited attempts. With `-PlodFar=8192`, the LOD builds 128 nodes on 5 levels (11.8 M quads, 95 MB of GPU memory, 106 MB of RLE quadrant cache) from 324 regions in 12.6 s standalone and 18 s in-game.
+
+| Run | Terrain visible to | FPS | Mean ms | Metal GPU ms/frame |
+|---|---|---|---|---|
+| RD 12 + LOD 8192 (`lod8k2_rd12`, noon, clear weather) | **8,192 blocks** | **270.3** | 3.70 | 5.86 |
+
+That's 16× vanilla RD 32's view distance at 45% more FPS. `rd12-lod8192-start.png`: coastlines, islands, and snow-capped mountains to the horizon. Two fixes made this work:
+
+- **Quadtree selection.** A split node now draws its own tiles for any missing child quarter. The old rule, "split only if all four children exist", drew the coarsest (32-block) level next to the camera whenever the world didn't fill a coarse node.
+- **Clear-weather haze.** The haze now stretches to the LOD distance. Vanilla's linear 0 → 1,024-block haze hid everything past 1 km.
+
+`-PbenchNoon=1` sets clear weather and noon, frozen, because the pregenerated fixture was saved during a rainstorm.
+
 ## Build cost
 
 The LOD is built in the background when the world opens: 81 non-empty regions in 26 s in-game (18 s standalone). The result is 74 nodes on 3 levels, 7.7 M quads, 61 MB of GPU memory. Filling sealed caves and not emitting faces under water halved the quad count.

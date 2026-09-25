@@ -76,6 +76,15 @@ public final class Bench {
                 }
                 state = State.WARMUP;
                 tick = 0;
+                if ("1".equals(System.getProperty("metalmc.bench.noon"))) {
+                    // Deterministic conditions for fixtures whose saved weather or time drifted (e.g. after pregen).
+                    net.minecraft.server.MinecraftServer server = mc.getSingleplayerServer();
+                    if (server != null) server.execute(() -> {
+                        for (String c : new String[]{"time set 6000", "weather clear", "gamerule advance_time false", "gamerule advance_weather false"}) {
+                            server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), c);
+                        }
+                    });
+                }
                 // Vanilla only runs its GPU timer query while this debug entry is enabled. The status is saved
                 // to disk, so set it explicitly either way.
                 mc.debugEntries.setStatus(DebugScreenEntries.GPU_UTILIZATION,

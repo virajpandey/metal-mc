@@ -163,27 +163,43 @@ final class LodRenderer: @unchecked Sendable {
         colorBuffer = ctx.device.makeBuffer(bytes: c, length: c.count * 16, options: [.storageModeShared])
     }
 
-    /// Quadtree selection: a node is split into its four children when the camera is closer than
-    /// `splitFactor` x the child size and all four children exist; otherwise the node itself is drawn.
-    static func select(_ meshes: [LodNodeKey: LodMeshNode], maxLevel: Int, camX: Double, camZ: Double, splitFactor: Double) -> [LodMeshNode] {
-        var out: [LodMeshNode] = []
+    /// Quadtree selection. A node splits when the camera is closer than `splitFactor` x the child size:
+    /// existing children are visited, and for each missing child the parent draws just the 2 x 2 tiles
+    /// covering that quarter (missing children are either empty or past the finest level's range).
+    /// Returns nodes with a 16-bit mask of the tiles to draw.
+    static func select(_ meshes: [LodNodeKey: LodMeshNode], maxLevel: Int, camX: Double, camZ: Double, splitFactor: Double) -> [(LodMeshNode, UInt16)] {
+        var out: [(LodMeshNode, UInt16)] = []
+        // Tile masks for each quarter (tiles t = tz * 4 + tx; quarter (qx, qz) covers tx, tz in 2q ..< 2q + 2).
+        func quarterMask(_ qx: Int, _ qz: Int) -> UInt16 {
+            var m: UInt16 = 0
+            for tz in (2 * qz)..<(2 * qz + 2) { for tx in (2 * qx)..<(2 * qx + 2) { m |= 1 << UInt16(tz * 4 + tx) } }
+            return m
+        }
         func visit(_ level: Int, _ nx: Int, _ nz: Int) {
-            guard let node = meshes[LodNodeKey(level: level, x: nx, z: nz)] else { return }
+            let node = meshes[LodNodeKey(level: level, x: nx, z: nz)]
             let size = Double(lodNodeVoxels << level)
             let x0 = Double(nx) * size, z0 = Double(nz) * size
             let dx = max(x0 - camX, 0, camX - (x0 + size)), dz = max(z0 - camZ, 0, camZ - (z0 + size))
             let dist = (dx * dx + dz * dz).squareRoot()
-            if level > 1, dist < splitFactor * size / 2,
-               meshes[LodNodeKey(level: level - 1, x: 2 * nx, z: 2 * nz)] != nil,
-               meshes[LodNodeKey(level: level - 1, x: 2 * nx + 1, z: 2 * nz)] != nil,
-               meshes[LodNodeKey(level: level - 1, x: 2 * nx, z: 2 * nz + 1)] != nil,
-               meshes[LodNodeKey(level: level - 1, x: 2 * nx + 1, z: 2 * nz + 1)] != nil {
-                visit(level - 1, 2 * nx, 2 * nz); visit(level - 1, 2 * nx + 1, 2 * nz)
-                visit(level - 1, 2 * nx, 2 * nz + 1); visit(level - 1, 2 * nx + 1, 2 * nz + 1)
+            if level > 1 && dist < splitFactor * size / 2 {
+                var parentMask: UInt16 = 0
+                for qz in 0...1 {
+                    for qx in 0...1 {
+                        let cx = 2 * nx + qx, cz = 2 * nz + qz
+                        if meshes[LodNodeKey(level: level - 1, x: cx, z: cz)] != nil || hasDescendant(level - 1, cx, cz) {
+                            visit(level - 1, cx, cz)
+                        } else {
+                            parentMask |= quarterMask(qx, qz)
+                        }
+                    }
+                }
+                if let node, parentMask != 0 { out.append((node, parentMask)) }
                 return
             }
-            out.append(node)
+            if let node { out.append((node, 0xFFFF)) }
         }
+        // A missing node may still have finer descendants (never happens today, but keep the recursion honest).
+        func hasDescendant(_ level: Int, _ nx: Int, _ nz: Int) -> Bool { false }
         for k in meshes.keys where k.level == maxLevel { visit(maxLevel, k.x, k.z) }
         return out
     }
@@ -245,7 +261,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let cx = cam[0], cy = cam[1], cz = cam[2]
     let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: 2.0)
     guard !chosen.isEmpty else { return 0 }
-    r.ensureIndexBuffer(quads: chosen.map(\.quadCount).max() ?? 1)
+    r.ensureIndexBuffer(quads: chosen.map { $0.0.quadCount }.max() ?? 1)
     guard let ib = r.indexBuffer else { return 0 }
 
     func mat(_ o: Int) -> simd_float4x4 {
@@ -274,14 +290,14 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     var xforms = [SIMD4<Float>]()
     xforms.reserveCapacity(chosen.count)
     let discard = u.discardRadius
-    for n in chosen {
+    for (n, tileMask) in chosen {
         let voxel = Float(1 << n.level)
         let nodeLo = SIMD3(Float(Double(n.x0) - cx), Float(Double(lodWorldMinY) - cy), Float(Double(n.z0) - cz))
         let nodeHi = nodeLo + SIMD3(Float(n.size), Float(lodWorldHeight), Float(n.size))
         if !visible(nodeLo, nodeHi) { continue }
         var slot = -1
         let tileSize = Float(lodTileVoxels) * voxel
-        for t in 0..<(lodTilesPerSide * lodTilesPerSide) {
+        for t in 0..<(lodTilesPerSide * lodTilesPerSide) where tileMask & (1 << UInt16(t)) != 0 {
             let yMin = n.tileY[2 * t], yMax = n.tileY[2 * t + 1]
             if yMin > yMax { continue }
             let tx = t % lodTilesPerSide, tz = t / lodTilesPerSide

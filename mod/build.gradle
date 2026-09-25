@@ -36,6 +36,7 @@ loom {
 			property "metalmc.bench.warmupTicks", (project.findProperty("benchWarmup") ?: "400").toString()
 			property "metalmc.bench.cx", (project.findProperty("benchCx") ?: "8").toString()
 			property "metalmc.bench.cz", (project.findProperty("benchCz") ?: "8").toString()
+			property "metalmc.bench.noon", (project.findProperty("benchNoon") ?: "0").toString()
 			property "metalmc.bench.trace", (project.findProperty("benchTrace") ?: "0").toString()
 			property "metalmc.facingCulling", (project.findProperty("facingCulling") ?: "1").toString()
 			property "metalmc.pregen", (project.findProperty("benchPregen") ?: "0").toString()
@@ -53,7 +54,7 @@ loom {
 				environmentVariable "MTL_DEBUG_LAYER_WARNING_MODE", "nslog"
 			}
 			if (project.hasProperty("benchPregen")) {
-				vmArg "-Xmx4G"
+				vmArg "-Xmx6G"
 			}
 			if (project.hasProperty("jfr")) {
 				// CPU profile of the timed part of the run: warm-up is 20 s, so start at 30 s and record 30 s.
