@@ -28,6 +28,10 @@ public final class MetalMCConfig {
         # Skip block faces that point away from the camera (identical image, less GPU work).
         facingCulling=true
 
+        # Skip distant chunk sections hidden behind terrain (tested on the GPU each frame; sections within
+        # 48 blocks are always drawn).
+        occlusionCulling=true
+
         # Far-terrain LOD beyond the render distance (Metal backend). In single-player it shows terrain the
         # world has already generated; on servers, terrain you've already seen there. It follows the player.
         lod=true
@@ -83,6 +87,10 @@ public final class MetalMCConfig {
 
     public static boolean facingCulling() {
         return flag("facingCulling", true);
+    }
+
+    public static boolean occlusionCulling() {
+        return flag("occlusionCulling", true);
     }
 
     public static boolean lod() {

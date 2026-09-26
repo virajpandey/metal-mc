@@ -46,6 +46,29 @@ Repeat runs at RD 12, alternating: early 357.8 and 359.3 fps; late 407.7, 407.9 
 - The profile charged 17.5% of the render thread to vanilla's `ChunkSectionsToRender$DrawIndirect.render`. Native timing of the indexed-indirect draws (`per_frame_indirect_cpu_ms`) shows only 0.11–0.13 ms per frame for about 1,600 draws at RD 12, and 0.58 ms for about 8,100 at RD 32. JFR attributes critical downcalls to their Java caller, which inflated that figure.
 - A standalone microbenchmark (`scratchpad icbbench`: 1,600 draws × 500 quads) measured Metal's own cost. Encoding 1,600 indirect draws costs 0.10–0.14 ms of CPU. An indirect command buffer written by a compute kernel costs 0.02 ms and was also 15–25% faster on the GPU at that draw size. So ICBs would save about 0.1 ms of CPU at RD 12. They'd need the terrain's textures in argument buffers, which isn't worth it yet.
 
+## Occlusion culling for chunk sections (2026-09-26)
+
+After the late-acquire fix, RD 12 fullscreen runs at the rate macOS presents frames: skipping the present copy entirely (`METALMC_EXP=noblit`) didn't raise fps (405.5 vs 413.6). Higher render distances are GPU-bound on terrain geometry. At RD 32 the main pass is 4.3 ms of a 5.5 ms frame (vertex 2.6, fragment 1.7). Vanilla culls sections outside the frustum and those its visibility graph rules out (sealed caves), but it still draws distant surface sections hidden behind hills.
+
+`metalmc.terrain.SectionOcclusion` and `SectionOcclusion.swift` reuse the LOD's box test:
+- **Test.** After solid terrain (and the LOD), each candidate section's box (16 blocks, grown by 1) is rasterized in the same pass with depth testing and no writes. A fragment function with early fragment tests marks the section visible.
+- **Skip.** Sections found hidden get an empty mesh when vanilla builds its draw lists. They're dropped before any draw group or section data is created; skipping the draw itself left empty groups and crashed vanilla's `writeDataBatchedMultiple`.
+- **Test cadence.** Hidden sections are re-tested every frame, so they come back 2–3 frames after coming into view. Visible ones are re-tested every 8th frame, staggered by key. Testing every visible box every frame made the high orbit 44% slower, because each visible box runs the marking shader over every pixel it covers.
+- **Near sections.** Sections within 48 blocks of the camera are never tested or skipped.
+- **Switch.** `occlusionCulling` in the config, `-PocclusionCulling=0` for A/B.
+
+4 km world, RD 32, fullscreen, noon, back to back:
+
+| Run | Culling off | Culling on |
+|---|---|---|
+| Ground level (`-PbenchY=ground`) | 247.3 fps, p99 6.49 ms, 6,093 draws | **347.6 fps (+41%)**, p99 5.07 ms, 2,060 draws |
+| High orbit (y = 150, 25° down) | 179.0 fps, p99 8.15 ms, 8,096 draws | **204.3 fps (+14%)**, p99 7.13 ms, 5,631 draws |
+
+Correctness checks, all against culling-off runs:
+- **Bench screenshots:** start and mid-orbit (the camera is moving at mid-orbit) differ on 0.01–0.23% of pixels, all animals near the player.
+- **11-scene rendering tour:** differs only where content is random (rain, particles, F3 text, Nether and End mobs).
+- **8-view LOD tour:** 0.01–0.31% of pixels differ, again animals.
+
 ## Correctness check
 
 `metal_fullscreen1-start.png` and `vulkan_ctl1-start.png` are the benchmark's own screenshots at the same pose. They read the main render target back through `copyTextureToBuffer`, so the readback path is exercised too. Downscaled to 1028×645, 95.1% of pixels agree within 15/255 on every channel. The remaining 4.9% are one region: the player's arm, which sits in a different animation pose in each run (arm bob depends on sub-tick frame timing). Terrain, water, foliage, the village, clouds, sky, fog, and the hotbar match.

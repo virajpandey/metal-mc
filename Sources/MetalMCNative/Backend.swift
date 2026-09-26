@@ -115,6 +115,7 @@ final class MetalContext: @unchecked Sendable {
     var statLodDraws = 0, statLodQuads = 0, statLodNanos: UInt64 = 0
     // Indexed-indirect draw calls (terrain): calls, draws, CPU nanoseconds inside the native call.
     var statIndirectCalls = 0, statIndirectDraws = 0, statIndirectNanos: UInt64 = 0
+    var statOccSections = 0   // chunk sections box-tested for occlusion
 
     // Utility pipelines, built on first use.
     let utilLock = NSLock()

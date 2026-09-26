@@ -62,6 +62,45 @@ public final class MetalLod {
         Mtl.lodIngest(chunkX, chunkZ, blocks, tints);
     }
 
+    /** Chunk sections (SectionPos.asLong) hidden in the newest completed occlusion test. Render thread. */
+    public static long[] occlusionHidden(double camX, double camY, double camZ, int max) {
+        if (!available()) return new long[0];
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            DoubleBuffer cam = stack.mallocDouble(3);
+            cam.put(0, camX).put(1, camY).put(2, camZ);
+            long out = MemoryUtil.nmemAlloc(8L * max);
+            try {
+                int n = Mtl.occHidden(MemoryUtil.memAddress(cam), out, max);
+                long[] keys = new long[n];
+                for (int i = 0; i < n; i++) keys[i] = MemoryUtil.memGetLong(out + 8L * i);
+                return keys;
+            } finally {
+                MemoryUtil.nmemFree(out);
+            }
+        }
+    }
+
+    /** Box-tests chunk sections for occlusion in the current render pass (the main world pass). */
+    public static void occlusionTest(Matrix4fc projection, Matrix4fc view, double camX, double camY, double camZ, long[] keys, int count) {
+        MetalDevice device = MetalDevice.current;
+        if (device == null) return;
+        MetalRenderPass pass = device.encoder().currentRenderPass();
+        if (pass == null) return;
+        long keysAddr = MemoryUtil.nmemAlloc(8L * count);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            for (int i = 0; i < count; i++) MemoryUtil.memPutLong(keysAddr + 8L * i, keys[i]);
+            FloatBuffer p = stack.mallocFloat(32);
+            projection.get(0, p);
+            view.get(16, p);
+            DoubleBuffer cam = stack.mallocDouble(3);
+            cam.put(0, camX).put(1, camY).put(2, camZ);
+            Mtl.occTest(MemoryUtil.memAddress(p), MemoryUtil.memAddress(cam), keysAddr, count);
+        } finally {
+            MemoryUtil.nmemFree(keysAddr);
+        }
+        pass.restoreAfterExternalDraw();
+    }
+
     /** Stops streaming and releases the LOD (the player left the world). */
     public static void close() {
         if (available()) Mtl.lodClose();

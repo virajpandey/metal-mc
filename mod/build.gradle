@@ -55,6 +55,7 @@ loom {
 			property "metalmc.bench.noon", (project.findProperty("benchNoon") ?: "0").toString()
 			property "metalmc.bench.trace", (project.findProperty("benchTrace") ?: "0").toString()
 			property "metalmc.facingCulling", (project.findProperty("facingCulling") ?: "1").toString()
+			property "metalmc.occlusionCulling", (project.findProperty("occlusionCulling") ?: "1").toString()
 			property "metalmc.pregen", (project.findProperty("benchPregen") ?: "0").toString()
 			property "metalmc.lod", (project.findProperty("lod") ?: "0").toString()
 			property "metalmc.lod.far", (project.findProperty("lodFar") ?: "2048").toString()

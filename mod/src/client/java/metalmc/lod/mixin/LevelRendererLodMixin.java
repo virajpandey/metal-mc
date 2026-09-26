@@ -17,7 +17,10 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-/** Draws the LOD in the main world pass right after vanilla's solid terrain. */
+/**
+ * Right after vanilla's solid terrain in the main world pass: draws the LOD, then box-tests chunk sections
+ * for occlusion (the depth buffer now holds both).
+ */
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererLodMixin {
     @Shadow
@@ -28,8 +31,12 @@ abstract class LevelRendererLodMixin {
         target = "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;renderGroup(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayerGroup;Lcom/mojang/renderpearl/api/commands/RenderPass;Lcom/mojang/renderpearl/api/textures/GpuSampler;Lcom/mojang/renderpearl/api/textures/GpuTextureView;Z)V",
         shift = At.Shift.AFTER))
     private void metalmc$drawLod(ChunkSectionsToRender chunks, FeatureRenderDispatcher.PreparedFrame featureFrame, RenderPass renderPass, CallbackInfo ci) {
-        if (!Lod.active()) return;
         CameraRenderState cam = levelRenderState.cameraRenderState;
+        if (Lod.active()) drawLod(cam);
+        metalmc.terrain.SectionOcclusion.test(cam.projectionMatrix, cam.viewRotationMatrix, cam.pos.x, cam.pos.y, cam.pos.z);
+    }
+
+    private static void drawLod(CameraRenderState cam) {
         FogData fog = cam.fogData;
         Minecraft mc = Minecraft.getInstance();
         int renderDistance = mc.options.getEffectiveRenderDistance();

@@ -6,9 +6,12 @@ import com.llamalad7.mixinextras.sugar.Local;
 import java.util.List;
 import metalmc.terrain.FacingData;
 import metalmc.terrain.FacingSorter;
+import metalmc.terrain.SectionOcclusion;
 import net.minecraft.client.renderer.DynamicGpuData;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.chunk.CompiledSectionMesh;
+import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 import net.minecraft.client.renderer.chunk.SectionMesh;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.core.BlockPos;
@@ -17,16 +20,39 @@ import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Replaces each section layer's single draw with draws of only the facing buckets that can face the
- * camera, merged where adjacent. Applies to both the indirect and the per-section terrain paths.
+ * camera, merged where adjacent. Applies to both the indirect and the per-section terrain paths. Also
+ * leaves out sections that the GPU occlusion test found hidden (SectionOcclusion).
  */
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererFacingMixin {
     @Shadow
     @Final
     private LevelRenderState levelRenderState;
+
+    @Inject(method = "extractSectionDrawGroups", at = @At("HEAD"))
+    private void metalmc$beginOcclusion(CallbackInfoReturnable<Integer> cir) {
+        Vec3 cam = levelRenderState.cameraRenderState.pos;
+        SectionOcclusion.beginFrame(cam.x, cam.y, cam.z);
+    }
+
+    /**
+     * A section the occlusion test found hidden gets an empty mesh here, so vanilla skips it before it
+     * creates draw groups or section data for it.
+     */
+    @WrapOperation(method = "extractSectionDrawGroups", at = @At(value = "INVOKE",
+        target = "Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection;getSectionMesh()Lnet/minecraft/client/renderer/chunk/SectionMesh;"))
+    private SectionMesh metalmc$skipHidden(SectionRenderDispatcher.RenderSection section, Operation<SectionMesh> original) {
+        SectionMesh mesh = original.call(section);
+        if (!mesh.hasRenderableLayers()) return mesh;
+        BlockPos o = section.getRenderOrigin();
+        Vec3 c = levelRenderState.cameraRenderState.pos;
+        return SectionOcclusion.skip(o.getX(), o.getY(), o.getZ(), c.x, c.y, c.z) ? CompiledSectionMesh.EMPTY : mesh;
+    }
 
     @WrapOperation(method = "extractSectionDrawGroups", at = @At(value = "INVOKE", target = "Ljava/util/List;add(Ljava/lang/Object;)Z"))
     private boolean metalmc$splitByFacing(List<Object> list, Object element, Operation<Boolean> original,
