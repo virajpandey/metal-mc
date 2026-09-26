@@ -36,6 +36,12 @@ The conclusion above, that the backend is GPU-bound, was only half right. A prof
 
 "Stutters" counts frames longer than 2× the median. The GPU time per command buffer goes up (2.44 → 2.82 ms at RD 12) because more frames now overlap on the GPU.
 
+Repeat runs at RD 12, alternating: early 357.8 and 359.3 fps; late 407.7, 407.9 and 402.2 fps. That's +13%.
+
+**Runs paced by the display.** Some runs, with either setting, came out at almost exactly the display's 120 Hz (120.0, 135.2, 144.0 fps), with GPU time per frame near 7 ms and almost no stutters. Macs pace a fullscreen window through the compositor at the refresh rate when it can't present directly: the display idled to sleep (bench runs now use `caffeinate -di`), or something overlays the window. These runs are excluded from comparisons.
+
+**Tried and dropped: lazy clears.** Minecraft clears its targets with separate passes (6 per frame at RD 12). Folding each clear into the load action of the next pass that renders to that target removed all of them (6.0 → 0.1 per frame). The 11-scene tour matched. It didn't change frame rate or GPU time (clear passes: 415.0 fps, 2.93 ms; lazy: 396.6–417.5 fps, 2.85–3.09 ms). Apple GPUs appear to make full clears cheap already, so the code was reverted.
+
 **Two other suspects, ruled out.**
 - The profile charged 17.5% of the render thread to vanilla's `ChunkSectionsToRender$DrawIndirect.render`. Native timing of the indexed-indirect draws (`per_frame_indirect_cpu_ms`) shows only 0.11–0.13 ms per frame for about 1,600 draws at RD 12, and 0.58 ms for about 8,100 at RD 32. JFR attributes critical downcalls to their Java caller, which inflated that figure.
 - A standalone microbenchmark (`scratchpad icbbench`: 1,600 draws × 500 quads) measured Metal's own cost. Encoding 1,600 indirect draws costs 0.10–0.14 ms of CPU. An indirect command buffer written by a compute kernel costs 0.02 ms and was also 15–25% faster on the GPU at that draw size. So ICBs would save about 0.1 ms of CPU at RD 12. They'd need the terrain's textures in argument buffers, which isn't worth it yet.
