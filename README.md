@@ -23,10 +23,10 @@ With `-Plod=1`, the mod draws far terrain past vanilla's render distance: voxel 
 | Setup | Terrain visible to | FPS |
 |---|---|---|
 | Vanilla, render distance 32 | 512 blocks | 185 |
-| **Render distance 12 + LOD** | **2,048 blocks** | **327** |
-| **Render distance 12 + LOD** (8.2 km world) | **8,192 blocks** | **318** |
+| **Render distance 12 + LOD** | **2,048 blocks** | **315** |
+| **Render distance 12 + LOD** (8.2 km world) | **8,192 blocks** | **310** |
 
-That is 4–16× the view distance at 72–77% higher FPS. Those numbers come from an orbit 150 blocks up. At ground level, occlusion culling skips LOD hidden behind hills, and the 8 km LOD runs at 362 fps, against 382 with no LOD. LOD surfaces use Minecraft's block textures, with colors calibrated to each texture's average and per-biome grass, foliage and water tints, so the seam with vanilla chunks is hard to see.
+That is 4–16× the view distance at 68–70% higher FPS. The LOD numbers include block texture detail (about 2%) and come from an orbit 150 blocks up. At ground level, occlusion culling skips LOD hidden behind hills: before texture detail, the 8 km LOD ran at 362 fps there, against 382 with no LOD. LOD surfaces use Minecraft's block textures, with colors calibrated to each texture's average and per-biome grass, foliage and water tints, so the seam with vanilla chunks is hard to see.
 
 ![Render distance 12 with LOD to 8 km](results/lod-v1/rd12-lod8192-start.png)
 
