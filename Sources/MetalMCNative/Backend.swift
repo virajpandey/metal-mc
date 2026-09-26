@@ -113,6 +113,8 @@ final class MetalContext: @unchecked Sendable {
     var statPasses = 0, statDraws = 0, statBlits = 0, statClears = 0, statSubmits = 0, statPassPixels = 0
     // LOD: draw calls, quads submitted, CPU nanoseconds spent in mmc_lod_draw.
     var statLodDraws = 0, statLodQuads = 0, statLodNanos: UInt64 = 0
+    // Indexed-indirect draw calls (terrain): calls, draws, CPU nanoseconds inside the native call.
+    var statIndirectCalls = 0, statIndirectDraws = 0, statIndirectNanos: UInt64 = 0
 
     // Utility pipelines, built on first use.
     let utilLock = NSLock()
@@ -825,6 +827,8 @@ func acquireICB(_ count: Int) -> MTLIndirectCommandBuffer? {
 /// one encoder call per chunk section.
 @_cdecl("mmc_rp_draw_indexed_indirect")
 public func mmc_rp_draw_indexed_indirect(_ h: Int64, _ offset: Int64, _ drawCount: Int32) {
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    defer { ctx.statIndirectNanos += DispatchTime.now().uptimeNanoseconds - t0; ctx.statIndirectCalls += 1; ctx.statIndirectDraws += Int(drawCount) }
     guard let r = drawReady(), let ib = ctx.indexBuffer else { return }
     let (enc, p) = r
     let buf = (from(h) as BufferBox).buffer
@@ -1198,8 +1202,10 @@ public func mmc_stats_take(_ out: UnsafeMutablePointer<Int64>) {
     out[0] = Int64(ctx.statPasses); out[1] = Int64(ctx.statDraws); out[2] = Int64(ctx.statBlits)
     out[3] = Int64(ctx.statClears); out[4] = Int64(ctx.statSubmits); out[5] = Int64(ctx.statPassPixels)
     out[6] = Int64(ctx.statLodDraws); out[7] = Int64(ctx.statLodQuads); out[8] = Int64(ctx.statLodNanos)
+    out[9] = Int64(ctx.statIndirectCalls); out[10] = Int64(ctx.statIndirectDraws); out[11] = Int64(ctx.statIndirectNanos)
     ctx.statPasses = 0; ctx.statDraws = 0; ctx.statBlits = 0; ctx.statClears = 0; ctx.statSubmits = 0; ctx.statPassPixels = 0
     ctx.statLodDraws = 0; ctx.statLodQuads = 0; ctx.statLodNanos = 0
+    ctx.statIndirectCalls = 0; ctx.statIndirectDraws = 0; ctx.statIndirectNanos = 0
 }
 
 @_cdecl("mmc_completed_submit")
@@ -1239,8 +1245,13 @@ public func mmc_surface2_configure(_ h: Int64, _ w: Int32, _ hh: Int32, _ displa
     s.layer.displaySyncEnabled = displaySync != 0
 }
 
+/// Minecraft acquires the surface at the start of its frame, but it renders into its own target and only
+/// the final copy writes the drawable. So the drawable is fetched late, in mmc_surface2_blit: holding it for
+/// the whole frame kept all three drawables busy, and the render thread spent about two thirds of each frame
+/// at RD 12 blocked in nextDrawable. METALMC_EXP=earlyacquire restores fetching it here.
 @_cdecl("mmc_surface2_acquire")
 public func mmc_surface2_acquire(_ h: Int64) -> Int32 {
+    guard experiments.contains("earlyacquire") else { return 1 }
     let s: SurfaceBox = from(h)
     return autoreleasepool { () -> Int32 in
         s.drawable = s.layer.nextDrawable()
@@ -1253,7 +1264,8 @@ public func mmc_surface2_acquire(_ h: Int64) -> Int32 {
 @_cdecl("mmc_surface2_blit")
 public func mmc_surface2_blit(_ h: Int64, _ srcTex: Int64) {
     let s: SurfaceBox = from(h)
-    guard let drawable = s.drawable else { return }
+    if s.drawable == nil { s.drawable = autoreleasepool { s.layer.nextDrawable() } }
+    guard let drawable = s.drawable else { return }   // timed out: this frame isn't shown
     if experiments.contains("noblit") {
         // Timing experiment only: present without copying (upper bound for a zero-copy present).
         ctx.pendingDrawables.append(drawable)

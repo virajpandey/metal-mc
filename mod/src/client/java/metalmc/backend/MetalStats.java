@@ -9,15 +9,15 @@ public final class MetalStats {
     }
 
     /**
-     * {passes, draws, blit encoders, clear passes, submits, attachment pixels, LOD draws, LOD quads, LOD CPU ns}
-     * since the last call.
+     * {passes, draws, blit encoders, clear passes, submits, attachment pixels, LOD draws, LOD quads, LOD CPU ns,
+     * indexed-indirect calls, indexed-indirect draws, indexed-indirect CPU ns} since the last call.
      */
     public static long[] takeCounters() {
-        java.nio.LongBuffer buf = MemoryUtil.memAllocLong(9);
+        java.nio.LongBuffer buf = MemoryUtil.memAllocLong(12);
         try {
             Mtl.statsTake(MemoryUtil.memAddress(buf));
-            long[] out = new long[9];
-            for (int i = 0; i < 9; i++) out[i] = buf.get(i);
+            long[] out = new long[12];
+            for (int i = 0; i < 12; i++) out[i] = buf.get(i);
             return out;
         } finally {
             MemoryUtil.memFree(buf);

@@ -221,10 +221,12 @@ public final class Bench {
             double sub = Math.max(1, c[4]);
             metalGpu = String.format(Locale.ROOT, " metal_gpu_submits=%d metal_gpu_ms_mean=%.3f metal_gpu_ms_p50=%.3f metal_gpu_ms_p95=%.3f metal_gpu_ms_p99=%.3f"
                     + " per_frame_passes=%.1f per_frame_draws=%.1f per_frame_blits=%.1f per_frame_clears=%.1f per_frame_pass_mpix=%.1f"
-                    + " per_frame_lod_draws=%.1f per_frame_lod_kquads=%.1f per_frame_lod_cpu_ms=%.3f",
+                    + " per_frame_lod_draws=%.1f per_frame_lod_kquads=%.1f per_frame_lod_cpu_ms=%.3f"
+                    + " per_frame_indirect_calls=%.1f per_frame_indirect_draws=%.1f per_frame_indirect_cpu_ms=%.3f",
                 g.length, gm, pctD(gs, 50), pctD(gs, 95), pctD(gs, 99),
                 c[0] / sub, c[1] / sub, c[2] / sub, c[3] / sub, c[5] / sub / 1e6,
-                c[6] / sub, c[7] / sub / 1e3, c[8] / sub / 1e6);
+                c[6] / sub, c[7] / sub / 1e3, c[8] / sub / 1e6,
+                c[9] / sub, c[10] / sub, c[11] / sub / 1e6);
         }
         String summary = String.format(Locale.ROOT,
             "METALMC_BENCH label=%s backend=%s gpu=\"%s\" driver=\"%s\" frames=%d seconds=%.1f fps_mean=%.1f "

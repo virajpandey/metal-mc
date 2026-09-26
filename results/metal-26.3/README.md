@@ -22,6 +22,24 @@ The relative stutter metric (`stutters_gt2x_median` in the .txt files) is higher
 
 `metal_gpu_ms_*` (in runs 3 and 4) is each frame's command buffer, measured from `gpuStartTime` to `gpuEndTime`: a mean of 2.70 ms and a p99 of 3.69 ms. That is longer than the 2.46 ms wall time per frame because consecutive frames overlap on the GPU. **The GPU is saturated: at this resolution the backend is GPU-bound, not CPU-bound.** Further gains have to come from the GPU side (render-pass load/store traffic, the present blit, shader cost), not from the Java→native call path.
 
+## Late drawable acquisition (2026-09-26)
+
+The conclusion above, that the backend is GPU-bound, was only half right. A profile that also samples native code (`jdk.NativeMethodSample`) showed the render thread at RD 12 blocked in `CAMetalLayer.nextDrawable` for about two thirds of each frame (88.6% of its native samples, which JFR takes half as often as Java samples). Minecraft acquires the surface at the start of its frame. It renders into its own target, though, and only the final copy writes the drawable. Acquiring at the start held each of the three drawables for the whole frame, so the pool ran dry.
+
+`mmc_surface2_acquire` now does nothing, and the drawable is fetched in `mmc_surface2_blit`, right before the copy (`METALMC_EXP=earlyacquire` restores the old behavior). A/B runs, back to back, fullscreen, noon:
+
+| Run | Early acquire | Late acquire |
+|---|---|---|
+| 4 km world, RD 12 | 359.3 fps, p99 4.45 ms, 110 stutters | **402.2 fps**, p99 4.13 ms, 65 stutters |
+| 8 km world, RD 12 + LOD 8192 | 301.7 fps | **311.7 fps** |
+| 4 km world, RD 32 | 173.2 fps (earlier the same night) | **179.5 fps** |
+
+"Stutters" counts frames longer than 2× the median. The GPU time per command buffer goes up (2.44 → 2.82 ms at RD 12) because more frames now overlap on the GPU.
+
+**Two other suspects, ruled out.**
+- The profile charged 17.5% of the render thread to vanilla's `ChunkSectionsToRender$DrawIndirect.render`. Native timing of the indexed-indirect draws (`per_frame_indirect_cpu_ms`) shows only 0.11–0.13 ms per frame for about 1,600 draws at RD 12, and 0.58 ms for about 8,100 at RD 32. JFR attributes critical downcalls to their Java caller, which inflated that figure.
+- A standalone microbenchmark (`scratchpad icbbench`: 1,600 draws × 500 quads) measured Metal's own cost. Encoding 1,600 indirect draws costs 0.10–0.14 ms of CPU. An indirect command buffer written by a compute kernel costs 0.02 ms and was also 15–25% faster on the GPU at that draw size. So ICBs would save about 0.1 ms of CPU at RD 12. They'd need the terrain's textures in argument buffers, which isn't worth it yet.
+
 ## Correctness check
 
 `metal_fullscreen1-start.png` and `vulkan_ctl1-start.png` are the benchmark's own screenshots at the same pose. They read the main render target back through `copyTextureToBuffer`, so the readback path is exercised too. Downscaled to 1028×645, 95.1% of pixels agree within 15/255 on every channel. The remaining 4.9% are one region: the player's arm, which sits in a different animation pose in each run (arm bob depends on sub-tick frame timing). Terrain, water, foliage, the village, clouds, sky, fog, and the hotbar match.
