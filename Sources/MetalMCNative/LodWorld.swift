@@ -124,6 +124,7 @@ final class LodWorld: @unchecked Sendable {
     private let queue = DispatchQueue(label: "metalmc.lod.update", qos: .utility)
     private var running = true
     var status = "starting"
+    private(set) var firstPassDone = false   // the first build of every level has finished
 
     init(regionDir: URL?, storeDir: URL?, maxLevel: Int, fineRadius: Int, centerX: Int, centerZ: Int) {
         self.regionDir = regionDir
@@ -163,6 +164,7 @@ final class LodWorld: @unchecked Sendable {
                 if !go { return }
                 let t0 = Date()
                 let did = poll()
+                firstPassDone = true
                 if did { log("LOD: update \(status) in \(String(format: "%.1f", Date().timeIntervalSince(t0))) s") }
                 Thread.sleep(forTimeInterval: 2.0)
             }

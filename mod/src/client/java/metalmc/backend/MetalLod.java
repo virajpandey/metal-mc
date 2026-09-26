@@ -101,6 +101,31 @@ public final class MetalLod {
         pass.restoreAfterExternalDraw();
     }
 
+    /** Top (or side) texture name under block/ for LOD material {@code index}: "" for none, null past the last. */
+    public static String spriteName(int index, boolean top) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            ByteBuffer buf = stack.malloc(128);
+            int n = Mtl.lodSpriteName(index, top ? 1 : 0, MemoryUtil.memAddress(buf), 128);
+            return n < 0 ? null : MemoryUtil.memUTF8(buf, n);
+        }
+    }
+
+    /**
+     * Gives the LOD Minecraft's block atlas and each material's sprite rectangles (8 floats per material:
+     * top u0 v0 u1 v1, side u0 v0 u1 v1). Returns false if the view isn't a Metal texture.
+     */
+    public static boolean setAtlas(com.mojang.renderpearl.api.textures.GpuTextureView view, float[] rects, int count) {
+        if (!available() || !(view instanceof MetalTextureView mv)) return false;
+        long addr = MemoryUtil.nmemAlloc(4L * rects.length);
+        try {
+            for (int i = 0; i < rects.length; i++) MemoryUtil.memPutFloat(addr + 4L * i, rects[i]);
+            Mtl.lodSetAtlas(mv.handle, addr, count);
+        } finally {
+            MemoryUtil.nmemFree(addr);
+        }
+        return true;
+    }
+
     /** Stops streaming and releases the LOD (the player left the world). */
     public static void close() {
         if (available()) Mtl.lodClose();
@@ -111,13 +136,13 @@ public final class MetalLod {
         if (available()) Mtl.lodCenter(x, z, vanillaRadius);
     }
 
-    /** {state (0 none, 1 building, 2 has nodes), nodes, quads}. */
+    /** {state (0 none, 1 building, 2 has nodes), nodes, quads, 1 once the first full build has finished}. */
     public static long[] status() {
-        if (!available()) return new long[3];
+        if (!available()) return new long[4];
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            LongBuffer out = stack.callocLong(3);
+            LongBuffer out = stack.callocLong(4);
             Mtl.lodStatus(MemoryUtil.memAddress(out));
-            return new long[]{out.get(0), out.get(1), out.get(2)};
+            return new long[]{out.get(0), out.get(1), out.get(2), out.get(3)};
         }
     }
 

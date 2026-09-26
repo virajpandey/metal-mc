@@ -37,6 +37,7 @@ abstract class LevelRendererLodMixin {
     }
 
     private static void drawLod(CameraRenderState cam) {
+        if (metalmc.lod.Lod.TEXTURES) metalmc.lod.LodTextures.ensure();
         FogData fog = cam.fogData;
         Minecraft mc = Minecraft.getInstance();
         int renderDistance = mc.options.getEffectiveRenderDistance();

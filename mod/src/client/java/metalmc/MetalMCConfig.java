@@ -41,6 +41,8 @@ public final class MetalMCConfig {
         lod.live=true
         # LOD on servers, built from the chunks you've seen there and saved under metalmc/lod/ (needs lod.live).
         lod.multiplayer=true
+        # Block texture detail on LOD terrain (about 2% slower than flat colors).
+        lod.textures=true
         """;
 
     private static final Properties FILE = load();
@@ -99,6 +101,10 @@ public final class MetalMCConfig {
 
     public static boolean lodLive() {
         return flag("lod.live", true);
+    }
+
+    public static boolean lodTextures() {
+        return flag("lod.textures", true);
     }
 
     public static boolean lodMultiplayer() {

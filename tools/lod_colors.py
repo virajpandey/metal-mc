@@ -88,6 +88,35 @@ colors = [
     ("granite", average("granite")), ("sandstone", average("sandstone_top")), ("mud", average("mud")),
     ("amethyst", average("amethyst_block")), ("pumpkin", average("pumpkin_side")),
 ]
+def luma(name):
+    """Mean Rec. 709 luma of the texture's opaque texels (untinted, gamma space like the atlas)."""
+    w, h, px = png(name)
+    opaque = [p for p in px if p[3] >= 128]
+    return sum(0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2] for p in opaque) / len(opaque) / 255
+
+# Top and side textures per material, for LOD texture detail (same order as colors). Grass sides use dirt:
+# a 2-block LOD voxel would otherwise show a grass edge on every block of a cliff.
+sprites = [
+    ("air", None, None), ("stone", "stone", "stone"), ("dirt", "dirt", "dirt"),
+    ("grass", "grass_block_top", "dirt"), ("sand", "sand", "sand"), ("water", "water_still", "water_still"),
+    ("unknown", "stone", "stone"), ("deepslate", "deepslate_top", "deepslate"), ("gravel", "gravel", "gravel"),
+    ("log", "oak_log_top", "oak_log"), ("planks", "oak_planks", "oak_planks"), ("leaves", "oak_leaves", "oak_leaves"),
+    ("cherryLeaves", "cherry_leaves", "cherry_leaves"), ("snow", "snow", "snow"), ("ice", "ice", "ice"),
+    ("clay", "clay", "clay"), ("terracotta", "terracotta", "terracotta"), ("lava", "lava_still", "lava_still"),
+    ("cobblestone", "cobblestone", "cobblestone"), ("bricks", "bricks", "bricks"), ("path", "dirt_path_top", "dirt_path_side"),
+    ("farmland", "farmland", "dirt"), ("hay", "hay_block_top", "hay_block_side"), ("wool", "white_wool", "white_wool"),
+    ("moss", "moss_block", "moss_block"), ("cherryWood", "cherry_log_top", "cherry_log"),
+    ("lightStone", "calcite", "calcite"), ("granite", "granite", "granite"), ("sandstone", "sandstone_top", "sandstone"),
+    ("mud", "mud", "mud"), ("amethyst", "amethyst_block", "amethyst_block"), ("pumpkin", "pumpkin_top", "pumpkin_side"),
+]
+assert [n for n, _, _ in sprites] == [n for n, _ in colors]
+sprite_lines = []
+for name, top, side in sprites:
+    if top is None:
+        sprite_lines.append(f'    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // {name}')
+    else:
+        sprite_lines.append(f'    LodSprite(top: "{top}", side: "{side}", topLuma: {luma(top):.3f}, sideLuma: {luma(side):.3f}),   // {name}')
+
 lines = []
 for name, c in colors:
     if c is None:
@@ -101,6 +130,17 @@ out = """import simd
 // MetalMCCore.Mat raw value. Keeps far LOD terrain close to the average color of vanilla's textured
 // terrain at the seam.
 let lodMaterialColors: [SIMD4<Float>] = [
-""" + "\n".join(lines) + "\n]\n"
+""" + "\n".join(lines) + "\n]\n" + """
+/// Block textures used for LOD texture detail (names under block/ in the block atlas), with the mean luma
+/// of each texture's opaque texels. The LOD multiplies its flat color by texel luma / mean luma.
+struct LodSprite {
+    let top: String
+    let side: String
+    let topLuma: Float
+    let sideLuma: Float
+}
+
+let lodMaterialSprites: [LodSprite] = [
+""" + "\n".join(sprite_lines) + "\n]\n"
 open(os.path.expanduser("~/Projects/metal-mc/Sources/MetalMCNative/LodColors.swift"), "w").write(out)
 print(out)

@@ -43,6 +43,7 @@ public final class Bench {
         || Tour.MP_TOUR;
 
     private enum State { WAITING, WARMUP, RUNNING, TOUR, PREGEN, DONE }
+    private static int lodWaitTicks;
 
     private static State state = State.WAITING;
     private static int tick;
@@ -96,6 +97,11 @@ public final class Bench {
             }
             case WARMUP -> {
                 if (!Tour.MP_TOUR) place(player, 0);
+                // With LOD on, don't start timing until every LOD level has been built (up to 2 extra minutes).
+                if (metalmc.lod.Lod.ENABLED && !metalmc.lod.Lod.built() && lodWaitTicks++ < 2400) {
+                    if (lodWaitTicks % 200 == 0) log("waiting for the LOD build (" + lodWaitTicks / 20 + " s)");
+                    break;
+                }
                 if (++tick >= WARMUP_TICKS && TOUR) {
                     state = State.TOUR;
                     tick = 0;

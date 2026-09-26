@@ -15,7 +15,7 @@ cx = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 cz = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 t0 = time.time()
 print("open:", lib.mmc_lod_open(world.encode(), far, cx, cz), flush=True)
-out = (ctypes.c_int64 * 3)()
+out = (ctypes.c_int64 * 4)()
 last, stable = -1, 0
 while stable < 32:   # streaming never "finishes": wait until the quad count holds for 8 s
     lib.mmc_lod_status(out)

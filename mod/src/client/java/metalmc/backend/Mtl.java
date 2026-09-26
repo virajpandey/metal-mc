@@ -91,6 +91,8 @@ final class Mtl {
     private static final MethodHandle LOD_INGEST = h("mmc_lod_ingest", false, null, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle OCC_HIDDEN = h("mmc_occ_hidden", true, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle OCC_TEST = h("mmc_occ_test", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
+    private static final MethodHandle LOD_SPRITE_NAME = h("mmc_lod_sprite_name", false, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT);
+    private static final MethodHandle LOD_SET_ATLAS = h("mmc_lod_set_atlas", false, null, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle COMPLETED_SUBMIT = h("mmc_completed_submit", true, JAVA_LONG);
     private static final MethodHandle SURFACE_CREATE = h("mmc_surface2_create", false, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle SURFACE_CONFIGURE = h("mmc_surface2_configure", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -321,6 +323,14 @@ final class Mtl {
 
     static void occTest(long params, long camera, long keys, int count) {
         try { OCC_TEST.invokeExact(params, camera, keys, count); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int lodSpriteName(int index, int top, long buf, int len) {
+        try { return (int) LOD_SPRITE_NAME.invokeExact(index, top, buf, len); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void lodSetAtlas(long view, long rects, int count) {
+        try { LOD_SET_ATLAS.invokeExact(view, rects, count); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static long completedSubmit() {

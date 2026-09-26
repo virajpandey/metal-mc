@@ -26,7 +26,7 @@ With `-Plod=1`, the mod draws far terrain past vanilla's render distance: voxel 
 | **Render distance 12 + LOD** | **2,048 blocks** | **327** |
 | **Render distance 12 + LOD** (8.2 km world) | **8,192 blocks** | **318** |
 
-That is 4–16× the view distance at 72–77% higher FPS. Those numbers come from an orbit 150 blocks up. At ground level, occlusion culling skips LOD hidden behind hills, and the 8 km LOD runs at 362 fps, against 382 with no LOD. LOD colors come from Minecraft's block textures with per-biome grass, foliage and water tints, so the seam with vanilla chunks is hard to see.
+That is 4–16× the view distance at 72–77% higher FPS. Those numbers come from an orbit 150 blocks up. At ground level, occlusion culling skips LOD hidden behind hills, and the 8 km LOD runs at 362 fps, against 382 with no LOD. LOD surfaces use Minecraft's block textures, with colors calibrated to each texture's average and per-biome grass, foliage and water tints, so the seam with vanilla chunks is hard to see.
 
 ![Render distance 12 with LOD to 8 km](results/lod-v1/rd12-lod8192-start.png)
 
@@ -34,7 +34,7 @@ That is 4–16× the view distance at 72–77% higher FPS. Those numbers come fr
 
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) 0.19.5+ for Minecraft 26.3, and put [Fabric API](https://modrinth.com/mod/fabric-api) in your `mods` folder.
 2. Build the mod: `cd mod && ./gradlew build` (needs Xcode's Swift toolchain and JDK 25). Copy `mod/build/libs/metalmc-0.1.0.jar` into `mods`. The jar bundles the Metal library, which is extracted to `<game dir>/metalmc/natives/` on first launch.
-3. Settings are in `config/metalmc.properties`, created on first launch: `backend=metal|off`, `facingCulling`, `occlusionCulling`, `lod`, `lod.far` (blocks), `lod.live`, and `lod.multiplayer`. If Metal can't start, Minecraft falls back to its own backends.
+3. Settings are in `config/metalmc.properties`, created on first launch: `backend=metal|off`, `facingCulling`, `occlusionCulling`, `lod`, `lod.far` (blocks), `lod.live`, `lod.multiplayer`, and `lod.textures`. If Metal can't start, Minecraft falls back to its own backends.
 
 It's experimental. It has been tested on one M3 Pro, in single-player and on a local server, and it isn't compatible with other rendering mods (Sodium, Iris).
 

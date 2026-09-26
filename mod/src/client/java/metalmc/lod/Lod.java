@@ -20,9 +20,11 @@ public final class Lod implements ClientModInitializer {
     public static final int FAR = metalmc.MetalMCConfig.lodFar();
     public static final boolean LIVE = metalmc.MetalMCConfig.lodLive();
     public static final boolean MULTIPLAYER = metalmc.MetalMCConfig.lodMultiplayer();
+    public static final boolean TEXTURES = metalmc.MetalMCConfig.lodTextures();
 
     private static boolean opened;
     private static volatile boolean ready;
+    private static volatile boolean built;
     private static int statusTicks;
     private static String openedDir;
 
@@ -34,6 +36,11 @@ public final class Lod implements ClientModInitializer {
         if (!ENABLED || !ready) return false;
         Minecraft mc = Minecraft.getInstance();
         return mc.level != null && mc.level.dimension() == net.minecraft.world.level.Level.OVERWORLD;
+    }
+
+    /** True once every LOD level has been built at least once (the benchmark waits for this). */
+    public static boolean built() {
+        return built;
     }
 
     @Override
@@ -71,6 +78,7 @@ public final class Lod implements ClientModInitializer {
             MetalLod.close();
             opened = false;
             ready = false;
+            built = false;
             openedDir = null;
         }
         if (!opened && src != null && MetalLod.available()) {
@@ -85,11 +93,15 @@ public final class Lod implements ClientModInitializer {
         if (mc.player != null) {
             MetalLod.center(mc.player.getBlockX(), mc.player.getBlockZ(), mc.options.getEffectiveRenderDistance() * 16);
         }
-        if (!ready) {
+        if (!ready || !built) {
             long[] s = MetalLod.status();
-            if (s[0] == 2) {
+            if (!ready && s[0] == 2) {
                 ready = true;
                 System.out.println("[metalmc-lod] ready: " + s[1] + " nodes, " + s[2] + " quads");
+            }
+            if (!built && s[3] == 1) {
+                built = true;
+                System.out.println("[metalmc-lod] first build done: " + s[1] + " nodes, " + s[2] + " quads");
             }
         }
     }

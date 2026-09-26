@@ -25,7 +25,7 @@ store = tempfile.mkdtemp(prefix="lodstore-")
 
 
 def wait_stable(label, t0):
-    out = (ctypes.c_int64 * 3)()
+    out = (ctypes.c_int64 * 4)()
     last, stable = -1, 0
     while stable < 32:   # quad count unchanged for 8 s
         lib.mmc_lod_status(out)

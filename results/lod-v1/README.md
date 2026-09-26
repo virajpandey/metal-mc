@@ -100,6 +100,12 @@ The LOD now also takes chunks as the client loads and unloads them. On a server 
 - **Edges of explored areas (2026-09-26).** Side faces toward chunks with no data are now kept only near the top of the terrain, and the deep-cave fill ignores those columns. The saved multiplayer strip rebuilt from 442,407 to 337,911 quads (24% fewer). The fully generated 4 km world lost 0.4% of its quads: region files, live ingest and the reopened store all give 4,513,827, down from 4,531,403. The 8-view LOD tour is unchanged (animals only).
 - **Single-player is unchanged:** 318.1 fps at LOD 8192, the same as before. The showcase tour matches, apart from animals and 0.02% of pixels in the high views. Those come from near regions rebuilt with slightly newer live data (water flow).
 
+## Texture detail and a visibility fix (2026-09-26)
+
+**Texture detail.** LOD surfaces now show Minecraft's block textures, repeated once per block. The texel's luma, relative to the texture's mean, scales the calibrated flat color (see `docs/lod-design.md`). `texture-detail-flat.png` and `texture-detail-textured.png` show the same ground-level crop from the tour: LOD trees now show leaf texture, and the LOD hillside reads as grass, dirt and stone instead of flat patches. It costs about 2%: 8 km world, RD 12, back to back, flat 316.1 fps, textured 310.2 fps, GPU 4.38 → 4.51 ms.
+
+**The LOD sometimes didn't draw at the start of a run.** Selection started from the top LOD level only, and at 8 km the top level is built last (18–25 s in-game). Bench runs that started timing before the build finished drew no LOD for their first seconds. The start screenshot showed sky past vanilla's chunks, in 7 of 9 runs from 17:40 on 09-25. Selection now starts from every node whose parent doesn't exist, and the benchmark waits for the first full build before timing. Re-measured flat at 8 km: 316.1 fps, against 316.6 before the fix. The earlier comparisons ran back to back with the same timing, and their frame rates barely moved.
+
 ## Build cost
 
 The LOD is built in the background when the world opens: 81 non-empty regions in 26 s in-game (18 s standalone). The result is 74 nodes on 3 levels, 7.7 M quads, 61 MB of GPU memory. Filling sealed caves and not emitting faces under water halved the quad count.

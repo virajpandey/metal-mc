@@ -20,13 +20,18 @@ struct LodUniforms {
     float discardRadius;   // horizontal distance inside which vanilla chunks are drawn instead
     float sky;             // daylight factor 0..1
     float2 pad;
+    float4 camFrac;        // xyz: fractional part of the camera position; w: 1 if texture detail is on
 };
+// Per base material: top and side sprite rectangles in the block atlas (u0, v0, u1, v1), and the mean luma
+// of each texture (x = top, y = side).
+struct LodSpriteGPU { float4 top; float4 side; float4 luma; };
 // Per draw: section origin relative to the camera (xyz) and voxel size in blocks (w).
 struct Xform { float4 offsetScale; };
 struct VOut {
     float4 pos [[position]];
     float3 color;
     float3 rel;
+    uint matFace [[flat]];   // base material | face << 8
 };
 
 // Unit-cube corners per face, counter-clockwise seen from outside. Face order: +X -X +Y -Y +Z -Z.
@@ -70,14 +75,19 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
         o.pos = float4(0.0, 0.0, 0.0, 1.0);
         o.color = float3(0.0);
         o.rel = float3(0.0);
+        o.matFace = 0;
         return o;
     }
     float4 clip = u.proj * (u.view * float4(rel, 1.0));
     clip.y = -clip.y;   // same vertical flip as every translated Minecraft shader (flip_vert_y)
     o.pos = clip;
-    float3 base = colors[q.y & 255].rgb;
+    uint m = q.y & 255;
+    float3 base = colors[m].rgb;
     o.color = base * kShade[face] * mix(0.2, 1.0, u.sky);
     o.rel = rel;
+    // Biome-tinted variants (64 + t grass, 96 + t leaves, 128 + t water) use their base material's texture.
+    uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
+    o.matFace = baseMat | (face << 8);
     return o;
 }
 
@@ -87,12 +97,32 @@ static float linearFog(float d, float s, float e) {
     return (d - s) / (e - s);
 }
 
-fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]]) {
+// Texture detail: the flat material color times the ratio of the texel's luma to the texture's mean luma,
+// so colors (and biome tints) stay calibrated while blocks show their texture. The texture repeats once per
+// block; mip selection uses the gradients of the continuous block coordinate, so it doesn't break at tile
+// seams, and far away the smallest mips average back to the flat color. Transparent texels (leaves, ice)
+// darken slightly instead of showing whatever color they store.
+fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
+                       constant LodSpriteGPU* sprites [[buffer(20)]],
+                       texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
+    float3 color = in.color;
+    if (u.camFrac.w > 0.5) {
+        uint face = in.matFace >> 8, mat = in.matFace & 255;
+        float3 wp = in.rel + u.camFrac.xyz;
+        float2 bc = face < 2 ? float2(wp.z, -wp.y) : (face < 4 ? wp.xz : float2(wp.x, -wp.y));
+        bool top = face == 2 || face == 3;
+        float4 rect = top ? sprites[mat].top : sprites[mat].side;
+        float2 size = rect.zw - rect.xy;
+        float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size, dfdy(bc) * size));
+        float luma = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
+        float mean = top ? sprites[mat].luma.x : sprites[mat].luma.y;
+        color *= clamp(mix(0.75, luma / max(mean, 0.02), t.a), 0.0, 2.0);
+    }
     float horiz = length(in.rel.xz);
     float spherical = length(in.rel);
     float cylindrical = max(horiz, abs(in.rel.y));
     float fog = max(linearFog(spherical, u.envStart, u.envEnd), linearFog(cylindrical, u.rdStart, u.rdEnd));
-    return float4(mix(in.color, u.fogColor.rgb, fog * u.fogColor.a), 1.0);
+    return float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), 1.0);
 }
 
 // Occlusion test. After the LOD is drawn, every candidate tile's bounding box is rasterized in the same
@@ -136,7 +166,11 @@ struct LodUniforms {
     var discardRadius: Float
     var sky: Float
     var pad: SIMD2<Float> = .zero
+    var camFrac: SIMD4<Float> = .zero
 }
+
+/// METALMC_EXP=lodflat turns off LOD texture detail (flat colors, for A/B comparisons).
+let lodFlat = experiments.contains("lodflat")
 
 /// One frame's occlusion test: the boxes drawn and the GPU-written visibility marks, one per slot.
 final class LodVisSet {
@@ -173,6 +207,11 @@ final class LodRenderer: @unchecked Sendable {
     var indexQuads = 0
     var pipelines: [String: MTLRenderPipelineState] = [:]
     var library: MTLLibrary?
+    // Texture detail: Minecraft's block atlas and the sprite table (render thread).
+    var atlas: MTLTexture?
+    var spriteBuffer: MTLBuffer?
+    var atlasSampler: MTLSamplerState?
+    var dummyTexture: MTLTexture?
     // Occlusion culling (render thread, except LodVisSet.done).
     let visLock = NSLock()
     var visSets: [LodVisSet] = []
@@ -185,7 +224,13 @@ final class LodRenderer: @unchecked Sendable {
         let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
         if let p = pipelines[key] { return p }
         do {
-            if library == nil { library = try ctx.device.makeLibrary(source: lodShaderSource, options: nil) }
+            if library == nil {
+                let src = lodShaderSource
+                    .replacingOccurrences(of: "MAT_WATER", with: "\(Mat.water.rawValue)u")
+                    .replacingOccurrences(of: "MAT_LEAVES", with: "\(Mat.leaves.rawValue)u")
+                    .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
+                library = try ctx.device.makeLibrary(source: src, options: nil)
+            }
             let d = MTLRenderPipelineDescriptor()
             d.label = box ? "MetalMC LOD occlusion boxes" : "MetalMC LOD"
             d.vertexFunction = library!.makeFunction(name: box ? "lod_box_vs" : "lod_vs")
@@ -241,6 +286,28 @@ final class LodRenderer: @unchecked Sendable {
         indexQuads = n
     }
 
+    /// Sampler for the atlas (nearest texels, linear between mips, like Minecraft) and a 1 x 1 stand-in
+    /// texture for when the atlas hasn't been set.
+    func ensureTextureDefaults() {
+        if atlasSampler == nil {
+            let d = MTLSamplerDescriptor()
+            d.minFilter = .nearest
+            d.magFilter = .nearest
+            d.mipFilter = .linear
+            d.sAddressMode = .clampToEdge
+            d.tAddressMode = .clampToEdge
+            atlasSampler = ctx.device.makeSamplerState(descriptor: d)
+        }
+        if dummyTexture == nil {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+            d.storageMode = .shared
+            let t = ctx.device.makeTexture(descriptor: d)
+            var white: UInt32 = 0xFFFF_FFFF
+            t?.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &white, bytesPerRow: 4)
+            dummyTexture = t
+        }
+    }
+
     /// Material colors from the texture averages in LodColors.swift, indexed by material id.
     func ensureColors() {
         if colorBuffer != nil { return }
@@ -285,7 +352,11 @@ final class LodRenderer: @unchecked Sendable {
         }
         // A missing node may still have finer descendants (never happens today, but keep the recursion honest).
         func hasDescendant(_ level: Int, _ nx: Int, _ nz: Int) -> Bool { false }
-        for k in meshes.keys where k.level == maxLevel { visit(maxLevel, k.x, k.z) }
+        // Roots: every node whose parent doesn't exist, not just the top level. Levels are built bottom-up,
+        // so while the coarse levels are still building (18-25 s for 8 km), the finer ones already draw.
+        for k in meshes.keys where k.level == maxLevel || meshes[LodNodeKey(level: k.level + 1, x: k.x >> 1, z: k.z >> 1)] == nil {
+            visit(k.level, k.x, k.z)
+        }
         return out
     }
 }
@@ -348,16 +419,17 @@ public func mmc_lod_center(_ x: Int32, _ z: Int32, _ vanillaRadius: Int32) {
     w?.setCenter(x: Int(x), z: Int(z), vanillaRadius: Int(vanillaRadius))
 }
 
-/// out: state (0 none, 1 building, 2 has nodes), nodes, quads.
+/// out: state (0 none, 1 building, 2 has nodes), nodes, quads, and 1 once the first full build has finished.
 @_cdecl("mmc_lod_status")
 public func mmc_lod_status(_ out: UnsafeMutablePointer<Int64>) {
     let r = LodRenderer.shared
     r.lock.lock(); let w = r.world; r.lock.unlock()
-    guard let w else { out[0] = 0; out[1] = 0; out[2] = 0; return }
+    guard let w else { out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0; return }
     let snap = w.snapshot()
     out[0] = snap.meshes.isEmpty ? 1 : 2
     out[1] = Int64(snap.meshes.count)
     out[2] = Int64(snap.meshes.values.reduce(0) { $0 + $1.quadCount })
+    out[3] = w.firstPassDone ? 1 : 0
 }
 
 /// Draws the LOD into the open render pass. p: proj[16], view[16] (column-major), fog color[4],
@@ -475,6 +547,14 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     enc.setCullMode(.back)
     enc.setTriangleFillMode(.fill)
     enc.setDepthBias(0, slopeScale: 0, clamp: 0)
+    // Texture detail resources live at slots vanilla doesn't use (texture 30, sampler 15, buffer 20).
+    r.ensureTextureDefaults()
+    if !lodFlat, r.atlas != nil, r.spriteBuffer != nil {
+        u.camFrac = SIMD4(Float(cx - cx.rounded(.down)), Float(cy - cy.rounded(.down)), Float(cz - cz.rounded(.down)), 1)
+    }
+    enc.setFragmentTexture(r.atlas ?? r.dummyTexture, index: 30)
+    enc.setFragmentSamplerState(r.atlasSampler, index: 15)
+    enc.setFragmentBuffer(r.spriteBuffer ?? r.colorBuffer, offset: 0, index: 20)
     enc.setVertexBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
     enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
     if xforms.count * 16 <= 4096 {
@@ -515,4 +595,34 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     ctx.pipe = nil
     ctx.boundPipeState = nil
     return Int32(draws.count)
+}
+
+/// Name of material `index`'s top (top != 0) or side texture under block/ in the atlas, written to `buf`.
+/// Returns its length, 0 for none (air), or -1 past the last material.
+@_cdecl("mmc_lod_sprite_name")
+public func mmc_lod_sprite_name(_ index: Int32, _ top: Int32, _ buf: UnsafeMutablePointer<CChar>, _ len: Int32) -> Int32 {
+    guard index >= 0, Int(index) < lodMaterialSprites.count else { return -1 }
+    let s = lodMaterialSprites[Int(index)]
+    let bytes = Array((top != 0 ? s.top : s.side).utf8.prefix(Int(len) - 1))
+    for (i, b) in bytes.enumerated() { buf[i] = CChar(bitPattern: b) }
+    buf[bytes.count] = 0
+    return Int32(bytes.count)
+}
+
+/// Sets Minecraft's block atlas (a texture view handle) and the sprite rectangles for each material:
+/// rects holds count x 8 floats (top u0 v0 u1 v1, side u0 v0 u1 v1). Render thread.
+@_cdecl("mmc_lod_set_atlas")
+public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ count: Int32) {
+    let r = LodRenderer.shared
+    let n = Int(count)
+    var table = [SIMD4<Float>](repeating: .zero, count: max(1, n) * 3)
+    for i in 0..<n {
+        table[3 * i] = SIMD4(rects[8 * i], rects[8 * i + 1], rects[8 * i + 2], rects[8 * i + 3])
+        table[3 * i + 1] = SIMD4(rects[8 * i + 4], rects[8 * i + 5], rects[8 * i + 6], rects[8 * i + 7])
+        let s = i < lodMaterialSprites.count ? lodMaterialSprites[i] : LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1)
+        table[3 * i + 2] = SIMD4(s.topLuma, s.sideLuma, 0, 0)
+    }
+    r.spriteBuffer = ctx.device.makeBuffer(bytes: table, length: table.count * 16, options: [.storageModeShared])
+    r.atlas = view == 0 ? nil : (from(view) as TextureBox).texture
+    if let a = r.atlas { log("LOD: texture detail from the block atlas \(a.width)x\(a.height), \(a.mipmapLevelCount) mips, \(n) materials") }
 }
