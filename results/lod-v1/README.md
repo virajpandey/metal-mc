@@ -97,6 +97,7 @@ The LOD now also takes chunks as the client loads and unloads them. On a server 
 - **Real local server** (`./gradlew runServer`, offline mode, the same world; `-PmpServer=127.0.0.1:25565 -PbenchTour=mp`):
   - **Session 1:** the server teleports the player east to x = 1,500. The LOD takes in 2,712 chunks and builds 20 nodes (442,407 quads) from them, then shows the explored strip from above (`multiplayer-explored-strip.jpg`).
   - **Session 2** (`-PbenchTour=mp2`): after reconnecting, the LOD loaded 10 saved regions and was drawing 2 s after joining. It rebuilt to the same 442,407 quads without the player moving.
+- **Edges of explored areas (2026-09-26).** Side faces toward chunks with no data are now kept only near the top of the terrain, and the deep-cave fill ignores those columns. The saved multiplayer strip rebuilt from 442,407 to 337,911 quads (24% fewer). The fully generated 4 km world lost 0.4% of its quads: region files, live ingest and the reopened store all give 4,513,827, down from 4,531,403. The 8-view LOD tour is unchanged (animals only).
 - **Single-player is unchanged:** 318.1 fps at LOD 8192, the same as before. The showcase tour matches, apart from animals and 0.02% of pixels in the high views. Those come from near regions rebuilt with slightly newer live data (water flow).
 
 ## Build cost

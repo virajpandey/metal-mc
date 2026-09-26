@@ -45,28 +45,36 @@ struct LodGrid {
         if deepRadius >= 0 {
             let stone = Mat.stone.rawValue
             v.withUnsafeMutableBufferPointer { g in
-                // Height from which each column is open to the sky (one above its highest non-water solid).
+                // Height from which each column is open to the sky (one above its highest non-water solid), or
+                // -1 for a column with no data at all (a chunk that was never generated or seen): those are
+                // ignored, so terrain next to missing chunks still gets its deep caves filled.
                 var open = [Int32](repeating: 0, count: n * n)
                 for i in 0..<(n * n) {
                     var y = h - 1
-                    while y >= 0 { let m = g[y * n * n + i]; if m != 0 && !lodIsWater(m) { break }; y -= 1 }
-                    open[i] = Int32(y + 1)
+                    var any = false
+                    while y >= 0 {
+                        let m = g[y * n * n + i]
+                        if m != 0 { any = true; if !lodIsWater(m) { break } }
+                        y -= 1
+                    }
+                    open[i] = any ? Int32(y + 1) : -1
                 }
                 // Lowest open height within the square neighborhood (separable min filter).
                 var rows = open
                 for z in 0..<n {
                     for x in 0..<n {
                         var m = Int32.max
-                        for k in max(0, x - deepRadius)...min(n - 1, x + deepRadius) { m = min(m, open[z * n + k]) }
+                        for k in max(0, x - deepRadius)...min(n - 1, x + deepRadius) where open[z * n + k] >= 0 { m = min(m, open[z * n + k]) }
                         rows[z * n + x] = m
                     }
                 }
                 for z in 0..<n {
                     for x in 0..<n {
+                        let i = z * n + x
+                        if open[i] < 0 { continue }
                         var m = Int32.max
                         for k in max(0, z - deepRadius)...min(n - 1, z + deepRadius) { m = min(m, rows[k * n + x]) }
                         let limit = Int(m) - deepDepth
-                        let i = z * n + x
                         var y = 0
                         while y < limit {
                             let c = g[y * n * n + i]
@@ -200,6 +208,12 @@ enum LodBuild {
         var mask = [UInt8](repeating: 0, count: n * max(n, h))
 
         grid.v.withUnsafeBufferPointer { g in
+            // Highest non-air voxel per column, -1 for a column with no data (a missing chunk). Side faces
+            // toward a missing column are kept only near the top, a short skirt instead of a cross-section of
+            // the terrain down to the world bottom at the edge of explored or generated terrain.
+            var top = [Int](repeating: -1, count: n * n)
+            for y in 0..<h { for i in 0..<(n * n) where g[y * n * n + i] != 0 { top[i] = y } }
+            let edgeSkirt = 8
             @inline(__always) func at(_ x: Int, _ y: Int, _ z: Int) -> UInt8 {
                 if y < 0 { return Mat.stone.rawValue }
                 if x < 0 || z < 0 || x >= n || z >= n || y >= h { return 0 }
@@ -234,6 +248,10 @@ enum LodBuild {
                                 let k = kinds[Int(m)]
                                 if k == waterK { if nk == airK { f = m } }
                                 else if nk == airK { f = m }   // LOD water is opaque, so faces under water are hidden
+                                if f != 0 && axis != 1 {
+                                    let nx = x + sx, nz = z + sz
+                                    if nx >= 0 && nz >= 0 && nx < n && nz < n && top[nz * n + nx] < 0 && y < top[z * n + x] - edgeSkirt { f = 0 }
+                                }
                             }
                             mask[vv * du + uu] = f
                             if f != 0 { anyFace = true }
