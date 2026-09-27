@@ -30,6 +30,7 @@ struct LodFarSurface {
     var leaves: UInt8        // canopy material (tinted)
     var frozen: Bool         // water freezes at the surface
     var mountain: Bool       // steep slopes show stone
+    var bands = false        // badlands: terracotta in horizontal color bands by height
     var water: UInt8 = lodTinted(Mat.water.rawValue, 0)   // tinted water
 }
 
@@ -60,8 +61,8 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     case "desert": s.top = sand; s.under = Mat.sandstone.rawValue
     case "beach": s.top = sand; s.under = sand
     case "snowy_beach": s.top = snow; s.under = sand; s.frozen = true
-    case "badlands", "eroded_badlands": s.top = Mat.terracotta.rawValue; s.under = Mat.terracotta.rawValue; s.mountain = true
-    case "wooded_badlands": s.top = Mat.terracotta.rawValue; s.under = Mat.terracotta.rawValue; s.canopy = 4
+    case "badlands", "eroded_badlands": s.top = Mat.terracotta.rawValue; s.under = Mat.terracotta.rawValue; s.bands = true
+    case "wooded_badlands": s.top = Mat.terracotta.rawValue; s.under = Mat.terracotta.rawValue; s.canopy = 4; s.bands = true
     case "warm_ocean", "lukewarm_ocean", "deep_lukewarm_ocean", "beach_ocean": s.top = sand; s.under = sand
     case "ocean", "deep_ocean", "cold_ocean", "deep_cold_ocean", "river": s.top = gravel; s.under = gravel
     case "frozen_ocean", "deep_frozen_ocean", "frozen_river": s.top = gravel; s.under = gravel; s.frozen = true
@@ -69,6 +70,23 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     }
     return s
 }
+
+/// Badlands bands: like vanilla's, a fixed sequence of terracotta colors by height (mostly plain terracotta,
+/// with orange, yellow, brown, red, white and light gray bands 1-3 blocks thick), here the same everywhere.
+let lodBadlandsBands: [UInt8] = {
+    let colors: [Mat] = [.orangeTerracotta, .yellowTerracotta, .brownTerracotta, .redTerracotta, .whiteTerracotta, .lightGrayTerracotta]
+    var out = [UInt8](repeating: Mat.terracotta.rawValue, count: 192)
+    var y = 0, k = 0
+    while y < out.count {
+        y += 2 + Int(lodHash(k, 7, 3) * 5)
+        let thick = 1 + Int(lodHash(k, 11, 4) * 3)
+        let c = colors[Int(lodHash(k, 13, 5) * Double(colors.count))]
+        for t in 0..<thick where y + t < out.count { out[y + t] = c.rawValue }
+        y += thick
+        k += 1
+    }
+    return out
+}()
 
 /// Deterministic hash of a block position, in [0, 1).
 @inline(__always) func lodHash(_ x: Int, _ z: Int, _ salt: UInt64 = 0) -> Double {
@@ -173,6 +191,15 @@ final class LodFarStore: @unchecked Sendable {
         let surfaceMat = s.mountain && steep ? Mat.stone.rawValue : s.top
         let vyTop = min(h - 1, max(0, (top + 64) >> L))
         for y in 0..<vyTop { v[y * n * n + col] = y + 2 >= vyTop ? s.under : Mat.stone.rawValue }
+        if s.bands {
+            // Terracotta bands down to 40 blocks under the surface (a voxel takes the band at its middle).
+            let first = max(0, vyTop - max(1, 40 >> L))
+            for y in first...vyTop {
+                let block = (y << L) + (1 << L) / 2 - 64
+                v[y * n * n + col] = lodBadlandsBands[((block % 192) + 192) % 192]
+            }
+            return
+        }
         // Under water, grass and snow give way to what's under them (lake and river beds).
         let wet = top + 1 < lodSeaLevel
         let vegetation = surfaceMat == Mat.grass.rawValue || surfaceMat == Mat.snow.rawValue
