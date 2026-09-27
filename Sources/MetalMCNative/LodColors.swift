@@ -31,12 +31,30 @@ let lodMaterialFaceColors: [SIMD4<Float>] = [
     SIMD4(0.916, 0.927, 0.929, 1), SIMD4(0.916, 0.927, 0.929, 1), SIMD4(0.916, 0.927, 0.929, 1),   // wool
     SIMD4(0.349, 0.430, 0.178, 1), SIMD4(0.349, 0.430, 0.178, 1), SIMD4(0.349, 0.430, 0.178, 1),   // moss
     SIMD4(0.726, 0.553, 0.538, 1), SIMD4(0.215, 0.129, 0.174, 1), SIMD4(0.726, 0.553, 0.538, 1),   // cherryWood
-    SIMD4(0.717, 0.718, 0.714, 1), SIMD4(0.717, 0.718, 0.714, 1), SIMD4(0.717, 0.718, 0.714, 1),   // lightStone
+    SIMD4(0.876, 0.880, 0.865, 1), SIMD4(0.876, 0.880, 0.865, 1), SIMD4(0.876, 0.880, 0.865, 1),   // lightStone
     SIMD4(0.586, 0.405, 0.337, 1), SIMD4(0.586, 0.405, 0.337, 1), SIMD4(0.586, 0.405, 0.337, 1),   // granite
     SIMD4(0.878, 0.840, 0.668, 1), SIMD4(0.849, 0.797, 0.611, 1), SIMD4(0.846, 0.792, 0.605, 1),   // sandstone
     SIMD4(0.236, 0.225, 0.238, 1), SIMD4(0.236, 0.225, 0.238, 1), SIMD4(0.236, 0.225, 0.238, 1),   // mud
     SIMD4(0.525, 0.384, 0.750, 1), SIMD4(0.525, 0.384, 0.750, 1), SIMD4(0.525, 0.384, 0.750, 1),   // amethyst
     SIMD4(0.777, 0.466, 0.096, 1), SIMD4(0.767, 0.450, 0.095, 1), SIMD4(0.777, 0.466, 0.096, 1),   // pumpkin
+    SIMD4(0.534, 0.534, 0.536, 1), SIMD4(0.534, 0.534, 0.536, 1), SIMD4(0.534, 0.534, 0.536, 1),   // andesite
+    SIMD4(0.740, 0.739, 0.741, 1), SIMD4(0.740, 0.739, 0.741, 1), SIMD4(0.740, 0.739, 0.741, 1),   // diorite
+    SIMD4(0.424, 0.428, 0.402, 1), SIMD4(0.424, 0.428, 0.402, 1), SIMD4(0.424, 0.428, 0.402, 1),   // tuff
+    SIMD4(0.527, 0.422, 0.363, 1), SIMD4(0.527, 0.422, 0.363, 1), SIMD4(0.527, 0.422, 0.363, 1),   // dripstone
+    SIMD4(0.468, 0.336, 0.233, 1), SIMD4(0.468, 0.336, 0.233, 1), SIMD4(0.468, 0.336, 0.233, 1),   // coarseDirt
+    SIMD4(0.360, 0.248, 0.094, 1), SIMD4(0.480, 0.344, 0.224, 1), SIMD4(0.526, 0.378, 0.263, 1),   // podzol
+    SIMD4(0.436, 0.387, 0.397, 1), SIMD4(0.445, 0.344, 0.282, 1), SIMD4(0.526, 0.378, 0.263, 1),   // mycelium
+    SIMD4(0.748, 0.404, 0.130, 1), SIMD4(0.748, 0.404, 0.130, 1), SIMD4(0.748, 0.404, 0.130, 1),   // redSand
+    SIMD4(0.711, 0.384, 0.123, 1), SIMD4(0.732, 0.390, 0.114, 1), SIMD4(0.728, 0.386, 0.111, 1),   // redSandstone
+    SIMD4(0.822, 0.698, 0.633, 1), SIMD4(0.822, 0.698, 0.633, 1), SIMD4(0.822, 0.698, 0.633, 1),   // whiteTerracotta
+    SIMD4(0.634, 0.329, 0.148, 1), SIMD4(0.634, 0.329, 0.148, 1), SIMD4(0.634, 0.329, 0.148, 1),   // orangeTerracotta
+    SIMD4(0.730, 0.522, 0.139, 1), SIMD4(0.730, 0.522, 0.139, 1), SIMD4(0.730, 0.522, 0.139, 1),   // yellowTerracotta
+    SIMD4(0.561, 0.239, 0.184, 1), SIMD4(0.561, 0.239, 0.184, 1), SIMD4(0.561, 0.239, 0.184, 1),   // redTerracotta
+    SIMD4(0.303, 0.201, 0.140, 1), SIMD4(0.303, 0.201, 0.140, 1), SIMD4(0.303, 0.201, 0.140, 1),   // brownTerracotta
+    SIMD4(0.530, 0.419, 0.382, 1), SIMD4(0.530, 0.419, 0.382, 1), SIMD4(0.530, 0.419, 0.382, 1),   // lightGrayTerracotta
+    SIMD4(0.555, 0.706, 0.982, 1), SIMD4(0.555, 0.706, 0.982, 1), SIMD4(0.555, 0.706, 0.982, 1),   // packedIce
+    SIMD4(0.455, 0.657, 0.992, 1), SIMD4(0.455, 0.657, 0.992, 1), SIMD4(0.455, 0.657, 0.992, 1),   // blueIce
+    SIMD4(0.059, 0.042, 0.096, 1), SIMD4(0.059, 0.042, 0.096, 1), SIMD4(0.059, 0.042, 0.096, 1),   // obsidian
 ]
 
 /// Grass block sides: the untinted dirt part's mean color, the tinted fringe's share of the texture, and the
@@ -87,5 +105,23 @@ let lodMaterialSprites: [LodSprite] = [
     LodSprite(top: "mud", side: "mud", topLuma: 0.229, sideLuma: 0.229),   // mud
     LodSprite(top: "amethyst_block", side: "amethyst_block", topLuma: 0.441, sideLuma: 0.441),   // amethyst
     LodSprite(top: "pumpkin_top", side: "pumpkin_side", topLuma: 0.505, sideLuma: 0.492),   // pumpkin
+    LodSprite(top: "andesite", side: "andesite", topLuma: 0.534, sideLuma: 0.534),   // andesite
+    LodSprite(top: "diorite", side: "diorite", topLuma: 0.739, sideLuma: 0.739),   // diorite
+    LodSprite(top: "tuff", side: "tuff", topLuma: 0.425, sideLuma: 0.425),   // tuff
+    LodSprite(top: "dripstone_block", side: "dripstone_block", topLuma: 0.440, sideLuma: 0.440),   // dripstone
+    LodSprite(top: "coarse_dirt", side: "coarse_dirt", topLuma: 0.356, sideLuma: 0.356),   // coarseDirt
+    LodSprite(top: "podzol_top", side: "podzol_side", topLuma: 0.261, sideLuma: 0.364),   // podzol
+    LodSprite(top: "mycelium_top", side: "mycelium_side", topLuma: 0.398, sideLuma: 0.361),   // mycelium
+    LodSprite(top: "red_sand", side: "red_sand", topLuma: 0.457, sideLuma: 0.457),   // redSand
+    LodSprite(top: "red_sandstone_top", side: "red_sandstone", topLuma: 0.434, sideLuma: 0.443),   // redSandstone
+    LodSprite(top: "white_terracotta", side: "white_terracotta", topLuma: 0.720, sideLuma: 0.720),   // whiteTerracotta
+    LodSprite(top: "orange_terracotta", side: "orange_terracotta", topLuma: 0.381, sideLuma: 0.381),   // orangeTerracotta
+    LodSprite(top: "yellow_terracotta", side: "yellow_terracotta", topLuma: 0.539, sideLuma: 0.539),   // yellowTerracotta
+    LodSprite(top: "red_terracotta", side: "red_terracotta", topLuma: 0.304, sideLuma: 0.304),   // redTerracotta
+    LodSprite(top: "brown_terracotta", side: "brown_terracotta", topLuma: 0.218, sideLuma: 0.218),   // brownTerracotta
+    LodSprite(top: "light_gray_terracotta", side: "light_gray_terracotta", topLuma: 0.440, sideLuma: 0.440),   // lightGrayTerracotta
+    LodSprite(top: "packed_ice", side: "packed_ice", topLuma: 0.694, sideLuma: 0.694),   // packedIce
+    LodSprite(top: "blue_ice", side: "blue_ice", topLuma: 0.639, sideLuma: 0.639),   // blueIce
+    LodSprite(top: "obsidian", side: "obsidian", topLuma: 0.049, sideLuma: 0.049),   // obsidian
     LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: 0.606, sideLuma: 0.425),   // grass side (not a material)
 ]

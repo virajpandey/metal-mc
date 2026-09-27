@@ -11,6 +11,11 @@ public enum Mat: UInt8, CaseIterable {
     case deepslate, gravel, log, planks, leaves, cherryLeaves, snow, ice, clay, terracotta, lava
     case cobblestone, bricks, path, farmland, hay, wool, moss, cherryWood, lightStone, granite, sandstone, mud
     case amethyst, pumpkin
+    // Landscape materials with their own textures: the stone varieties of mountains, the terracotta bands of
+    // badlands, taiga and mushroom-island ground, frozen peaks. The LOD keeps ids below 64.
+    case andesite, diorite, tuff, dripstone, coarseDirt, podzol, mycelium, redSand, redSandstone
+    case whiteTerracotta, orangeTerracotta, yellowTerracotta, redTerracotta, brownTerracotta, lightGrayTerracotta
+    case packedIce, blueIce, obsidian
 
     public var kind: MaterialKind {
         switch self {
@@ -54,6 +59,24 @@ public enum Mat: UInt8, CaseIterable {
         case .mud: return SIMD4(0.35, 0.30, 0.28, 1)
         case .amethyst: return SIMD4(0.60, 0.45, 0.80, 1)
         case .pumpkin: return SIMD4(0.85, 0.52, 0.12, 1)
+        case .andesite: return SIMD4(0.53, 0.53, 0.53, 1)
+        case .diorite: return SIMD4(0.74, 0.74, 0.74, 1)
+        case .tuff: return SIMD4(0.42, 0.43, 0.38, 1)
+        case .dripstone: return SIMD4(0.53, 0.42, 0.36, 1)
+        case .coarseDirt: return SIMD4(0.47, 0.33, 0.23, 1)
+        case .podzol: return SIMD4(0.36, 0.25, 0.10, 1)
+        case .mycelium: return SIMD4(0.44, 0.39, 0.42, 1)
+        case .redSand: return SIMD4(0.75, 0.40, 0.13, 1)
+        case .redSandstone: return SIMD4(0.72, 0.39, 0.13, 1)
+        case .whiteTerracotta: return SIMD4(0.82, 0.70, 0.63, 1)
+        case .orangeTerracotta: return SIMD4(0.63, 0.33, 0.14, 1)
+        case .yellowTerracotta: return SIMD4(0.73, 0.52, 0.21, 1)
+        case .redTerracotta: return SIMD4(0.56, 0.24, 0.18, 1)
+        case .brownTerracotta: return SIMD4(0.30, 0.20, 0.14, 1)
+        case .lightGrayTerracotta: return SIMD4(0.53, 0.42, 0.38, 1)
+        case .packedIce: return SIMD4(0.55, 0.71, 0.97, 1)
+        case .blueIce: return SIMD4(0.45, 0.63, 0.99, 1)
+        case .obsidian: return SIMD4(0.06, 0.04, 0.10, 1)
         }
     }
 }
@@ -107,16 +130,33 @@ public enum Materials {
         if has("dirt_path") { return .path }
         if has("farmland") { return .farmland }
         if has("mud") { return .mud }
-        if any(["dirt", "podzol", "mycelium"]) { return .dirt }
+        if has("coarse_dirt") { return .coarseDirt }
+        if has("podzol") { return .podzol }
+        if has("mycelium") { return .mycelium }
+        if has("dirt") { return .dirt }
+        if has("red_sandstone") { return .redSandstone }
         if has("sandstone") { return .sandstone }
+        if has("red_sand") { return .redSand }
         if has("sand") { return .sand }
         if has("gravel") { return .gravel }
         if has("clay") { return .clay }
-        if any(["deepslate", "tuff", "basalt", "blackstone"]) { return .deepslate }
+        if has("tuff") { return .tuff }
+        if any(["deepslate", "basalt", "blackstone"]) { return .deepslate }
         if has("granite") { return .granite }
-        if any(["diorite", "andesite", "calcite", "dripstone"]) { return .lightStone }
+        if has("diorite") { return .diorite }
+        if has("andesite") { return .andesite }
+        if has("dripstone") { return .dripstone }
+        if has("calcite") { return .lightStone }
         if any(["cobblestone", "stone_brick"]) { return .cobblestone }
+        if has("glazed") { return .terracotta }
+        if has("light_gray_terracotta") { return .lightGrayTerracotta }
+        if has("white_terracotta") { return .whiteTerracotta }
+        if has("orange_terracotta") { return .orangeTerracotta }
+        if has("yellow_terracotta") { return .yellowTerracotta }
+        if has("brown_terracotta") { return .brownTerracotta }
+        if has("red_terracotta") { return .redTerracotta }
         if has("terracotta") { return .terracotta }
+        if has("obsidian") { return .obsidian }
         if has("brick") { return .bricks }
         if any(["ore", "stone", "bedrock", "obsidian", "furnace", "smoker", "anvil", "cauldron", "grindstone"]) { return .stone }
         if has("cherry") { return .cherryWood }
@@ -124,6 +164,8 @@ public enum Materials {
         if any(["planks", "stairs", "slab", "crafting_table", "barrel", "bookshelf", "chest", "lectern",
                 "composter", "loom", "cartography", "fletching", "smithing", "beehive", "bee_nest"]) { return .planks }
         if has("snow") { return .snow }
+        if has("packed_ice") { return .packedIce }
+        if has("blue_ice") { return .blueIce }
         if has("ice") { return .ice }
         if has("lava") { return .lava }
         if has("hay") { return .hay }

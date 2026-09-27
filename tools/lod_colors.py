@@ -98,9 +98,16 @@ colors = [
     ("cobblestone", average("cobblestone")), ("bricks", average("bricks")), ("path", average("dirt_path_top")),
     ("farmland", average("farmland")), ("hay", average("hay_block_top")), ("wool", average("white_wool")),
     ("moss", average("moss_block")), ("cherryWood", average("cherry_log")),
-    ("lightStone", mix(average("diorite"), average("andesite"), average("calcite"))),
+    ("lightStone", average("calcite")),
     ("granite", average("granite")), ("sandstone", average("sandstone_top")), ("mud", average("mud")),
     ("amethyst", average("amethyst_block")), ("pumpkin", average("pumpkin_side")),
+    ("andesite", average("andesite")), ("diorite", average("diorite")), ("tuff", average("tuff")),
+    ("dripstone", average("dripstone_block")), ("coarseDirt", average("coarse_dirt")), ("podzol", average("podzol_top")),
+    ("mycelium", average("mycelium_top")), ("redSand", average("red_sand")), ("redSandstone", average("red_sandstone_top")),
+    ("whiteTerracotta", average("white_terracotta")), ("orangeTerracotta", average("orange_terracotta")),
+    ("yellowTerracotta", average("yellow_terracotta")), ("redTerracotta", average("red_terracotta")),
+    ("brownTerracotta", average("brown_terracotta")), ("lightGrayTerracotta", average("light_gray_terracotta")),
+    ("packedIce", average("packed_ice")), ("blueIce", average("blue_ice")), ("obsidian", average("obsidian")),
 ]
 def luma(name):
     """Mean Rec. 709 luma of the texture's opaque texels (untinted, gamma space like the atlas)."""
@@ -122,6 +129,14 @@ sprites = [
     ("moss", "moss_block", "moss_block"), ("cherryWood", "cherry_log_top", "cherry_log"),
     ("lightStone", "calcite", "calcite"), ("granite", "granite", "granite"), ("sandstone", "sandstone_top", "sandstone"),
     ("mud", "mud", "mud"), ("amethyst", "amethyst_block", "amethyst_block"), ("pumpkin", "pumpkin_top", "pumpkin_side"),
+    ("andesite", "andesite", "andesite"), ("diorite", "diorite", "diorite"), ("tuff", "tuff", "tuff"),
+    ("dripstone", "dripstone_block", "dripstone_block"), ("coarseDirt", "coarse_dirt", "coarse_dirt"),
+    ("podzol", "podzol_top", "podzol_side"), ("mycelium", "mycelium_top", "mycelium_side"), ("redSand", "red_sand", "red_sand"),
+    ("redSandstone", "red_sandstone_top", "red_sandstone"), ("whiteTerracotta", "white_terracotta", "white_terracotta"),
+    ("orangeTerracotta", "orange_terracotta", "orange_terracotta"), ("yellowTerracotta", "yellow_terracotta", "yellow_terracotta"),
+    ("redTerracotta", "red_terracotta", "red_terracotta"), ("brownTerracotta", "brown_terracotta", "brown_terracotta"),
+    ("lightGrayTerracotta", "light_gray_terracotta", "light_gray_terracotta"), ("packedIce", "packed_ice", "packed_ice"),
+    ("blueIce", "blue_ice", "blue_ice"), ("obsidian", "obsidian", "obsidian"),
 ]
 assert [n for n, _, _ in sprites] == [n for n, _ in colors]
 sprite_lines = []
@@ -164,6 +179,9 @@ faces = {
     "cherryWood": (average("cherry_log_top"), average("cherry_log"), average("cherry_log_top")),
     "sandstone": (average("sandstone_top"), average("sandstone"), average("sandstone_bottom")),
     "pumpkin": (average("pumpkin_top"), average("pumpkin_side"), average("pumpkin_top")),
+    "podzol": (average("podzol_top"), average("podzol_side"), average("dirt")),
+    "mycelium": (average("mycelium_top"), average("mycelium_side"), average("dirt")),
+    "redSandstone": (average("red_sandstone_top"), average("red_sandstone"), average("red_sandstone_bottom")),
 }
 
 lines = []
