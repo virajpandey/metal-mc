@@ -53,6 +53,7 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     case "old_growth_pine_taiga", "old_growth_spruce_taiga": s.canopy = 11
     case "jungle", "bamboo_jungle": s.canopy = 13
     case "cherry_grove": s.canopy = 5; s.leaves = Mat.cherryLeaves.rawValue
+    case "dappled_forest": s.canopy = 8; s.leaves = Mat.orangePoplarLeaves.rawValue   // poplars: yellow, orange and red
     case "mangrove_swamp": s.canopy = 6; s.top = Mat.mud.rawValue; s.under = Mat.mud.rawValue
     case "snowy_taiga", "grove": s.canopy = 7; s.top = snow
     case "snowy_plains", "ice_spikes": s.top = snow; s.frozen = true

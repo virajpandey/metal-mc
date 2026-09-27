@@ -152,6 +152,28 @@ public final class MetalLod {
         return true;
     }
 
+    /** The representative biome of LOD tint class {@code index}, or null past the last. */
+    public static String tintBiome(int index) {
+        if (!available()) return null;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            ByteBuffer out = stack.malloc(128);
+            int n = Mtl.lodTintBiome(index, MemoryUtil.memAddress(out), 128);
+            return n < 0 ? null : MemoryUtil.memUTF8(out, n);
+        }
+    }
+
+    /** Grass, foliage and water colors (0xRRGGBB, or -1 to keep the built-in ones) per LOD tint class. Render thread. */
+    public static void setTints(int[] colors) {
+        if (!available()) return;
+        long addr = MemoryUtil.nmemAlloc(4L * colors.length);
+        try {
+            for (int i = 0; i < colors.length; i++) MemoryUtil.memPutInt(addr + 4L * i, colors[i]);
+            Mtl.lodSetTints(addr, colors.length / 3);
+        } finally {
+            MemoryUtil.nmemFree(addr);
+        }
+    }
+
     /** Vanilla's level lightmap, so LOD terrain is lit like vanilla's (day, night, night vision). Render thread. */
     public static void setLightmap(com.mojang.renderpearl.api.textures.GpuTextureView view) {
         if (!available()) return;

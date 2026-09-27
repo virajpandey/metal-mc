@@ -12,13 +12,14 @@ struct LodTint {
 }
 
 /// Vanilla's biome grass/foliage/water colors (Java edition), grouped into tint classes. Index 0 is the default (plains).
+/// As 26.3 reports them (mmc_lod_set_tints replaces them at runtime anyway).
 let lodTints: [LodTint] = [
     LodTint(grass: 0x91BD59, foliage: 0x77AB2F, water: 0x3F76E4),   // 0 plains and default
     LodTint(grass: 0x79C05A, foliage: 0x59AE30, water: 0x3F76E4),   // 1 forest
-    LodTint(grass: 0x88BB67, foliage: 0x6BA941, water: 0x3F76E4),   // 2 birch forest
+    LodTint(grass: 0x88BB66, foliage: 0x6BA940, water: 0x3F76E4),   // 2 birch forest
     LodTint(grass: 0x507A32, foliage: 0x59AE30, water: 0x3F76E4),   // 3 dark forest
     LodTint(grass: 0x86B783, foliage: 0x68A464, water: 0x3F76E4),   // 4 taiga
-    LodTint(grass: 0x80B497, foliage: 0x60A17B, water: 0x3D57D6),   // 5 snowy
+    LodTint(grass: 0x80B497, foliage: 0x60A17B, water: 0x3F76E4),   // 5 snowy
     LodTint(grass: 0xBFB755, foliage: 0xAEA42A, water: 0x3F76E4),   // 6 savanna, desert
     LodTint(grass: 0x90814D, foliage: 0x9E814D, water: 0x3F76E4),   // 7 badlands
     LodTint(grass: 0x6A7039, foliage: 0x6A7039, water: 0x617B64),   // 8 swamp
@@ -28,12 +29,20 @@ let lodTints: [LodTint] = [
     LodTint(grass: 0xB6DB61, foliage: 0xB6DB61, water: 0x5DB7EF),   // 12 cherry grove
     LodTint(grass: 0x8AB689, foliage: 0x6DA36B, water: 0x3F76E4),   // 13 windswept hills, stony peaks
     LodTint(grass: 0x55C93F, foliage: 0x2BBB0F, water: 0x3F76E4),   // 14 mushroom fields
-    LodTint(grass: 0x91BD59, foliage: 0x77AB2F, water: 0x43D5EE),   // 15 warm ocean
-    LodTint(grass: 0x91BD59, foliage: 0x77AB2F, water: 0x45ADF2),   // 16 lukewarm ocean
-    LodTint(grass: 0x91BD59, foliage: 0x77AB2F, water: 0x3D57D6),   // 17 cold ocean
+    LodTint(grass: 0x8EB971, foliage: 0x71A74D, water: 0x43D5EE),   // 15 warm ocean
+    LodTint(grass: 0x8EB971, foliage: 0x71A74D, water: 0x45ADF2),   // 16 lukewarm ocean
+    LodTint(grass: 0x8EB971, foliage: 0x71A74D, water: 0x3D57D6),   // 17 cold ocean
     LodTint(grass: 0x80B497, foliage: 0x60A17B, water: 0x3938C9),   // 18 frozen ocean and river
     LodTint(grass: 0x778272, foliage: 0x878D76, water: 0x76889D),   // 19 pale garden
+    LodTint(grass: 0xDF6827, foliage: 0xE68E30, water: 0x375154),   // 20 dappled forest (26.3, autumn colors)
+    LodTint(grass: 0x80B497, foliage: 0x60A17B, water: 0x3D57D6),   // 21 snowy taiga and beach (cold water)
 ]
+
+/// A biome of each tint class, whose colors the game reports at runtime (mmc_lod_set_tints): that follows resource
+/// packs' color maps and any change in vanilla's biome colors.
+let lodTintBiomes = ["plains", "forest", "birch_forest", "dark_forest", "taiga", "snowy_plains", "savanna", "badlands", "swamp",
+                     "mangrove_swamp", "jungle", "meadow", "cherry_grove", "windswept_hills", "mushroom_fields", "warm_ocean",
+                     "lukewarm_ocean", "cold_ocean", "frozen_ocean", "pale_garden", "dappled_forest", "snowy_taiga"].map { "minecraft:" + $0 }
 
 private let lodBiomeTable: [String: UInt8] = {
     var t: [String: UInt8] = [:]
@@ -42,7 +51,7 @@ private let lodBiomeTable: [String: UInt8] = {
     set(2, ["birch_forest", "old_growth_birch_forest"])
     set(3, ["dark_forest"])
     set(4, ["taiga", "old_growth_pine_taiga", "old_growth_spruce_taiga"])
-    set(5, ["snowy_plains", "snowy_taiga", "ice_spikes", "grove", "snowy_slopes", "frozen_peaks", "jagged_peaks", "snowy_beach"])
+    set(5, ["snowy_plains", "ice_spikes", "grove", "snowy_slopes", "frozen_peaks", "jagged_peaks"])
     set(6, ["savanna", "savanna_plateau", "windswept_savanna", "desert"])
     set(7, ["badlands", "eroded_badlands", "wooded_badlands"])
     set(8, ["swamp"])
@@ -57,6 +66,8 @@ private let lodBiomeTable: [String: UInt8] = {
     set(17, ["cold_ocean", "deep_cold_ocean"])
     set(18, ["frozen_ocean", "deep_frozen_ocean", "frozen_river"])
     set(19, ["pale_garden"])
+    set(20, ["dappled_forest"])
+    set(21, ["snowy_taiga", "snowy_beach"])
     return t
 }()
 
@@ -102,14 +113,14 @@ let lodEmission: [UInt8] = {
 }
 
 /// LOD colors, three per material id (top, side, bottom): material * 3 + face class.
-func lodColorTable() -> [SIMD4<Float>] {
+func lodColorTable(tints: [LodTint] = lodTints) -> [SIMD4<Float>] {
     var c = [SIMD4<Float>](repeating: SIMD4(0.492, 0.492, 0.492, 1), count: 256 * 3)
     for (i, color) in lodMaterialFaceColors.enumerated() { c[i] = color }
     func rgb(_ v: UInt32, _ gray: Float) -> SIMD4<Float> {
         SIMD4(Float((v >> 16) & 255) / 255 * gray, Float((v >> 8) & 255) / 255 * gray, Float(v & 255) / 255 * gray, 1)
     }
     let dirt = c[Int(Mat.dirt.rawValue) * 3]
-    for (t, tint) in lodTints.enumerated() {
+    for (t, tint) in tints.enumerated() {
         let g = Int(lodGrassBase) + t, l = Int(lodLeavesBase) + t, w = Int(lodWaterBase) + t
         // Grass: tinted top; sides are dirt with the tinted fringe; bottom is dirt.
         let fringe = SIMD3(Float((tint.grass >> 16) & 255), Float((tint.grass >> 8) & 255), Float(tint.grass & 255)) / 255

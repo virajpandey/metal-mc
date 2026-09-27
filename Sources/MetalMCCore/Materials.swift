@@ -22,6 +22,11 @@ public enum Mat: UInt8, CaseIterable {
     // glow lichen) are invisible from LOD distances but light what's around them, by their light level.
     case glowstone, seaLantern, shroomlight, jackOLantern, froglight
     case light15, light14, light10, light7
+    // 26.3's poplars (dappled forests): leaves with their own colors, not tinted by the biome. Past the LOD's
+    // biome-tinted ids (64-159).
+    case yellowPoplarLeaves = 160, redPoplarLeaves, orangePoplarLeaves
+    // Huge mushrooms (dark forests, mushroom fields) and ocean monuments.
+    case redMushroomBlock, brownMushroomBlock, mushroomStem, prismarine, darkPrismarine
 
     public var kind: MaterialKind {
         switch self {
@@ -92,13 +97,30 @@ public enum Mat: UInt8, CaseIterable {
         case .jackOLantern: return SIMD4(0.84, 0.60, 0.19, 1)
         case .froglight: return SIMD4(0.93, 0.89, 0.72, 1)
         case .light15, .light14, .light10, .light7: return SIMD4(0, 0, 0, 0)
+        case .yellowPoplarLeaves: return SIMD4(0.84, 0.52, 0.16, 1)
+        case .redPoplarLeaves: return SIMD4(0.60, 0.17, 0.15, 1)
+        case .orangePoplarLeaves: return SIMD4(0.74, 0.34, 0.09, 1)
+        case .redMushroomBlock: return SIMD4(0.78, 0.18, 0.17, 1)
+        case .brownMushroomBlock: return SIMD4(0.58, 0.44, 0.33, 1)
+        case .mushroomStem: return SIMD4(0.80, 0.77, 0.70, 1)
+        case .prismarine: return SIMD4(0.39, 0.63, 0.58, 1)
+        case .darkPrismarine: return SIMD4(0.20, 0.36, 0.30, 1)
         }
     }
 }
 
 public enum Materials {
-    public static let kinds: [MaterialKind] = Mat.allCases.map(\.kind)
-    public static let colors: [SIMD4<Float>] = Mat.allCases.map(\.color)
+    /// Indexed by raw value (256 entries: material ids aren't contiguous; ids from 160 on follow the LOD's tinted ids).
+    public static let kinds: [MaterialKind] = {
+        var k = [MaterialKind](repeating: .opaque, count: 256)
+        for m in Mat.allCases { k[Int(m.rawValue)] = m.kind }
+        return k
+    }()
+    public static let colors: [SIMD4<Float>] = {
+        var c = [SIMD4<Float>](repeating: SIMD4(0.5, 0.5, 0.5, 1), count: 256)
+        for m in Mat.allCases { c[Int(m.rawValue)] = m.color }
+        return c
+    }()
 
     /// Thin or decorative blocks (plants, torches, rails, glass, fences, ...) are skipped for now.
     private static let decorative = [
@@ -110,7 +132,7 @@ public enum Materials {
         "sunflower", "pitcher", "roots", "lichen", "sculk_vein", "pointed_dripstone", "amethyst_cluster",
         "_bud", "coral", "sea_pickle", "twisting", "weeping", "frogspawn", "redstone_wire", "hopper",
         "cactus", "bamboo", "cocoa", "melon_stem", "pumpkin_stem", "nether_wart", "sweet_berry",
-        "brewing_stand", "end_rod",
+        "brewing_stand", "end_rod", "shrub", "eyeblossom", "shelf_mushroom",
     ]
 
     public static func classify(_ fullName: String) -> Mat {
@@ -146,7 +168,17 @@ public enum Materials {
         if has("purpur") { return .purpur }
         if has("chorus") { return .chorus }
         if n == "end_portal" || n == "end_gateway" || n == "dragon_egg" { return .obsidian }
+        if has("yellow_poplar_leaves") { return .yellowPoplarLeaves }
+        if has("red_poplar_leaves") { return .redPoplarLeaves }
+        if has("orange_poplar_leaves") { return .orangePoplarLeaves }
         if has("cherry_leaves") { return .cherryLeaves }
+        if n == "red_mushroom_block" { return .redMushroomBlock }
+        if n == "brown_mushroom_block" { return .brownMushroomBlock }
+        if n == "mushroom_stem" { return .mushroomStem }
+        if has("dark_prismarine") { return .darkPrismarine }
+        if has("prismarine") { return .prismarine }
+        if n == "creaking_heart" { return .log }
+        if has("quartz") { return .lightStone }
         if has("leaves") { return .leaves }
         if has("grass_block") { return .grass }
         if any(decorative) { return .air }

@@ -19,12 +19,19 @@ public final class LodTextures {
     }
 
     private static GpuTextureView sent;
+    private static Object sentLevel;
 
     public static void ensure() {
         AbstractTexture tex = Minecraft.getInstance().getTextureManager().getTexture(TextureAtlas.LOCATION_BLOCKS);
         if (!(tex instanceof TextureAtlas atlas)) return;
         GpuTextureView view = atlas.getTextureView();
+        Object level = Minecraft.getInstance().level;
+        if (level != sentLevel && level != null) {
+            sendTints();
+            sentLevel = level;
+        }
         if (view == null || view == sent) return;
+        sendTints();   // a resource reload can change the biome color maps too
         List<float[]> rows = new ArrayList<>();
         List<float[]> meanRows = new ArrayList<>();
         for (int i = 0; ; i++) {
@@ -45,6 +52,28 @@ public final class LodTextures {
             System.arraycopy(meanRows.get(i), 0, means, 6 * i, 6);
         }
         if (MetalLod.setAtlas(view, rects, means, rows.size())) sent = view;
+    }
+
+    /** Each LOD tint class's biome colors as the game computes them (color maps from the loaded resource packs). */
+    private static void sendTints() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null) return;
+        var biomes = mc.level.registryAccess().lookupOrThrow(net.minecraft.core.registries.Registries.BIOME);
+        List<Integer> out = new ArrayList<>();
+        for (int i = 0; ; i++) {
+            String name = MetalLod.tintBiome(i);
+            if (name == null) break;
+            var b = biomes.get(net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.BIOME, Identifier.parse(name)));
+            if (b.isEmpty()) {
+                out.add(-1); out.add(-1); out.add(-1);
+                continue;
+            }
+            net.minecraft.world.level.biome.Biome biome = b.get().value();
+            out.add(biome.getGrassColor(0, 0));
+            out.add(biome.getFoliageColor());
+            out.add(biome.getWaterColor());
+        }
+        MetalLod.setTints(out.stream().mapToInt(Integer::intValue).toArray());
     }
 
     /**

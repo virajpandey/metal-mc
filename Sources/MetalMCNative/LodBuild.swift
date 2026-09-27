@@ -58,7 +58,10 @@ let lodDownsampleRule: LodDownsampleRule = experiments.contains("ds_last") ? .la
 /// Tree materials (logs and every leaf tint), which ds_hybrid keeps even when they fill less than half a group.
 let lodTreeMaterial: [Bool] = {
     var t = [Bool](repeating: false, count: 256)
-    for m in [Mat.log, Mat.leaves, Mat.cherryLeaves, Mat.cherryWood] { t[Int(m.rawValue)] = true }
+    for m in [Mat.log, Mat.leaves, Mat.cherryLeaves, Mat.cherryWood, .yellowPoplarLeaves, .redPoplarLeaves, .orangePoplarLeaves,
+              .redMushroomBlock, .brownMushroomBlock, .mushroomStem] {
+        t[Int(m.rawValue)] = true
+    }
     for i in 0..<32 { t[Int(lodLeavesBase) + i] = true }
     return t
 }()
@@ -968,4 +971,15 @@ public func mmc_debug_region_emitters(_ path: UnsafePointer<CChar>, _ regionX: I
         }
     }
     return Int32(count)
+}
+
+/// Debug: level-0 quads per material id in one region file (its four quarters meshed as the LOD does): out[256].
+@_cdecl("mmc_debug_region_quad_materials")
+public func mmc_debug_region_quad_materials(_ path: UnsafePointer<CChar>, _ out: UnsafeMutablePointer<Int64>) {
+    for q in 0..<4 {
+        guard var g = LodBuild.regionQuarterGrid(path: String(cString: path), qx: q & 1, qz: q >> 1) else { continue }
+        g.fillUnreachable(deepRadius: 16, deepDepth: 8)
+        let m = LodBuild.mesh(g, maxMerge: 64)
+        for i in 0..<(m.quads.count / 2) { out[Int(m.quads[2 * i + 1] & 255)] += 1 }
+    }
 }

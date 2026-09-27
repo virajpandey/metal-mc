@@ -85,7 +85,7 @@ extension Anvil {
         print("LOAD unknown_blocks=\(topUnknown.isEmpty ? "none" : topUnknown)")
         print("LOAD unparsed_palette_entries=\(unparsed)\(unparsed > 0 ? " sample=\(unparsedSample)" : "")")
 
-        var histogram = [Int](repeating: 0, count: Mat.allCases.count)
+        var histogram = [Int](repeating: 0, count: 256)
         world.storage.withUnsafeBufferPointer { s in
             for b in s where Int(b) < histogram.count { histogram[Int(b)] += 1 }
         }

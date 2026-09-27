@@ -112,6 +112,12 @@ colors = [
     ("glowstone", average("glowstone")), ("seaLantern", average("sea_lantern")), ("shroomlight", average("shroomlight")),
     ("jackOLantern", average("jack_o_lantern")), ("froglight", average("ochre_froglight_side")),
     ("light15", None), ("light14", None), ("light10", None), ("light7", None),
+] + [(f"(id {i})", None) for i in range(62, 160)] + [
+    ("yellowPoplarLeaves", average("yellow_poplar_leaves")), ("redPoplarLeaves", average("red_poplar_leaves")),
+    ("orangePoplarLeaves", average("orange_poplar_leaves")),
+    ("redMushroomBlock", average("red_mushroom_block")), ("brownMushroomBlock", average("brown_mushroom_block")),
+    ("mushroomStem", average("mushroom_stem")), ("prismarine", average("prismarine")),
+    ("darkPrismarine", average("dark_prismarine")),
 ]
 def luma(name):
     """Mean Rec. 709 luma of the texture's opaque texels (untinted, gamma space like the atlas)."""
@@ -145,8 +151,34 @@ sprites = [
     ("glowstone", "glowstone", "glowstone"), ("seaLantern", "sea_lantern", "sea_lantern"), ("shroomlight", "shroomlight", "shroomlight"),
     ("jackOLantern", "pumpkin_top", "jack_o_lantern"), ("froglight", "ochre_froglight_top", "ochre_froglight_side"),
     ("light15", None, None), ("light14", None, None), ("light10", None, None), ("light7", None, None),
+] + [(f"(id {i})", None, None) for i in range(62, 160)] + [
+    ("yellowPoplarLeaves", "yellow_poplar_leaves", "yellow_poplar_leaves"), ("redPoplarLeaves", "red_poplar_leaves", "red_poplar_leaves"),
+    ("orangePoplarLeaves", "orange_poplar_leaves", "orange_poplar_leaves"),
+    ("redMushroomBlock", "red_mushroom_block", "red_mushroom_block"), ("brownMushroomBlock", "brown_mushroom_block", "brown_mushroom_block"),
+    ("mushroomStem", "mushroom_stem", "mushroom_stem"), ("prismarine", "prismarine", "prismarine"),
+    ("darkPrismarine", "dark_prismarine", "dark_prismarine"),
 ]
 assert [n for n, _, _ in sprites] == [n for n, _ in colors]
+
+# The tables are indexed by material id: check every row against MetalMCCore's Mat enum (ids aren't contiguous).
+def mat_ids():
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../Sources/MetalMCCore/Materials.swift")).read()
+    body = src.split("public enum Mat: UInt8, CaseIterable {")[1].split("\n\n")[0]
+    ids, next_id = {}, 0
+    for line in body.splitlines():
+        line = line.split("//")[0].strip()
+        if not line.startswith("case "):
+            continue
+        for item in line[5:].split(","):
+            name, _, raw = item.strip().partition("=")
+            if raw.strip():
+                next_id = int(raw)
+            ids[name.strip()] = next_id
+            next_id += 1
+    return ids
+for i, (n, _) in enumerate(colors):
+    if not n.startswith("("):
+        assert mat_ids().get(n) == i, f"{n} is row {i} but Mat.{n} is {mat_ids().get(n)}"
 def v3(c):
     return f"SIMD3({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f})"
 

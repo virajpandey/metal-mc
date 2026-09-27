@@ -578,7 +578,8 @@ final class LodWorld: @unchecked Sendable {
     // MARK: - Region cache
 
     /// Bump when what a quadrant holds changes (materials, downsampling), so older cache files are rebuilt.
-    static let cacheVersion: UInt8 = 1
+    /// 2: 26.3's poplar leaves got their own materials. 3: huge mushrooms, prismarine.
+    static let cacheVersion: UInt8 = 3
 
     private func cacheURL(_ x: Int, _ z: Int) -> URL? { cacheDir?.appendingPathComponent("r.\(x).\(z).lq") }
 

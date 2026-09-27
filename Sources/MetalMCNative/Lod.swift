@@ -173,7 +173,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     float3 c = kCorners[face][corner];
     o.quv = (face < 2 ? c.yz : (face < 4 ? c.xz : c.xy)) * float2(w, h);
     // Biome-tinted variants (64 + t grass, 96 + t leaves, 128 + t water) use their base material's texture.
-    uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
+    uint baseMat = (m >= 128u && m < 160u) ? MAT_WATER : ((m >= 96u && m < 128u) ? MAT_LEAVES : ((m >= 64u && m < 96u) ? MAT_GRASS : m));
     o.matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17) | (grassSide ? 1u << 23 : 0u) | (xs.w < 1.5 ? 1u << 24 : 0u) | (deep ? 1u << 25 : 0u);
     o.ao = aoOffsets[vid >> 2];
     return o;
@@ -219,7 +219,7 @@ using LodMeshOut = metal::mesh<VOut, LodPrim, 4 * MESH_QUADS, 2 * MESH_QUADS, me
     uint color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
     uint color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0))
                 : (deep ? pack_float_to_unorm4x8(float4(float3(0.56, 0.53, 0.45) * lodLight(u, lightmap, lightSampler, 2.0, 13), 0.0)) : 0u);
-    uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
+    uint baseMat = (m >= 128u && m < 160u) ? MAT_WATER : ((m >= 96u && m < 128u) ? MAT_LEAVES : ((m >= 64u && m < 96u) ? MAT_GRASS : m));
     uint matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17) | (grassSide ? 1u << 23 : 0u)
                  | (xs.w < 1.5 ? 1u << 24 : 0u) | (deep ? 1u << 25 : 0u);
     uint ao = aoOffsets[qi];
@@ -686,10 +686,12 @@ final class LodRenderer: @unchecked Sendable {
     /// Material colors from the texture averages in LodColors.swift, indexed by material id.
     /// Per color-table entry scale for the loaded resource pack's textures (all 1 with vanilla's; mmc_lod_set_atlas).
     var packRatio = [SIMD3<Float>](repeating: SIMD3(1, 1, 1), count: 256 * 3)
+    /// Biome tints as the game computes them (mmc_lod_set_tints); the built-in table until then.
+    var tints = lodTints
 
     func ensureColors() {
         if colorBuffer != nil { return }
-        var c = lodColorTable()
+        var c = lodColorTable(tints: tints)
         for i in 0..<c.count { c[i] = SIMD4(c[i].x * packRatio[i].x, c[i].y * packRatio[i].y, c[i].z * packRatio[i].z, c[i].w) }
         colorBuffer = ctx.device.makeBuffer(bytes: c, length: c.count * 16, options: [.storageModeShared])
     }
@@ -1307,7 +1309,7 @@ public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ me
     // Color table scale: a material's top faces by its top texture, sides by its side texture, bottoms by the top;
     // biome-tinted grass, leaves and water by their base textures.
     var pack = [SIMD3<Float>](repeating: SIMD3(1, 1, 1), count: 256 * 3)
-    for m in 0..<min(n, 64) {
+    for m in 0..<min(n, 256) where m < 64 || m >= 160 {   // 64-159 are the tinted ids, set below
         pack[3 * m] = ratio[2 * m]; pack[3 * m + 1] = ratio[2 * m + 1]; pack[3 * m + 2] = ratio[2 * m]
     }
     func row(_ m: Mat, side: Bool = false) -> SIMD3<Float> { Int(m.rawValue) < n ? ratio[2 * Int(m.rawValue) + (side ? 1 : 0)] : SIMD3(1, 1, 1) }
@@ -1326,6 +1328,39 @@ public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ me
     r.spriteBuffer = ctx.device.makeBuffer(bytes: table, length: table.count * 16, options: [.storageModeShared])
     r.atlas = view == 0 ? nil : (from(view) as TextureBox).texture
     if let a = r.atlas { log("LOD: texture detail from the block atlas \(a.width)x\(a.height), \(a.mipmapLevelCount) mips, \(n) materials") }
+}
+
+/// Tint class `index`'s representative biome (e.g. minecraft:forest) into `out` (UTF-8, NUL-terminated); returns its
+/// length, or -1 past the last class.
+@_cdecl("mmc_lod_tint_biome")
+public func mmc_lod_tint_biome(_ index: Int32, _ out: UnsafeMutablePointer<CChar>, _ capacity: Int32) -> Int32 {
+    guard index >= 0, Int(index) < lodTintBiomes.count else { return -1 }
+    let bytes = Array(lodTintBiomes[Int(index)].utf8)
+    guard bytes.count < Int(capacity) else { return -1 }
+    for (i, b) in bytes.enumerated() { out[i] = CChar(bitPattern: b) }
+    out[bytes.count] = 0
+    return Int32(bytes.count)
+}
+
+/// Grass, foliage and water colors (0xRRGGBB) of each tint class's biome, as the game computes them (resource packs'
+/// color maps included). Render thread.
+@_cdecl("mmc_lod_set_tints")
+public func mmc_lod_set_tints(_ colors: UnsafePointer<UInt32>, _ count: Int32) {
+    let r = LodRenderer.shared
+    var t = lodTints
+    var changed = 0
+    for i in 0..<min(Int(count), t.count) where colors[3 * i] != UInt32.max {   // max: biome missing, keep the table's
+        let n = LodTint(grass: colors[3 * i] & 0xFFFFFF, foliage: colors[3 * i + 1] & 0xFFFFFF, water: colors[3 * i + 2] & 0xFFFFFF)
+        if n.grass != t[i].grass || n.foliage != t[i].foliage || n.water != t[i].water {
+            changed += 1
+            log(String(format: "LOD: tint %@: grass %06X -> %06X, foliage %06X -> %06X, water %06X -> %06X", lodTintBiomes[i],
+                       t[i].grass, n.grass, t[i].foliage, n.foliage, t[i].water, n.water))
+        }
+        t[i] = n
+    }
+    r.tints = t
+    r.colorBuffer = nil
+    if changed > 0 { log("LOD: biome colors from the game: \(changed) of \(t.count) tint classes differ from the built-in table") }
 }
 
 /// Vanilla's lightmap (a texture view handle; 0 for none), for lighting LOD terrain like vanilla's. Render thread.
