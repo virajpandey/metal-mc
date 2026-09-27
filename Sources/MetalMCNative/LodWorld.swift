@@ -126,6 +126,7 @@ final class LodWorld: @unchecked Sendable {
 
     private let lock = NSLock()
     private var meshes: [LodNodeKey: LodMeshNode] = [:]
+    let far = LodFarStore()   // generated columns where no chunk exists (LodFar.swift)
     private(set) var generation = 0
 
     // Update-thread state.
@@ -258,17 +259,24 @@ final class LodWorld: @unchecked Sendable {
             changed = keep
         }
         let moved = meshedCenter.map { abs($0.x - want.x) > 128 || abs($0.z - want.z) > 128 } ?? true
-        if changed.isEmpty && !moved { return false }
+        far.lock.lock(); var farKeys = far.dirty; far.dirty.removeAll(); far.lock.unlock()
+        if changed.isEmpty && !moved && farKeys.isEmpty { return false }
         center = want
 
         // 1. Changed regions: level-1 grid -> cached level-2 quadrant, and a level-1 mesh if near the player.
         var changedKeys = Set<Int64>()
         let results = rebuildRegions(changed, meshFine: true)
-        for (k, quadrant, node) in results {
-            changedKeys.insert(k)
-            quadrants[k] = quadrant
-            let (x, z) = LodBuild.unkey(k)
-            install(LodNodeKey(level: 1, x: x, z: z), node)
+        far.lock.lock()
+        for r in results {
+            if r.hasData { far.realRegions.insert(r.key) } else { far.realRegions.remove(r.key) }
+            if r.full { far.fullRegions.insert(r.key) } else { far.fullRegions.remove(r.key) }
+        }
+        far.lock.unlock()
+        for r in results {
+            changedKeys.insert(r.key)
+            quadrants[r.key] = r.quadrant
+            let (x, z) = LodBuild.unkey(r.key)
+            install(LodNodeKey(level: 1, x: x, z: z), r.node)
         }
 
         // 2. The player moved: mesh level-1 nodes that came into range (from disk), drop the ones that left.
@@ -283,9 +291,9 @@ final class LodWorld: @unchecked Sendable {
                     if withinFine(regionX: x, regionZ: z, cx: center.x, cz: center.z) { need.append((x, z)) }
                 }
             }
-            for (k, _, node) in rebuildRegions(need, meshFine: true) {
-                let (x, z) = LodBuild.unkey(k)
-                install(LodNodeKey(level: 1, x: x, z: z), node)
+            for r in rebuildRegions(need, meshFine: true) {
+                let (x, z) = LodBuild.unkey(r.key)
+                install(LodNodeKey(level: 1, x: x, z: z), r.node)
             }
             dropLevel1(outside: center.x, center.z)
             meshedCenter = center
@@ -304,6 +312,7 @@ final class LodWorld: @unchecked Sendable {
                 let outp = out.baseAddress!
                 DispatchQueue.concurrentPerform(iterations: parents.count) { i in
                     var g = self.grid(level: parents[i].level, x: parents[i].x, z: parents[i].z)
+                    if parents[i].level >= lodFarMinLevel { _ = self.far.fill(&g, key: parents[i]) }
                     g.fillUnreachable()
                     let m = LodBuild.mesh(g, maxMerge: 64)
                     let size = lodNodeVoxels << parents[i].level
@@ -311,8 +320,33 @@ final class LodWorld: @unchecked Sendable {
                 }
             }
             for (i, p) in parents.enumerated() { install(p, built[i]) }
+            farKeys.subtract(parents)
             dirty = Set(parents)
             level += 1
+        }
+
+        // 4. Nodes whose generated columns arrived (and weren't just rebuilt above).
+        if !farKeys.isEmpty {
+            let keys = Array(farKeys)
+            var built = [LodNode?](repeating: nil, count: keys.count)
+            built.withUnsafeMutableBufferPointer { out in
+                let outp = out.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: keys.count) { i in
+                    let k = keys[i]
+                    let real = self.hasRealData(level: k.level, x: k.x, z: k.z)
+                    var g = real ? self.grid(level: k.level, x: k.x, z: k.z) : LodGrid(level: k.level)
+                    let filled = self.far.fill(&g, key: k)
+                    if lodFarDebug {
+                        self.far.lock.lock(); let hs = self.far.columns[k]?.height ?? []; self.far.lock.unlock()
+                        log("LOD: far node \(k.level) \(k.x) \(k.z): real \(real), filled \(filled) columns, heights \(hs.min() ?? 0)...\(hs.max() ?? 0)")
+                    }
+                    g.fillUnreachable()
+                    let m = LodBuild.mesh(g, maxMerge: 64)
+                    let size = lodNodeVoxels << k.level
+                    outp[i] = LodNode(level: k.level, x0: k.x * size, z0: k.z * size, mesh: m)
+                }
+            }
+            for (i, k) in keys.enumerated() { install(k, built[i]) }
         }
         live.saveUnsaved()
         lock.lock()
@@ -320,7 +354,7 @@ final class LodWorld: @unchecked Sendable {
         let quads = meshes.values.reduce(0) { $0 + $1.quadCount }
         lock.unlock()
         let cacheMB = quadrants.values.reduce(0) { $0 + $1.bytes } / 1_000_000
-        status = "\(changed.count) changed regions, moved \(moved): \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB, \(live.chunkCount) live chunks"
+        status = "\(changed.count) changed regions, moved \(moved), \(farKeys.count) generated: \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB, \(live.chunkCount) live chunks"
         return true
     }
 
@@ -375,10 +409,18 @@ final class LodWorld: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Reads regions in parallel (region file, then live chunks on top): returns (key, level-2 quadrant,
-    /// level-1 node if within the fine radius).
-    private func rebuildRegions(_ list: [(Int, Int)], meshFine: Bool) -> [(Int64, LodQuadrant, LodNode?)] {
-        var out = [(Int64, LodQuadrant, LodNode?)?](repeating: nil, count: list.count)
+    struct RegionResult {
+        var key: Int64
+        var quadrant: LodQuadrant
+        var node: LodNode?
+        var hasData: Bool   // any real chunk
+        var full: Bool      // every column has data
+    }
+
+    /// Reads regions in parallel (region file, then live chunks on top): returns each region's level-2
+    /// quadrant, level-1 node if within the fine radius, and whether it has real chunks (all or any).
+    private func rebuildRegions(_ list: [(Int, Int)], meshFine: Bool) -> [RegionResult] {
+        var out = [RegionResult?](repeating: nil, count: list.count)
         let c = center
         out.withUnsafeMutableBufferPointer { buf in
             let outp = buf.baseAddress!
@@ -388,9 +430,12 @@ final class LodWorld: @unchecked Sendable {
                 var g = fromFile ?? LodGrid(level: 1)
                 let hasLive = self.live.overlay(regionX: x, regionZ: z, into: &g)
                 guard fromFile != nil || hasLive else {
-                    outp[i] = (LodBuild.key(x, z), LodQuadrant(grid: LodGrid(level: 2)), nil)
+                    outp[i] = RegionResult(key: LodBuild.key(x, z), quadrant: LodQuadrant(grid: LodGrid(level: 2)), node: nil, hasData: false, full: false)
                     return
                 }
+                // Every generated column has something (bedrock) in its bottom voxel.
+                var full = true
+                g.v.withUnsafeBufferPointer { v in for c in 0..<(lodNodeVoxels * lodNodeVoxels) where v[c] == 0 { full = false; break } }
                 var q = LodGrid(level: 2)
                 g.downsample(into: &q, qx: 0, qz: 0)   // the quadrant occupies the low corner
                 let quadrant = LodQuadrant(grid: q)
@@ -402,10 +447,69 @@ final class LodWorld: @unchecked Sendable {
                     let size = lodNodeVoxels << 1
                     node = LodNode(level: 1, x0: x * size, z0: z * size, mesh: m)
                 }
-                outp[i] = (LodBuild.key(x, z), quadrant, node)
+                outp[i] = RegionResult(key: LodBuild.key(x, z), quadrant: quadrant, node: node, hasData: true, full: full)
             }
         }
         return out.compactMap { $0 }
+    }
+
+    /// True if any region under node (level, x, z) has real chunks.
+    func hasRealData(level: Int, x: Int, z: Int) -> Bool {
+        let span = 1 << (level - 1)   // regions per node side
+        far.lock.lock(); defer { far.lock.unlock() }
+        if far.realRegions.isEmpty { return false }
+        if span * span > far.realRegions.count {
+            for k in far.realRegions {
+                let (rx, rz) = LodBuild.unkey(k)
+                if rx >> (level - 1) == x && rz >> (level - 1) == z { return true }
+            }
+            return false
+        }
+        for rz in (z * span)..<((z + 1) * span) {
+            for rx in (x * span)..<((x + 1) * span) where far.realRegions.contains(LodBuild.key(rx, rz)) { return true }
+        }
+        return false
+    }
+
+    /// Nodes of levels 3 and up that the quadtree can draw around the player and that lack real chunks
+    /// somewhere, nearest first, not yet generated or requested. Marks them requested.
+    func farWanted(max: Int) -> [LodNodeKey] {
+        lock.lock(); let c = requestedCenter; lock.unlock()
+        guard maxLevel >= lodFarMinLevel else { return [] }
+        func dist(_ x0: Int, _ z0: Int, _ size: Int) -> Double {
+            let dx = Double(Swift.max(x0 - c.x, 0, c.x - (x0 + size))), dz = Double(Swift.max(z0 - c.z, 0, c.z - (z0 + size)))
+            return (dx * dx + dz * dz).squareRoot()
+        }
+        var found: [(Double, LodNodeKey)] = []
+        far.lock.lock(); defer { far.lock.unlock() }
+        for level in lodFarMinLevel...maxLevel {
+            let size = lodNodeVoxels << level
+            // A node is drawn when its parent splits (the parent's nearest point within 2 x this node's size)
+            // or, at the top level, anywhere within the LOD distance.
+            let reach = level == maxLevel ? Double(size) : 2.0 * Double(size)
+            let psize = size * 2
+            let cx = Int((Double(c.x) / Double(size)).rounded(.down)), cz = Int((Double(c.z) / Double(size)).rounded(.down))
+            let r = Int(reach) / size + 2
+            for nz in (cz - r)...(cz + r) {
+                for nx in (cx - r)...(cx + r) {
+                    let key = LodNodeKey(level: level, x: nx, z: nz)
+                    if far.columns[key] != nil || far.requested.contains(key) { continue }
+                    let d = level == maxLevel ? dist(nx * size, nz * size, size) : dist((nx >> 1) * psize, (nz >> 1) * psize, psize)
+                    if d > reach { continue }
+                    let span = 1 << (level - 1)
+                    var covered = true
+                    check: for rz in (nz * span)..<((nz + 1) * span) {
+                        for rx in (nx * span)..<((nx + 1) * span) where !far.fullRegions.contains(LodBuild.key(rx, rz)) { covered = false; break check }
+                    }
+                    if covered { continue }
+                    found.append((dist(nx * size, nz * size, size), key))
+                }
+            }
+        }
+        found.sort { $0.0 < $1.0 }
+        let out = found.prefix(max).map { $0.1 }
+        for k in out { far.requested.insert(k) }
+        return Array(out)
     }
 
     /// Dense grid for a node at `level` >= 2, assembled from cached region quadrants (downsampled further
@@ -423,6 +527,9 @@ final class LodWorld: @unchecked Sendable {
         var g = LodGrid(level: level)
         for qz in 0...1 {
             for qx in 0...1 {
+                // Children with no real chunks are air: skip them (at the top levels most of a node can be
+                // generated terrain, and assembling empty subtrees down to level 2 costs gigabytes of grids).
+                if !hasRealData(level: level - 1, x: 2 * x + qx, z: 2 * z + qz) { continue }
                 let child = grid(level: level - 1, x: 2 * x + qx, z: 2 * z + qz)
                 child.downsample(into: &g, qx: qx, qz: qz)
             }

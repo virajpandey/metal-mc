@@ -43,6 +43,9 @@ public final class MetalMCConfig {
         lod.multiplayer=true
         # Block texture detail on LOD terrain (about 2% slower than flat colors).
         lod.textures=true
+        # Single-player: past the terrain the world has generated, show terrain sampled from the world's own
+        # generator (heights and biomes, on a coarse grid in the background) out to lod.far.
+        lod.generate=true
         """;
 
     private static final Properties FILE = load();
@@ -105,6 +108,10 @@ public final class MetalMCConfig {
 
     public static boolean lodTextures() {
         return flag("lod.textures", true);
+    }
+
+    public static boolean lodGenerate() {
+        return flag("lod.generate", true);
     }
 
     public static boolean lodMultiplayer() {

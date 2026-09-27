@@ -21,6 +21,7 @@ public final class Lod implements ClientModInitializer {
     public static final boolean LIVE = metalmc.MetalMCConfig.lodLive();
     public static final boolean MULTIPLAYER = metalmc.MetalMCConfig.lodMultiplayer();
     public static final boolean TEXTURES = metalmc.MetalMCConfig.lodTextures();
+    public static final boolean GENERATE = metalmc.MetalMCConfig.lodGenerate();
 
     private static boolean opened;
     private static volatile boolean ready;
@@ -75,6 +76,7 @@ public final class Lod implements ClientModInitializer {
         // A different save or server (or none) since the LOD was opened: start over.
         if (opened && !java.util.Objects.equals(current, openedDir)) {
             LiveIngest.setEnabled(false);
+            FarTerrain.stop();
             MetalLod.close();
             opened = false;
             ready = false;
@@ -88,6 +90,7 @@ public final class Lod implements ClientModInitializer {
             boolean ok = MetalLod.open2(src[0], src[1], FAR, cx, cz);
             System.out.println("[metalmc-lod] opening " + current + " far=" + FAR + " live=" + LIVE + ": " + ok);
             if (ok && LIVE) LiveIngest.setEnabled(true);
+            if (ok && GENERATE && mc.getSingleplayerServer() != null) FarTerrain.start(mc.getSingleplayerServer());
         }
         if (!opened || ++statusTicks % 20 != 0) return;
         if (mc.player != null) {

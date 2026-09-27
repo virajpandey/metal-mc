@@ -26,6 +26,8 @@ public final class Bench {
     static final String LABEL = System.getProperty("metalmc.bench.label", "unlabeled");
     static final int WARMUP_TICKS = Integer.getInteger("metalmc.bench.warmupTicks", 400);   // 20 s
     static final int RUN_TICKS = Integer.getInteger("metalmc.bench.runTicks", 1200);        // 60 s
+    static final int EXTRA_WAIT = Integer.getInteger("metalmc.bench.extraWait", 0);
+    private static int extraWaitTicks;
     /** Vanilla's GPU timer needs its debug-screen line enabled, which itself costs frame time; opt-in. */
     static final boolean GPU_TIMER = "1".equals(System.getProperty("metalmc.bench.gpuTimer", "0"));
     static final double CENTER_X = Double.parseDouble(System.getProperty("metalmc.bench.cx", "8"));
@@ -93,6 +95,10 @@ public final class Bench {
                 // to disk, so set it explicitly either way.
                 mc.debugEntries.setStatus(DebugScreenEntries.GPU_UTILIZATION,
                     GPU_TIMER ? DebugScreenEntryStatus.ALWAYS_ON : DebugScreenEntryStatus.NEVER);
+                if ("1".equals(System.getProperty("metalmc.farProbe")) && mc.getSingleplayerServer() != null) {
+                    net.minecraft.server.MinecraftServer server = mc.getSingleplayerServer();
+                    server.execute(() -> metalmc.lod.FarTerrainProbe.run(server));
+                }
                 log("world loaded; warming up for " + WARMUP_TICKS + " ticks; " + presentInfo(mc)
                     + "; app active " + metalmc.backend.MetalLod.activateApp());
             }
@@ -101,6 +107,11 @@ public final class Bench {
                 // With LOD on, don't start timing until every LOD level has been built (up to 2 extra minutes).
                 if (metalmc.lod.Lod.ENABLED && !metalmc.lod.Lod.built() && lodWaitTicks++ < 2400) {
                     if (lodWaitTicks % 200 == 0) log("waiting for the LOD build (" + lodWaitTicks / 20 + " s)");
+                    break;
+                }
+                // -PbenchExtraWait=<ticks>: more time after the build (e.g. for generated far terrain).
+                if (extraWaitTicks++ < EXTRA_WAIT) {
+                    if (extraWaitTicks % 200 == 0) log("extra wait (" + extraWaitTicks / 20 + " s)");
                     break;
                 }
                 if (++tick >= WARMUP_TICKS && TOUR) {

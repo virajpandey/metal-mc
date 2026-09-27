@@ -161,6 +161,42 @@ public final class MetalLod {
         return available() && Mtl.activateApp() != 0;
     }
 
+    /** Nodes that want generated far terrain, as level, x, z triples (at most max nodes). Any thread. */
+    public static int[] farWanted(int max) {
+        if (!available()) return new int[0];
+        long addr = MemoryUtil.nmemAlloc(12L * max);
+        try {
+            int n = Mtl.lodFarWanted(addr, max);
+            int[] out = new int[3 * n];
+            for (int i = 0; i < out.length; i++) out[i] = MemoryUtil.memGetInt(addr + 4L * i);
+            return out;
+        } finally {
+            MemoryUtil.nmemFree(addr);
+        }
+    }
+
+    /** Registers a biome name under a small id for farPut. Any thread. */
+    public static void farBiome(int id, String name) {
+        if (!available()) return;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            Mtl.lodFarBiome(id, MemoryUtil.memAddress(stack.UTF8(name)));
+        }
+    }
+
+    /** Generated columns for a node: 256 x 256 ground heights and biome ids, x fastest. Any thread. */
+    public static void farPut(int level, int x, int z, short[] heights, short[] biomes) {
+        if (!available()) return;
+        long h = MemoryUtil.nmemAlloc(2L * heights.length), b = MemoryUtil.nmemAlloc(2L * biomes.length);
+        try {
+            for (int i = 0; i < heights.length; i++) MemoryUtil.memPutShort(h + 2L * i, heights[i]);
+            for (int i = 0; i < biomes.length; i++) MemoryUtil.memPutShort(b + 2L * i, biomes[i]);
+            Mtl.lodFarPut(level, x, z, h, b);
+        } finally {
+            MemoryUtil.nmemFree(h);
+            MemoryUtil.nmemFree(b);
+        }
+    }
+
     /** Stops streaming and releases the LOD (the player left the world). */
     public static void close() {
         if (available()) Mtl.lodClose();

@@ -96,6 +96,9 @@ final class Mtl {
     private static final MethodHandle LOD_SET_VANILLA = h("mmc_lod_set_vanilla", false, null, JAVA_LONG, JAVA_INT);
     private static final MethodHandle LOD_SET_COMPILED = h("mmc_lod_set_compiled", false, null, JAVA_LONG, JAVA_INT, JAVA_INT);
     private static final MethodHandle ACTIVATE_APP = h("mmc_activate_app", false, JAVA_INT);
+    private static final MethodHandle LOD_FAR_WANTED = h("mmc_lod_far_wanted", false, JAVA_INT, JAVA_LONG, JAVA_INT);
+    private static final MethodHandle LOD_FAR_BIOME = h("mmc_lod_far_biome", false, null, JAVA_INT, JAVA_LONG);
+    private static final MethodHandle LOD_FAR_PUT = h("mmc_lod_far_put", false, null, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle COMPLETED_SUBMIT = h("mmc_completed_submit", true, JAVA_LONG);
     private static final MethodHandle SURFACE_CREATE = h("mmc_surface2_create", false, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle SURFACE_CONFIGURE = h("mmc_surface2_configure", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -338,6 +341,18 @@ final class Mtl {
 
     static void lodSetVanilla(long keys, int count) {
         try { LOD_SET_VANILLA.invokeExact(keys, count); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int lodFarWanted(long out, int max) {
+        try { return (int) LOD_FAR_WANTED.invokeExact(out, max); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void lodFarBiome(int id, long name) {
+        try { LOD_FAR_BIOME.invokeExact(id, name); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void lodFarPut(int level, int x, int z, long heights, long biomes) {
+        try { LOD_FAR_PUT.invokeExact(level, x, z, heights, biomes); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static int activateApp() {

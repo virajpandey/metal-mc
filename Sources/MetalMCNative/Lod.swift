@@ -468,7 +468,8 @@ final class LodRenderer: @unchecked Sendable {
             let x0 = Double(nx) * size, z0 = Double(nz) * size
             let dx = max(x0 - camX, 0, camX - (x0 + size)), dz = max(z0 - camZ, 0, camZ - (z0 + size))
             let dist = (dx * dx + dz * dz).squareRoot()
-            if level > 1 ? dist < splitFactor * size / 2 : (level == 1 && dist < level0Radius) {
+            // Coarser nodes also split within the level-0 radius, so a large radius reaches level 0 through level 1.
+            if level > 1 ? (dist < splitFactor * size / 2 || dist < level0Radius) : (level == 1 && dist < level0Radius) {
                 var parentMask: UInt16 = 0
                 for qz in 0...1 {
                     for qx in 0...1 {
@@ -526,7 +527,9 @@ private func lodOpen(regionDir: URL?, storeDir: URL?, far: Int, centerX: Int, ce
     let r = LodRenderer.shared
     var maxLevel = 1
     while (lodNodeVoxels << maxLevel) < far && maxLevel < 8 { maxLevel += 1 }
-    let w = LodWorld(regionDir: regionDir, storeDir: storeDir, maxLevel: maxLevel, fineRadius: 1536, centerX: centerX, centerZ: centerZ)
+    // Level-1 nodes exist far enough out for level 0's parents (METALMC_LOD0 can reach past 1.5 km).
+    let fine = max(1536, lodLevel0Radius + 512)
+    let w = LodWorld(regionDir: regionDir, storeDir: storeDir, maxLevel: maxLevel, fineRadius: fine, centerX: centerX, centerZ: centerZ)
     r.lock.lock()
     r.world?.stop()
     r.world = w
@@ -750,7 +753,9 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         }
     }
     if r.frame % 1000 == 0 {
-        log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames; vanilla drew \(r.vanillaSections.count) sections, compiled \(r.compiledSections.count), distance \(r.vanillaDistance), skip checks \(r.skipDebug)")
+        var perLevel = [Int](repeating: 0, count: 9)
+        for c in chosen { perLevel[min(8, c.0.level)] += 1 }
+        log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, chosen per level \(perLevel), \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames; vanilla drew \(r.vanillaSections.count) sections, compiled \(r.compiledSections.count), distance \(r.vanillaDistance), skip checks \(r.skipDebug)")
         r.skipDebug = [0, 0, 0, 0, 0]
         r.coveredTiles = 0
     }
