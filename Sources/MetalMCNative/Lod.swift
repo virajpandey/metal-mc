@@ -424,6 +424,8 @@ let lodTileSplit = Double(ProcessInfo.processInfo.environment["METALMC_TILESPLIT
 
 /// Frames a level transition takes to fade (METALMC_FADE, 0 turns fading off): tiles that appear dither in while
 /// the ones they replace dither out, instead of popping. 24 frames is 0.2 s at 120 Hz.
+/// METALMC_EXP=nozoomlod: levels by distance alone, even zoomed in.
+let lodNoZoom = experiments.contains("nozoomlod")
 let lodFadeFrames = Int(ProcessInfo.processInfo.environment["METALMC_FADE"] ?? "") ?? 24
 
 /// METALMC_EXP=meshshader draws the LOD with a mesh shader (one thread per quad) instead of indexed vertices.
@@ -693,7 +695,7 @@ final class LodRenderer: @unchecked Sendable {
     /// child the parent draws just the 2 x 2 tiles covering that quarter (missing children are either empty
     /// or past the finest level's range). Returns nodes with a 16-bit mask of the tiles to draw.
     static func select(_ meshes: [LodNodeKey: LodMeshNode], maxLevel: Int, camX: Double, camZ: Double, splitFactor: Double,
-                       level0Radius: Double) -> [(LodMeshNode, UInt16)] {
+                       level0Radius: Double, zoom: Double = 1) -> [(LodMeshNode, UInt16)] {
         var out: [(LodMeshNode, UInt16)] = []
         // Tile masks for each quarter (tiles t = tz * 4 + tx; quarter (qx, qz) covers tx, tz in 2q ..< 2q + 2).
         func quarterMask(_ qx: Int, _ qz: Int) -> UInt16 {
@@ -706,7 +708,8 @@ final class LodRenderer: @unchecked Sendable {
             let size = Double(lodNodeVoxels << level)
             let x0 = Double(nx) * size, z0 = Double(nz) * size
             let dx = max(x0 - camX, 0, camX - (x0 + size)), dz = max(z0 - camZ, 0, camZ - (z0 + size))
-            let dist = (dx * dx + dz * dz).squareRoot()
+            // Zoomed in (spyglass, low field of view), terrain looks as close as its distance over the zoom.
+            let dist = (dx * dx + dz * dz).squareRoot() / zoom
             // Coarser nodes also split within the level-0 radius, so a large radius reaches level 0 through level 1.
             if level > 1 ? (dist < splitFactor * size / 2 || dist < level0Radius) : (level == 1 && dist < level0Radius) {
                 var parentMask: UInt16 = 0
@@ -912,8 +915,11 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     guard let pipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, mesh: useMesh) else { return 0 }
     r.ensureColors()
     let cx = cam[0], cy = cam[1], cz = cam[2]
+    // Zoom relative to vanilla's default 70-degree field of view (proj[1][1] = cot(35 degrees)), counted only when it's
+    // clearly zoomed (the spyglass is about 10x; sprinting widens the view a little, which changes nothing).
+    let fovZoom = Double(p[5]) / 1.4281
     let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: 2.0,
-                                    level0Radius: Double(lodLevel0Radius))
+                                    level0Radius: Double(lodLevel0Radius), zoom: fovZoom > 1.25 && !lodNoZoom ? fovZoom : 1)
     guard !chosen.isEmpty else { return 0 }
     r.ensureIndexBuffer(quads: chosen.map { $0.0.quadCount }.max() ?? 1)
     guard let ib = r.indexBuffer else { return 0 }

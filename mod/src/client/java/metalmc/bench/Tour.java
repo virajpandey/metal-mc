@@ -226,8 +226,20 @@ final class Tour {
         new Step("walk-end", null, 20, mc -> walk(mc, false))
     );
 
+    /** Zoomed view (-PbenchTour=zoom): the mid pose north at field of view 30 (vanilla's minimum, 2.6x zoom). */
+    static final boolean ZOOM_TOUR = "zoom".equals(System.getProperty("metalmc.tour"));
+    static final List<Step> ZOOM_STEPS = List.of(
+        new Step("zoom-wide", at(150, 180f, 8f), 400, mc -> {
+            cmd(mc, "time set 6000", "weather clear", "gamerule advance_time false", "gamerule advance_weather false");
+            if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();
+        }),
+        new Step("zoom-30", at(150, 180f, 8f), 120, mc -> mc.options.fov().set(30)),
+        new Step("zoom-back", at(150, 180f, 8f), 20, mc -> mc.options.fov().set(70))
+    );
+
     static List<Step> steps() {
         if (FIDELITY_TOUR) return FIDELITY_STEPS;
+        if (ZOOM_TOUR) return ZOOM_STEPS;
         if (END_TOUR) return END_STEPS;
         if (WALK_TOUR) return WALK_STEPS;
         if (MP_TOUR) return "mp2".equals(System.getProperty("metalmc.tour")) ? MP2_STEPS : MP_STEPS;
