@@ -684,9 +684,13 @@ final class LodRenderer: @unchecked Sendable {
     }
 
     /// Material colors from the texture averages in LodColors.swift, indexed by material id.
+    /// Per color-table entry scale for the loaded resource pack's textures (all 1 with vanilla's; mmc_lod_set_atlas).
+    var packRatio = [SIMD3<Float>](repeating: SIMD3(1, 1, 1), count: 256 * 3)
+
     func ensureColors() {
         if colorBuffer != nil { return }
-        let c = lodColorTable()
+        var c = lodColorTable()
+        for i in 0..<c.count { c[i] = SIMD4(c[i].x * packRatio[i].x, c[i].y * packRatio[i].y, c[i].z * packRatio[i].z, c[i].w) }
         colorBuffer = ctx.device.makeBuffer(bytes: c, length: c.count * 16, options: [.storageModeShared])
     }
 
@@ -1268,16 +1272,56 @@ public func mmc_lod_sprite_name(_ index: Int32, _ top: Int32, _ buf: UnsafeMutab
 
 /// Sets Minecraft's block atlas (a texture view handle) and the sprite rectangles for each material:
 /// rects holds count x 8 floats (top u0 v0 u1 v1, side u0 v0 u1 v1). Render thread.
+/// The block atlas and, per LOD material, its top and side textures' UV rects (8 floats each). `means`, if not null:
+/// those textures' mean colors in the loaded resource pack (6 floats: top RGB, side RGB, opaque texels, untinted).
+/// Their ratio to vanilla's means scales the LOD's colors and texture detail, so a pack's recolored blocks carry
+/// over to far terrain.
 @_cdecl("mmc_lod_set_atlas")
-public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ count: Int32) {
+public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ means: UnsafePointer<Float>?, _ count: Int32) {
     let r = LodRenderer.shared
     let n = Int(count)
     var table = [SIMD4<Float>](repeating: .zero, count: max(1, n) * 3)
+    var ratio = [SIMD3<Float>](repeating: SIMD3(1, 1, 1), count: max(1, n) * 2)   // per row: top, side
+    @inline(__always) func luma(_ c: SIMD3<Float>) -> Float { 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z }
     for i in 0..<n {
         table[3 * i] = SIMD4(rects[8 * i], rects[8 * i + 1], rects[8 * i + 2], rects[8 * i + 3])
         table[3 * i + 1] = SIMD4(rects[8 * i + 4], rects[8 * i + 5], rects[8 * i + 6], rects[8 * i + 7])
-        let s = i < lodMaterialSprites.count ? lodMaterialSprites[i] : LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1)
-        table[3 * i + 2] = SIMD4(s.topLuma, s.sideLuma, 0, 0)
+        let s = i < lodMaterialSprites.count ? lodMaterialSprites[i]
+            : LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1, topMean: SIMD3(1, 1, 1), sideMean: SIMD3(1, 1, 1))
+        var topLuma = s.topLuma, sideLuma = s.sideLuma
+        if let means, !s.top.isEmpty {
+            for (k, base) in [s.topMean, s.sideMean].enumerated() {
+                let cur = SIMD3(means[6 * i + 3 * k], means[6 * i + 3 * k + 1], means[6 * i + 3 * k + 2])
+                guard cur.x >= 0, luma(base) > 0.01 else { continue }
+                // Per channel where the vanilla texture has some of it, else by brightness; within 0.2x-5x.
+                let l = min(5, max(0.2, luma(cur) / luma(base)))
+                var q = SIMD3<Float>(l, l, l)
+                for ch in 0..<3 where base[ch] > 0.03 { q[ch] = min(5, max(0.2, cur[ch] / base[ch])) }
+                ratio[2 * i + k] = q
+            }
+            topLuma *= min(5, max(0.2, luma(ratio[2 * i] * s.topMean) / max(0.001, luma(s.topMean))))
+            sideLuma *= min(5, max(0.2, luma(ratio[2 * i + 1] * s.sideMean) / max(0.001, luma(s.sideMean))))
+        }
+        table[3 * i + 2] = SIMD4(topLuma, sideLuma, 0, 0)
+    }
+    // Color table scale: a material's top faces by its top texture, sides by its side texture, bottoms by the top;
+    // biome-tinted grass, leaves and water by their base textures.
+    var pack = [SIMD3<Float>](repeating: SIMD3(1, 1, 1), count: 256 * 3)
+    for m in 0..<min(n, 64) {
+        pack[3 * m] = ratio[2 * m]; pack[3 * m + 1] = ratio[2 * m + 1]; pack[3 * m + 2] = ratio[2 * m]
+    }
+    func row(_ m: Mat, side: Bool = false) -> SIMD3<Float> { Int(m.rawValue) < n ? ratio[2 * Int(m.rawValue) + (side ? 1 : 0)] : SIMD3(1, 1, 1) }
+    for t in 0..<32 {
+        let g = Int(lodGrassBase) + t, l = Int(lodLeavesBase) + t, w = Int(lodWaterBase) + t
+        pack[3 * g] = row(.grass); pack[3 * g + 1] = row(.dirt); pack[3 * g + 2] = row(.dirt)
+        for f in 0..<3 { pack[3 * l + f] = row(.leaves); pack[3 * w + f] = row(.water) }
+    }
+    r.packRatio = pack
+    r.colorBuffer = nil   // rebuilt with the new scale on the next draw
+    if means != nil {
+        let all = ratio.flatMap { [$0.x, $0.y, $0.z] }
+        let changed = (0..<n).filter { i in simd_reduce_max(simd_abs(ratio[2 * i] - 1)) > 0.03 || simd_reduce_max(simd_abs(ratio[2 * i + 1] - 1)) > 0.03 }
+        log("LOD: resource pack colors: ratios \(String(format: "%.3f", all.min() ?? 1))...\(String(format: "%.3f", all.max() ?? 1)), \(changed.count) materials changed \(changed.prefix(8).map { lodMaterialSprites[$0].top })")
     }
     r.spriteBuffer = ctx.device.makeBuffer(bytes: table, length: table.count * 16, options: [.storageModeShared])
     r.atlas = view == 0 ? nil : (from(view) as TextureBox).texture

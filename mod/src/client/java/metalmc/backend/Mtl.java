@@ -95,7 +95,7 @@ final class Mtl {
     private static final MethodHandle OCC_HIDDEN = h("mmc_occ_hidden", true, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle OCC_TEST = h("mmc_occ_test", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle LOD_SPRITE_NAME = h("mmc_lod_sprite_name", false, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT);
-    private static final MethodHandle LOD_SET_ATLAS = h("mmc_lod_set_atlas", false, null, JAVA_LONG, JAVA_LONG, JAVA_INT);
+    private static final MethodHandle LOD_SET_ATLAS = h("mmc_lod_set_atlas", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle LOD_SET_VANILLA = h("mmc_lod_set_vanilla", false, null, JAVA_LONG, JAVA_INT);
     private static final MethodHandle LOD_SET_COMPILED = h("mmc_lod_set_compiled", false, null, JAVA_LONG, JAVA_INT, JAVA_INT);
     private static final MethodHandle ACTIVATE_APP = h("mmc_activate_app", false, JAVA_INT);
@@ -353,8 +353,8 @@ final class Mtl {
         try { return (int) LOD_SPRITE_NAME.invokeExact(index, top, buf, len); } catch (Throwable t) { throw rethrow(t); }
     }
 
-    static void lodSetAtlas(long view, long rects, int count) {
-        try { LOD_SET_ATLAS.invokeExact(view, rects, count); } catch (Throwable t) { throw rethrow(t); }
+    static void lodSetAtlas(long view, long rects, long means, int count) {
+        try { LOD_SET_ATLAS.invokeExact(view, rects, means, count); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static void lodSetVanilla(long keys, int count) {

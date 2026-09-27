@@ -26,6 +26,7 @@ public final class LodTextures {
         GpuTextureView view = atlas.getTextureView();
         if (view == null || view == sent) return;
         List<float[]> rows = new ArrayList<>();
+        List<float[]> meanRows = new ArrayList<>();
         for (int i = 0; ; i++) {
             String top = MetalLod.spriteName(i, true), side = MetalLod.spriteName(i, false);
             if (top == null) break;
@@ -33,10 +34,45 @@ public final class LodTextures {
             put(atlas, top, r, 0);
             put(atlas, side, r, 4);
             rows.add(r);
+            float[] m = {-1, -1, -1, -1, -1, -1};
+            mean(atlas, top, m, 0);
+            mean(atlas, side, m, 3);
+            meanRows.add(m);
         }
-        float[] rects = new float[rows.size() * 8];
-        for (int i = 0; i < rows.size(); i++) System.arraycopy(rows.get(i), 0, rects, 8 * i, 8);
-        if (MetalLod.setAtlas(view, rects, rows.size())) sent = view;
+        float[] rects = new float[rows.size() * 8], means = new float[rows.size() * 6];
+        for (int i = 0; i < rows.size(); i++) {
+            System.arraycopy(rows.get(i), 0, rects, 8 * i, 8);
+            System.arraycopy(meanRows.get(i), 0, means, 6 * i, 6);
+        }
+        if (MetalLod.setAtlas(view, rects, means, rows.size())) sent = view;
+    }
+
+    /**
+     * The mean color of a texture's opaque texels (all animation frames) in the loaded resource pack, like
+     * tools/lod_colors.py computes vanilla's; the LOD scales its colors by the ratio.
+     */
+    private static void mean(TextureAtlas atlas, String name, float[] out, int at) {
+        if (name.isEmpty()) return;
+        TextureAtlasSprite s = atlas.getSprite(Identifier.withDefaultNamespace("block/" + name));
+        com.mojang.blaze3d.platform.NativeImage img = ((metalmc.lod.mixin.SpriteContentsAccessor) s.contents()).metalmc$originalImage();
+        if (img == null) return;
+        // Every animation frame, as tools/lod_colors.py averages vanilla's textures.
+        int w = img.getWidth(), h = img.getHeight();
+        long r = 0, g = 0, b = 0, n = 0;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int p = img.getPixel(x, y);
+                if ((p >>> 24) < 128) continue;
+                r += (p >> 16) & 255;
+                g += (p >> 8) & 255;
+                b += p & 255;
+                n++;
+            }
+        }
+        if (n == 0) return;
+        out[at] = r / 255f / n;
+        out[at + 1] = g / 255f / n;
+        out[at + 2] = b / 255f / n;
     }
 
     private static void put(TextureAtlas atlas, String name, float[] out, int at) {

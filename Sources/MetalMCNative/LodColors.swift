@@ -76,76 +76,79 @@ let lodGrassSideFringe: Float = 0.176
 let lodGrassOverlayGray: Float = 0.606
 
 /// Block textures used for LOD texture detail (names under block/ in the block atlas), with the mean luma
-/// of each texture's opaque texels. The LOD multiplies its flat color by texel luma / mean luma.
+/// of each texture's opaque texels. The LOD multiplies its flat color by texel luma / mean luma. The mean
+/// colors (vanilla's textures, untinted) let a resource pack's textures scale the LOD's colors (LodTextures).
 struct LodSprite {
     let top: String
     let side: String
     let topLuma: Float
     let sideLuma: Float
+    let topMean: SIMD3<Float>
+    let sideMean: SIMD3<Float>
 }
 
 let lodMaterialSprites: [LodSprite] = [
-    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // air
-    LodSprite(top: "stone", side: "stone", topLuma: 0.492, sideLuma: 0.492),   // stone
-    LodSprite(top: "dirt", side: "dirt", topLuma: 0.401, sideLuma: 0.401),   // dirt
-    LodSprite(top: "grass_block_top", side: "dirt", topLuma: 0.578, sideLuma: 0.401),   // grass
-    LodSprite(top: "sand", side: "sand", topLuma: 0.810, sideLuma: 0.810),   // sand
-    LodSprite(top: "water_still", side: "water_still", topLuma: 0.694, sideLuma: 0.694),   // water
-    LodSprite(top: "stone", side: "stone", topLuma: 0.492, sideLuma: 0.492),   // unknown
-    LodSprite(top: "deepslate_top", side: "deepslate", topLuma: 0.343, sideLuma: 0.315),   // deepslate
-    LodSprite(top: "gravel", side: "gravel", topLuma: 0.503, sideLuma: 0.503),   // gravel
-    LodSprite(top: "oak_log_top", side: "oak_log", topLuma: 0.488, sideLuma: 0.344),   // log
-    LodSprite(top: "oak_planks", side: "oak_planks", topLuma: 0.524, sideLuma: 0.524),   // planks
-    LodSprite(top: "oak_leaves", side: "oak_leaves", topLuma: 0.565, sideLuma: 0.565),   // leaves
-    LodSprite(top: "cherry_leaves", side: "cherry_leaves", topLuma: 0.731, sideLuma: 0.731),   // cherryLeaves
-    LodSprite(top: "snow", side: "snow", topLuma: 0.993, sideLuma: 0.993),   // snow
-    LodSprite(top: "ice", side: "ice", topLuma: 0.709, sideLuma: 0.709),   // ice
-    LodSprite(top: "clay", side: "clay", topLuma: 0.652, sideLuma: 0.652),   // clay
-    LodSprite(top: "terracotta", side: "terracotta", topLuma: 0.410, sideLuma: 0.410),   // terracotta
-    LodSprite(top: "lava_still", side: "lava_still", topLuma: 0.435, sideLuma: 0.435),   // lava
-    LodSprite(top: "cobblestone", side: "cobblestone", topLuma: 0.500, sideLuma: 0.500),   // cobblestone
-    LodSprite(top: "bricks", side: "bricks", topLuma: 0.423, sideLuma: 0.423),   // bricks
-    LodSprite(top: "dirt_path_top", side: "dirt_path_side", topLuma: 0.483, sideLuma: 0.416),   // path
-    LodSprite(top: "farmland", side: "dirt", topLuma: 0.427, sideLuma: 0.401),   // farmland
-    LodSprite(top: "hay_block_top", side: "hay_block_side", topLuma: 0.532, sideLuma: 0.533),   // hay
-    LodSprite(top: "white_wool", side: "white_wool", topLuma: 0.925, sideLuma: 0.925),   // wool
-    LodSprite(top: "moss_block", side: "moss_block", topLuma: 0.395, sideLuma: 0.395),   // moss
-    LodSprite(top: "cherry_log_top", side: "cherry_log", topLuma: 0.589, sideLuma: 0.151),   // cherryWood
-    LodSprite(top: "calcite", side: "calcite", topLuma: 0.878, sideLuma: 0.878),   // lightStone
-    LodSprite(top: "granite", side: "granite", topLuma: 0.438, sideLuma: 0.438),   // granite
-    LodSprite(top: "sandstone_top", side: "sandstone", topLuma: 0.836, sideLuma: 0.795),   // sandstone
-    LodSprite(top: "mud", side: "mud", topLuma: 0.229, sideLuma: 0.229),   // mud
-    LodSprite(top: "amethyst_block", side: "amethyst_block", topLuma: 0.441, sideLuma: 0.441),   // amethyst
-    LodSprite(top: "pumpkin_top", side: "pumpkin_side", topLuma: 0.505, sideLuma: 0.492),   // pumpkin
-    LodSprite(top: "andesite", side: "andesite", topLuma: 0.534, sideLuma: 0.534),   // andesite
-    LodSprite(top: "diorite", side: "diorite", topLuma: 0.739, sideLuma: 0.739),   // diorite
-    LodSprite(top: "tuff", side: "tuff", topLuma: 0.425, sideLuma: 0.425),   // tuff
-    LodSprite(top: "dripstone_block", side: "dripstone_block", topLuma: 0.440, sideLuma: 0.440),   // dripstone
-    LodSprite(top: "coarse_dirt", side: "coarse_dirt", topLuma: 0.356, sideLuma: 0.356),   // coarseDirt
-    LodSprite(top: "podzol_top", side: "podzol_side", topLuma: 0.261, sideLuma: 0.364),   // podzol
-    LodSprite(top: "mycelium_top", side: "mycelium_side", topLuma: 0.398, sideLuma: 0.361),   // mycelium
-    LodSprite(top: "red_sand", side: "red_sand", topLuma: 0.457, sideLuma: 0.457),   // redSand
-    LodSprite(top: "red_sandstone_top", side: "red_sandstone", topLuma: 0.434, sideLuma: 0.443),   // redSandstone
-    LodSprite(top: "white_terracotta", side: "white_terracotta", topLuma: 0.720, sideLuma: 0.720),   // whiteTerracotta
-    LodSprite(top: "orange_terracotta", side: "orange_terracotta", topLuma: 0.381, sideLuma: 0.381),   // orangeTerracotta
-    LodSprite(top: "yellow_terracotta", side: "yellow_terracotta", topLuma: 0.539, sideLuma: 0.539),   // yellowTerracotta
-    LodSprite(top: "red_terracotta", side: "red_terracotta", topLuma: 0.304, sideLuma: 0.304),   // redTerracotta
-    LodSprite(top: "brown_terracotta", side: "brown_terracotta", topLuma: 0.218, sideLuma: 0.218),   // brownTerracotta
-    LodSprite(top: "light_gray_terracotta", side: "light_gray_terracotta", topLuma: 0.440, sideLuma: 0.440),   // lightGrayTerracotta
-    LodSprite(top: "packed_ice", side: "packed_ice", topLuma: 0.694, sideLuma: 0.694),   // packedIce
-    LodSprite(top: "blue_ice", side: "blue_ice", topLuma: 0.639, sideLuma: 0.639),   // blueIce
-    LodSprite(top: "obsidian", side: "obsidian", topLuma: 0.049, sideLuma: 0.049),   // obsidian
-    LodSprite(top: "end_stone", side: "end_stone", topLuma: 0.853, sideLuma: 0.853),   // endStone
-    LodSprite(top: "purpur_block", side: "purpur_block", topLuma: 0.543, sideLuma: 0.543),   // purpur
-    LodSprite(top: "chorus_plant", side: "chorus_plant", topLuma: 0.265, sideLuma: 0.265),   // chorus
-    LodSprite(top: "glowstone", side: "glowstone", topLuma: 0.535, sideLuma: 0.535),   // glowstone
-    LodSprite(top: "sea_lantern", side: "sea_lantern", topLuma: 0.758, sideLuma: 0.758),   // seaLantern
-    LodSprite(top: "shroomlight", side: "shroomlight", topLuma: 0.632, sideLuma: 0.632),   // shroomlight
-    LodSprite(top: "pumpkin_top", side: "jack_o_lantern", topLuma: 0.505, sideLuma: 0.621),   // jackOLantern
-    LodSprite(top: "ochre_froglight_top", side: "ochre_froglight_side", topLuma: 0.955, sideLuma: 0.910),   // froglight
-    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light15
-    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light14
-    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light10
-    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light7
-    LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: 0.606, sideLuma: 0.425),   // grass side (not a material)
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1, topMean: SIMD3(1, 1, 1), sideMean: SIMD3(1, 1, 1)),   // air
+    LodSprite(top: "stone", side: "stone", topLuma: 0.492, sideLuma: 0.492, topMean: SIMD3(0.492, 0.492, 0.492), sideMean: SIMD3(0.492, 0.492, 0.492)),   // stone
+    LodSprite(top: "dirt", side: "dirt", topLuma: 0.401, sideLuma: 0.401, topMean: SIMD3(0.526, 0.378, 0.263), sideMean: SIMD3(0.526, 0.378, 0.263)),   // dirt
+    LodSprite(top: "grass_block_top", side: "dirt", topLuma: 0.578, sideLuma: 0.401, topMean: SIMD3(0.578, 0.578, 0.578), sideMean: SIMD3(0.526, 0.378, 0.263)),   // grass
+    LodSprite(top: "sand", side: "sand", topLuma: 0.810, sideLuma: 0.810, topMean: SIMD3(0.859, 0.813, 0.640), sideMean: SIMD3(0.859, 0.813, 0.640)),   // sand
+    LodSprite(top: "water_still", side: "water_still", topLuma: 0.694, sideLuma: 0.694, topMean: SIMD3(0.694, 0.694, 0.694), sideMean: SIMD3(0.694, 0.694, 0.694)),   // water
+    LodSprite(top: "stone", side: "stone", topLuma: 0.492, sideLuma: 0.492, topMean: SIMD3(0.492, 0.492, 0.492), sideMean: SIMD3(0.492, 0.492, 0.492)),   // unknown
+    LodSprite(top: "deepslate_top", side: "deepslate", topLuma: 0.343, sideLuma: 0.315, topMean: SIMD3(0.342, 0.342, 0.351), sideMean: SIMD3(0.314, 0.314, 0.324)),   // deepslate
+    LodSprite(top: "gravel", side: "gravel", topLuma: 0.503, sideLuma: 0.503, topMean: SIMD3(0.517, 0.500, 0.496), sideMean: SIMD3(0.517, 0.500, 0.496)),   // gravel
+    LodSprite(top: "oak_log_top", side: "oak_log", topLuma: 0.488, sideLuma: 0.344, topMean: SIMD3(0.594, 0.477, 0.286), sideMean: SIMD3(0.428, 0.334, 0.199)),   // log
+    LodSprite(top: "oak_planks", side: "oak_planks", topLuma: 0.524, sideLuma: 0.524, topMean: SIMD3(0.636, 0.513, 0.308), sideMean: SIMD3(0.636, 0.513, 0.308)),   // planks
+    LodSprite(top: "oak_leaves", side: "oak_leaves", topLuma: 0.565, sideLuma: 0.565, topMean: SIMD3(0.566, 0.565, 0.566), sideMean: SIMD3(0.566, 0.565, 0.566)),   // leaves
+    LodSprite(top: "cherry_leaves", side: "cherry_leaves", topLuma: 0.731, sideLuma: 0.731, topMean: SIMD3(0.900, 0.678, 0.761), sideMean: SIMD3(0.900, 0.678, 0.761)),   // cherryLeaves
+    LodSprite(top: "snow", side: "snow", topLuma: 0.993, sideLuma: 0.993, topMean: SIMD3(0.977, 0.997, 0.997), sideMean: SIMD3(0.977, 0.997, 0.997)),   // snow
+    LodSprite(top: "ice", side: "ice", topLuma: 0.709, sideLuma: 0.709, topMean: SIMD3(0.571, 0.721, 0.996), sideMean: SIMD3(0.571, 0.721, 0.996)),   // ice
+    LodSprite(top: "clay", side: "clay", topLuma: 0.652, sideLuma: 0.652, topMean: SIMD3(0.630, 0.653, 0.704), sideMean: SIMD3(0.630, 0.653, 0.704)),   // clay
+    LodSprite(top: "terracotta", side: "terracotta", topLuma: 0.410, sideLuma: 0.410, topMean: SIMD3(0.597, 0.369, 0.266), sideMean: SIMD3(0.597, 0.369, 0.266)),   // terracotta
+    LodSprite(top: "lava_still", side: "lava_still", topLuma: 0.435, sideLuma: 0.435, topMean: SIMD3(0.833, 0.353, 0.071), sideMean: SIMD3(0.833, 0.353, 0.071)),   // lava
+    LodSprite(top: "cobblestone", side: "cobblestone", topLuma: 0.500, sideLuma: 0.500, topMean: SIMD3(0.501, 0.499, 0.500), sideMean: SIMD3(0.501, 0.499, 0.500)),   // cobblestone
+    LodSprite(top: "bricks", side: "bricks", topLuma: 0.423, sideLuma: 0.423, topMean: SIMD3(0.592, 0.383, 0.326), sideMean: SIMD3(0.592, 0.383, 0.326)),   // bricks
+    LodSprite(top: "dirt_path_top", side: "dirt_path_side", topLuma: 0.483, sideLuma: 0.416, topMean: SIMD3(0.582, 0.477, 0.256), sideMean: SIMD3(0.535, 0.396, 0.261)),   // path
+    LodSprite(top: "farmland", side: "dirt", topLuma: 0.427, sideLuma: 0.401, topMean: SIMD3(0.561, 0.402, 0.278), sideMean: SIMD3(0.526, 0.378, 0.263)),   // farmland
+    LodSprite(top: "hay_block_top", side: "hay_block_side", topLuma: 0.532, sideLuma: 0.533, topMean: SIMD3(0.651, 0.546, 0.049), sideMean: SIMD3(0.653, 0.536, 0.150)),   // hay
+    LodSprite(top: "white_wool", side: "white_wool", topLuma: 0.925, sideLuma: 0.925, topMean: SIMD3(0.916, 0.927, 0.929), sideMean: SIMD3(0.916, 0.927, 0.929)),   // wool
+    LodSprite(top: "moss_block", side: "moss_block", topLuma: 0.395, sideLuma: 0.395, topMean: SIMD3(0.349, 0.430, 0.178), sideMean: SIMD3(0.349, 0.430, 0.178)),   // moss
+    LodSprite(top: "cherry_log_top", side: "cherry_log", topLuma: 0.589, sideLuma: 0.151, topMean: SIMD3(0.726, 0.553, 0.538), sideMean: SIMD3(0.215, 0.129, 0.174)),   // cherryWood
+    LodSprite(top: "calcite", side: "calcite", topLuma: 0.878, sideLuma: 0.878, topMean: SIMD3(0.876, 0.880, 0.865), sideMean: SIMD3(0.876, 0.880, 0.865)),   // lightStone
+    LodSprite(top: "granite", side: "granite", topLuma: 0.438, sideLuma: 0.438, topMean: SIMD3(0.586, 0.405, 0.337), sideMean: SIMD3(0.586, 0.405, 0.337)),   // granite
+    LodSprite(top: "sandstone_top", side: "sandstone", topLuma: 0.836, sideLuma: 0.795, topMean: SIMD3(0.878, 0.840, 0.668), sideMean: SIMD3(0.849, 0.797, 0.611)),   // sandstone
+    LodSprite(top: "mud", side: "mud", topLuma: 0.229, sideLuma: 0.229, topMean: SIMD3(0.236, 0.225, 0.238), sideMean: SIMD3(0.236, 0.225, 0.238)),   // mud
+    LodSprite(top: "amethyst_block", side: "amethyst_block", topLuma: 0.441, sideLuma: 0.441, topMean: SIMD3(0.525, 0.384, 0.750), sideMean: SIMD3(0.525, 0.384, 0.750)),   // amethyst
+    LodSprite(top: "pumpkin_top", side: "pumpkin_side", topLuma: 0.505, sideLuma: 0.492, topMean: SIMD3(0.777, 0.466, 0.096), sideMean: SIMD3(0.767, 0.450, 0.095)),   // pumpkin
+    LodSprite(top: "andesite", side: "andesite", topLuma: 0.534, sideLuma: 0.534, topMean: SIMD3(0.534, 0.534, 0.536), sideMean: SIMD3(0.534, 0.534, 0.536)),   // andesite
+    LodSprite(top: "diorite", side: "diorite", topLuma: 0.739, sideLuma: 0.739, topMean: SIMD3(0.740, 0.739, 0.741), sideMean: SIMD3(0.740, 0.739, 0.741)),   // diorite
+    LodSprite(top: "tuff", side: "tuff", topLuma: 0.425, sideLuma: 0.425, topMean: SIMD3(0.424, 0.428, 0.402), sideMean: SIMD3(0.424, 0.428, 0.402)),   // tuff
+    LodSprite(top: "dripstone_block", side: "dripstone_block", topLuma: 0.440, sideLuma: 0.440, topMean: SIMD3(0.527, 0.422, 0.363), sideMean: SIMD3(0.527, 0.422, 0.363)),   // dripstone
+    LodSprite(top: "coarse_dirt", side: "coarse_dirt", topLuma: 0.356, sideLuma: 0.356, topMean: SIMD3(0.468, 0.336, 0.233), sideMean: SIMD3(0.468, 0.336, 0.233)),   // coarseDirt
+    LodSprite(top: "podzol_top", side: "podzol_side", topLuma: 0.261, sideLuma: 0.364, topMean: SIMD3(0.360, 0.248, 0.094), sideMean: SIMD3(0.480, 0.344, 0.224)),   // podzol
+    LodSprite(top: "mycelium_top", side: "mycelium_side", topLuma: 0.398, sideLuma: 0.361, topMean: SIMD3(0.436, 0.387, 0.397), sideMean: SIMD3(0.445, 0.344, 0.282)),   // mycelium
+    LodSprite(top: "red_sand", side: "red_sand", topLuma: 0.457, sideLuma: 0.457, topMean: SIMD3(0.748, 0.404, 0.130), sideMean: SIMD3(0.748, 0.404, 0.130)),   // redSand
+    LodSprite(top: "red_sandstone_top", side: "red_sandstone", topLuma: 0.434, sideLuma: 0.443, topMean: SIMD3(0.711, 0.384, 0.123), sideMean: SIMD3(0.732, 0.390, 0.114)),   // redSandstone
+    LodSprite(top: "white_terracotta", side: "white_terracotta", topLuma: 0.720, sideLuma: 0.720, topMean: SIMD3(0.822, 0.698, 0.633), sideMean: SIMD3(0.822, 0.698, 0.633)),   // whiteTerracotta
+    LodSprite(top: "orange_terracotta", side: "orange_terracotta", topLuma: 0.381, sideLuma: 0.381, topMean: SIMD3(0.634, 0.329, 0.148), sideMean: SIMD3(0.634, 0.329, 0.148)),   // orangeTerracotta
+    LodSprite(top: "yellow_terracotta", side: "yellow_terracotta", topLuma: 0.539, sideLuma: 0.539, topMean: SIMD3(0.730, 0.522, 0.139), sideMean: SIMD3(0.730, 0.522, 0.139)),   // yellowTerracotta
+    LodSprite(top: "red_terracotta", side: "red_terracotta", topLuma: 0.304, sideLuma: 0.304, topMean: SIMD3(0.561, 0.239, 0.184), sideMean: SIMD3(0.561, 0.239, 0.184)),   // redTerracotta
+    LodSprite(top: "brown_terracotta", side: "brown_terracotta", topLuma: 0.218, sideLuma: 0.218, topMean: SIMD3(0.303, 0.201, 0.140), sideMean: SIMD3(0.303, 0.201, 0.140)),   // brownTerracotta
+    LodSprite(top: "light_gray_terracotta", side: "light_gray_terracotta", topLuma: 0.440, sideLuma: 0.440, topMean: SIMD3(0.530, 0.419, 0.382), sideMean: SIMD3(0.530, 0.419, 0.382)),   // lightGrayTerracotta
+    LodSprite(top: "packed_ice", side: "packed_ice", topLuma: 0.694, sideLuma: 0.694, topMean: SIMD3(0.555, 0.706, 0.982), sideMean: SIMD3(0.555, 0.706, 0.982)),   // packedIce
+    LodSprite(top: "blue_ice", side: "blue_ice", topLuma: 0.639, sideLuma: 0.639, topMean: SIMD3(0.455, 0.657, 0.992), sideMean: SIMD3(0.455, 0.657, 0.992)),   // blueIce
+    LodSprite(top: "obsidian", side: "obsidian", topLuma: 0.049, sideLuma: 0.049, topMean: SIMD3(0.059, 0.042, 0.096), sideMean: SIMD3(0.059, 0.042, 0.096)),   // obsidian
+    LodSprite(top: "end_stone", side: "end_stone", topLuma: 0.853, sideLuma: 0.853, topMean: SIMD3(0.861, 0.874, 0.621), sideMean: SIMD3(0.861, 0.874, 0.621)),   // endStone
+    LodSprite(top: "purpur_block", side: "purpur_block", topLuma: 0.543, sideLuma: 0.543, topMean: SIMD3(0.666, 0.494, 0.665), sideMean: SIMD3(0.666, 0.494, 0.665)),   // purpur
+    LodSprite(top: "chorus_plant", side: "chorus_plant", topLuma: 0.265, sideLuma: 0.265, topMean: SIMD3(0.368, 0.224, 0.368), sideMean: SIMD3(0.368, 0.224, 0.368)),   // chorus
+    LodSprite(top: "glowstone", side: "glowstone", topLuma: 0.535, sideLuma: 0.535, topMean: SIMD3(0.674, 0.514, 0.331), sideMean: SIMD3(0.674, 0.514, 0.331)),   // glowstone
+    LodSprite(top: "sea_lantern", side: "sea_lantern", topLuma: 0.758, sideLuma: 0.758, topMean: SIMD3(0.676, 0.784, 0.745), sideMean: SIMD3(0.676, 0.784, 0.745)),   // seaLantern
+    LodSprite(top: "shroomlight", side: "shroomlight", topLuma: 0.632, sideLuma: 0.632, topMean: SIMD3(0.945, 0.575, 0.278), sideMean: SIMD3(0.945, 0.575, 0.278)),   // shroomlight
+    LodSprite(top: "pumpkin_top", side: "jack_o_lantern", topLuma: 0.505, sideLuma: 0.621, topMean: SIMD3(0.777, 0.466, 0.096), sideMean: SIMD3(0.841, 0.598, 0.207)),   // jackOLantern
+    LodSprite(top: "ochre_froglight_top", side: "ochre_froglight_side", topLuma: 0.955, sideLuma: 0.910, topMean: SIMD3(0.983, 0.961, 0.810), sideMean: SIMD3(0.963, 0.915, 0.713)),   // froglight
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1, topMean: SIMD3(1, 1, 1), sideMean: SIMD3(1, 1, 1)),   // light15
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1, topMean: SIMD3(1, 1, 1), sideMean: SIMD3(1, 1, 1)),   // light14
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1, topMean: SIMD3(1, 1, 1), sideMean: SIMD3(1, 1, 1)),   // light10
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1, topMean: SIMD3(1, 1, 1), sideMean: SIMD3(1, 1, 1)),   // light7
+    LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: 0.606, sideLuma: 0.425, topMean: SIMD3(0.606, 0.606, 0.606), sideMean: SIMD3(0.497, 0.420, 0.257)),   // grass side (not a material)
 ]

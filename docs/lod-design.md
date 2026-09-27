@@ -107,6 +107,8 @@ Without it, the LOD ends where the world's generated chunks end, at the edge of 
   - The atlas and sprite table are bound at slots vanilla never uses (texture 30, sampler 15, buffer 20), so vanilla's cached bindings stay valid.
 - **Grass, leaves and water are biome-tinted** (`LodBiomes.swift`). The chunk decoder reads each chunk's 4 × 4 surface biome grid (y 96–111, above cave biomes). Tinted voxels use material ids 64 + t, 96 + t and 128 + t for 20 tint classes (vanilla's grass/foliage/water colors), so the tint survives downsampling. `results/lod-v1/far-orbit-biome-tints.png` shows savanna hills matching vanilla's yellow-olive grass across the seam.
 
+- **Resource packs.** The base colors come from vanilla's textures, averaged when the mod is built. When the block atlas loads, the mod averages the opaque texels of each LOD material's top and side textures in the loaded pack (`SpriteContents` keeps them in memory). The ratio to vanilla's averages scales that material's colors and texture-detail luma: top faces by the top texture, sides by the side, grass, leaves and water by their base textures. With a test pack (red stone, purple dirt, brighter grass) the far terrain took the pack's colors, with no break at the seam. Biome color maps changed by a pack aren't followed yet.
+
 ## Where the time goes
 
 Per-frame counters from `-PbenchTrace=1` runs: `per_frame_lod_draws`, `per_frame_lod_kquads` and `per_frame_lod_cpu_ms`.

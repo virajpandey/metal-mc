@@ -134,14 +134,20 @@ public final class MetalLod {
      * Gives the LOD Minecraft's block atlas and each material's sprite rectangles (8 floats per material:
      * top u0 v0 u1 v1, side u0 v0 u1 v1). Returns false if the view isn't a Metal texture.
      */
-    public static boolean setAtlas(com.mojang.renderpearl.api.textures.GpuTextureView view, float[] rects, int count) {
+    /**
+     * The block atlas, per LOD material its textures' UV rects (8 floats: top, side), and their mean colors in the
+     * loaded resource pack (6 floats: top RGB, side RGB; negative for a texture that's missing).
+     */
+    public static boolean setAtlas(com.mojang.renderpearl.api.textures.GpuTextureView view, float[] rects, float[] means, int count) {
         if (!available() || !(view instanceof MetalTextureView mv)) return false;
-        long addr = MemoryUtil.nmemAlloc(4L * rects.length);
+        long addr = MemoryUtil.nmemAlloc(4L * rects.length), meansAddr = MemoryUtil.nmemAlloc(4L * Math.max(1, means.length));
         try {
             for (int i = 0; i < rects.length; i++) MemoryUtil.memPutFloat(addr + 4L * i, rects[i]);
-            Mtl.lodSetAtlas(mv.handle, addr, count);
+            for (int i = 0; i < means.length; i++) MemoryUtil.memPutFloat(meansAddr + 4L * i, means[i]);
+            Mtl.lodSetAtlas(mv.handle, addr, meansAddr, count);
         } finally {
             MemoryUtil.nmemFree(addr);
+            MemoryUtil.nmemFree(meansAddr);
         }
         return true;
     }

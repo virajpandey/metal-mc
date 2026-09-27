@@ -147,15 +147,21 @@ sprites = [
     ("light15", None, None), ("light14", None, None), ("light10", None, None), ("light7", None, None),
 ]
 assert [n for n, _, _ in sprites] == [n for n, _ in colors]
+def v3(c):
+    return f"SIMD3({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f})"
+
 sprite_lines = []
 for name, top, side in sprites:
     if top is None:
-        sprite_lines.append(f'    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // {name}')
+        sprite_lines.append(f'    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1, topMean: SIMD3(1, 1, 1), sideMean: SIMD3(1, 1, 1)),   // {name}')
     else:
-        sprite_lines.append(f'    LodSprite(top: "{top}", side: "{side}", topLuma: {luma(top):.3f}, sideLuma: {luma(side):.3f}),   // {name}')
+        sprite_lines.append(f'    LodSprite(top: "{top}", side: "{side}", topLuma: {luma(top):.3f}, sideLuma: {luma(side):.3f}, '
+                            f'topMean: {v3(average(top))}, sideMean: {v3(average(side))}),   // {name}')
 # Past the materials: the grass side overlay (top) and base (side), for full-resolution grass sides, which
 # show vanilla's fringe (lodGrassSideSprite).
-sprite_lines.append(f'    LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: {luma("grass_block_side_overlay"):.3f}, sideLuma: {luma("grass_block_side"):.3f}),   // grass side (not a material)')
+sprite_lines.append(f'    LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: {luma("grass_block_side_overlay"):.3f}, '
+                    f'sideLuma: {luma("grass_block_side"):.3f}, topMean: {v3(average("grass_block_side_overlay"))}, '
+                    f'sideMean: {v3(average("grass_block_side"))}),   // grass side (not a material)')
 
 # Grass block sides are dirt with a biome-tinted grass fringe on top (grass_block_side_overlay). The side
 # color for tint T is (1 - f) * base + f * gray * T, with f the overlay's share of the texture.
@@ -215,12 +221,15 @@ let lodGrassSideFringe: Float = {GS_FRINGE:.3f}
 let lodGrassOverlayGray: Float = {GS_GRAY:.3f}
 """ + """
 /// Block textures used for LOD texture detail (names under block/ in the block atlas), with the mean luma
-/// of each texture's opaque texels. The LOD multiplies its flat color by texel luma / mean luma.
+/// of each texture's opaque texels. The LOD multiplies its flat color by texel luma / mean luma. The mean
+/// colors (vanilla's textures, untinted) let a resource pack's textures scale the LOD's colors (LodTextures).
 struct LodSprite {
     let top: String
     let side: String
     let topLuma: Float
     let sideLuma: Float
+    let topMean: SIMD3<Float>
+    let sideMean: SIMD3<Float>
 }
 
 let lodMaterialSprites: [LodSprite] = [
