@@ -30,6 +30,7 @@ public final class Bench {
     // -PbenchFly=<blocks per second>: fly a straight line along +X through the center (at the bench height,
     // looking 10 degrees down) instead of orbiting, so chunks and LOD stream in as they would in play.
     static final double FLY = Double.parseDouble(System.getProperty("metalmc.bench.fly", "0"));
+    static final boolean HITCHES = "1".equals(System.getProperty("metalmc.bench.hitches", "0"));
     private static int extraWaitTicks;
     /** Vanilla's GPU timer needs its debug-screen line enabled, which itself costs frame time; opt-in. */
     static final boolean GPU_TIMER = "1".equals(System.getProperty("metalmc.bench.gpuTimer", "0"));
@@ -67,6 +68,11 @@ public final class Bench {
         if (lastFrameNs != 0 && frameCount < frameNs.length) {
             gpuUtil[frameCount] = Minecraft.getInstance().getGpuUtilization();
             frameNs[frameCount++] = now - lastFrameNs;
+            // -PbenchHitches=1: log every frame that misses 120 Hz, with the wall clock, to line up with other logs.
+            if (HITCHES && now - lastFrameNs > 8_333_333L) {
+                System.out.println(String.format(java.util.Locale.ROOT, "METALMC_HITCH %s %.1f ms",
+                    java.time.LocalTime.now(), (now - lastFrameNs) / 1e6));
+            }
         }
         lastFrameNs = now;
     }

@@ -33,8 +33,14 @@ public func mmc_handle_release(_ h: Int64) {
     Unmanaged<AnyObject>.fromOpaque(p).release()
 }
 
+private let logClock: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss.SSS"
+    return f
+}()
+
 func log(_ s: String) {
-    FileHandle.standardError.write(("[metalmc-native] " + s + "\n").data(using: .utf8)!)
+    FileHandle.standardError.write(("[metalmc-native] " + logClock.string(from: Date()) + " " + s + "\n").data(using: .utf8)!)
 }
 
 final class BufferBox {

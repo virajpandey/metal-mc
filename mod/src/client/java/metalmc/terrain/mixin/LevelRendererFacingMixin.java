@@ -1,8 +1,5 @@
 package metalmc.terrain.mixin;
 
-import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
-import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
-import com.llamalad7.mixinextras.sugar.Local;
 import java.util.List;
 import metalmc.terrain.FacingData;
 import metalmc.terrain.FacingSorter;
@@ -21,6 +18,8 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyArg;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
@@ -44,31 +43,52 @@ abstract class LevelRendererFacingMixin {
         if (viewArea != null && metalmc.lod.Lod.active()) SectionOcclusion.recordCompiled(((ViewAreaAccessor) viewArea).metalmc$sections());
     }
 
+    // The section and layer vanilla is working on, recorded by the hooks below as it walks the visible sections
+    // (render thread). Redirects and ModifyArg rather than WrapOperation with @Local: those allocated a holder
+    // per local and a varargs array per call, per section per layer per frame (about a tenth of all allocation
+    // while flying, and G1 pauses are most of the frames that miss 120 Hz).
+    private static SectionMesh currentMesh;
+    private static int currentX, currentY, currentZ;
+    private static ChunkSectionLayer currentLayer;
+
     /**
      * A section the occlusion test found hidden gets an empty mesh here, so vanilla skips it before it
      * creates draw groups or section data for it.
      */
-    @WrapOperation(method = "extractSectionDrawGroups", at = @At(value = "INVOKE",
+    @Redirect(method = "extractSectionDrawGroups", at = @At(value = "INVOKE",
         target = "Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection;getSectionMesh()Lnet/minecraft/client/renderer/chunk/SectionMesh;"))
-    private SectionMesh metalmc$skipHidden(SectionRenderDispatcher.RenderSection section, Operation<SectionMesh> original) {
-        SectionMesh mesh = original.call(section);
+    private SectionMesh metalmc$skipHidden(SectionRenderDispatcher.RenderSection section) {
+        SectionMesh mesh = section.getSectionMesh();
         BlockPos o = section.getRenderOrigin();
-        if (mesh != CompiledSectionMesh.UNCOMPILED) SectionOcclusion.recordVanilla(o.getX(), o.getY(), o.getZ());
-        if (!mesh.hasRenderableLayers()) return mesh;
-        Vec3 c = levelRenderState.cameraRenderState.pos;
-        return SectionOcclusion.skip(o.getX(), o.getY(), o.getZ(), c.x, c.y, c.z) ? CompiledSectionMesh.EMPTY : mesh;
+        currentX = o.getX();
+        currentY = o.getY();
+        currentZ = o.getZ();
+        if (mesh != CompiledSectionMesh.UNCOMPILED) SectionOcclusion.recordVanilla(currentX, currentY, currentZ);
+        if (mesh.hasRenderableLayers()) {
+            Vec3 c = levelRenderState.cameraRenderState.pos;
+            if (SectionOcclusion.skip(currentX, currentY, currentZ, c.x, c.y, c.z)) mesh = CompiledSectionMesh.EMPTY;
+        }
+        currentMesh = mesh;
+        return mesh;
     }
 
-    @WrapOperation(method = "extractSectionDrawGroups", at = @At(value = "INVOKE", target = "Ljava/util/List;add(Ljava/lang/Object;)Z"))
-    private boolean metalmc$splitByFacing(List<Object> list, Object element, Operation<Boolean> original,
-                                          @Local SectionMesh sectionMesh, @Local ChunkSectionLayer layer, @Local BlockPos renderOffset) {
-        if (!FacingSorter.ENABLED || !(element instanceof DynamicGpuData.IndexedDraw draw) || !(sectionMesh instanceof FacingData data)) {
-            return original.call(list, element);
+    @ModifyArg(method = "extractSectionDrawGroups", at = @At(value = "INVOKE",
+        target = "Lnet/minecraft/client/renderer/chunk/SectionMesh;getSectionDraw(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;)Lnet/minecraft/client/renderer/chunk/SectionMesh$SectionDraw;"))
+    private ChunkSectionLayer metalmc$recordLayer(ChunkSectionLayer layer) {
+        currentLayer = layer;
+        return layer;
+    }
+
+    /** The section layer's draw (the third List.add in the method): split into the facing buckets that can face the camera. */
+    @Redirect(method = "extractSectionDrawGroups", at = @At(value = "INVOKE", target = "Ljava/util/List;add(Ljava/lang/Object;)Z", ordinal = 2))
+    private boolean metalmc$splitByFacing(List<Object> list, Object element) {
+        if (!FacingSorter.ENABLED || !(element instanceof DynamicGpuData.IndexedDraw draw) || !(currentMesh instanceof FacingData data)) {
+            return list.add(element);
         }
-        int[] counts = data.metalmc$facings(layer);
-        if (counts == null) return original.call(list, element);
+        int[] counts = data.metalmc$facings(currentLayer);
+        if (counts == null) return list.add(element);
         Vec3 cam = levelRenderState.cameraRenderState.pos;
-        int mask = FacingSorter.visibleMask(cam.x, cam.y, cam.z, renderOffset.getX(), renderOffset.getY(), renderOffset.getZ());
+        int mask = FacingSorter.visibleMask(cam.x, cam.y, cam.z, currentX, currentY, currentZ);
         int quad = 0;
         int runStart = -1;
         for (int b = 0; b < FacingSorter.BUCKETS; b++) {
@@ -76,18 +96,22 @@ abstract class LevelRendererFacingMixin {
             if (visible) {
                 if (runStart < 0) runStart = quad;
             } else if (runStart >= 0) {
-                emit(list, original, draw, runStart, quad);
+                emit(list, draw, runStart, quad);
                 runStart = -1;
             }
             quad += counts[b];
         }
-        if (runStart >= 0) emit(list, original, draw, runStart, quad);
+        if (runStart >= 0) emit(list, draw, runStart, quad);
         return true;
     }
 
-    private static void emit(List<Object> list, Operation<Boolean> original, DynamicGpuData.IndexedDraw draw, int fromQuad, int toQuad) {
+    private static void emit(List<Object> list, DynamicGpuData.IndexedDraw draw, int fromQuad, int toQuad) {
         if (toQuad <= fromQuad) return;
-        original.call(list, new DynamicGpuData.IndexedDraw((toQuad - fromQuad) * 6, draw.instanceCount(), draw.firstIndex() + fromQuad * 6,
+        if (fromQuad == 0 && (toQuad - fromQuad) * 6 == draw.indexCount()) {
+            list.add(draw);   // every bucket visible: keep vanilla's draw
+            return;
+        }
+        list.add(new DynamicGpuData.IndexedDraw((toQuad - fromQuad) * 6, draw.instanceCount(), draw.firstIndex() + fromQuad * 6,
             draw.baseVertex(), draw.baseInstance()));
     }
 }
