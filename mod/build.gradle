@@ -98,7 +98,7 @@ loom {
 			}
 			if (project.hasProperty("jfr")) {
 				// CPU profile of the timed part of the run: warm-up is 20 s, so start at 30 s and record 30 s.
-				vmArg "-XX:StartFlightRecording=" + (project.findProperty("jfrOpts") ?: "delay=30s,duration=30s") + ",settings=profile,filename=" + project.findProperty("jfr").toString()
+				vmArg "-XX:StartFlightRecording=" + (project.findProperty("jfrOpts") ?: "delay=30s,duration=30s") + ",settings=" + (project.findProperty("jfrSettings") ?: "profile") + ",filename=" + project.findProperty("jfr").toString()
 			}
 			// Generational ZGC (sub-millisecond pauses) by default; -Pgc=g1 for the launcher's default. G1's
 			// 5-10 ms young collections every 2-3 s while chunks stream in were most of the frames that missed
