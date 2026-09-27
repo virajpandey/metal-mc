@@ -122,6 +122,9 @@ final class MetalContext: @unchecked Sendable {
     // Indexed-indirect draw calls (terrain): calls, draws, CPU nanoseconds inside the native call.
     var statIndirectCalls = 0, statIndirectDraws = 0, statIndirectNanos: UInt64 = 0
     var statOccSections = 0   // chunk sections box-tested for occlusion
+    // METALMC_EXP=hitchlog: per-frame render-thread time in native calls, logged for frames over 8.33 ms.
+    var hitchLastPresent: UInt64 = 0
+    var hitchDrawableNanos: UInt64 = 0, hitchSubmitNanos: UInt64 = 0, hitchLodNanos: UInt64 = 0
 
     // Utility pipelines, built on first use.
     let utilLock = NSLock()
@@ -1108,6 +1111,8 @@ public func mmc_clear_region(_ color: Int64, _ rgba: UnsafePointer<Float>, _ dep
 
 @_cdecl("mmc_submit")
 public func mmc_submit(_ index: Int64) {
+    let hitchT0 = DispatchTime.now().uptimeNanoseconds
+    defer { ctx.hitchSubmitNanos += DispatchTime.now().uptimeNanoseconds - hitchT0 }
     autoreleasepool {
         ctx.endBlit()
         precondition(ctx.pass == nil, "submit with an open render pass")
@@ -1271,7 +1276,11 @@ public func mmc_surface2_acquire(_ h: Int64) -> Int32 {
 @_cdecl("mmc_surface2_blit")
 public func mmc_surface2_blit(_ h: Int64, _ srcTex: Int64) {
     let s: SurfaceBox = from(h)
-    if s.drawable == nil { s.drawable = autoreleasepool { s.layer.nextDrawable() } }
+    if s.drawable == nil {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        s.drawable = autoreleasepool { s.layer.nextDrawable() }
+        ctx.hitchDrawableNanos += DispatchTime.now().uptimeNanoseconds - t0
+    }
     guard let drawable = s.drawable else { return }   // timed out: this frame isn't shown
     if experiments.contains("noblit") {
         // Timing experiment only: present without copying (upper bound for a zero-copy present).
@@ -1315,4 +1324,21 @@ public func mmc_surface2_blit(_ h: Int64, _ srcTex: Int64) {
 public func mmc_surface2_present(_ h: Int64) {
     let s: SurfaceBox = from(h)
     s.drawable = nil
+    if lodHitchLog {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if ctx.hitchLastPresent != 0 {
+            let frame = now - ctx.hitchLastPresent
+            if frame > 8_333_333 {
+                ctx.cond.lock(); let gpu = ctx.gpuSeconds.last ?? 0; ctx.cond.unlock()
+                let native = ctx.hitchDrawableNanos + ctx.hitchSubmitNanos + ctx.hitchLodNanos
+                log(String(format: "hitch %.1f ms: drawable wait %.1f, submits %.1f, LOD encode %.1f, other (Java) %.1f; last GPU frame %.1f ms",
+                           Double(frame) / 1e6, Double(ctx.hitchDrawableNanos) / 1e6, Double(ctx.hitchSubmitNanos) / 1e6,
+                           Double(ctx.hitchLodNanos) / 1e6, Double(frame > native ? frame - native : 0) / 1e6, gpu * 1000))
+            }
+        }
+        ctx.hitchLastPresent = now
+        ctx.hitchDrawableNanos = 0; ctx.hitchSubmitNanos = 0; ctx.hitchLodNanos = 0
+    }
 }
+
+let lodHitchLog = experiments.contains("hitchlog")

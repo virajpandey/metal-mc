@@ -645,7 +645,11 @@ public func mmc_lod_status(_ out: UnsafeMutablePointer<Int64>) {
 @_cdecl("mmc_lod_draw")
 public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>) -> Int32 {
     let t0 = DispatchTime.now().uptimeNanoseconds
-    defer { ctx.statLodNanos += DispatchTime.now().uptimeNanoseconds - t0 }
+    defer {
+        let dt = DispatchTime.now().uptimeNanoseconds - t0
+        ctx.statLodNanos += dt
+        ctx.hitchLodNanos += dt
+    }
     let r = LodRenderer.shared
     guard let enc = ctx.pass, !ctx.scissorEmpty else { return 0 }
     r.lock.lock(); let w = r.world; r.lock.unlock()
