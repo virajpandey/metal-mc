@@ -4,7 +4,9 @@ import metalmc.backend.MetalLod;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.storage.LevelResource;
 
 /**
@@ -14,6 +16,10 @@ import net.minecraft.world.level.storage.LevelResource;
  * loaded chunks only, saved per server under {@code <game dir>/metalmc/lod/}, so it grows as the player
  * explores. While the LOD is ready, the mixins push the far plane and render-distance fog out to FAR and
  * draw the LOD after solid terrain.
+ * <p>
+ * Each dimension with a LOD (the overworld and the End) gets its own. The native side keeps the one the player
+ * left (paused), so coming back from the End is instant. The Nether has none: its fog ends about 100 blocks
+ * out, well inside vanilla's chunks.
  */
 public final class Lod implements ClientModInitializer {
     public static final boolean ENABLED = metalmc.MetalMCConfig.lod();
@@ -28,15 +34,18 @@ public final class Lod implements ClientModInitializer {
     private static volatile boolean built;
     private static int statusTicks;
     private static String openedDir;
+    private static ResourceKey<Level> openedDim;   // the dimension whose LOD is current
 
-    /**
-     * True once the LOD is built and should be drawn (and the far plane and fog extended). Overworld only:
-     * the LOD reads the overworld's region files, and the Nether and End don't benefit from it.
-     */
+    /** Dimensions with a LOD. */
+    private static boolean supported(ResourceKey<Level> dim) {
+        return dim == Level.OVERWORLD || dim == Level.END;
+    }
+
+    /** True once the LOD of the player's dimension is built and should be drawn (and the far plane and fog extended). */
     public static boolean active() {
         if (!ENABLED || !ready) return false;
         Minecraft mc = Minecraft.getInstance();
-        return mc.level != null && mc.level.dimension() == net.minecraft.world.level.Level.OVERWORLD;
+        return mc.level != null && mc.level.dimension() == openedDim;
     }
 
     /** True once every LOD level has been built at least once (the benchmark waits for this). */
@@ -65,9 +74,16 @@ public final class Lod implements ClientModInitializer {
         net.minecraft.client.multiplayer.ServerData data = mc.getCurrentServer();
         if (data == null || !MULTIPLAYER || !LIVE) return null;
         String name = data.ip.toLowerCase(java.util.Locale.ROOT).replaceAll("[^a-z0-9._-]", "_");
-        String store = mc.gameDirectory.toPath().resolve("metalmc").resolve("lod").resolve(name).resolve("overworld")
-            .toAbsolutePath().normalize().toString();
-        return new String[]{"", store, "server:" + name};
+        return new String[]{"", mc.gameDirectory.toPath().resolve("metalmc").resolve("lod").resolve(name).toAbsolutePath().normalize().toString(),
+            "server:" + name};
+    }
+
+    /** A server's store for one dimension: <game dir>/metalmc/lod/<server>/overworld (the_end, ...). */
+    private static String store(String serverDir, ResourceKey<Level> dim) {
+        if (serverDir.isEmpty()) return "";
+        net.minecraft.resources.Identifier id = dim.identifier();
+        String sub = id.getNamespace().equals("minecraft") ? id.getPath() : id.getNamespace() + "_" + id.getPath();
+        return java.nio.file.Path.of(serverDir).resolve(sub.replaceAll("[^a-z0-9._-]", "_")).toString();
     }
 
     private static void tick(Minecraft mc) {
@@ -82,18 +98,30 @@ public final class Lod implements ClientModInitializer {
             ready = false;
             built = false;
             openedDir = null;
+            openedDim = null;
         }
-        if (!opened && src != null && MetalLod.available()) {
+        // Entering a dimension with a LOD: open (or resume) its own. Elsewhere (the Nether) the last one is left
+        // as it was, neither drawn nor moved.
+        ResourceKey<Level> dim = mc.level != null ? mc.level.dimension() : null;
+        if (src != null && dim != null && dim != openedDim && supported(dim) && MetalLod.available()) {
+            LiveIngest.setEnabled(false);
+            FarTerrain.stop();
+            int cx = mc.player != null ? mc.player.getBlockX() : 0, cz = mc.player != null ? mc.player.getBlockZ() : 0;
+            long world = MetalLod.open3(src[0], store(src[1], dim), dim.identifier().toString(), FAR, cx, cz);
+            System.out.println("[metalmc-lod] opening " + current + " " + dim.identifier() + " far=" + FAR + " live=" + LIVE + ": " + world);
+            // Nothing to build from: drop every dimension's LOD, so the last one can't be drawn here.
+            if (world == 0) MetalLod.close();
             opened = true;
             openedDir = current;
-            int cx = mc.player != null ? mc.player.getBlockX() : 0, cz = mc.player != null ? mc.player.getBlockZ() : 0;
-            boolean ok = MetalLod.open2(src[0], src[1], FAR, cx, cz);
-            System.out.println("[metalmc-lod] opening " + current + " far=" + FAR + " live=" + LIVE + ": " + ok);
-            if (ok && LIVE) LiveIngest.setEnabled(true);
-            if (ok && GENERATE && mc.getSingleplayerServer() != null) FarTerrain.start(mc.getSingleplayerServer());
+            openedDim = dim;
+            ready = false;
+            built = false;
+            statusTicks = 19;   // check the status on the next tick: a resumed dimension draws right away
+            if (world != 0 && LIVE) LiveIngest.setEnabled(true, world, dim);
+            if (world != 0 && GENERATE && mc.getSingleplayerServer() != null) FarTerrain.start(mc.getSingleplayerServer(), dim, world);
         }
         if (!opened || ++statusTicks % 20 != 0) return;
-        if (mc.player != null) {
+        if (mc.player != null && dim == openedDim) {
             MetalLod.center(mc.player.getBlockX(), mc.player.getBlockZ(), mc.options.getEffectiveRenderDistance() * 16);
         }
         if (!ready || !built) {

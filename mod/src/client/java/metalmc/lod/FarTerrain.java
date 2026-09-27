@@ -16,8 +16,11 @@ import net.minecraft.world.level.biome.BiomeResolver;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.RandomState;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.levelgen.densityfunction.DensityBuffer;
 import net.minecraft.world.level.levelgen.densityfunction.DensityFunction;
 import net.minecraft.world.level.levelgen.densityfunction.DensitySampler;
+import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
 
 /**
@@ -33,6 +36,10 @@ import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
  * <li>Biome at that height, which the native side turns into surface materials, tints and tree canopy
  * (LodFar.swift).</li>
  * </ul>
+ * In the End (floating islands) each column is the island's top and bottom instead: the generator's final
+ * density sampled at its own cell corners (8 x 4 x 8 blocks, which it interpolates between) up the column,
+ * with the span around the highest solid sample found by the same linear interpolation.
+ * <p>
  * Runs on a few low-priority threads; the samplers are the ones vanilla's parallel world generation shares.
  */
 public final class FarTerrain {
@@ -41,19 +48,39 @@ public final class FarTerrain {
 
     private static final int THREADS = 3;
     private static final int COLUMNS = 256;
+    private static final int END_SAMPLES = 32;   // y 0-124 every 4 blocks: the End generator's height (128)
     private static volatile Thread loop;
     private static volatile boolean running;
+    private static volatile long world;          // the native LOD the columns go to (MetalLod.open3)
     private static final ConcurrentHashMap<Holder<Biome>, Integer> BIOME_IDS = new ConcurrentHashMap<>();
 
-    public static synchronized void start(MinecraftServer server) {
+    public static synchronized void start(MinecraftServer server, net.minecraft.resources.ResourceKey<Level> dim, long worldId) {
         stop();
-        ServerLevel level = server.overworld();
+        ServerLevel level = server.getLevel(dim);
+        if (level == null) return;
         ChunkGenerator gen = level.getChunkSource().getGenerator();
         if (!(gen instanceof NoiseBasedChunkGenerator noise)) {
             System.out.println("[metalmc-lod] far terrain: generator " + gen.getClass().getSimpleName() + " isn't noise-based; off");
             return;
         }
         RandomState rs = level.getChunkSource().randomState();
+        world = worldId;
+        BIOME_IDS.clear();
+        // Cache per save, seed and dimension, outside the save: <game dir>/metalmc/lod/far/<save>-<seed>[-the_end].
+        java.nio.file.Path save = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
+        String name = (save.getFileName() == null ? "world" : save.getFileName().toString()).replaceAll("[^A-Za-z0-9._-]", "_");
+        String suffix = dim == Level.OVERWORLD ? "" : "-" + dim.identifier().getPath().replaceAll("[^a-z0-9._-]", "_");
+        java.nio.file.Path cache = net.minecraft.client.Minecraft.getInstance().gameDirectory.toPath()
+            .resolve("metalmc").resolve("lod").resolve("far").resolve(name + "-" + Long.toHexString(level.getSeed()) + suffix);
+        if (dim == Level.END) {
+            DensitySampler density = rs.getSampler(noise.generatorSettings().value().noiseRouter().finalDensity());
+            int endBiome = Math.max(0, MetalLod.farBiome(worldId, "minecraft:the_end"));
+            MetalLod.farCache(worldId, cache.toAbsolutePath().toString());
+            launch(() -> run(worldId, (lv, nx, nz) -> generateEnd(worldId, lv, nx, nz, density, endBiome)));
+            System.out.println("[metalmc-lod] far terrain: generating End islands from the world's noise");
+            return;
+        }
+        if (dim != Level.OVERWORLD) return;
         DensityFunction cheeseFn = server.registryAccess().lookupOrThrow(Registries.DENSITY_FUNCTION)
             .get(ResourceKey.create(Registries.DENSITY_FUNCTION, Identifier.withDefaultNamespace("overworld/sloped_cheese")))
             .map(Holder::value).orElse(null);
@@ -64,20 +91,23 @@ public final class FarTerrain {
         DensitySampler surface = rs.getSampler(noise.generatorSettings().value().noiseRouter().chunkSurfaceLevel());
         DensitySampler cheese = rs.getSampler(cheeseFn);
         int minY = level.getMinY(), maxY = level.getMaxY();
-        BIOME_IDS.clear();
-        // Cache per save and seed, outside the save: <game dir>/metalmc/lod/far/<save>-<seed>.
-        java.nio.file.Path save = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
-        String name = (save.getFileName() == null ? "world" : save.getFileName().toString()).replaceAll("[^A-Za-z0-9._-]", "_");
-        java.nio.file.Path cache = net.minecraft.client.Minecraft.getInstance().gameDirectory.toPath()
-            .resolve("metalmc").resolve("lod").resolve("far").resolve(name + "-" + Long.toHexString(level.getSeed()));
-        MetalLod.farCache(cache.toAbsolutePath().toString());
+        MetalLod.farCache(worldId, cache.toAbsolutePath().toString());
+        ThreadLocal<BiomeResolver> resolvers = ThreadLocal.withInitial(() -> gen.getBiomeSource().createUncachedResolver(rs));
+        launch(() -> run(worldId, (lv, nx, nz) -> generate(worldId, lv, nx, nz, surface, cheese, resolvers.get(), minY, maxY)));
+        System.out.println("[metalmc-lod] far terrain: generating from the world's noise");
+    }
+
+    private interface NodeJob {
+        void generate(int level, int nx, int nz);
+    }
+
+    private static void launch(Runnable body) {
         running = true;
-        Thread t = new Thread(() -> run(gen, rs, surface, cheese, minY, maxY), "metalmc-far-terrain");
+        Thread t = new Thread(body, "metalmc-far-terrain");
         t.setDaemon(true);
         t.setPriority(Thread.MIN_PRIORITY);
         loop = t;
         t.start();
-        System.out.println("[metalmc-lod] far terrain: generating from the world's noise");
     }
 
     public static synchronized void stop() {
@@ -87,18 +117,17 @@ public final class FarTerrain {
         if (t != null) t.interrupt();
     }
 
-    private static void run(ChunkGenerator gen, RandomState rs, DensitySampler surface, DensitySampler cheese, int minY, int maxY) {
+    private static void run(long worldId, NodeJob job) {
         ExecutorService pool = Executors.newFixedThreadPool(THREADS, r -> {
             Thread t = new Thread(r, "metalmc-far-terrain-worker");
             t.setDaemon(true);
             t.setPriority(Thread.MIN_PRIORITY);
             return t;
         });
-        ThreadLocal<BiomeResolver> resolvers = ThreadLocal.withInitial(() -> gen.getBiomeSource().createUncachedResolver(rs));
         long nodes = 0, columns = 0, nanos = 0;
         try {
-            while (running) {
-                int[] wanted = MetalLod.farWanted(THREADS * 2);
+            while (running && world == worldId) {
+                int[] wanted = MetalLod.farWanted(worldId, THREADS * 2);
                 if (wanted.length == 0) {
                     Thread.sleep(2000);
                     continue;
@@ -107,7 +136,7 @@ public final class FarTerrain {
                 java.util.List<Future<?>> jobs = new java.util.ArrayList<>();
                 for (int i = 0; i + 2 < wanted.length; i += 3) {
                     int lv = wanted[i], nx = wanted[i + 1], nz = wanted[i + 2];
-                    jobs.add(pool.submit(() -> generate(lv, nx, nz, surface, cheese, resolvers.get(), minY, maxY)));
+                    jobs.add(pool.submit(() -> job.generate(lv, nx, nz)));
                 }
                 for (Future<?> f : jobs) f.get();
                 nodes += jobs.size();
@@ -125,8 +154,8 @@ public final class FarTerrain {
         }
     }
 
-    private static void generate(int level, int nx, int nz, DensitySampler surface, DensitySampler cheese, BiomeResolver biomes,
-                                 int minY, int maxY) {
+    private static void generate(long worldId, int level, int nx, int nz, DensitySampler surface, DensitySampler cheese,
+                                 BiomeResolver biomes, int minY, int maxY) {
         if (!running) return;
         SamplerContext ctx = SamplerContext.EMPTY_UNCACHED;
         int s = 1 << level, size = COLUMNS * s;
@@ -137,7 +166,7 @@ public final class FarTerrain {
         short[] heights = new short[COLUMNS * COLUMNS];
         short[] ids = new short[COLUMNS * COLUMNS];
         for (int j = 0; j < COLUMNS; j++) {
-            if (!running) return;
+            if (!running || world != worldId) return;
             for (int i = 0; i < COLUMNS; i++) {
                 int x = x0 + i * s + s / 2, z = z0 + j * s + s / 2;
                 int est = (int) surface.sampleValue(ctx, x, 0, z);
@@ -151,13 +180,55 @@ public final class FarTerrain {
                 int h = Math.max(minY, lo + 1);
                 heights[j * COLUMNS + i] = (short) h;
                 Holder<Biome> b = biomes.getNoiseBiome(x >> 2, Math.min(maxY - 1, h) >> 2, z >> 2);
-                ids[j * COLUMNS + i] = (short) biomeId(b).intValue();
+                ids[j * COLUMNS + i] = (short) biomeId(worldId, b).intValue();
             }
         }
-        MetalLod.farPut(level, nx, nz, heights, ids);
+        if (running && world == worldId) MetalLod.farPut(worldId, level, nx, nz, heights, null, ids);
     }
 
-    private static Integer biomeId(Holder<Biome> b) {
-        return BIOME_IDS.computeIfAbsent(b, h -> Math.max(0, MetalLod.farBiome(h.getRegisteredName())));
+    /**
+     * End islands for one node: per column the top (first air block above) and bottom (lowest block) of the
+     * island span holding the highest solid sample; void columns get top = bottom = 0. All end stone, one biome.
+     */
+    private static void generateEnd(long worldId, int level, int nx, int nz, DensitySampler density, int biome) {
+        if (!running) return;
+        SamplerContext ctx = SamplerContext.EMPTY_UNCACHED;
+        int s = 1 << level, size = COLUMNS * s;
+        int x0 = nx * size, z0 = nz * size;
+        short[] heights = new short[COLUMNS * COLUMNS], bottoms = new short[COLUMNS * COLUMNS], ids = new short[COLUMNS * COLUMNS];
+        java.util.Arrays.fill(ids, (short) biome);
+        DensityBuffer d = DensityBuffer.createUnpooled(END_SAMPLES);
+        for (int j = 0; j < COLUMNS; j++) {
+            if (!running || world != worldId) return;
+            for (int i = 0; i < COLUMNS; i++) {
+                // The cell corner nearest the column's middle: the generator's density is exact there.
+                int x = Math.floorDiv(x0 + i * s + s / 2 + 4, 8) * 8, z = Math.floorDiv(z0 + j * s + s / 2 + 4, 8) * 8;
+                density.sampleVolume(ctx, d, new DensityVolume(1, END_SAMPLES, 1, x, 0, z, 8, 4, 8));
+                int top = END_SAMPLES - 1;
+                while (top >= 0 && d.get(top) <= 0) top--;
+                int c = j * COLUMNS + i;
+                if (top < 0) continue;
+                // Blocks between samples k and k + 1 are solid where the linear interpolation is positive.
+                int height = 128;
+                if (top < END_SAMPLES - 1) {
+                    float a = d.get(top), b = d.get(top + 1);
+                    height = 4 * top + (int) Math.ceil(4 * a / (a - b));
+                }
+                int low = top;
+                while (low > 0 && d.get(low - 1) > 0) low--;
+                int bottom = 0;
+                if (low > 0) {
+                    float a = d.get(low - 1), b = d.get(low);
+                    bottom = 4 * (low - 1) + (int) Math.floor(4 * -a / (b - a)) + 1;
+                }
+                heights[c] = (short) height;
+                bottoms[c] = (short) bottom;
+            }
+        }
+        if (running && world == worldId) MetalLod.farPut(worldId, level, nx, nz, heights, bottoms, ids);
+    }
+
+    private static Integer biomeId(long worldId, Holder<Biome> b) {
+        return BIOME_IDS.computeIfAbsent(b, h -> Math.max(0, MetalLod.farBiome(worldId, h.getRegisteredName())));
     }
 }

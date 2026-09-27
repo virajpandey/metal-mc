@@ -175,8 +175,34 @@ final class Tour {
         new Step("high-south", at(260, 0f, 12f), 80, mc -> {})
     );
 
+    /**
+     * End LOD test (-PbenchTour=end): the main island in four directions, high above it, then out among the outer
+     * islands (1.5 km east, which vanilla generates on arrival). No HUD (the dragon's boss bar), noon.
+     */
+    static final boolean END_TOUR = "end".equals(System.getProperty("metalmc.tour"));
+    private static Pose end(double x, double y, float yaw, float pitch) {
+        return new Pose(x, y, 0.5, yaw, pitch);
+    }
+    private static final String KILL_DRAGON = "kill @e[type=minecraft:ender_dragon]";
+    static final List<Step> END_STEPS = List.of(
+        new Step("end-arrive", end(0.5, 90, 270f, 6f), 700, mc -> {
+            cmd(mc, "execute in minecraft:the_end run tp @a 0.5 90 0.5", "time set 6000", "gamerule advance_time false");
+            if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();
+        }),
+        // The dragon fight's boss bar fogs the End to 96 blocks (vanilla); the tour shows it after the fight.
+        new Step("end-east", end(0.5, 90, 270f, 6f), 300, mc -> cmd(mc, KILL_DRAGON)),
+        new Step("end-north", end(0.5, 90, 180f, 6f), 100, mc -> cmd(mc, KILL_DRAGON)),
+        new Step("end-south", end(0.5, 90, 0f, 6f), 100, mc -> {}),
+        new Step("end-west", end(0.5, 90, 90f, 6f), 100, mc -> {}),
+        new Step("end-high", end(0.5, 300, 270f, 25f), 200, mc -> {}),
+        new Step("end-outer", end(1500.5, 110, 270f, 8f), 600, mc -> cmd(mc, "execute in minecraft:the_end run tp @a 1500.5 110 0.5")),
+        new Step("end-outer-high", end(1500.5, 300, 270f, 30f), 200, mc -> {}),
+        new Step("end-back", end(0.5, 90, 270f, 6f), 300, mc -> cmd(mc, "execute in minecraft:the_end run tp @a 0.5 90 0.5"))
+    );
+
     static List<Step> steps() {
         if (FIDELITY_TOUR) return FIDELITY_STEPS;
+        if (END_TOUR) return END_STEPS;
         if (MP_TOUR) return "mp2".equals(System.getProperty("metalmc.tour")) ? MP2_STEPS : MP_STEPS;
         return LOD_TOUR ? LOD_STEPS : STEPS;
     }

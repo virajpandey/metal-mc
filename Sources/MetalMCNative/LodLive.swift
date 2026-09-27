@@ -202,9 +202,22 @@ public func mmc_lod_ingest(_ cx: Int32, _ cz: Int32, _ blocks: UnsafePointer<UIn
     let r = LodRenderer.shared
     r.lock.lock(); let w = r.world; r.lock.unlock()
     guard let w else { return }
+    lodIngest(w, cx, cz, blocks, tints)
+}
+
+/// mmc_lod_ingest for the world `id` (mmc_lod_open3): a chunk converted after the player changed dimension
+/// doesn't land in the new dimension's LOD.
+@_cdecl("mmc_lod_ingest2")
+public func mmc_lod_ingest2(_ id: Int64, _ cx: Int32, _ cz: Int32, _ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8>) {
+    guard let w = lodWorld(id) else { return }
+    lodIngest(w, cx, cz, blocks, tints)
+}
+
+private func lodIngest(_ w: LodWorld, _ cx: Int32, _ cz: Int32, _ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8>) {
     let n = lodChunkVoxels, h = lodColumnHeight
     var v = [UInt8](repeating: 0, count: n * n * h)
-    v.withUnsafeMutableBufferPointer { lodReduceChunk(blocks, tints, into: $0.baseAddress!) }
+    v.withUnsafeMutableBufferPointer { lodReduceChunk(blocks, tints, into: $0.baseAddress!, rule: w.downsampleRule) }
+    if w.floating { for k in 0..<(n * n) { v[k] = lodChunkMarker } }
     let cols = v.withUnsafeBufferPointer { LodChunkColumns(voxels: $0) }
     if lodLiveCheck, let dir = w.regionDir { liveCheck(dir: dir, cx: Int(cx), cz: Int(cz), live: v) }
     w.live.put(cx: Int(cx), cz: Int(cz), cols)

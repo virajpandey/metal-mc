@@ -89,6 +89,8 @@ final class Mtl {
     private static final MethodHandle LOD_CLASSIFY = h("mmc_lod_classify", false, JAVA_INT, JAVA_LONG);
     private static final MethodHandle LOD_TINT_INDEX = h("mmc_lod_tint_index", false, JAVA_INT, JAVA_LONG);
     private static final MethodHandle LOD_INGEST = h("mmc_lod_ingest", false, null, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle LOD_INGEST2 = h("mmc_lod_ingest2", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle LOD_OPEN3 = h("mmc_lod_open3", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
     private static final MethodHandle OCC_HIDDEN = h("mmc_occ_hidden", true, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle OCC_TEST = h("mmc_occ_test", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle LOD_SPRITE_NAME = h("mmc_lod_sprite_name", false, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT);
@@ -98,10 +100,10 @@ final class Mtl {
     private static final MethodHandle ACTIVATE_APP = h("mmc_activate_app", false, JAVA_INT);
     private static final MethodHandle LOD_SET_DETAIL = h("mmc_lod_set_detail", false, null, JAVA_INT);
     private static final MethodHandle LOD_SET_LIGHTMAP = h("mmc_lod_set_lightmap", false, null, JAVA_LONG);
-    private static final MethodHandle LOD_FAR_WANTED = h("mmc_lod_far_wanted", false, JAVA_INT, JAVA_LONG, JAVA_INT);
-    private static final MethodHandle LOD_FAR_BIOME = h("mmc_lod_far_biome", false, JAVA_INT, JAVA_LONG);
-    private static final MethodHandle LOD_FAR_CACHE = h("mmc_lod_far_cache", false, null, JAVA_LONG);
-    private static final MethodHandle LOD_FAR_PUT = h("mmc_lod_far_put", false, null, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle LOD_FAR_WANTED = h("mmc_lod_far_wanted", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
+    private static final MethodHandle LOD_FAR_BIOME = h("mmc_lod_far_biome", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle LOD_FAR_CACHE = h("mmc_lod_far_cache", false, null, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle LOD_FAR_PUT = h("mmc_lod_far_put", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle COMPLETED_SUBMIT = h("mmc_completed_submit", true, JAVA_LONG);
     private static final MethodHandle SURFACE_CREATE = h("mmc_surface2_create", false, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle SURFACE_CONFIGURE = h("mmc_surface2_configure", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -326,6 +328,14 @@ final class Mtl {
         try { LOD_INGEST.invokeExact(cx, cz, blocks, tints); } catch (Throwable t) { throw rethrow(t); }
     }
 
+    static void lodIngest2(long world, int cx, int cz, long blocks, long tints) {
+        try { LOD_INGEST2.invokeExact(world, cx, cz, blocks, tints); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static long lodOpen3(long worldDir, long storeDir, long dimension, int far, int centerX, int centerZ) {
+        try { return (long) LOD_OPEN3.invokeExact(worldDir, storeDir, dimension, far, centerX, centerZ); } catch (Throwable t) { throw rethrow(t); }
+    }
+
     static int occHidden(long camera, long out, int max) {
         try { return (int) OCC_HIDDEN.invokeExact(camera, out, max); } catch (Throwable t) { throw rethrow(t); }
     }
@@ -346,20 +356,20 @@ final class Mtl {
         try { LOD_SET_VANILLA.invokeExact(keys, count); } catch (Throwable t) { throw rethrow(t); }
     }
 
-    static int lodFarWanted(long out, int max) {
-        try { return (int) LOD_FAR_WANTED.invokeExact(out, max); } catch (Throwable t) { throw rethrow(t); }
+    static int lodFarWanted(long world, long out, int max) {
+        try { return (int) LOD_FAR_WANTED.invokeExact(world, out, max); } catch (Throwable t) { throw rethrow(t); }
     }
 
-    static int lodFarBiome(long name) {
-        try { return (int) LOD_FAR_BIOME.invokeExact(name); } catch (Throwable t) { throw rethrow(t); }
+    static int lodFarBiome(long world, long name) {
+        try { return (int) LOD_FAR_BIOME.invokeExact(world, name); } catch (Throwable t) { throw rethrow(t); }
     }
 
-    static void lodFarCache(long dir) {
-        try { LOD_FAR_CACHE.invokeExact(dir); } catch (Throwable t) { throw rethrow(t); }
+    static void lodFarCache(long world, long dir) {
+        try { LOD_FAR_CACHE.invokeExact(world, dir); } catch (Throwable t) { throw rethrow(t); }
     }
 
-    static void lodFarPut(int level, int x, int z, long heights, long biomes) {
-        try { LOD_FAR_PUT.invokeExact(level, x, z, heights, biomes); } catch (Throwable t) { throw rethrow(t); }
+    static void lodFarPut(long world, int level, int x, int z, long heights, long bottoms, long biomes) {
+        try { LOD_FAR_PUT.invokeExact(world, level, x, z, heights, bottoms, biomes); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static void lodSetLightmap(long view) {

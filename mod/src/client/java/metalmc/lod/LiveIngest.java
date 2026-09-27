@@ -21,7 +21,7 @@ import net.minecraft.world.level.chunk.PalettedContainer;
 import org.lwjgl.system.MemoryUtil;
 
 /**
- * Live chunk ingestion for the LOD. Every overworld chunk the client loads, and again when it unloads
+ * Live chunk ingestion for the LOD. Every chunk of the LOD's dimension the client loads, and again when it unloads
  * (which captures edits made while it was loaded), is handed to the native LOD. The client thread only
  * copies the chunk's non-empty block sections and reads its surface biomes. A worker thread converts
  * the blocks to LOD material ids. This keeps the LOD current without waiting for the server to save,
@@ -31,7 +31,7 @@ public final class LiveIngest {
     private LiveIngest() {
     }
 
-    /** Matches the native layout: overworld sections -4..19 (y -64..319). */
+    /** Matches the native layout: sections -4..19 (y -64..319); the End's 0..15 sit inside it. */
     private static final int MIN_SECTION = -4;
     private static final int SECTIONS = 24;
     private static final int BLOCK_BYTES = 16 * 16 * 16 * SECTIONS;
@@ -40,6 +40,8 @@ public final class LiveIngest {
 
     private static volatile int generation;              // bumped when the LOD closes or reopens
     private static volatile boolean enabled;
+    private static volatile long world;                  // the native LOD (MetalLod.open3) chunks go to
+    private static volatile net.minecraft.resources.ResourceKey<Level> dimension = Level.OVERWORLD;
     private static final AtomicInteger QUEUED = new AtomicInteger();
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "MetalMC LOD ingest");
@@ -61,14 +63,23 @@ public final class LiveIngest {
         ClientChunkEvents.CHUNK_UNLOAD.register(LiveIngest::capture);
     }
 
-    /** Called when the native LOD opens (true) or closes (false). Pending chunks from before are dropped. */
-    static void setEnabled(boolean on) {
+    /**
+     * Called when a dimension's LOD opens (true, with its native id and dimension) or closes (false). Pending
+     * chunks from before are dropped.
+     */
+    static void setEnabled(boolean on, long worldId, net.minecraft.resources.ResourceKey<Level> dim) {
         generation++;
+        world = worldId;
+        dimension = dim;
         enabled = on;
     }
 
+    static void setEnabled(boolean on) {
+        setEnabled(on, world, dimension);
+    }
+
     private static void capture(ClientLevel level, LevelChunk chunk) {
-        if (!enabled || level.dimension() != Level.OVERWORLD) return;
+        if (!enabled || level.dimension() != dimension) return;
         if (QUEUED.get() >= MAX_QUEUED) return;   // the worker is far behind; the unload will catch up
         LevelChunkSection[] sections = chunk.getSections();
         int first = level.getMinSectionY();
@@ -90,10 +101,11 @@ public final class LiveIngest {
             }
         }
         int gen = generation;
+        long target = world;
         QUEUED.incrementAndGet();
         WORKER.execute(() -> {
             try {
-                if (gen == generation && enabled) convert(pos.x(), pos.z(), copies, tints);
+                if (gen == generation && enabled) convert(target, pos.x(), pos.z(), copies, tints);
             } catch (Throwable t) {
                 System.err.println("[metalmc-lod] live ingest failed for chunk " + pos + ": " + t);
             } finally {
@@ -102,7 +114,7 @@ public final class LiveIngest {
         });
     }
 
-    private static void convert(int cx, int cz, PalettedContainer<BlockState>[] copies, byte[] tints) {
+    private static void convert(long target, int cx, int cz, PalettedContainer<BlockState>[] copies, byte[] tints) {
         if (blocksAddr == 0) {
             blocksAddr = MemoryUtil.nmemAlloc(BLOCK_BYTES);
             tintsAddr = MemoryUtil.nmemAlloc(16);
@@ -128,7 +140,7 @@ public final class LiveIngest {
             }
         }
         for (int i = 0; i < 16; i++) MemoryUtil.memPutByte(tintsAddr + i, tints[i]);
-        MetalLod.ingest(cx, cz, blocksAddr, tintsAddr);
+        MetalLod.ingest(target, cx, cz, blocksAddr, tintsAddr);
     }
 
     private static byte material(BlockState state) {

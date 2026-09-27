@@ -23,7 +23,8 @@ struct LodUniforms {
     float lightmapOn;      // 1 if vanilla's lightmap is bound (texture 29), else the fallback daylight curve
     float4 camFrac;        // xyz: fractional part of the camera position; w: 1 if texture detail is on
     float4 camInSection;   // xyz: camera position within its chunk section (0-16); w: seam bitmap half-size H
-    int4 seamInfo;         // x: camera section y - world bottom section; y: bitmap width W (2H + 1)
+    int4 seamInfo;         // x: camera section y - world bottom section; y: bitmap width W (2H + 1);
+                           // z: sky light at open surfaces (15, or 0 in a dimension without sky light)
 };
 // Per base material: top and side sprite rectangles in the block atlas (u0, v0, u1, v1), and the mean luma
 // of each texture (x = top, y = side).
@@ -156,7 +157,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     bool deep = water && depthField == 15;
     uint depth = water ? 0u : depthField;
     // Lava gives off block light 15, so it glows at night like vanilla's.
-    float3 k = kShade[face] * ao * lodLight(u, lightmap, lightSampler, 15.0 - float(depth), depth, m == MAT_LAVA ? 15.0 : 0.0);
+    float3 k = kShade[face] * ao * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, m == MAT_LAVA ? 15.0 : 0.0);
     // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
     // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
@@ -211,7 +212,7 @@ using LodMeshOut = metal::mesh<VOut, LodPrim, 4 * MESH_QUADS, 2 * MESH_QUADS, me
     uint depthField = (q.x >> 28) & 15;
     bool deep = water && depthField == 15;
     uint depth = water ? 0u : depthField;
-    float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, 15.0 - float(depth), depth, m == MAT_LAVA ? 15.0 : 0.0);
+    float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, m == MAT_LAVA ? 15.0 : 0.0);
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
     uint color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
     uint color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0))
@@ -466,7 +467,9 @@ final class LodRenderer: @unchecked Sendable {
     static let shared = LodRenderer()
 
     let lock = NSLock()
-    var world: LodWorld?
+    var world: LodWorld?                   // the dimension the player is in
+    var worlds: [String: LodWorld] = [:]   // every dimension opened for this save or server; the others are paused
+    var nextWorldId = 1
     var colorBuffer: MTLBuffer?
     var indexBuffer: MTLBuffer?        // shared pattern 4q + {0,1,2,0,2,3}
     var indexQuads = 0
@@ -723,7 +726,9 @@ public func mmc_lod_open(_ worldDir: UnsafePointer<CChar>, _ far: Int32, _ cente
         log("LOD: no region directory under \(dir)")
         return 0
     }
-    return lodOpen(regionDir: regionDir, storeDir: nil, far: Int(far), centerX: Int(centerX), centerZ: Int(centerZ))
+    mmc_lod_close()
+    return lodOpen(regionDir: regionDir, storeDir: nil, dimension: "minecraft:overworld", far: Int(far),
+                   centerX: Int(centerX), centerZ: Int(centerZ)) > 0 ? 1 : 0
 }
 
 /// Opens the LOD with either source or both: `worldDir` is a single-player save ("" in multiplayer) and
@@ -739,32 +744,80 @@ public func mmc_lod_open2(_ worldDir: UnsafePointer<CChar>, _ storeDir: UnsafePo
     }
     let storeURL = store.isEmpty ? nil : URL(fileURLWithPath: store)
     if regionDir == nil && storeURL == nil { return 0 }
-    return lodOpen(regionDir: regionDir, storeDir: storeURL, far: Int(far), centerX: Int(centerX), centerZ: Int(centerZ))
+    mmc_lod_close()
+    return lodOpen(regionDir: regionDir, storeDir: storeURL, dimension: "minecraft:overworld", far: Int(far),
+                   centerX: Int(centerX), centerZ: Int(centerZ)) > 0 ? 1 : 0
 }
 
-private func lodOpen(regionDir: URL?, storeDir: URL?, far: Int, centerX: Int, centerZ: Int) -> Int32 {
+/// Opens the LOD of one dimension (e.g. minecraft:the_end) of a single-player save (`worldDir`, "" in
+/// multiplayer) and/or a live-chunk store (`storeDir`, "" for none). A dimension opened before resumes where it
+/// was, so coming back from the End is instant; the dimension the player left is paused, not dropped
+/// (mmc_lod_close drops them all, for a different save or server). Returns the world's id, which the calls
+/// that feed it (ingest, far terrain) pass back, or 0 if there's nothing to build from.
+@_cdecl("mmc_lod_open3")
+public func mmc_lod_open3(_ worldDir: UnsafePointer<CChar>, _ storeDir: UnsafePointer<CChar>, _ dimension: UnsafePointer<CChar>,
+                          _ far: Int32, _ centerX: Int32, _ centerZ: Int32) -> Int64 {
+    let dir = String(cString: worldDir), store = String(cString: storeDir), dim = String(cString: dimension)
+    let regionDir = dir.isEmpty ? nil : Anvil.regionDirectory(URL(fileURLWithPath: dir), dimension: dim)
+    let storeURL = store.isEmpty ? nil : URL(fileURLWithPath: store)
+    if regionDir == nil && storeURL == nil { return 0 }
+    let r = LodRenderer.shared
+    r.lock.lock()
+    if let w = r.worlds[dim], w.regionDir == regionDir, w.live.saveDir == storeURL {
+        if r.world !== w { r.world?.setPaused(true) }
+        r.world = w
+        r.lastCamera = SIMD3(repeating: .nan)   // like a teleport: no fades from the other dimension
+        r.lock.unlock()
+        w.setCenter(x: Int(centerX), z: Int(centerZ), vanillaRadius: 0)
+        w.setPaused(false)
+        log("LOD: resuming \(dim) (world \(w.id))")
+        return Int64(w.id)
+    }
+    r.lock.unlock()
+    return Int64(lodOpen(regionDir: regionDir, storeDir: storeURL, dimension: dim, far: Int(far), centerX: Int(centerX), centerZ: Int(centerZ)))
+}
+
+private func lodOpen(regionDir: URL?, storeDir: URL?, dimension: String, far: Int, centerX: Int, centerZ: Int) -> Int {
     let r = LodRenderer.shared
     var maxLevel = 1
     while (lodNodeVoxels << maxLevel) < far && maxLevel < 8 { maxLevel += 1 }
     // Level-1 nodes exist far enough out for level 0's parents (METALMC_LOD0 can reach past 1.5 km).
     let fine = max(1536, lodLevel0Radius + 512)
-    let w = LodWorld(regionDir: regionDir, storeDir: storeDir, maxLevel: maxLevel, fineRadius: fine, centerX: centerX, centerZ: centerZ)
     r.lock.lock()
-    r.world?.stop()
+    let id = r.nextWorldId
+    r.nextWorldId += 1
+    // 26.x's End has sky light (sky_light_color #ac60cd is what tints its end stone pink); the Nether has none.
+    let w = LodWorld(id: id, dimension: dimension, floating: dimension == "minecraft:the_end",
+                     hasSkyLight: dimension != "minecraft:the_nether", regionDir: regionDir, storeDir: storeDir,
+                     maxLevel: maxLevel, fineRadius: fine, centerX: centerX, centerZ: centerZ)
+    r.worlds[dimension]?.stop()
+    r.world?.setPaused(true)
+    r.worlds[dimension] = w
     r.world = w
+    r.lastCamera = SIMD3(repeating: .nan)
     r.lock.unlock()
-    log("LOD: streaming \(regionDir?.path ?? "no region files") + live chunks\(storeDir.map { " (saved to \($0.path))" } ?? "") far=\(far) levels 1...\(maxLevel) around (\(centerX), \(centerZ))")
+    log("LOD: streaming \(dimension) from \(regionDir?.path ?? "no region files") + live chunks\(storeDir.map { " (saved to \($0.path))" } ?? "") far=\(far) levels 1...\(maxLevel) around (\(centerX), \(centerZ)), world \(id)")
     w.start()
-    return 1
+    return id
 }
 
-/// Stops streaming and drops the LOD (the player left the world).
+/// The world with this id (open, active or paused), for calls that feed a specific dimension.
+func lodWorld(_ id: Int64) -> LodWorld? {
+    let r = LodRenderer.shared
+    r.lock.lock(); defer { r.lock.unlock() }
+    if let w = r.world, w.id == Int(id) { return w }
+    return r.worlds.values.first { $0.id == Int(id) }
+}
+
+/// Stops streaming and drops the LOD of every dimension (the player left the world).
 @_cdecl("mmc_lod_close")
 public func mmc_lod_close() {
     let r = LodRenderer.shared
     r.lock.lock()
     r.world?.stop()
+    for w in r.worlds.values { w.stop() }
     r.world = nil
+    r.worlds.removeAll()
     r.lock.unlock()
 }
 
@@ -854,7 +907,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let csx = Int((cx / 16).rounded(.down)), csy = Int((cy / 16).rounded(.down)), csz = Int((cz / 16).rounded(.down))
     let bottomSection = lodWorldMinY >> 4
     u.camInSection = SIMD4(Float(cx - Double(csx * 16)), Float(cy - Double(csy * 16)), Float(cz - Double(csz * 16)), Float(H))
-    u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), 0, 0)
+    u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), w.hasSkyLight ? 15 : 0, 0)
     var seamBuffer: MTLBuffer?
     if !r.vanillaSections.isEmpty {
         while r.seamBuffers.count < 3, let b = ctx.device.makeBuffer(length: lodSeamWords * 4, options: [.storageModeShared]) {
@@ -971,11 +1024,14 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             let lo = SIMD3(nodeLo.x + Float(tx) * tileSize, nodeLo.y + Float(yMin) * voxel, nodeLo.z + Float(tz) * tileSize)
             let hi = SIMD3(lo.x + tileSize, nodeLo.y + Float(yMax) * voxel, lo.z + tileSize)
             if !visible(lo, hi) { continue }
-            let seam = lo.x < vanillaHalf && hi.x > -vanillaHalf && lo.z < vanillaHalf && hi.z > -vanillaHalf
-            if seam && leftToVanilla(n, t) {
+            let nearVanilla = lo.x < vanillaHalf && hi.x > -vanillaHalf && lo.z < vanillaHalf && hi.z > -vanillaHalf
+            if nearVanilla && leftToVanilla(n, t) {
                 r.coveredTiles += 1
                 continue
             }
+            // With nothing drawn by vanilla this frame (high above the terrain, or before its chunks load) there's
+            // no bitmap and nothing to cut out: the plain variant.
+            let seam = nearVanilla && seamBuffer != nil
             // Only box faces toward the camera are rasterized, so a camera inside a box would see nothing
             // of it: such tiles are left untested, which keeps them drawn.
             let inside = lo.x - voxel < 0 && hi.x + voxel > 0 && lo.y - voxel < 0 && hi.y + voxel > 0
@@ -1083,7 +1139,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         let fading = d.fade > 0
         if d.seam != state.seam || d.water != state.water || fading != state.fade {
             let p = fading ? (d.water ? fadeWaterPipe : fadePipe) : (d.water ? (d.seam ? seamWaterPipe : waterPipe) : (d.seam ? seamPipe : pipe))
-            guard let p else { break }
+            guard let p else { continue }   // a pipeline that failed to build: skip its draws, not everything after them
             if d.water && !state.water {
                 enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
                 u.alpha = lodOpaqueWater ? 1 : lodWaterAlpha
@@ -1193,4 +1249,63 @@ public func mmc_lod_set_compiled(_ keys: UnsafePointer<Int64>, _ count: Int32, _
     let r = LodRenderer.shared
     r.compiledSections = Array(UnsafeBufferPointer(start: keys, count: Int(count)))
     r.vanillaDistance = Int(renderDistance)
+}
+
+/// Debug: the active world's nodes as (level, x, z, quads) quadruples, at most `max`. Returns the count.
+@_cdecl("mmc_debug_lod_nodes")
+public func mmc_debug_lod_nodes(_ out: UnsafeMutablePointer<Int64>, _ max: Int32) -> Int32 {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { return 0 }
+    var i = 0
+    for (k, n) in w.snapshot().meshes.sorted(by: { ($0.key.level, $0.key.x, $0.key.z) < ($1.key.level, $1.key.x, $1.key.z) }) where i < Int(max) {
+        out[4 * i] = Int64(k.level); out[4 * i + 1] = Int64(k.x); out[4 * i + 2] = Int64(k.z); out[4 * i + 3] = Int64(n.quadCount)
+        i += 1
+    }
+    return Int32(i)
+}
+
+/// Debug: runs the quadtree selection for a camera at (x, z) on the active world. Writes (level, x, z, tile
+/// mask, quads) per chosen node, at most `max`; returns the count.
+@_cdecl("mmc_debug_lod_select")
+public func mmc_debug_lod_select(_ camX: Double, _ camZ: Double, _ out: UnsafeMutablePointer<Int64>, _ max: Int32) -> Int32 {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { return 0 }
+    let snap = w.snapshot()
+    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: camX, camZ: camZ, splitFactor: 2.0,
+                                    level0Radius: Double(lodLevel0Radius))
+    var i = 0
+    for (n, mask) in chosen where i < Int(max) {
+        out[5 * i] = Int64(n.level); out[5 * i + 1] = Int64(n.x0 >> (8 + n.level)); out[5 * i + 2] = Int64(n.z0 >> (8 + n.level))
+        out[5 * i + 3] = Int64(mask); out[5 * i + 4] = Int64(n.quadCount)
+        i += 1
+    }
+    return Int32(i)
+}
+
+/// Debug: quads of the active world at voxel y 0-1 (the world bottom, where lodChunkMarker lives), as
+/// (level, material, face, count) quadruples; returns the count.
+@_cdecl("mmc_debug_lod_bottom_quads")
+public func mmc_debug_lod_bottom_quads(_ out: UnsafeMutablePointer<Int64>, _ max: Int32) -> Int32 {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { return 0 }
+    var hist: [Int64: Int64] = [:]
+    for (k, n) in w.snapshot().meshes {
+        let q = n.buffer.contents().bindMemory(to: UInt32.self, capacity: 2 * n.quadCount)
+        for i in 0..<n.quadCount {
+            let w0 = q[2 * i], w1 = q[2 * i + 1]
+            let y = Int((w0 >> 16) & 511)
+            if y > 1 { continue }
+            let key = Int64(k.level) << 32 | Int64(w1 & 255) << 16 | Int64((w0 >> 25) & 7)
+            hist[key, default: 0] += 1
+        }
+    }
+    var i = 0
+    for (key, c) in hist.sorted(by: { $0.key < $1.key }) where i < Int(max) {
+        out[4 * i] = key >> 32; out[4 * i + 1] = (key >> 16) & 255; out[4 * i + 2] = key & 7; out[4 * i + 3] = c
+        i += 1
+    }
+    return Int32(i)
 }

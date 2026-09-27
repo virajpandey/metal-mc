@@ -37,6 +37,8 @@ let lodSlowMesh = experiments.contains("slowmesh")
 /// METALMC_EXP=noao turns ambient occlusion off; vertexao stores it per quad corner instead of per pixel, as
 /// before (faces with different corner patterns can't merge, which cost about 54% more quads).
 let lodNoAO = experiments.contains("noao")
+/// Sky light under cover in the overworld too (METALMC_EXP=skycover); the End always has it (LodWorld).
+let lodSkyCover = experiments.contains("skycover")
 let lodVertexAO = experiments.contains("vertexao")
 /// No ambient occlusion data for a quad (its whole rim is unoccluded).
 let lodNoAOData = UInt32.max
@@ -60,17 +62,18 @@ let lodTreeMaterial: [Bool] = {
     return t
 }()
 
-/// Reduces a group indexed dy << 2 | dz << 1 | dx.
-@inline(__always) func lodReduce(_ c: SIMD8<UInt8>) -> UInt8 {
-    if lodDownsampleRule == .last {
+/// Reduces a group indexed dy << 2 | dz << 1 | dx. Floating terrain (the End) uses `.top`: an island thinner
+/// than half a voxel still shows at the coarse levels instead of vanishing.
+@inline(__always) func lodReduce(_ c: SIMD8<UInt8>, rule: LodDownsampleRule = lodDownsampleRule) -> UInt8 {
+    if rule == .last {
         var r: UInt8 = 0
         for i in 0..<8 where c[i] != 0 { r = c[i] }
         return r
     }
     var solid = 0
     for i in 0..<8 where c[i] != 0 { solid += 1 }
-    if solid == 0 || (lodDownsampleRule == .half && solid < 4) { return 0 }
-    if lodDownsampleRule == .hybrid && solid < 4 {
+    if solid == 0 || (rule == .half && solid < 4) { return 0 }
+    if rule == .hybrid && solid < 4 {
         // Terrain rounds to the nearer voxel (half the group or more is solid), but trees stay: a single
         // trunk or small canopy is less than half of any group.
         var tree = false
@@ -91,7 +94,8 @@ let lodTreeMaterial: [Bool] = {
 
 /// One chunk's blocks (16 x 16 x 384 material ids, laid out y, z, x from the world bottom) to its level-1
 /// voxels (8 x 8 x 192, laid out y, z, x), with each 4 x 4-block cell's biome tint (tints[z * 4 + x]).
-func lodReduceChunk(_ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8>, into out: UnsafeMutablePointer<UInt8>) {
+func lodReduceChunk(_ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8>, into out: UnsafeMutablePointer<UInt8>,
+                    rule: LodDownsampleRule = lodDownsampleRule) {
     let n = lodChunkVoxels
     for vy in 0..<(lodWorldHeight >> 1) {
         for vz in 0..<n {
@@ -104,7 +108,7 @@ func lodReduceChunk(_ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8
                         c[dy << 2 | dz << 1 | 1] = blocks[row + 1]
                     }
                 }
-                let m = lodReduce(c)
+                let m = lodReduce(c, rule: rule)
                 out[(vy * n + vz) * n + vx] = m == 0 ? 0 : lodTinted(m, tints[(vz >> 1) * 4 + (vx >> 1)])
             }
         }
@@ -236,7 +240,7 @@ struct LodGrid {
 
     /// Half-resolution copy of this grid, written into one quadrant (qx, qz in 0...1) of `parent`
     /// (each 2 x 2 x 2 group reduced by lodReduce).
-    func downsample(into parent: inout LodGrid, qx: Int, qz: Int) {
+    func downsample(into parent: inout LodGrid, qx: Int, qz: Int, rule: LodDownsampleRule = lodDownsampleRule) {
         let half = lodNodeVoxels / 2
         let ph = min(parent.height, height / 2)
         let n = lodNodeVoxels
@@ -254,7 +258,7 @@ struct LodGrid {
                                     c[dy << 2 | dz << 1 | 1] = src[srow + 1]
                                 }
                             }
-                            let m = lodReduce(c)
+                            let m = lodReduce(c, rule: rule)
                             if m != 0 { dst[drow + px] = m }
                         }
                     }
@@ -293,7 +297,8 @@ struct LodNode {
 
 enum LodBuild {
     /// Builds a level-1 grid from one region file (r.X.Z.mca), or nil if it has no fully generated chunks.
-    static func regionGrid(path: String) -> LodGrid? {
+    /// `floating`: the End, where chunks of only air count too (lodChunkMarker records them).
+    static func regionGrid(path: String, floating: Bool = false) -> LodGrid? {
         guard let data = FileManager.default.contents(atPath: path), data.count >= 8192 else { return nil }
         let r = [UInt8](data)
         var grid = LodGrid(level: 1)
@@ -308,7 +313,7 @@ enum LodBuild {
         grid.v.withUnsafeMutableBufferPointer { g in
             for i in 0..<1024 {
                 guard Anvil.be32(r, i * 4) != 0, let chunk = try? ChunkScan.decodeChunk(region: rb, index: i, cache: &cache, scratch: scratch),
-                      !chunk.sections.isEmpty else { continue }
+                      !chunk.sections.isEmpty || (floating && chunk.status.hasSuffix("full")) else { continue }
                 any = true
                 let lx0 = (chunk.cx & 31) * cv, lz0 = (chunk.cz & 31) * cv
                 // Biome tint class per 4 x 4-block cell (index z * 4 + x).
@@ -319,9 +324,12 @@ enum LodBuild {
                 }
                 blocks.withUnsafeBufferPointer { bp in
                     tint.withUnsafeBufferPointer { tp in
-                        voxels.withUnsafeMutableBufferPointer { vp in lodReduceChunk(bp.baseAddress!, tp.baseAddress!, into: vp.baseAddress!) }
+                        voxels.withUnsafeMutableBufferPointer { vp in
+                            lodReduceChunk(bp.baseAddress!, tp.baseAddress!, into: vp.baseAddress!, rule: floating ? .top : lodDownsampleRule)
+                        }
                     }
                 }
+                if floating { for k in 0..<(cv * cv) { voxels[k] = lodChunkMarker } }
                 for vy in 0..<(lodWorldHeight >> 1) {
                     for vz in 0..<cv {
                         let src = (vy * cv + vz) * cv, dst = (vy * n + lz0 + vz) * n + lx0
@@ -335,8 +343,8 @@ enum LodBuild {
     }
 
     /// Builds a level-0 grid (full resolution: 256 x 256 blocks, 16 x 16 chunks) from quarter (qx, qz) of a
-    /// region file, or nil if that quarter has no fully generated chunks.
-    static func regionQuarterGrid(path: String, qx: Int, qz: Int) -> LodGrid? {
+    /// region file, or nil if that quarter has no fully generated chunks. `floating` as for regionGrid.
+    static func regionQuarterGrid(path: String, qx: Int, qz: Int, floating: Bool = false) -> LodGrid? {
         guard let data = FileManager.default.contents(atPath: path), data.count >= 8192 else { return nil }
         let r = [UInt8](data)
         var grid = LodGrid(level: 0)
@@ -351,7 +359,7 @@ enum LodBuild {
                 for lx in 0..<16 {
                     let i = (qz * 16 + lz) * 32 + qx * 16 + lx
                     guard Anvil.be32(r, i * 4) != 0, let chunk = try? ChunkScan.decodeChunk(region: rb, index: i, cache: &cache, scratch: scratch),
-                          !chunk.sections.isEmpty else { continue }
+                          !chunk.sections.isEmpty || (floating && chunk.status.hasSuffix("full")) else { continue }
                     any = true
                     let x0 = ((chunk.cx & 31) - qx * 16) * 16, z0 = ((chunk.cz & 31) - qz * 16) * 16
                     guard x0 >= 0, z0 >= 0, x0 < n, z0 < n else { continue }
@@ -370,6 +378,7 @@ enum LodBuild {
                             }
                         }
                     }
+                    if floating { for z in 0..<16 { for x in 0..<16 { g[(z0 + z) * n + x0 + x] = lodChunkMarker } } }
                 }
             }
         }
@@ -383,7 +392,7 @@ enum LodBuild {
     /// vanilla's skylight does. Outside the node counts as air on the sides (skirt walls that hide cracks
     /// between levels) and as solid below the world. Merged quads are capped at `maxMerge` voxels per side
     /// (tiles cap them at 64 anyway).
-    static func mesh(_ grid: LodGrid, maxMerge: Int = 64) -> LodMesh {
+    static func mesh(_ grid: LodGrid, maxMerge: Int = 64, skyCover: Bool = false) -> LodMesh {
         let n = lodNodeVoxels, h = grid.height
         let kinds = lodKinds
         let airK = MaterialKind.air.rawValue, waterK = MaterialKind.water.rawValue
@@ -428,6 +437,64 @@ enum LodBuild {
                     y += 1
                 }
                 floorOpen[i] = y
+            }
+            // Sky light under cover (skyCover): air below its column's top (under End islands, overhangs and
+            // canopies) gets vanilla's falloff, 15 at open air and one less per block from the nearest open
+            // voxel, found by a breadth-first walk through covered air that stops where the light runs out.
+            // Faces toward covered air carry 15 minus that light in the water-depth bits (air-facing faces
+            // don't use them), so the shader's lightmap lookup gives vanilla's color there (the green under
+            // End islands). Stored per voxel as 15 - light, 255 where the walk didn't reach (no light).
+            var cover: [UInt8] = []
+            if skyCover {
+                cover = [UInt8](repeating: 255, count: n * n * h)
+                var layer: [Int32] = []
+                @inline(__always) func coveredAir(_ x: Int, _ y: Int, _ z: Int) -> Bool {
+                    let i = z * n + x
+                    return y < top[i] && kinds[Int(g[(y * n + z) * n + x])] == airK
+                }
+                for z in 0..<n {
+                    for x in 0..<n {
+                        let i = z * n + x
+                        if top[i] <= floorOpen[i] { continue }
+                        for y in floorOpen[i]..<top[i] where kinds[Int(g[y * n * n + i])] == airK {
+                            // Beside an open voxel (above a neighbor's top; outside the node counts as closed).
+                            var lit = false
+                            if x > 0 && y > top[i - 1] { lit = true }
+                            else if x < n - 1 && y > top[i + 1] { lit = true }
+                            else if z > 0 && y > top[i - n] { lit = true }
+                            else if z < n - 1 && y > top[i + n] { lit = true }
+                            if lit { layer.append(Int32(y * n * n + i)) }
+                        }
+                    }
+                }
+                let s = voxelBlocks
+                var d = 1
+                while !layer.isEmpty {
+                    // A voxel d steps in holds blocks (d - 1) * s + 1 ... d * s from the open air; light at its middle.
+                    let light = 15 - ((d - 1) * s + (s + 1) / 2)
+                    if light <= 0 { break }
+                    var next: [Int32] = []
+                    for v32 in layer {
+                        let v = Int(v32)
+                        if cover[v] != 255 { continue }
+                        cover[v] = UInt8(15 - light)
+                        let x = v % n, z = (v / n) % n, y = v / (n * n)
+                        if x > 0 && coveredAir(x - 1, y, z) && cover[v - 1] == 255 { next.append(Int32(v - 1)) }
+                        if x < n - 1 && coveredAir(x + 1, y, z) && cover[v + 1] == 255 { next.append(Int32(v + 1)) }
+                        if z > 0 && coveredAir(x, y, z - 1) && cover[v - n] == 255 { next.append(Int32(v - n)) }
+                        if z < n - 1 && coveredAir(x, y, z + 1) && cover[v + n] == 255 { next.append(Int32(v + n)) }
+                        if y > 0 && coveredAir(x, y - 1, z) && cover[v - n * n] == 255 { next.append(Int32(v - n * n)) }
+                        if y < h - 1 && coveredAir(x, y + 1, z) && cover[v + n * n] == 255 { next.append(Int32(v + n * n)) }
+                    }
+                    layer = next
+                    d += 1
+                }
+            }
+            /// 15 - sky light of the air in front of a face at (x, y, z): 0 in open air (and outside the node).
+            @inline(__always) func coverDepth(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
+                if !skyCover || x < 0 || z < 0 || x >= n || z >= n || y < 0 || y >= h || y > top[z * n + x] { return 0 }
+                let c = cover[(y * n + z) * n + x]
+                return c == 255 ? 15 : UInt32(c)
             }
             var bandLo = [Int](repeating: 0, count: max(n, h)), bandHi = [Int](repeating: -1, count: max(n, h))
             let edgeSkirt = 8
@@ -513,9 +580,9 @@ enum LodBuild {
                             let (x, y, z) = xyz(d, uu, vv)
                             let m = at(x, y, z)
                             var f: UInt32 = 0
-                            if m != 0 {
+                            let k = kinds[Int(m)]
+                            if k != airK {   // air, and lodChunkMarker (air that records an explored End chunk)
                                 let nk = kinds[Int(at(x + sx, y + sy, z + sz))]
-                                let k = kinds[Int(m)]
                                 if k == waterK {
                                     if nk == airK {
                                         f = UInt32(m)
@@ -527,7 +594,7 @@ enum LodBuild {
                                         }
                                     }
                                 }
-                                else if nk == airK { f = UInt32(m) }
+                                else if nk == airK { f = UInt32(m) | coverDepth(x + sx, y + sy, z + sz) << 16 }
                                 else if nk == waterK && !lodOpaqueWater {
                                     // Water voxels from the one in front of the face up.
                                     var d = 0, yy = y + sy

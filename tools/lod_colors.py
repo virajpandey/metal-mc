@@ -108,6 +108,7 @@ colors = [
     ("yellowTerracotta", average("yellow_terracotta")), ("redTerracotta", average("red_terracotta")),
     ("brownTerracotta", average("brown_terracotta")), ("lightGrayTerracotta", average("light_gray_terracotta")),
     ("packedIce", average("packed_ice")), ("blueIce", average("blue_ice")), ("obsidian", average("obsidian")),
+    ("endStone", average("end_stone")), ("purpur", average("purpur_block")), ("chorus", average("chorus_plant")),
 ]
 def luma(name):
     """Mean Rec. 709 luma of the texture's opaque texels (untinted, gamma space like the atlas)."""
@@ -137,6 +138,7 @@ sprites = [
     ("redTerracotta", "red_terracotta", "red_terracotta"), ("brownTerracotta", "brown_terracotta", "brown_terracotta"),
     ("lightGrayTerracotta", "light_gray_terracotta", "light_gray_terracotta"), ("packedIce", "packed_ice", "packed_ice"),
     ("blueIce", "blue_ice", "blue_ice"), ("obsidian", "obsidian", "obsidian"),
+    ("endStone", "end_stone", "end_stone"), ("purpur", "purpur_block", "purpur_block"), ("chorus", "chorus_plant", "chorus_plant"),
 ]
 assert [n for n, _, _ in sprites] == [n for n, _ in colors]
 sprite_lines = []

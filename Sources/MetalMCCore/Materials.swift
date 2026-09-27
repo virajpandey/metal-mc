@@ -16,6 +16,8 @@ public enum Mat: UInt8, CaseIterable {
     case andesite, diorite, tuff, dripstone, coarseDirt, podzol, mycelium, redSand, redSandstone
     case whiteTerracotta, orangeTerracotta, yellowTerracotta, redTerracotta, brownTerracotta, lightGrayTerracotta
     case packedIce, blueIce, obsidian
+    // The End: end stone islands, purpur end cities and chorus plants.
+    case endStone, purpur, chorus
 
     public var kind: MaterialKind {
         switch self {
@@ -77,6 +79,9 @@ public enum Mat: UInt8, CaseIterable {
         case .packedIce: return SIMD4(0.55, 0.71, 0.97, 1)
         case .blueIce: return SIMD4(0.45, 0.63, 0.99, 1)
         case .obsidian: return SIMD4(0.06, 0.04, 0.10, 1)
+        case .endStone: return SIMD4(0.86, 0.87, 0.62, 1)
+        case .purpur: return SIMD4(0.66, 0.49, 0.66, 1)
+        case .chorus: return SIMD4(0.37, 0.24, 0.37, 1)
         }
     }
 }
@@ -95,7 +100,7 @@ public enum Materials {
         "sunflower", "pitcher", "roots", "lichen", "sculk_vein", "pointed_dripstone", "amethyst_cluster",
         "_bud", "coral", "sea_pickle", "twisting", "weeping", "frogspawn", "redstone_wire", "hopper",
         "cactus", "bamboo", "cocoa", "melon_stem", "pumpkin_stem", "nether_wart", "sweet_berry",
-        "brewing_stand",
+        "brewing_stand", "end_rod",
     ]
 
     public static func classify(_ fullName: String) -> Mat {
@@ -118,6 +123,10 @@ public enum Materials {
         func has(_ s: String) -> Bool { n.contains(s) }
         func any(_ list: [String]) -> Bool { list.contains { n.contains($0) } }
 
+        if has("end_stone") || n == "end_portal_frame" { return .endStone }
+        if has("purpur") { return .purpur }
+        if has("chorus") { return .chorus }
+        if n == "end_portal" || n == "end_gateway" || n == "dragon_egg" { return .obsidian }
         if has("cherry_leaves") { return .cherryLeaves }
         if has("leaves") { return .leaves }
         if has("grass_block") { return .grass }

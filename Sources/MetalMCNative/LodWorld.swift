@@ -126,6 +126,13 @@ struct LodNodeKey: Hashable {
 }
 
 final class LodWorld: @unchecked Sendable {
+    let id: Int                 // unique per opened world: calls from threads of a previous dimension or save miss it
+    let dimension: String       // e.g. minecraft:overworld
+    /// The End: islands over the void. Air columns are sky (chunks are marked with lodChunkMarker instead)
+    /// and the air under an island isn't a cave to fill.
+    let floating: Bool
+    let hasSkyLight: Bool       // open surfaces get sky light 15 (vanilla's lightmap then gives the dimension's color)
+    var downsampleRule: LodDownsampleRule { floating ? .top : lodDownsampleRule }
     let regionDir: URL?
     let live: LodLiveStore
     let maxLevel: Int
@@ -146,10 +153,16 @@ final class LodWorld: @unchecked Sendable {
     private var deferred = Set<Int64>()                // changed regions waiting until the player leaves them
     private let queue = DispatchQueue(label: "metalmc.lod.update", qos: .utility)
     private var running = true
+    private var paused = false   // the player is in another dimension: keep the meshes, stop updating
     var status = "starting"
     private(set) var firstPassDone = false   // the first build of every level has finished
 
-    init(regionDir: URL?, storeDir: URL?, maxLevel: Int, fineRadius: Int, centerX: Int, centerZ: Int) {
+    init(id: Int, dimension: String, floating: Bool, hasSkyLight: Bool, regionDir: URL?, storeDir: URL?, maxLevel: Int,
+         fineRadius: Int, centerX: Int, centerZ: Int) {
+        self.id = id
+        self.dimension = dimension
+        self.floating = floating
+        self.hasSkyLight = hasSkyLight
         self.regionDir = regionDir
         live = LodLiveStore(saveDir: storeDir)
         self.maxLevel = maxLevel
@@ -179,12 +192,18 @@ final class LodWorld: @unchecked Sendable {
         lock.lock(); running = false; lock.unlock()
     }
 
+    /// Pauses updates (the player left for another dimension) or resumes them. A pass in progress finishes.
+    func setPaused(_ p: Bool) {
+        lock.lock(); paused = p; lock.unlock()
+    }
+
     func start() {
         queue.async { [self] in
             if live.saveDir != nil { log("LOD: loaded \(live.load()) saved regions from \(live.saveDir!.path)") }
             while true {
-                lock.lock(); let go = running; lock.unlock()
+                lock.lock(); let go = running, idle = paused; lock.unlock()
                 if !go { return }
+                if idle { Thread.sleep(forTimeInterval: 0.5); continue }
                 let t0 = Date()
                 let did = poll()
                 firstPassDone = true
@@ -342,8 +361,8 @@ final class LodWorld: @unchecked Sendable {
                         // Level 2: regions without any chunks are empty in the quadrants it's built from.
                         _ = self.far.fillFromAncestors(&g, x0: parents[i].x * size, z0: parents[i].z * size, maxLevel: self.maxLevel)
                     }
-                    g.fillUnreachable()
-                    let m = LodBuild.mesh(g, maxMerge: 64)
+                    self.fillHidden(&g)
+                    let m = self.meshNode(g)
                     outp[i] = LodNode(level: parents[i].level, x0: parents[i].x * size, z0: parents[i].z * size, mesh: m)
                 }
             }
@@ -368,8 +387,8 @@ final class LodWorld: @unchecked Sendable {
                         self.far.lock.lock(); let hs = self.far.columns[k]?.height ?? []; self.far.lock.unlock()
                         log("LOD: far node \(k.level) \(k.x) \(k.z): real \(real), filled \(filled) columns, heights \(hs.min() ?? 0)...\(hs.max() ?? 0)")
                     }
-                    g.fillUnreachable()
-                    let m = LodBuild.mesh(g, maxMerge: 64)
+                    self.fillHidden(&g)
+                    let m = self.meshNode(g)
                     let size = lodNodeVoxels << k.level
                     outp[i] = LodNode(level: k.level, x0: k.x * size, z0: k.z * size, mesh: m)
                 }
@@ -420,10 +439,10 @@ final class LodWorld: @unchecked Sendable {
                 DispatchQueue.concurrentPerform(iterations: part.count) { j in
                     let (nx, nz) = part[j]
                     let path = regionDir.appendingPathComponent("r.\(nx >> 1).\(nz >> 1).mca").path
-                    guard var g = LodBuild.regionQuarterGrid(path: path, qx: nx & 1, qz: nz & 1) else { return }
+                    guard var g = LodBuild.regionQuarterGrid(path: path, qx: nx & 1, qz: nz & 1, floating: self.floating) else { return }
                     _ = self.far.fillFromAncestors(&g, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, maxLevel: self.maxLevel)
-                    g.fillUnreachable(deepRadius: 16, deepDepth: 8)
-                    let m = LodBuild.mesh(g)
+                    self.fillHidden(&g, deepRadius: 16, deepDepth: 8)
+                    let m = self.meshNode(g)
                     outp[j] = LodNode(level: 0, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, mesh: m)
                 }
             }
@@ -455,7 +474,7 @@ final class LodWorld: @unchecked Sendable {
             let outp = buf.baseAddress!
             DispatchQueue.concurrentPerform(iterations: list.count) { i in
                 let (x, z) = list[i]
-                let fromFile = self.regionDir.flatMap { LodBuild.regionGrid(path: $0.appendingPathComponent("r.\(x).\(z).mca").path) }
+                let fromFile = self.regionDir.flatMap { LodBuild.regionGrid(path: $0.appendingPathComponent("r.\(x).\(z).mca").path, floating: self.floating) }
                 var g = fromFile ?? LodGrid(level: 1)
                 let hasLive = self.live.overlay(regionX: x, regionZ: z, into: &g)
                 guard fromFile != nil || hasLive else {
@@ -467,13 +486,13 @@ final class LodWorld: @unchecked Sendable {
                 g.v.withUnsafeBufferPointer { v in for c in 0..<(lodNodeVoxels * lodNodeVoxels) where v[c] == 0 { full = false; break } }
                 if !full { _ = self.far.fillFromAncestors(&g, x0: x * 512, z0: z * 512, maxLevel: self.maxLevel) }
                 var q = LodGrid(level: 2)
-                g.downsample(into: &q, qx: 0, qz: 0)   // the quadrant occupies the low corner
+                g.downsample(into: &q, qx: 0, qz: 0, rule: self.downsampleRule)   // the quadrant occupies the low corner
                 let quadrant = LodQuadrant(grid: q)
                 var node: LodNode?
                 if meshFine && self.withinFine(regionX: x, regionZ: z, cx: c.x, cz: c.z) {
                     var filled = g
-                    filled.fillUnreachable()
-                    let m = LodBuild.mesh(filled, maxMerge: 64)
+                    self.fillHidden(&filled)
+                    let m = self.meshNode(filled)
                     let size = lodNodeVoxels << 1
                     node = LodNode(level: 1, x0: x * size, z0: z * size, mesh: m)
                 }
@@ -481,6 +500,17 @@ final class LodWorld: @unchecked Sendable {
             }
         }
         return out.compactMap { $0 }
+    }
+
+    /// Fills air that can't be seen (LodGrid.fillUnreachable), without the deep-air step in floating dimensions:
+    /// the air under an island is open to the void, not a cave.
+    func fillHidden(_ g: inout LodGrid, deepRadius: Int = lodDeepFill ? 8 : -1, deepDepth: Int = 4) {
+        g.fillUnreachable(deepRadius: floating ? -1 : deepRadius, deepDepth: deepDepth)
+    }
+
+    /// Greedy mesh of a node grid, with sky light under cover in floating dimensions (METALMC_EXP=skycover: everywhere).
+    func meshNode(_ g: LodGrid) -> LodMesh {
+        LodBuild.mesh(g, maxMerge: 64, skyCover: floating || lodSkyCover)
     }
 
     /// True if any region under node (level, x, z) has real chunks.
@@ -570,7 +600,7 @@ final class LodWorld: @unchecked Sendable {
                 // generated terrain, and assembling empty subtrees down to level 2 costs gigabytes of grids).
                 if !hasRealData(level: level - 1, x: 2 * x + qx, z: 2 * z + qz) { continue }
                 let child = grid(level: level - 1, x: 2 * x + qx, z: 2 * z + qz)
-                child.downsample(into: &g, qx: qx, qz: qz)
+                child.downsample(into: &g, qx: qx, qz: qz, rule: downsampleRule)
             }
         }
         return g

@@ -20,6 +20,9 @@ let lodSeaLevel = 63
 struct LodFarColumns {
     var height: [Int16]      // first block above the ground (world y)
     var biome: [UInt16]      // id registered with mmc_lod_far_biome
+    /// Floating terrain (End islands): each column's lowest block (world y), terrain between it and `height`;
+    /// a column with bottom >= height is void. nil: ground down to the world bottom.
+    var bottom: [Int16]? = nil
 }
 
 /// How a biome's surface looks from far away.
@@ -66,6 +69,8 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     case "warm_ocean", "lukewarm_ocean", "deep_lukewarm_ocean", "beach_ocean": s.top = sand; s.under = sand
     case "ocean", "deep_ocean", "cold_ocean", "deep_cold_ocean", "river": s.top = gravel; s.under = gravel
     case "frozen_ocean", "deep_frozen_ocean", "frozen_river": s.top = gravel; s.under = gravel; s.frozen = true
+    case "the_end", "end_highlands", "end_midlands", "small_end_islands", "end_barrens":
+        s.top = Mat.endStone.rawValue; s.under = Mat.endStone.rawValue
     default: break
     }
     return s
@@ -124,7 +129,8 @@ final class LodFarStore: @unchecked Sendable {
     static func fileName(_ k: LodNodeKey) -> String { "\(k.level).\(k.x).\(k.z).far" }
 
     /// Writes a node's columns to the cache: "MMCF" 1, then LZFSE of: palette count, names (length-prefixed
-    /// UTF-8), heights (Int16) and palette indices (UInt16), 256 x 256 each. Caller holds no lock.
+    /// UTF-8), heights (Int16) and palette indices (UInt16), 256 x 256 each. Version 2 (floating terrain)
+    /// appends the bottoms (Int16). Caller holds no lock.
     func save(_ k: LodNodeKey, _ c: LodFarColumns) {
         lock.lock(); let dir = cacheDir; let names = biomeNames; lock.unlock()
         guard let dir else { return }
@@ -144,11 +150,12 @@ final class LodFarStore: @unchecked Sendable {
         for n in paletteNames { let u = Array(n.utf8); body.append(UInt8(u.count)); body += u }
         for h in c.height { body += [UInt8(UInt16(bitPattern: h) & 255), UInt8(UInt16(bitPattern: h) >> 8)] }
         for p in idx { body += [UInt8(p & 255), UInt8(p >> 8)] }
+        if let b = c.bottom { for h in b { body += [UInt8(UInt16(bitPattern: h) & 255), UInt8(UInt16(bitPattern: h) >> 8)] } }
         var packed = [UInt8](repeating: 0, count: body.count + 1024)
         let n = body.withUnsafeBufferPointer { compression_encode_buffer(&packed, packed.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
         guard n > 0 else { return }
         let len = body.count
-        let out = Data(Array("MMCF".utf8) + [1, UInt8(len & 255), UInt8((len >> 8) & 255), UInt8((len >> 16) & 255), UInt8(len >> 24)] + packed[0..<n])
+        let out = Data(Array("MMCF".utf8) + [c.bottom == nil ? 1 : 2, UInt8(len & 255), UInt8((len >> 8) & 255), UInt8((len >> 16) & 255), UInt8(len >> 24)] + packed[0..<n])
         try? out.write(to: dir.appendingPathComponent(Self.fileName(k)), options: .atomic)
     }
 
@@ -156,7 +163,8 @@ final class LodFarStore: @unchecked Sendable {
     func load(_ k: LodNodeKey) -> LodFarColumns? {
         guard let dir = cacheDir, let d = try? Data(contentsOf: dir.appendingPathComponent(Self.fileName(k))), d.count > 9 else { return nil }
         let raw = [UInt8](d)
-        guard raw[0...3] == Array("MMCF".utf8)[0...3], raw[4] == 1 else { return nil }
+        guard raw[0...3] == Array("MMCF".utf8)[0...3], raw[4] == 1 || raw[4] == 2 else { return nil }
+        let version = raw[4]
         let len = Int(raw[5]) | Int(raw[6]) << 8 | Int(raw[7]) << 16 | Int(raw[8]) << 24
         var body = [UInt8](repeating: 0, count: len)
         let got = raw.withUnsafeBufferPointer { compression_decode_buffer(&body, len, $0.baseAddress! + 9, $0.count - 9, nil, COMPRESSION_LZFSE) }
@@ -171,7 +179,7 @@ final class LodFarStore: @unchecked Sendable {
             guard i + l <= len, let name = String(bytes: body[i..<(i + l)], encoding: .utf8) else { return nil }
             ids.append(biomeId(name)); i += l
         }
-        guard len - i == cols * 4 else { return nil }
+        guard len - i == cols * (version == 2 ? 6 : 4) else { return nil }
         var height = [Int16](repeating: 0, count: cols), biome = [UInt16](repeating: 0, count: cols)
         for c in 0..<cols { height[c] = Int16(bitPattern: UInt16(body[i + 2 * c]) | UInt16(body[i + 2 * c + 1]) << 8) }
         i += cols * 2
@@ -179,14 +187,32 @@ final class LodFarStore: @unchecked Sendable {
             let p = Int(UInt16(body[i + 2 * c]) | UInt16(body[i + 2 * c + 1]) << 8)
             biome[c] = p < ids.count ? ids[p] : 0
         }
-        return LodFarColumns(height: height, biome: biome)
+        var bottom: [Int16]?
+        if version == 2 {
+            i += cols * 2
+            var b = [Int16](repeating: 0, count: cols)
+            for c in 0..<cols { b[c] = Int16(bitPattern: UInt16(body[i + 2 * c]) | UInt16(body[i + 2 * c + 1]) << 8) }
+            bottom = b
+        }
+        return LodFarColumns(height: height, biome: biome, bottom: bottom)
     }
 
     /// Writes one generated column into grid column `col` (voxels of level `L`, `h` voxels tall): stone, then
     /// the surface's under material, the surface block, and water up to sea level or tree canopy above it.
     /// `height` is the first block above the ground; `steep` puts stone on the surface in mountain biomes.
     static func writeColumn(_ v: UnsafeMutableBufferPointer<UInt8>, col: Int, n: Int, h: Int, L: Int,
-                            height: Int, s: LodFarSurface, steep: Bool, bx: Int, bz: Int) {
+                            height: Int, s: LodFarSurface, steep: Bool, bx: Int, bz: Int, bottom: Int? = nil) {
+        if let bottom {
+            // Floating terrain: the surface material from the island's bottom to its top (a voxel is solid if
+            // its middle is inside, and an island thinner than that still gets the voxel holding its middle),
+            // nothing for a void column.
+            guard height > bottom else { return }
+            let half = (1 << L) / 2
+            var lo = max(0, (bottom + 64 + (1 << L) - 1 - half) >> L), hi = min(h - 1, (height - 1 + 64 - half) >> L)
+            if hi < lo { lo = min(h - 1, max(0, ((bottom + height) / 2 + 64) >> L)); hi = lo }
+            for y in lo...hi { v[y * n * n + col] = y == hi ? s.top : s.under }
+            return
+        }
         let top = height - 1                                  // the ground's top block
         let surfaceMat = s.mountain && steep ? Mat.stone.rawValue : s.top
         let vyTop = min(h - 1, max(0, (top + 64) >> L))
@@ -250,7 +276,8 @@ final class LodFarStore: @unchecked Sendable {
                     }
                     Self.writeColumn(v, col: col, n: n, h: h, L: L, height: Int(cols.height[col]),
                                      s: table[cols.biome[col]] ?? Self.defaultSurface, steep: slope * 2 > 3 << L,
-                                     bx: key.x * (n << L) + (x << L), bz: key.z * (n << L) + (z << L))
+                                     bx: key.x * (n << L) + (x << L), bz: key.z * (n << L) + (z << L),
+                                     bottom: cols.bottom.map { Int($0[col]) })
                     filled += 1
                 }
             }
@@ -297,12 +324,25 @@ final class LodFarStore: @unchecked Sendable {
                     let tx = min(1, max(0, fx - Double(ix))), tz = min(1, max(0, fz - Double(iz)))
                     let h00 = Double(c.height[iz * n + ix]), h10 = Double(c.height[iz * n + ix + 1])
                     let h01 = Double(c.height[(iz + 1) * n + ix]), h11 = Double(c.height[(iz + 1) * n + ix + 1])
-                    let height = Int(((h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz).rounded())
+                    var height = Int(((h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz).rounded())
                     let nearest = (tz < 0.5 ? iz : iz + 1) * n + (tx < 0.5 ? ix : ix + 1)
+                    var bottom: Int?
+                    if let b = c.bottom {
+                        // Islands: interpolate between solid neighbors only; the nearest column decides void or not.
+                        let corners = [iz * n + ix, iz * n + ix + 1, (iz + 1) * n + ix, (iz + 1) * n + ix + 1]
+                        let weights = [(1 - tx) * (1 - tz), tx * (1 - tz), (1 - tx) * tz, tx * tz]
+                        guard c.height[nearest] > b[nearest] else { continue }
+                        var wsum = 0.0, top = 0.0, low = 0.0
+                        for (j, k) in corners.enumerated() where c.height[k] > b[k] {
+                            wsum += weights[j]; top += weights[j] * Double(c.height[k]); low += weights[j] * Double(b[k])
+                        }
+                        height = Int((top / wsum).rounded())
+                        bottom = Int((low / wsum).rounded())
+                    }
                     let slope = max(abs(h10 - h00), abs(h01 - h00), abs(h11 - h10), abs(h11 - h01)) / s
                     Self.writeColumn(v, col: col, n: n, h: h, L: L, height: height,
                                      s: table[c.biome[nearest]] ?? Self.defaultSurface, steep: slope > 1.5,
-                                     bx: x0 + x * voxel, bz: z0 + z * voxel)
+                                     bx: x0 + x * voxel, bz: z0 + z * voxel, bottom: bottom)
                     filled += 1
                 }
             }
@@ -313,11 +353,10 @@ final class LodFarStore: @unchecked Sendable {
 
 /// Nodes (level, x, z triples in `out`) that should get generated columns, nearest first: levels 3 and up
 /// that the quadtree can draw around the player. Returned nodes are marked requested until they're put.
+/// `id` is the world (mmc_lod_open3) the generator feeds: nothing if it's no longer open.
 @_cdecl("mmc_lod_far_wanted")
-public func mmc_lod_far_wanted(_ out: UnsafeMutablePointer<Int32>, _ max: Int32) -> Int32 {
-    let r = LodRenderer.shared
-    r.lock.lock(); let w = r.world; r.lock.unlock()
-    guard let w else { return 0 }
+public func mmc_lod_far_wanted(_ id: Int64, _ out: UnsafeMutablePointer<Int32>, _ max: Int32) -> Int32 {
+    guard let w = lodWorld(id) else { return 0 }
     let list = w.farWanted(max: Int(max))
     for (i, k) in list.enumerated() {
         out[3 * i] = Int32(k.level); out[3 * i + 1] = Int32(k.x); out[3 * i + 2] = Int32(k.z)
@@ -325,22 +364,19 @@ public func mmc_lod_far_wanted(_ out: UnsafeMutablePointer<Int32>, _ max: Int32)
     return Int32(list.count)
 }
 
-/// The id mmc_lod_far_put uses for biome `name` (e.g. minecraft:forest), or -1 with no LOD open.
+/// The id mmc_lod_far_put uses for biome `name` (e.g. minecraft:forest), or -1 if the world isn't open.
 @_cdecl("mmc_lod_far_biome")
-public func mmc_lod_far_biome(_ name: UnsafePointer<CChar>) -> Int32 {
-    let r = LodRenderer.shared
-    r.lock.lock(); let w = r.world; r.lock.unlock()
-    guard let w else { return -1 }
+public func mmc_lod_far_biome(_ id: Int64, _ name: UnsafePointer<CChar>) -> Int32 {
+    guard let w = lodWorld(id) else { return -1 }
     w.far.lock.lock(); defer { w.far.lock.unlock() }
     return Int32(w.far.biomeId(String(cString: name)))
 }
 
-/// Where generated nodes are cached for this world and seed (created if missing); "" for no cache.
+/// Where generated nodes are cached for this world, dimension and seed (created if missing); "" for no cache.
+/// Called when the generator starts for the world.
 @_cdecl("mmc_lod_far_cache")
-public func mmc_lod_far_cache(_ dir: UnsafePointer<CChar>) {
-    let r = LodRenderer.shared
-    r.lock.lock(); let w = r.world; r.lock.unlock()
-    guard let w else { return }
+public func mmc_lod_far_cache(_ id: Int64, _ dir: UnsafePointer<CChar>) {
+    guard let w = lodWorld(id) else { return }
     let path = String(cString: dir)
     guard !path.isEmpty else { return }
     let url = URL(fileURLWithPath: path)
@@ -350,20 +386,23 @@ public func mmc_lod_far_cache(_ dir: UnsafePointer<CChar>) {
         let p = f.dropLast(4).split(separator: ".")
         if p.count == 3, let l = Int(p[0]), let x = Int(p[1]), let z = Int(p[2]) { keys.insert(LodNodeKey(level: l, x: x, z: z)) }
     }
-    w.far.lock.lock(); w.far.cacheDir = url; w.far.cached = keys; w.far.lock.unlock()
+    // A new generator session (FarTerrain.start): nodes the last one was handed but never delivered (the player
+    // changed dimension) are wanted again.
+    w.far.lock.lock(); w.far.cacheDir = url; w.far.cached = keys.subtracting(w.far.columns.keys); w.far.requested.removeAll(); w.far.lock.unlock()
     log("LOD: far terrain cache \(path): \(keys.count) nodes")
 }
 
 /// Generated columns for node (level, x, z): 256 x 256 ground heights (first block above the ground) and
-/// biome ids, x fastest. The node is rebuilt with them on the next update pass.
+/// biome ids, x fastest, and for floating terrain (the End) each column's lowest block (else null). The node
+/// is rebuilt with them on the next update pass.
 @_cdecl("mmc_lod_far_put")
-public func mmc_lod_far_put(_ level: Int32, _ x: Int32, _ z: Int32, _ heights: UnsafePointer<Int16>, _ biomes: UnsafePointer<UInt16>) {
-    let r = LodRenderer.shared
-    r.lock.lock(); let w = r.world; r.lock.unlock()
-    guard let w else { return }
+public func mmc_lod_far_put(_ id: Int64, _ level: Int32, _ x: Int32, _ z: Int32, _ heights: UnsafePointer<Int16>,
+                            _ bottoms: UnsafePointer<Int16>?, _ biomes: UnsafePointer<UInt16>) {
+    guard let w = lodWorld(id) else { return }
     let n = lodNodeVoxels * lodNodeVoxels
     let key = LodNodeKey(level: Int(level), x: Int(x), z: Int(z))
-    let cols = LodFarColumns(height: Array(UnsafeBufferPointer(start: heights, count: n)), biome: Array(UnsafeBufferPointer(start: biomes, count: n)))
+    let cols = LodFarColumns(height: Array(UnsafeBufferPointer(start: heights, count: n)), biome: Array(UnsafeBufferPointer(start: biomes, count: n)),
+                             bottom: bottoms.map { Array(UnsafeBufferPointer(start: $0, count: n)) })
     w.far.lock.lock()
     w.far.columns[key] = cols
     w.far.requested.remove(key)

@@ -67,10 +67,16 @@ let lodGrassBase: UInt8 = 64, lodLeavesBase: UInt8 = 96, lodWaterBase: UInt8 = 1
 /// Untinted texture averages (grass_block_top, oak_leaves, water_still), from tools/lod_colors.py.
 let lodGrassGray: Float = 0.579, lodLeavesGray: Float = 0.565, lodWaterGray: Float = 0.695
 
+/// Marks a column as generated in dimensions whose terrain floats over the void (the End), where a column
+/// of air is real sky, not a chunk that doesn't exist yet. It sits in the bottom voxel, below the End's
+/// lowest block (y 0), counts as solid when downsampling (so it reaches every level) and is never drawn.
+let lodChunkMarker: UInt8 = 63
+
 /// Material kind for every LOD material id, including the tinted variants.
 let lodKinds: [UInt8] = {
     var k = [UInt8](repeating: MaterialKind.opaque.rawValue, count: 256)
     for m in Mat.allCases { k[Int(m.rawValue)] = m.kind.rawValue }
+    k[Int(lodChunkMarker)] = MaterialKind.air.rawValue
     for t in 0..<32 { k[Int(lodWaterBase) + t] = MaterialKind.water.rawValue }
     return k
 }()

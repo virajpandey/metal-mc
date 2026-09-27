@@ -29,12 +29,41 @@ public enum Anvil {
     }
 
     public static func regionDirectory(_ world: URL) -> URL? {
-        for rel in ["dimensions/minecraft/overworld/region", "region"] {
+        for rel in regionPaths("minecraft:overworld") {
             let u = world.appendingPathComponent(rel)
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue { return u }
         }
         return nil
+    }
+
+    /// Where a dimension's region files are in a save (relative), newest layout first: 26.x keeps every
+    /// dimension under dimensions/<namespace>/<path>/region; older saves use region, DIM-1/region, DIM1/region.
+    public static func regionPaths(_ dimension: String) -> [String] {
+        let parts = dimension.split(separator: ":", maxSplits: 1).map(String.init)
+        let ns = parts.count == 2 ? parts[0] : "minecraft", path = parts.count == 2 ? parts[1] : parts[0]
+        var rels = ["dimensions/\(ns)/\(path)/region"]
+        if ns == "minecraft" {
+            switch path {
+            case "overworld": rels.append("region")
+            case "the_nether": rels.append("DIM-1/region")
+            case "the_end": rels.append("DIM1/region")
+            default: break
+            }
+        }
+        return rels
+    }
+
+    /// A dimension's region directory in a save: the first that exists, else where 26.x will create it (a
+    /// dimension the player has just entered has no region files until the game saves).
+    public static func regionDirectory(_ world: URL, dimension: String) -> URL {
+        let rels = regionPaths(dimension)
+        for rel in rels {
+            let u = world.appendingPathComponent(rel)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue { return u }
+        }
+        return world.appendingPathComponent(rels[0])
     }
 
     @inline(__always)

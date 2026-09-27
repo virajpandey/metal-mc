@@ -40,6 +40,23 @@ public final class MetalLod {
         }
     }
 
+    /**
+     * Opens the LOD of one dimension (e.g. "minecraft:the_end") of a single-player save ("" in multiplayer)
+     * and/or a live-chunk store ("" for none). A dimension opened before for the same save resumes where it
+     * was; the one the player left is paused. Returns the dimension's LOD id for ingest and the far-terrain
+     * calls, or 0 if there's nothing to build from.
+     */
+    public static long open3(String worldDir, String storeDir, String dimension, int farBlocks, int centerX, int centerZ) {
+        if (!available()) return 0;
+        Mtl.lodSetDetail(metalmc.MetalMCConfig.lodDetail());
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            ByteBuffer world = stack.UTF8(worldDir);
+            ByteBuffer store = stack.UTF8(storeDir);
+            ByteBuffer dim = stack.UTF8(dimension);
+            return Mtl.lodOpen3(MemoryUtil.memAddress(world), MemoryUtil.memAddress(store), MemoryUtil.memAddress(dim), farBlocks, centerX, centerZ);
+        }
+    }
+
     /** LOD material id for a block name such as "minecraft:stone". Any thread. */
     public static int classify(String blockName) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -59,8 +76,8 @@ public final class MetalLod {
      * then z, then x) and {@code tints} the 4 x 4 surface biome tint classes (z * 4 + x). Both are native
      * addresses. Any thread.
      */
-    public static void ingest(int chunkX, int chunkZ, long blocks, long tints) {
-        Mtl.lodIngest(chunkX, chunkZ, blocks, tints);
+    public static void ingest(long world, int chunkX, int chunkZ, long blocks, long tints) {
+        Mtl.lodIngest2(world, chunkX, chunkZ, blocks, tints);
     }
 
     /** Chunk sections (SectionPos.asLong) hidden in the newest completed occlusion test. Render thread. */
@@ -168,12 +185,12 @@ public final class MetalLod {
         return available() && Mtl.activateApp() != 0;
     }
 
-    /** Nodes that want generated far terrain, as level, x, z triples (at most max nodes). Any thread. */
-    public static int[] farWanted(int max) {
+    /** Nodes of LOD {@code world} that want generated far terrain, as level, x, z triples (at most max). Any thread. */
+    public static int[] farWanted(long world, int max) {
         if (!available()) return new int[0];
         long addr = MemoryUtil.nmemAlloc(12L * max);
         try {
-            int n = Mtl.lodFarWanted(addr, max);
+            int n = Mtl.lodFarWanted(world, addr, max);
             int[] out = new int[3 * n];
             for (int i = 0; i < out.length; i++) out[i] = MemoryUtil.memGetInt(addr + 4L * i);
             return out;
@@ -183,32 +200,38 @@ public final class MetalLod {
     }
 
     /** The id farPut uses for a biome name, or -1 with no LOD open. Any thread. */
-    public static int farBiome(String name) {
+    public static int farBiome(long world, String name) {
         if (!available()) return -1;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            return Mtl.lodFarBiome(MemoryUtil.memAddress(stack.UTF8(name)));
+            return Mtl.lodFarBiome(world, MemoryUtil.memAddress(stack.UTF8(name)));
         }
     }
 
-    /** Directory where generated far terrain is cached for this world and seed. */
-    public static void farCache(String dir) {
+    /** Directory where generated far terrain is cached for this world, dimension and seed. */
+    public static void farCache(long world, String dir) {
         if (!available()) return;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            Mtl.lodFarCache(MemoryUtil.memAddress(stack.UTF8(dir)));
+            Mtl.lodFarCache(world, MemoryUtil.memAddress(stack.UTF8(dir)));
         }
     }
 
-    /** Generated columns for a node: 256 x 256 ground heights and biome ids, x fastest. Any thread. */
-    public static void farPut(int level, int x, int z, short[] heights, short[] biomes) {
+    /**
+     * Generated columns for a node: 256 x 256 ground heights (first block above the ground) and biome ids, x
+     * fastest, and for floating terrain (the End) each column's lowest block, else null. Any thread.
+     */
+    public static void farPut(long world, int level, int x, int z, short[] heights, short[] bottoms, short[] biomes) {
         if (!available()) return;
         long h = MemoryUtil.nmemAlloc(2L * heights.length), b = MemoryUtil.nmemAlloc(2L * biomes.length);
+        long lo = bottoms == null ? 0 : MemoryUtil.nmemAlloc(2L * bottoms.length);
         try {
             for (int i = 0; i < heights.length; i++) MemoryUtil.memPutShort(h + 2L * i, heights[i]);
             for (int i = 0; i < biomes.length; i++) MemoryUtil.memPutShort(b + 2L * i, biomes[i]);
-            Mtl.lodFarPut(level, x, z, h, b);
+            if (bottoms != null) for (int i = 0; i < bottoms.length; i++) MemoryUtil.memPutShort(lo + 2L * i, bottoms[i]);
+            Mtl.lodFarPut(world, level, x, z, h, lo, b);
         } finally {
             MemoryUtil.nmemFree(h);
             MemoryUtil.nmemFree(b);
+            if (lo != 0) MemoryUtil.nmemFree(lo);
         }
     }
 

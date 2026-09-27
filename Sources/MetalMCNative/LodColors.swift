@@ -55,6 +55,9 @@ let lodMaterialFaceColors: [SIMD4<Float>] = [
     SIMD4(0.555, 0.706, 0.982, 1), SIMD4(0.555, 0.706, 0.982, 1), SIMD4(0.555, 0.706, 0.982, 1),   // packedIce
     SIMD4(0.455, 0.657, 0.992, 1), SIMD4(0.455, 0.657, 0.992, 1), SIMD4(0.455, 0.657, 0.992, 1),   // blueIce
     SIMD4(0.059, 0.042, 0.096, 1), SIMD4(0.059, 0.042, 0.096, 1), SIMD4(0.059, 0.042, 0.096, 1),   // obsidian
+    SIMD4(0.861, 0.874, 0.621, 1), SIMD4(0.861, 0.874, 0.621, 1), SIMD4(0.861, 0.874, 0.621, 1),   // endStone
+    SIMD4(0.666, 0.494, 0.665, 1), SIMD4(0.666, 0.494, 0.665, 1), SIMD4(0.666, 0.494, 0.665, 1),   // purpur
+    SIMD4(0.368, 0.224, 0.368, 1), SIMD4(0.368, 0.224, 0.368, 1), SIMD4(0.368, 0.224, 0.368, 1),   // chorus
 ]
 
 /// Grass block sides: the untinted dirt part's mean color, the tinted fringe's share of the texture, and the
@@ -123,5 +126,8 @@ let lodMaterialSprites: [LodSprite] = [
     LodSprite(top: "packed_ice", side: "packed_ice", topLuma: 0.694, sideLuma: 0.694),   // packedIce
     LodSprite(top: "blue_ice", side: "blue_ice", topLuma: 0.639, sideLuma: 0.639),   // blueIce
     LodSprite(top: "obsidian", side: "obsidian", topLuma: 0.049, sideLuma: 0.049),   // obsidian
+    LodSprite(top: "end_stone", side: "end_stone", topLuma: 0.853, sideLuma: 0.853),   // endStone
+    LodSprite(top: "purpur_block", side: "purpur_block", topLuma: 0.543, sideLuma: 0.543),   // purpur
+    LodSprite(top: "chorus_plant", side: "chorus_plant", topLuma: 0.265, sideLuma: 0.265),   // chorus
     LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: 0.606, sideLuma: 0.425),   // grass side (not a material)
 ]
