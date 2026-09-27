@@ -61,15 +61,23 @@ public final class Bench {
 
     private Bench() {}
 
-    /** True during the timed run. */
+    /** True during the timed run (except the frames right after a bench screenshot: its readback isn't gameplay). */
     public static boolean running() {
-        return state == State.RUNNING;
+        return state == State.RUNNING && skipFrames == 0;
     }
+
+    /** Frames left to leave out of the stats after a screenshot request (the readback lands a few frames later). */
+    private static int skipFrames;
 
     /** Called once per rendered frame (see FrameHookMixin). */
     public static void onFrame() {
         if (state != State.RUNNING) return;
         long now = System.nanoTime();
+        if (skipFrames > 0) {
+            skipFrames--;
+            lastFrameNs = now;
+            return;
+        }
         if (lastFrameNs != 0 && frameCount < frameNs.length) {
             gpuUtil[frameCount] = Minecraft.getInstance().getGpuUtilization();
             frameNs[frameCount++] = now - lastFrameNs;
@@ -177,7 +185,9 @@ public final class Bench {
     }
 
     private static void screenshot(Minecraft mc, String tag) {
-        if (SCREENSHOTS) screenshotNow(mc, tag);
+        if (!SCREENSHOTS) return;
+        screenshotNow(mc, tag);
+        skipFrames = 6;
     }
 
     static void screenshotNow(Minecraft mc, String tag) {

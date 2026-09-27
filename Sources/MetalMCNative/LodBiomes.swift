@@ -81,6 +81,16 @@ let lodKinds: [UInt8] = {
     return k
 }()
 
+/// Block light each LOD material gives off (vanilla's levels). Solid sources (and lava) are also drawn self-lit.
+let lodEmission: [UInt8] = {
+    var e = [UInt8](repeating: 0, count: 256)
+    for m in [Mat.lava, .glowstone, .seaLantern, .shroomlight, .jackOLantern, .froglight, .light15] { e[Int(m.rawValue)] = 15 }
+    e[Int(Mat.light14.rawValue)] = 14
+    e[Int(Mat.light10.rawValue)] = 10
+    e[Int(Mat.light7.rawValue)] = 7
+    return e
+}()
+
 @inline(__always) func lodIsWater(_ m: UInt8) -> Bool { m == Mat.water.rawValue || (m >= lodWaterBase && m < lodWaterBase + 32) }
 
 /// Tinted variant of a block material for a biome tint class (other materials are unchanged).

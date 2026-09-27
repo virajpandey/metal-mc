@@ -61,11 +61,11 @@ static float3 extentScale(uint face, float w, float h) {
     return float3(w, h, 1);
 }
 
-// Quads are 8 bytes: word0 = x | z << 8 | y << 16 (9 bits) | face << 25 | water depth << 28 (voxel coordinates
-// within the node; blocks of water above an underwater face, 0 for none), word1 = material | (w - 1) << 8 |
-// (h - 1) << 16 | ao << 24 (greedy extents along the face's u and v axes; ao is the METALMC_EXP=vertexao
-// variant's 2 bits per corner, 0 otherwise). Ambient occlusion is normally per pixel from the quad's rim
-// values (see lodAO).
+// Quads are 8 bytes: word0 = x | z << 8 | y << 16 (9 bits) | face << 25 | depth << 28 (voxel coordinates within
+// the node; depth: blocks of water above an underwater face, or 15 minus the sky light of covered air in front of
+// the face; 0 for none), word1 = material | (w - 1) << 8 | (h - 1) << 16 | block light << 24 (greedy extents
+// along the face's u and v axes; block light of the air in front, level 0). Ambient occlusion is per pixel from
+// the quad's rim values (see lodAO).
 // Brightness for 0, 1, 2 and 3 occluders: vanilla's smooth-lighting steps (1, 0.8, 0.6, 0.4) at 60% strength,
 // because an LOD voxel's corner gradient spans 2+ blocks where vanilla's spans one (measured with the
 // fidelity score: full strength left the LOD 3.5 levels too dark, none 3.5 too bright).
@@ -151,18 +151,19 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     clip.y = -clip.y;   // same vertical flip as every translated Minecraft shader (flip_vert_y)
     o.pos = clip;
     uint faceClass = face == 2 ? 0u : (face == 3 ? 2u : 1u);   // top, side, bottom
-    float ao = kAO[(q.y >> (24 + 2 * corner)) & 3];
     // An underwater face's depth darkens it; on water, depth 15 marks deep water (drawn opaque, no floor meshed).
     uint depthField = (q.x >> 28) & 15;
     bool deep = water && depthField == 15;
     uint depth = water ? 0u : depthField;
-    // Lava gives off block light 15, so it glows at night like vanilla's.
-    float3 k = kShade[face] * ao * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, m == MAT_LAVA ? 15.0 : 0.0);
+    // Block light: lava and solid light sources glow at night like vanilla's; other faces get the light of the
+    // air in front of them (torches, lanterns).
+    float blockLevel = (m == MAT_LAVA || (m >= MAT_GLOW_FIRST && m <= MAT_GLOW_LAST)) ? 15.0 : float((q.y >> 24) & 15u);
+    float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, blockLevel);
     // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
     // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
     // Varyings cost vertex output bandwidth on this tile-based GPU (a float3 color2 cost 9% of the frame at a
-    // million quads), so the colors are flat and packed. METALMC_EXP=vertexao shades per quad here, not per corner.
+    // million quads), so the colors are flat and packed.
     o.color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
     // Flat: per-pixel AO is applied in the fragment shader and the rest of k is constant over the quad.
     // Deep water carries the light of its (unmeshed) floor, a dozen or more blocks down, for its blend.
@@ -212,7 +213,8 @@ using LodMeshOut = metal::mesh<VOut, LodPrim, 4 * MESH_QUADS, 2 * MESH_QUADS, me
     uint depthField = (q.x >> 28) & 15;
     bool deep = water && depthField == 15;
     uint depth = water ? 0u : depthField;
-    float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, m == MAT_LAVA ? 15.0 : 0.0);
+    float blockLevel = (m == MAT_LAVA || (m >= MAT_GLOW_FIRST && m <= MAT_GLOW_LAST)) ? 15.0 : float((q.y >> 24) & 15u);
+    float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, blockLevel);
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
     uint color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
     uint color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0))
@@ -520,6 +522,8 @@ final class LodRenderer: @unchecked Sendable {
                     .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
                     .replacingOccurrences(of: "MAT_DIRT", with: "\(Mat.dirt.rawValue)u")
                     .replacingOccurrences(of: "MAT_LAVA", with: "\(Mat.lava.rawValue)u")
+                    .replacingOccurrences(of: "MAT_GLOW_FIRST", with: "\(Mat.glowstone.rawValue)u")
+                    .replacingOccurrences(of: "MAT_GLOW_LAST", with: "\(Mat.froglight.rawValue)u")
                     .replacingOccurrences(of: "MESH_QUADS", with: "\(lodMeshQuads)")
                     .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
                     .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")

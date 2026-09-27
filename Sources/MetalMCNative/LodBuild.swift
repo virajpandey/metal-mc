@@ -41,7 +41,6 @@ let lodNoAO = experiments.contains("noao")
 let lodSkyCover = !experiments.contains("noskycover")
 /// 15 - light, rounded to the nearest multiple of 3 (METALMC_EXP=coverexact: unrounded).
 let lodCoverSteps: [UInt8] = (0...15).map { d in experiments.contains("coverexact") ? UInt8(d) : UInt8(min(15, (d + 1) / 3 * 3)) }
-let lodVertexAO = experiments.contains("vertexao")
 /// No ambient occlusion data for a quad (its whole rim is unoccluded).
 let lodNoAOData = UInt32.max
 /// METALMC_EXP=nodeepfill turns off deep-cave filling (for A/B comparisons).
@@ -94,6 +93,12 @@ let lodTreeMaterial: [Bool] = {
     return best
 }
 
+/// Material ids for downsampling blocks to level 1: light sources that aren't drawn (torches, lanterns) become air.
+/// Only level 0 spreads their light, and in a group's vote they could turn a solid voxel invisible.
+let lodReduceInput: [UInt8] = (0..<256).map { m in
+    lodKinds[m] == MaterialKind.air.rawValue && lodEmission[m] != 0 ? 0 : UInt8(m)
+}
+
 /// One chunk's blocks (16 x 16 x 384 material ids, laid out y, z, x from the world bottom) to its level-1
 /// voxels (8 x 8 x 192, laid out y, z, x), with each 4 x 4-block cell's biome tint (tints[z * 4 + x]).
 func lodReduceChunk(_ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8>, into out: UnsafeMutablePointer<UInt8>,
@@ -106,8 +111,8 @@ func lodReduceChunk(_ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8
                 for dy in 0..<2 {
                     for dz in 0..<2 {
                         let row = ((vy * 2 + dy) * 16 + vz * 2 + dz) * 16 + vx * 2
-                        c[dy << 2 | dz << 1] = blocks[row]
-                        c[dy << 2 | dz << 1 | 1] = blocks[row + 1]
+                        c[dy << 2 | dz << 1] = lodReduceInput[Int(blocks[row])]
+                        c[dy << 2 | dz << 1 | 1] = lodReduceInput[Int(blocks[row + 1])]
                     }
                 }
                 let m = lodReduce(c, rule: rule)
@@ -122,6 +127,8 @@ struct LodGrid {
     let level: Int
     let height: Int            // voxels
     var v: [UInt8]
+    /// Level 0: voxels holding light sources (lodEmission), found while decoding; the mesher spreads their light.
+    var emitters: [Int32] = []
 
     init(level: Int) {
         self.level = level
@@ -275,7 +282,7 @@ struct LodGrid {
 /// values (2 bits each, 0-3 occluders like vanilla's smooth lighting, 2 x (w + h) of them counterclockwise
 /// in (u, v) from (0, 0)) packed into `ao`, starting at `aoOffsets[quad]` (in 2-bit units).
 struct LodMesh {
-    var quads: [UInt32]         // pairs: word0 = x | z<<8 | y<<16 (9 bits) | face<<25 | water depth<<28, word1 = mat | (w-1)<<8 | (h-1)<<16 | vertex ao<<24
+    var quads: [UInt32]         // pairs: word0 = x | z<<8 | y<<16 (9 bits) | face<<25 | water depth or cover<<28, word1 = mat | (w-1)<<8 | (h-1)<<16 | block light<<24
     var counts: [Int]           // quads per (tile, bucket), tile-major: tile = tz * 4 + tx, buckets as lodBucketsPerTile
     var tileY: [Int]            // per tile: min and max voxel y of its quads (min > max if empty)
     var tileYCore: [Int]        // the same without the skirt walls on the node's outer edges
@@ -355,6 +362,7 @@ enum LodBuild {
         let scratch = ChunkScan.Scratch()
         let n = lodNodeVoxels
         var tint = [UInt8](repeating: 0, count: 16)
+        var emitters: [Int32] = []
         r.withUnsafeBufferPointer { rb in
         grid.v.withUnsafeMutableBufferPointer { g in
             for lz in 0..<16 {
@@ -375,6 +383,7 @@ enum LodBuild {
                                     for x in 0..<16 {
                                         let m = src[srow + x]
                                         g[row + x] = m == 0 ? 0 : lodTinted(m, tint[(z >> 2) * 4 + (x >> 2)])
+                                        if lodEmission[Int(m)] != 0 { emitters.append(Int32(row + x)) }
                                     }
                                 }
                             }
@@ -385,6 +394,7 @@ enum LodBuild {
             }
         }
         }
+        grid.emitters = emitters
         return any ? grid : nil
     }
 
@@ -419,7 +429,7 @@ enum LodBuild {
         let maskSide = grid.level <= 1 ? lodTileSections(grid.level) : 0
         let maskWords = grid.level <= 1 ? lodTileSectionWords(grid.level) : 0
         var sectionMask = [UInt32](repeating: 0, count: tiles * maskWords)
-        var mask = [UInt32](repeating: 0, count: n * max(n, h))   // material | vertex ao pattern << 8 | water depth << 16
+        var mask = [UInt32](repeating: 0, count: n * max(n, h))   // material | water depth or cover << 16 | block light << 20
 
         grid.v.withUnsafeBufferPointer { g in
             // Highest non-air voxel per column, -1 for a column with no data (a missing chunk). Side faces
@@ -499,6 +509,43 @@ enum LodBuild {
                 let c = cover[(y * n + z) * n + x]
                 return c == 255 ? 15 : UInt32(lodCoverSteps[Int(c)])
             }
+            // Block light (level 0): vanilla's, spread from the light sources found while decoding through air and
+            // water, one level less per block. Torches and lanterns hold their light in their own (air) voxel;
+            // glowstone and the like light the air around them. A face carries the light of the voxel in front of
+            // it (mask bits 20-23, quad word1 bits 24-27), which the shader passes to vanilla's lightmap.
+            var blockLight: [UInt8] = []
+            if grid.level == 0 && !grid.emitters.isEmpty {
+                blockLight = [UInt8](repeating: 0, count: n * n * h)
+                var queue = [[Int32]](repeating: [], count: 16)
+                @inline(__always) func clear(_ v: Int) -> Bool { let k = kinds[Int(g[v])]; return k == airK || k == waterK }
+                @inline(__always) func seed(_ v: Int, _ l: UInt8) {
+                    if l > blockLight[v] { blockLight[v] = l; queue[Int(l)].append(Int32(v)) }
+                }
+                @inline(__always) func spread(_ v: Int, _ l: UInt8) {
+                    let x = v % n, z = (v / n) % n, y = v / (n * n)
+                    if x > 0 && clear(v - 1) { seed(v - 1, l) }
+                    if x < n - 1 && clear(v + 1) { seed(v + 1, l) }
+                    if z > 0 && clear(v - n) { seed(v - n, l) }
+                    if z < n - 1 && clear(v + n) { seed(v + n, l) }
+                    if y > 0 && clear(v - n * n) { seed(v - n * n, l) }
+                    if y < h - 1 && clear(v + n * n) { seed(v + n * n, l) }
+                }
+                for e32 in grid.emitters {
+                    let e = Int(e32), l = lodEmission[Int(g[e])]
+                    if l == 0 { continue }
+                    if clear(e) { seed(e, l) } else { spread(e, l - 1) }
+                }
+                var level = 15
+                while level > 1 {
+                    for v32 in queue[level] where blockLight[Int(v32)] == level { spread(Int(v32), UInt8(level - 1)) }
+                    queue[level].removeAll()
+                    level -= 1
+                }
+            }
+            @inline(__always) func blockLightAt(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
+                if blockLight.isEmpty || x < 0 || z < 0 || x >= n || z >= n || y < 0 || y >= h { return 0 }
+                return UInt32(blockLight[(y * n + z) * n + x])
+            }
             var bandLo = [Int](repeating: 0, count: max(n, h)), bandHi = [Int](repeating: -1, count: max(n, h))
             let edgeSkirt = 8
             @inline(__always) func at(_ x: Int, _ y: Int, _ z: Int) -> UInt8 {
@@ -523,18 +570,6 @@ enum LodBuild {
                     }
                 }
                 let (sx, sy, sz) = axis == 0 ? (dir, 0, 0) : (axis == 1 ? (0, dir, 0) : (0, 0, dir))
-                // Ambient occlusion like vanilla's smooth lighting: each corner of a face looks at the two
-                // voxels beside it and the diagonal one, in the layer in front of the face. Corner k is the
-                // shader's kCorners[face][k]; its offsets along the face's two in-plane axes are +-1.
-                var cornerOffsets: [(Int, Int, Int, Int, Int, Int)] = []   // side1 (x, y, z), side2 (x, y, z)
-                for k in 0..<4 {
-                    let c = lodFaceCorners[face][k]
-                    switch axis {
-                    case 0: cornerOffsets.append((0, c.1 == 1 ? 1 : -1, 0, 0, 0, c.2 == 1 ? 1 : -1))
-                    case 1: cornerOffsets.append((c.0 == 1 ? 1 : -1, 0, 0, 0, 0, c.2 == 1 ? 1 : -1))
-                    default: cornerOffsets.append((c.0 == 1 ? 1 : -1, 0, 0, 0, c.1 == 1 ? 1 : -1, 0))
-                    }
-                }
                 @inline(__always) func solid(_ x: Int, _ y: Int, _ z: Int) -> Int {
                     let k = kinds[Int(at(x, y, z))]
                     return k == airK || k == waterK ? 0 : 1
@@ -588,7 +623,7 @@ enum LodBuild {
                                 let nk = kinds[Int(at(x + sx, y + sy, z + sz))]
                                 if k == waterK {
                                     if nk == airK {
-                                        f = UInt32(m)
+                                        f = UInt32(m) | blockLightAt(x + sx, y + sy, z + sz) << 20
                                         if deepWater && face == 2 {
                                             // Water voxels from this one down to the floor.
                                             var d = 0, yy = y
@@ -597,7 +632,10 @@ enum LodBuild {
                                         }
                                     }
                                 }
-                                else if nk == airK { f = UInt32(m) | coverDepth(x + sx, y + sy, z + sz) << 16 }
+                                else if nk == airK {
+                                    let fx = x + sx, fy = y + sy, fz = z + sz
+                                    f = UInt32(m) | coverDepth(fx, fy, fz) << 16 | blockLightAt(fx, fy, fz) << 20
+                                }
                                 else if nk == waterK && !lodOpaqueWater {
                                     // Water voxels from the one in front of the face up.
                                     var d = 0, yy = y + sy
@@ -608,17 +646,6 @@ enum LodBuild {
                                 if f != 0 && axis != 1 {
                                     let nx = x + sx, nz = z + sz
                                     if nx >= 0 && nz >= 0 && nx < n && nz < n && top[nz * n + nx] < 0 && y < top[z * n + x] - edgeSkirt { f = 0 }
-                                }
-                                if f != 0 && lodVertexAO {
-                                    let fx = x + sx, fy = y + sy, fz = z + sz
-                                    var pattern: UInt32 = 0
-                                    for k in 0..<4 {
-                                        let o = cornerOffsets[k]
-                                        let s1 = solid(fx + o.0, fy + o.1, fz + o.2), s2 = solid(fx + o.3, fy + o.4, fz + o.5)
-                                        let level = s1 == 1 && s2 == 1 ? 3 : s1 + s2 + solid(fx + o.0 + o.3, fy + o.1 + o.4, fz + o.2 + o.5)
-                                        pattern |= UInt32(level) << UInt32(2 * k)
-                                    }
-                                    f |= pattern << 8
                                 }
                             }
                             mask[vv * du + uu] = f
@@ -648,12 +675,12 @@ enum LodBuild {
                             let isWater = kinds[Int(m & 255)] == waterK
                             let b = t * lodBucketsPerTile + (isWater ? 6 : 0) + face
                             buckets[b].append(UInt32(x) | UInt32(z) << 8 | UInt32(y) << 16 | UInt32(face) << 25 | (m >> 16) << 28)
-                            buckets[b].append((m & 255) | UInt32(w - 1) << 8 | UInt32(ht - 1) << 16 | ((m >> 8) & 255) << 24)
+                            buckets[b].append((m & 255) | UInt32(w - 1) << 8 | UInt32(ht - 1) << 16 | ((m >> 20) & 15) << 24)
                             // Rim ambient occlusion (vanilla's fluids have none). A rim point touches one (a corner
                             // of the quad) or two voxel faces of the quad; the voxels in front of those are open,
                             // and the other front voxels around the point decide its level.
                             var aoOffset = lodNoAOData
-                            if !isWater && !lodVertexAO && !lodNoAO {
+                            if !isWater && !lodNoAO {
                                 @inline(__always) func front(_ ca: Int, _ cb: Int) -> Int {
                                     if ca >= 0 && cb >= 0 && ca < w && cb < ht { return 0 }
                                     let (fx, fy, fz) = xyz(d, uu + ca, vv + cb)
@@ -920,4 +947,25 @@ public func mmc_debug_lod_mesh_stats(_ path: UnsafePointer<CChar>, _ level: Int3
         }
     }
     out[0] = Int64(total); out[1] = buried
+}
+
+/// Debug: light sources (lodEmission) in a region file at full resolution; out = (count, x, y, z of the first
+/// 64 found, block coordinates). Returns the count.
+@_cdecl("mmc_debug_region_emitters")
+public func mmc_debug_region_emitters(_ path: UnsafePointer<CChar>, _ regionX: Int32, _ regionZ: Int32, _ out: UnsafeMutablePointer<Int32>) -> Int32 {
+    var count = 0
+    for q in 0..<4 {
+        guard let g = LodBuild.regionQuarterGrid(path: String(cString: path), qx: q & 1, qz: q >> 1) else { continue }
+        let n = lodNodeVoxels
+        for e in g.emitters {
+            let v = Int(e)
+            if count < 64 {
+                out[3 * count] = Int32(Int(regionX) * 512 + (q & 1) * 256 + v % n)
+                out[3 * count + 1] = Int32(v / (n * n) + lodWorldMinY)
+                out[3 * count + 2] = Int32(Int(regionZ) * 512 + (q >> 1) * 256 + (v / n) % n)
+            }
+            count += 1
+        }
+    }
+    return Int32(count)
 }

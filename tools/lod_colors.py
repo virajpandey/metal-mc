@@ -109,6 +109,9 @@ colors = [
     ("brownTerracotta", average("brown_terracotta")), ("lightGrayTerracotta", average("light_gray_terracotta")),
     ("packedIce", average("packed_ice")), ("blueIce", average("blue_ice")), ("obsidian", average("obsidian")),
     ("endStone", average("end_stone")), ("purpur", average("purpur_block")), ("chorus", average("chorus_plant")),
+    ("glowstone", average("glowstone")), ("seaLantern", average("sea_lantern")), ("shroomlight", average("shroomlight")),
+    ("jackOLantern", average("jack_o_lantern")), ("froglight", average("ochre_froglight_side")),
+    ("light15", None), ("light14", None), ("light10", None), ("light7", None),
 ]
 def luma(name):
     """Mean Rec. 709 luma of the texture's opaque texels (untinted, gamma space like the atlas)."""
@@ -139,6 +142,9 @@ sprites = [
     ("lightGrayTerracotta", "light_gray_terracotta", "light_gray_terracotta"), ("packedIce", "packed_ice", "packed_ice"),
     ("blueIce", "blue_ice", "blue_ice"), ("obsidian", "obsidian", "obsidian"),
     ("endStone", "end_stone", "end_stone"), ("purpur", "purpur_block", "purpur_block"), ("chorus", "chorus_plant", "chorus_plant"),
+    ("glowstone", "glowstone", "glowstone"), ("seaLantern", "sea_lantern", "sea_lantern"), ("shroomlight", "shroomlight", "shroomlight"),
+    ("jackOLantern", "pumpkin_top", "jack_o_lantern"), ("froglight", "ochre_froglight_top", "ochre_froglight_side"),
+    ("light15", None, None), ("light14", None, None), ("light10", None, None), ("light7", None, None),
 ]
 assert [n for n, _, _ in sprites] == [n for n, _ in colors]
 sprite_lines = []
@@ -184,6 +190,8 @@ faces = {
     "podzol": (average("podzol_top"), average("podzol_side"), average("dirt")),
     "mycelium": (average("mycelium_top"), average("mycelium_side"), average("dirt")),
     "redSandstone": (average("red_sandstone_top"), average("red_sandstone"), average("red_sandstone_bottom")),
+    "jackOLantern": (average("pumpkin_top"), average("jack_o_lantern"), average("pumpkin_top")),
+    "froglight": (average("ochre_froglight_top"), average("ochre_froglight_side"), average("ochre_froglight_top")),
 }
 
 lines = []

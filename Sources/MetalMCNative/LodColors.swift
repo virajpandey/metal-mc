@@ -58,6 +58,15 @@ let lodMaterialFaceColors: [SIMD4<Float>] = [
     SIMD4(0.861, 0.874, 0.621, 1), SIMD4(0.861, 0.874, 0.621, 1), SIMD4(0.861, 0.874, 0.621, 1),   // endStone
     SIMD4(0.666, 0.494, 0.665, 1), SIMD4(0.666, 0.494, 0.665, 1), SIMD4(0.666, 0.494, 0.665, 1),   // purpur
     SIMD4(0.368, 0.224, 0.368, 1), SIMD4(0.368, 0.224, 0.368, 1), SIMD4(0.368, 0.224, 0.368, 1),   // chorus
+    SIMD4(0.674, 0.514, 0.331, 1), SIMD4(0.674, 0.514, 0.331, 1), SIMD4(0.674, 0.514, 0.331, 1),   // glowstone
+    SIMD4(0.676, 0.784, 0.745, 1), SIMD4(0.676, 0.784, 0.745, 1), SIMD4(0.676, 0.784, 0.745, 1),   // seaLantern
+    SIMD4(0.945, 0.575, 0.278, 1), SIMD4(0.945, 0.575, 0.278, 1), SIMD4(0.945, 0.575, 0.278, 1),   // shroomlight
+    SIMD4(0.777, 0.466, 0.096, 1), SIMD4(0.841, 0.598, 0.207, 1), SIMD4(0.777, 0.466, 0.096, 1),   // jackOLantern
+    SIMD4(0.983, 0.961, 0.810, 1), SIMD4(0.963, 0.915, 0.713, 1), SIMD4(0.983, 0.961, 0.810, 1),   // froglight
+    SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0),   // light15
+    SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0),   // light14
+    SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0),   // light10
+    SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0), SIMD4(0, 0, 0, 0),   // light7
 ]
 
 /// Grass block sides: the untinted dirt part's mean color, the tinted fringe's share of the texture, and the
@@ -129,5 +138,14 @@ let lodMaterialSprites: [LodSprite] = [
     LodSprite(top: "end_stone", side: "end_stone", topLuma: 0.853, sideLuma: 0.853),   // endStone
     LodSprite(top: "purpur_block", side: "purpur_block", topLuma: 0.543, sideLuma: 0.543),   // purpur
     LodSprite(top: "chorus_plant", side: "chorus_plant", topLuma: 0.265, sideLuma: 0.265),   // chorus
+    LodSprite(top: "glowstone", side: "glowstone", topLuma: 0.535, sideLuma: 0.535),   // glowstone
+    LodSprite(top: "sea_lantern", side: "sea_lantern", topLuma: 0.758, sideLuma: 0.758),   // seaLantern
+    LodSprite(top: "shroomlight", side: "shroomlight", topLuma: 0.632, sideLuma: 0.632),   // shroomlight
+    LodSprite(top: "pumpkin_top", side: "jack_o_lantern", topLuma: 0.505, sideLuma: 0.621),   // jackOLantern
+    LodSprite(top: "ochre_froglight_top", side: "ochre_froglight_side", topLuma: 0.955, sideLuma: 0.910),   // froglight
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light15
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light14
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light10
+    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // light7
     LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: 0.606, sideLuma: 0.425),   // grass side (not a material)
 ]

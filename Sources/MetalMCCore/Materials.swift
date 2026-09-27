@@ -18,10 +18,14 @@ public enum Mat: UInt8, CaseIterable {
     case packedIce, blueIce, obsidian
     // The End: end stone islands, purpur end cities and chorus plants.
     case endStone, purpur, chorus
+    // Light sources. Solid ones are drawn (and glow); the others (torches, lanterns, fire, campfires, end rods,
+    // glow lichen) are invisible from LOD distances but light what's around them, by their light level.
+    case glowstone, seaLantern, shroomlight, jackOLantern, froglight
+    case light15, light14, light10, light7
 
     public var kind: MaterialKind {
         switch self {
-        case .air: return .air
+        case .air, .light15, .light14, .light10, .light7: return .air
         case .water: return .water
         default: return .opaque
         }
@@ -82,6 +86,12 @@ public enum Mat: UInt8, CaseIterable {
         case .endStone: return SIMD4(0.86, 0.87, 0.62, 1)
         case .purpur: return SIMD4(0.66, 0.49, 0.66, 1)
         case .chorus: return SIMD4(0.37, 0.24, 0.37, 1)
+        case .glowstone: return SIMD4(0.67, 0.53, 0.33, 1)
+        case .seaLantern: return SIMD4(0.67, 0.78, 0.74, 1)
+        case .shroomlight: return SIMD4(0.94, 0.58, 0.28, 1)
+        case .jackOLantern: return SIMD4(0.84, 0.60, 0.19, 1)
+        case .froglight: return SIMD4(0.93, 0.89, 0.72, 1)
+        case .light15, .light14, .light10, .light7: return SIMD4(0, 0, 0, 0)
         }
     }
 }
@@ -108,6 +118,14 @@ public enum Materials {
         switch n {
         case "air", "cave_air", "void_air", "structure_void", "light", "barrier":
             return .air
+        case "torch", "wall_torch", "end_rod": return .light14
+        case "soul_torch", "soul_wall_torch", "soul_lantern", "soul_fire", "soul_campfire": return .light10
+        case "redstone_torch", "redstone_wall_torch", "glow_lichen": return .light7
+        case "lantern", "fire", "campfire", "beacon": return .light15
+        case "glowstone": return .glowstone
+        case "sea_lantern": return .seaLantern
+        case "shroomlight": return .shroomlight
+        case "jack_o_lantern": return .jackOLantern
         case "water", "bubble_column", "seagrass", "tall_seagrass", "kelp", "kelp_plant":
             return .water
         case "snow":
@@ -115,7 +133,7 @@ public enum Materials {
             return .snow
         case "short_grass", "tall_grass", "grass", "fern", "large_fern", "brown_mushroom", "red_mushroom",
              "short_dry_grass", "tall_dry_grass", "azalea", "flowering_azalea", "big_dripleaf", "big_dripleaf_stem",
-             "small_dripleaf", "fire", "soul_fire", "spore_blossom", "hanging_roots", "cactus_flower":
+             "small_dripleaf", "spore_blossom", "hanging_roots", "cactus_flower":
             return .air
         default:
             break
@@ -123,6 +141,7 @@ public enum Materials {
         func has(_ s: String) -> Bool { n.contains(s) }
         func any(_ list: [String]) -> Bool { list.contains { n.contains($0) } }
 
+        if has("froglight") { return .froglight }
         if has("end_stone") || n == "end_portal_frame" { return .endStone }
         if has("purpur") { return .purpur }
         if has("chorus") { return .chorus }
