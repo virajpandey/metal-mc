@@ -79,6 +79,12 @@ loom {
 			if (project.hasProperty("lod0")) {
 				environmentVariable "METALMC_LOD0", project.findProperty("lod0").toString()
 			}
+			if (project.hasProperty("meshQuads")) {
+				environmentVariable "METALMC_MESHQUADS", project.findProperty("meshQuads").toString()
+			}
+			if (project.hasProperty("tileSplit")) {
+				environmentVariable "METALMC_TILESPLIT", project.findProperty("tileSplit").toString()
+			}
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
 				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"

@@ -49,6 +49,8 @@ constant float3 kCorners[6][4] = {
     { float3(1,0,1), float3(1,1,1), float3(0,1,1), float3(0,0,1) },
     { float3(0,0,0), float3(0,1,0), float3(1,1,0), float3(1,0,0) },
 };
+// Face normals, same order.
+constant float3 kNormal[6] = { float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
 // Directional shading close to vanilla's face shading (top 1.0, bottom 0.5, X 0.6, Z 0.8).
 constant float kShade[6] = { 0.6, 0.6, 1.0, 0.5, 0.8, 0.8 };
 
@@ -175,6 +177,90 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     return o;
 }
 
+// Mesh-shader path (METALMC_EXP=meshshader): one thread per quad, 64 quads per threadgroup. The per-quad work
+// (decode, color, lighting, AO lookup) runs once instead of in each of the quad's four vertices, and quads
+// facing away from the camera or entirely off one side of the view are culled before rasterization.
+struct MeshDraw { uint first; uint count; uint slot; uint pad; };
+struct LodPrim { bool culled [[primitive_culled]]; };
+using LodMeshOut = metal::mesh<VOut, LodPrim, 4 * MESH_QUADS, 2 * MESH_QUADS, metal::topology::triangle>;
+
+[[mesh]] void lod_mesh(LodMeshOut out,
+                       uint tid [[thread_index_in_threadgroup]], uint gid [[threadgroup_position_in_grid]],
+                       constant MeshDraw& md [[buffer(17)]],
+                       const device uint2* quads [[buffer(18)]],
+                       constant LodUniforms& u [[buffer(19)]],
+                       const device Xform* xforms [[buffer(20)]],
+                       constant float4* colors [[buffer(21)]],
+                       const device uint* aoOffsets [[buffer(22)]],
+                       texture2d<float> lightmap [[texture(29)]], sampler lightSampler [[sampler(14)]]) {
+    uint base = gid * MESH_QUADS;
+    uint n = min(uint(MESH_QUADS), md.count - base);
+    if (tid == 0) out.set_primitive_count(n * 2);
+    if (tid >= n) return;
+    uint qi = md.first + base + tid;
+    uint2 q = quads[qi];
+    uint face = (q.x >> 25) & 7;
+    float3 local = float3(q.x & 255, (q.x >> 16) & 511, (q.x >> 8) & 255);
+    float w = float(((q.y >> 8) & 255) + 1), h = float(((q.y >> 16) & 255) + 1);
+    float3 ext = extentScale(face, w, h);
+    float4 xs = xforms[md.slot].offsetScale;
+    uint m = q.y & 255;
+    bool water = (m >= 128u && m < 160u) || m == MAT_WATER;
+    float drop = xs.w < 1.5 ? kWaterSurfaceDrop0 : kWaterSurfaceDrop;
+    uint faceClass = face == 2 ? 0u : (face == 3 ? 2u : 1u);
+    uint depthField = (q.x >> 28) & 15;
+    bool deep = water && depthField == 15;
+    uint depth = water ? 0u : depthField;
+    float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, 15.0 - float(depth), depth, m == MAT_LAVA ? 15.0 : 0.0);
+    bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
+    uint color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
+    uint color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0))
+                : (deep ? pack_float_to_unorm4x8(float4(float3(0.56, 0.53, 0.45) * lodLight(u, lightmap, lightSampler, 2.0, 13), 0.0)) : 0u);
+    uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
+    uint matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17) | (grassSide ? 1u << 23 : 0u)
+                 | (xs.w < 1.5 ? 1u << 24 : 0u) | (deep ? 1u << 25 : 0u);
+    uint ao = aoOffsets[qi];
+    // Culled: facing away (the camera is at the origin of these camera-relative coordinates, so it's in front
+    // if it's on the normal's side of the quad's plane) or all four corners beyond the same clip plane. Culled
+    // quads write no vertices.
+    float3 rels[4];
+    float4 clips[4];
+    uint outL = 0, outR = 0, outB = 0, outT = 0;
+    for (uint c = 0; c < 4; c++) {
+        float3 cc = kCorners[face][c];
+        float3 rel = xs.xyz + (local + cc * ext) * xs.w;
+        if (water && cc.y > 0.5) rel.y -= drop;
+        float4 clip = u.proj * (u.view * float4(rel, 1.0));
+        clip.y = -clip.y;
+        outL += clip.x < -clip.w; outR += clip.x > clip.w; outB += clip.y < -clip.w; outT += clip.y > clip.w;
+        rels[c] = rel;
+        clips[c] = clip;
+    }
+    bool culled = dot(kNormal[face], rels[0]) >= 0.0 || outL == 4 || outR == 4 || outB == 4 || outT == 4;
+    LodPrim p;
+    p.culled = culled;
+    out.set_primitive(tid * 2, p);
+    out.set_primitive(tid * 2 + 1, p);
+    if (culled) return;
+    for (uint c = 0; c < 4; c++) {
+        float3 cc = kCorners[face][c];
+        float3 rel = rels[c];
+        float4 clip = clips[c];
+        VOut o;
+        o.pos = clip;
+        o.color = color;
+        o.color2 = color2;
+        o.rel = rel;
+        o.quv = (face < 2 ? cc.yz : (face < 4 ? cc.xz : cc.xy)) * float2(w, h);
+        o.matFace = matFace;
+        o.ao = ao;
+        out.set_vertex(tid * 4 + c, o);
+    }
+    uint v = tid * 4, i = tid * 6;
+    out.set_index(i, v); out.set_index(i + 1, v + 1); out.set_index(i + 2, v + 2);
+    out.set_index(i + 3, v); out.set_index(i + 4, v + 2); out.set_index(i + 5, v + 3);
+}
+
 static float linearFog(float d, float s, float e) {
     if (d <= s) return 0.0;
     if (d >= e) return 1.0;
@@ -234,7 +320,6 @@ fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19
 // voxels whose chunk section vanilla drew this frame (a bitmap of sections around the camera). It's exact
 // at any camera height (vanilla picks sections by 3D distance), leaves no gap and never draws LOD over
 // vanilla terrain. Only these tiles pay for the discard, which turns off hidden-surface removal for them.
-constant float3 kNormal[6] = { float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
 fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
                             constant LodSpriteGPU* sprites [[buffer(20)]],
                             const device uint* vanilla [[buffer(21)]], const device uint* aoBits [[buffer(22)]],
@@ -308,6 +393,11 @@ let lodSeamWords = (lodSeamWidth * lodSeamWidth * 24 + 31) / 32
 let lodTileSelection = experiments.contains("tilesel")
 let lodTileSplit = Double(ProcessInfo.processInfo.environment["METALMC_TILESPLIT"] ?? "") ?? 2.8
 
+/// METALMC_EXP=meshshader draws the LOD with a mesh shader (one thread per quad) instead of indexed vertices.
+let lodMeshShaders = experiments.contains("meshshader")
+/// Quads per mesh threadgroup (METALMC_MESHQUADS, default 32).
+let lodMeshQuads = Int(ProcessInfo.processInfo.environment["METALMC_MESHQUADS"] ?? "") ?? 32
+
 /// METALMC_EXP=nolightmap lights the LOD with the old daylight curve instead of vanilla's lightmap (A/B).
 let lodNoLightmap = experiments.contains("nolightmap")
 
@@ -379,9 +469,10 @@ final class LodRenderer: @unchecked Sendable {
     var coveredTiles = 0               // tiles skipped because vanilla drew all their sections (logged every 1000 frames)
     var skipDebug = [0, 0, 0, 0, 0]    // seam tiles failing: y range, bitmap bounds, horizontal distance, not compiled; passing
 
-    func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false, seam: Bool = false, water: Bool = false) -> MTLRenderPipelineState? {
+    func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false, seam: Bool = false, water: Bool = false,
+                  mesh: Bool = false) -> MTLRenderPipelineState? {
         let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
-            + (seam ? "/seam" : "") + (water ? "/water" : "")
+            + (seam ? "/seam" : "") + (water ? "/water" : "") + (mesh ? "/mesh" : "")
         if let p = pipelines[key] { return p }
         do {
             if library == nil {
@@ -391,9 +482,33 @@ final class LodRenderer: @unchecked Sendable {
                     .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
                     .replacingOccurrences(of: "MAT_DIRT", with: "\(Mat.dirt.rawValue)u")
                     .replacingOccurrences(of: "MAT_LAVA", with: "\(Mat.lava.rawValue)u")
+                    .replacingOccurrences(of: "MESH_QUADS", with: "\(lodMeshQuads)")
                     .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
                     .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")
                 library = try ctx.device.makeLibrary(source: src, options: nil)
+            }
+            if mesh {
+                let d = MTLMeshRenderPipelineDescriptor()
+                d.label = "MetalMC LOD (mesh)"
+                d.meshFunction = library!.makeFunction(name: "lod_mesh")
+                d.fragmentFunction = library!.makeFunction(name: seam ? "lod_fs_seam" : "lod_fs")
+                d.maxTotalThreadsPerMeshThreadgroup = lodMeshQuads
+                for (i, f) in colorFormats.enumerated() {
+                    d.colorAttachments[i].pixelFormat = f
+                    if i > 0 { d.colorAttachments[i].writeMask = [] }
+                }
+                if water {
+                    let a = d.colorAttachments[0]!
+                    a.isBlendingEnabled = true
+                    a.sourceRGBBlendFactor = .sourceAlpha
+                    a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+                    a.sourceAlphaBlendFactor = .one
+                    a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+                }
+                d.depthAttachmentPixelFormat = depth
+                let (p, _) = try ctx.device.makeRenderPipelineState(descriptor: d, options: [])
+                pipelines[key] = p
+                return p
             }
             let d = MTLRenderPipelineDescriptor()
             d.label = box ? "MetalMC LOD occlusion boxes" : "MetalMC LOD"
@@ -656,7 +771,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     guard let w else { return 0 }
     let snap = w.snapshot()
     guard !snap.meshes.isEmpty else { return 0 }
-    guard let pipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat) else { return 0 }
+    let useMesh = lodMeshShaders
+    guard let pipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, mesh: useMesh) else { return 0 }
     r.ensureColors()
     let cx = cam[0], cy = cam[1], cz = cam[2]
     let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: 2.0,
@@ -846,9 +962,9 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     if !lodFlat, r.atlas != nil, r.spriteBuffer != nil {
         u.camFrac = SIMD4(Float(cx - cx.rounded(.down)), Float(cy - cy.rounded(.down)), Float(cz - cz.rounded(.down)), 1)
     }
-    let seamPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true)
-    let seamWaterPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, water: true)
-    let waterPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, water: true)
+    let seamPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, mesh: useMesh)
+    let seamWaterPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, water: true, mesh: useMesh)
+    let waterPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, water: true, mesh: useMesh)
     if r.lightSampler == nil {
         let d = MTLSamplerDescriptor()
         d.minFilter = .nearest
@@ -860,6 +976,12 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     u.lightmapOn = r.lightmap != nil && !lodNoLightmap ? 1 : 0
     enc.setVertexTexture(r.lightmap ?? r.dummyTexture, index: 29)
     enc.setVertexSamplerState(r.lightSampler, index: 14)
+    if useMesh {
+        enc.setMeshTexture(r.lightmap ?? r.dummyTexture, index: 29)
+        enc.setMeshSamplerState(r.lightSampler, index: 14)
+        enc.setMeshBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
+        enc.setMeshBuffer(r.colorBuffer!, offset: 0, index: 21)
+    }
     enc.setFragmentTexture(r.atlas ?? r.dummyTexture, index: 30)
     enc.setFragmentSamplerState(r.atlasSampler, index: 15)
     enc.setFragmentBuffer(r.spriteBuffer ?? r.colorBuffer, offset: 0, index: 20)
@@ -867,8 +989,10 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
     if xforms.count * 16 <= 4096 {
         enc.setVertexBytes(xforms, length: xforms.count * 16, index: 20)
+        if useMesh { enc.setMeshBytes(xforms, length: xforms.count * 16, index: 20) }
     } else if let xb = ctx.device.makeBuffer(bytes: xforms, length: xforms.count * 16, options: [.storageModeShared]) {
         enc.setVertexBuffer(xb, offset: 0, index: 20)
+        if useMesh { enc.setMeshBuffer(xb, offset: 0, index: 20) }
     }
     enc.setVertexBuffer(r.colorBuffer!, offset: 0, index: 21)
     var bound: ObjectIdentifier?
@@ -893,13 +1017,26 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         ctx.statLodQuads += d.count
         let id = ObjectIdentifier(d.node)
         if bound != id {
-            enc.setVertexBuffer(d.node.buffer, offset: 0, index: 18)
-            enc.setVertexBuffer(d.node.aoOffsets, offset: 0, index: 22)
+            if useMesh {
+                enc.setMeshBuffer(d.node.buffer, offset: 0, index: 18)
+                enc.setMeshBuffer(d.node.aoOffsets, offset: 0, index: 22)
+            } else {
+                enc.setVertexBuffer(d.node.buffer, offset: 0, index: 18)
+                enc.setVertexBuffer(d.node.aoOffsets, offset: 0, index: 22)
+            }
             enc.setFragmentBuffer(d.node.ao, offset: 0, index: 22)
             bound = id
         }
-        enc.drawIndexedPrimitives(type: .triangle, indexCount: d.count * 6, indexType: .uint32, indexBuffer: ib,
-                                  indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * d.first, baseInstance: d.slot)
+        if useMesh {
+            var md = SIMD4<UInt32>(UInt32(d.first), UInt32(d.count), UInt32(d.slot), 0)
+            enc.setMeshBytes(&md, length: 16, index: 17)
+            enc.drawMeshThreadgroups(MTLSize(width: (d.count + lodMeshQuads - 1) / lodMeshQuads, height: 1, depth: 1),
+                                     threadsPerObjectThreadgroup: MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerMeshThreadgroup: MTLSize(width: lodMeshQuads, height: 1, depth: 1))
+        } else {
+            enc.drawIndexedPrimitives(type: .triangle, indexCount: d.count * 6, indexType: .uint32, indexBuffer: ib,
+                                      indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * d.first, baseInstance: d.slot)
+        }
     }
     if let vis, testBoxes, let boxPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, box: true),
        let cb = ctx.cb {
