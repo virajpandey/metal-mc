@@ -159,7 +159,8 @@ final class Tour {
     }
     static final List<Step> FIDELITY_STEPS = List.of(
         new Step("ground-north", ground(180f), 600, mc -> {
-            cmd(mc, "time set 6000", "weather clear", "gamerule advance_time false", "gamerule advance_weather false",
+            // -PfidelityTime=<ticks> (6000 noon, 13000 dusk, 18000 midnight).
+            cmd(mc, "time set " + Integer.getInteger("metalmc.fidelity.time", 6000), "weather clear", "gamerule advance_time false", "gamerule advance_weather false",
                 "gamerule spawn_mobs false", "kill @e[type=!player]");
             if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();   // F1: no HUD, no hand
         }),

@@ -127,6 +127,12 @@ public final class MetalLod {
         return true;
     }
 
+    /** Vanilla's level lightmap, so LOD terrain is lit like vanilla's (day, night, night vision). Render thread. */
+    public static void setLightmap(com.mojang.renderpearl.api.textures.GpuTextureView view) {
+        if (!available()) return;
+        Mtl.lodSetLightmap(view instanceof MetalTextureView mv ? mv.handle : 0);
+    }
+
     /** The chunk sections vanilla drew this frame (SectionPos.asLong keys), for the LOD's seam. */
     public static void setVanilla(long[] keys, int count) {
         if (!available()) return;

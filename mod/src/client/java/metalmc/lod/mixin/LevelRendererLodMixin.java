@@ -43,6 +43,7 @@ abstract class LevelRendererLodMixin {
         int renderDistance = mc.options.getEffectiveRenderDistance();
         // Half-size of vanilla's area; the LOD's seam test is exact per chunk section inside it.
         float discard = (renderDistance + 1) * 16f;
+        MetalLod.setLightmap(mc.gameRenderer.levelLightmap());
         MetalLod.setVanilla(metalmc.terrain.SectionOcclusion.vanillaKeys(), metalmc.terrain.SectionOcclusion.vanillaCount());
         MetalLod.setCompiled(metalmc.terrain.SectionOcclusion.compiledKeys(), metalmc.terrain.SectionOcclusion.compiledCount(), renderDistance);
         float sky = mc.level == null ? 1f : 1f - mc.level.getSkyDarken() / 15f;

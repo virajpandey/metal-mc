@@ -20,7 +20,7 @@ struct LodUniforms {
     float discardRadius;   // horizontal distance inside which vanilla chunks are drawn instead
     float sky;             // daylight factor 0..1
     float alpha;           // output alpha: 1 for opaque quads, vanilla's water texture alpha for water
-    float pad;
+    float lightmapOn;      // 1 if vanilla's lightmap is bound (texture 29), else the fallback daylight curve
     float4 camFrac;        // xyz: fractional part of the camera position; w: 1 if texture detail is on
     float4 camInSection;   // xyz: camera position within its chunk section (0-16); w: seam bitmap half-size H
     int4 seamInfo;         // x: camera section y - world bottom section; y: bitmap width W (2H + 1)
@@ -103,12 +103,22 @@ constant float kWaterLight[16] = { 1.0, 0.908, 0.822, 0.747, 0.676, 0.609, 0.544
 // Vanilla's water surface is 1/9 block below the top of the highest water block. A level-0 voxel is that block;
 // coarser voxels end on the grid, and at sea level (y 62) the block's top is 1 block below a voxel boundary.
 constant float kWaterSurfaceDrop0 = 1.0 / 9.0, kWaterSurfaceDrop = 10.0 / 9.0;
+// Light like vanilla's terrain: its lightmap (16 x 16, block light along x, sky light along y) at no block light
+// and full sky light, or 15 - depth under water (sky light loses a level per block of water). That follows the
+// day, dusk and night, night vision and the darkness effect exactly as vanilla chunks do.
+static float3 lodLight(constant LodUniforms& u, texture2d<float> lightmap, sampler s, float skyLevel, uint depth,
+                       float blockLevel = 0.0) {
+    if (u.lightmapOn > 0.5) return lightmap.sample(s, float2((blockLevel + 0.5) / 16.0, (skyLevel + 0.5) / 16.0), level(0)).rgb;
+    return float3(blockLevel > 0.0 ? 1.0 : kWaterLight[depth] * mix(0.2, 1.0, u.sky));
+}
+
 vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
                    const device uint2* quads [[buffer(18)]],
                    constant LodUniforms& u [[buffer(19)]],
                    const device Xform* xforms [[buffer(20)]],
                    constant float4* colors [[buffer(21)]],
-                   const device uint* aoOffsets [[buffer(22)]]) {
+                   const device uint* aoOffsets [[buffer(22)]],
+                   texture2d<float> lightmap [[texture(29)]], sampler lightSampler [[sampler(14)]]) {
     uint2 q = quads[vid >> 2];
     uint corner = vid & 3;
     uint face = (q.x >> 25) & 7;
@@ -142,7 +152,9 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     // An underwater face's depth darkens it; on water, depth 15 marks deep water (drawn opaque, no floor meshed).
     uint depthField = (q.x >> 28) & 15;
     bool deep = water && depthField == 15;
-    float k = kShade[face] * ao * (water ? 1.0 : kWaterLight[depthField]) * mix(0.2, 1.0, u.sky);
+    uint depth = water ? 0u : depthField;
+    // Lava gives off block light 15, so it glows at night like vanilla's.
+    float3 k = kShade[face] * ao * lodLight(u, lightmap, lightSampler, 15.0 - float(depth), depth, m == MAT_LAVA ? 15.0 : 0.0);
     // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
     // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
@@ -150,7 +162,9 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     // million quads), so the colors are flat and packed. METALMC_EXP=vertexao shades per quad here, not per corner.
     o.color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
     // Flat: per-pixel AO is applied in the fragment shader and the rest of k is constant over the quad.
-    o.color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0)) : 0u;
+    // Deep water carries the light of its (unmeshed) floor, a dozen or more blocks down, for its blend.
+    o.color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0))
+             : (deep ? pack_float_to_unorm4x8(float4(float3(0.56, 0.53, 0.45) * lodLight(u, lightmap, lightSampler, 2.0, 13), 0.0)) : 0u);
     o.rel = rel;
     float3 c = kCorners[face][corner];
     o.quv = (face < 2 ? c.yz : (face < 4 ? c.xz : c.xy)) * float2(w, h);
@@ -204,7 +218,7 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
     // under 12+ blocks of water, at vanilla's lightmap brightness for sky light 0-3).
     float alpha = u.alpha;
     if ((in.matFace >> 25) & 1) {
-        color = color * alpha + float3(0.085, 0.080, 0.068) * mix(0.2, 1.0, u.sky) * (1.0 - alpha);
+        color = color * alpha + unpack_unorm4x8_to_float(in.color2).rgb * (1.0 - alpha);
         alpha = 1.0;
     }
     return float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), alpha);
@@ -278,7 +292,7 @@ struct LodUniforms {
     var discardRadius: Float
     var sky: Float
     var alpha: Float = 1
-    var pad: Float = 0
+    var lightmapOn: Float = 0
     var camFrac: SIMD4<Float> = .zero
     var camInSection: SIMD4<Float> = .zero
     var seamInfo: SIMD4<Int32> = .zero
@@ -293,6 +307,9 @@ let lodSeamWords = (lodSeamWidth * lodSeamWidth * 24 + 31) / 32
 /// node size hands a tile to the finer level). METALMC_TILESPLIT sets the factor.
 let lodTileSelection = experiments.contains("tilesel")
 let lodTileSplit = Double(ProcessInfo.processInfo.environment["METALMC_TILESPLIT"] ?? "") ?? 2.8
+
+/// METALMC_EXP=nolightmap lights the LOD with the old daylight curve instead of vanilla's lightmap (A/B).
+let lodNoLightmap = experiments.contains("nolightmap")
 
 /// Mean alpha of vanilla's water texture (water_still), the LOD water's opacity.
 let lodWaterAlpha: Float = 0.706
@@ -338,6 +355,9 @@ final class LodRenderer: @unchecked Sendable {
     // Texture detail: Minecraft's block atlas and the sprite table (render thread).
     var atlas: MTLTexture?
     var spriteBuffer: MTLBuffer?
+    // Vanilla's lightmap (render thread): LOD terrain is lit the way vanilla terrain is.
+    var lightmap: MTLTexture?
+    var lightSampler: MTLSamplerState?
     // The chunk sections vanilla drew this frame (SectionPos.asLong keys), set before each draw, and a ring
     // of bitmap buffers for the seam shader.
     var vanillaSections: [Int64] = []
@@ -370,6 +390,7 @@ final class LodRenderer: @unchecked Sendable {
                     .replacingOccurrences(of: "MAT_LEAVES", with: "\(Mat.leaves.rawValue)u")
                     .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
                     .replacingOccurrences(of: "MAT_DIRT", with: "\(Mat.dirt.rawValue)u")
+                    .replacingOccurrences(of: "MAT_LAVA", with: "\(Mat.lava.rawValue)u")
                     .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
                     .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")
                 library = try ctx.device.makeLibrary(source: src, options: nil)
@@ -824,6 +845,17 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let seamPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true)
     let seamWaterPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, water: true)
     let waterPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, water: true)
+    if r.lightSampler == nil {
+        let d = MTLSamplerDescriptor()
+        d.minFilter = .nearest
+        d.magFilter = .nearest
+        d.sAddressMode = .clampToEdge
+        d.tAddressMode = .clampToEdge
+        r.lightSampler = ctx.device.makeSamplerState(descriptor: d)
+    }
+    u.lightmapOn = r.lightmap != nil && !lodNoLightmap ? 1 : 0
+    enc.setVertexTexture(r.lightmap ?? r.dummyTexture, index: 29)
+    enc.setVertexSamplerState(r.lightSampler, index: 14)
     enc.setFragmentTexture(r.atlas ?? r.dummyTexture, index: 30)
     enc.setFragmentSamplerState(r.atlasSampler, index: 15)
     enc.setFragmentBuffer(r.spriteBuffer ?? r.colorBuffer, offset: 0, index: 20)
@@ -915,6 +947,12 @@ public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ co
     r.spriteBuffer = ctx.device.makeBuffer(bytes: table, length: table.count * 16, options: [.storageModeShared])
     r.atlas = view == 0 ? nil : (from(view) as TextureBox).texture
     if let a = r.atlas { log("LOD: texture detail from the block atlas \(a.width)x\(a.height), \(a.mipmapLevelCount) mips, \(n) materials") }
+}
+
+/// Vanilla's lightmap (a texture view handle; 0 for none), for lighting LOD terrain like vanilla's. Render thread.
+@_cdecl("mmc_lod_set_lightmap")
+public func mmc_lod_set_lightmap(_ view: Int64) {
+    LodRenderer.shared.lightmap = view == 0 ? nil : (from(view) as TextureBox).texture
 }
 
 /// The chunk sections vanilla drew this frame (SectionPos.asLong keys, compiled sections only), for the LOD's
