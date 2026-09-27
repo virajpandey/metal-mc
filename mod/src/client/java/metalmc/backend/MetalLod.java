@@ -138,6 +138,29 @@ public final class MetalLod {
         }
     }
 
+    /**
+     * Every section vanilla has compiled in its view area (SectionPos.asLong keys) and its render distance:
+     * LOD tiles made only of such sections are left to vanilla.
+     */
+    public static void setCompiled(long[] keys, int count, int renderDistance) {
+        if (!available()) return;
+        long addr = MemoryUtil.nmemAlloc(8L * Math.max(1, count));
+        try {
+            for (int i = 0; i < count; i++) MemoryUtil.memPutLong(addr + 8L * i, keys[i]);
+            Mtl.lodSetCompiled(addr, count, renderDistance);
+        } finally {
+            MemoryUtil.nmemFree(addr);
+        }
+    }
+
+    /**
+     * Brings the game window to the front (benchmarks): a window the user can't see is paced to the display
+     * refresh. Returns true if the app is active afterwards. Render thread (the main thread on macOS).
+     */
+    public static boolean activateApp() {
+        return available() && Mtl.activateApp() != 0;
+    }
+
     /** Stops streaming and releases the LOD (the player left the world). */
     public static void close() {
         if (available()) Mtl.lodClose();

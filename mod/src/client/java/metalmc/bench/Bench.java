@@ -93,7 +93,8 @@ public final class Bench {
                 // to disk, so set it explicitly either way.
                 mc.debugEntries.setStatus(DebugScreenEntries.GPU_UTILIZATION,
                     GPU_TIMER ? DebugScreenEntryStatus.ALWAYS_ON : DebugScreenEntryStatus.NEVER);
-                log("world loaded; warming up for " + WARMUP_TICKS + " ticks; " + presentInfo(mc));
+                log("world loaded; warming up for " + WARMUP_TICKS + " ticks; " + presentInfo(mc)
+                    + "; app active " + metalmc.backend.MetalLod.activateApp());
             }
             case WARMUP -> {
                 if (!Tour.MP_TOUR) place(player, 0);
@@ -111,7 +112,7 @@ public final class Bench {
                     tick = 0;
                     frameCount = 0;
                     lastFrameNs = 0;
-                    log("running for " + RUN_TICKS + " ticks");
+                    log("running for " + RUN_TICKS + " ticks; app active " + metalmc.backend.MetalLod.activateApp());
                     if (isMetal()) {
                         metalmc.backend.MetalStats.takeGpuMillis();
                         metalmc.backend.MetalStats.takeCounters();

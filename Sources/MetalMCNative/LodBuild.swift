@@ -30,8 +30,12 @@ let lodFaceCorners: [[(Int, Int, Int)]] = [
 ]
 /// METALMC_EXP=opaquewater meshes water as before translucency (no floors under it; for A/B comparisons).
 let lodOpaqueWater = experiments.contains("opaquewater")
-/// METALMC_EXP=noao meshes without ambient occlusion (for measuring how much it splits merges).
+/// METALMC_EXP=noao turns ambient occlusion off; vertexao stores it per quad corner instead of per pixel, as
+/// before (faces with different corner patterns can't merge, which cost about 54% more quads).
 let lodNoAO = experiments.contains("noao")
+let lodVertexAO = experiments.contains("vertexao")
+/// No ambient occlusion data for a quad (its whole rim is unoccluded).
+let lodNoAOData = UInt32.max
 /// METALMC_EXP=nodeepfill turns off deep-cave filling (for A/B comparisons).
 let lodDeepFill = !(ProcessInfo.processInfo.environment["METALMC_EXP"] ?? "").contains("nodeepfill")
 
@@ -216,13 +220,30 @@ struct LodGrid {
     }
 }
 
+/// A node's mesh. Ambient occlusion is per pixel: inside a merged quad every voxel in front of it is open,
+/// so only the corners on the quad's rim can be occluded. Each quad with any occluded rim corner has its rim
+/// values (2 bits each, 0-3 occluders like vanilla's smooth lighting, 2 x (w + h) of them counterclockwise
+/// in (u, v) from (0, 0)) packed into `ao`, starting at `aoOffsets[quad]` (in 2-bit units).
+struct LodMesh {
+    var quads: [UInt32]         // pairs: word0 = x | z<<8 | y<<16 (9 bits) | face<<25 | water depth<<28, word1 = mat | (w-1)<<8 | (h-1)<<16 | vertex ao<<24
+    var counts: [Int]           // quads per (tile, bucket), tile-major: tile = tz * 4 + tx, buckets as lodBucketsPerTile
+    var tileY: [Int]            // per tile: min and max voxel y of its quads (min > max if empty)
+    var tileYCore: [Int]        // the same without the skirt walls on the node's outer edges
+    var sectionMask: [UInt32]   // levels 0-1: per tile, the chunk sections holding its quads (skirts aside), lodTileSectionBits
+    var aoOffsets: [UInt32]     // per quad: first rim value in `ao`, or lodNoAOData
+    var ao: [UInt32]            // rim values, 16 per word
+}
+
+/// Chunk sections per tile side at `level` (levels 0 and 1 only: tiles of 64 and 128 blocks).
+@inline(__always) func lodTileSections(_ level: Int) -> Int { (lodTileVoxels << level) / 16 }
+/// Words per tile of LodMesh.sectionMask: bit (sy * side + sz) * side + sx, sections relative to the tile.
+@inline(__always) func lodTileSectionWords(_ level: Int) -> Int { (lodTileSections(level) * lodTileSections(level) * (lodWorldHeight / 16) + 31) / 32 }
+
 /// A meshed node ready to draw.
 struct LodNode {
     let level: Int
     let x0: Int, z0: Int        // world block coordinates of the node's corner
-    var quads: [UInt32]         // pairs: word0 = x | z<<8 | y<<16 (9 bits) | face<<25 | water depth<<28, word1 = mat | (w-1)<<8 | (h-1)<<16 | ao<<24
-    var counts: [Int]           // quads per (tile, bucket), tile-major: tile = tz * 4 + tx, buckets as lodBucketsPerTile
-    var tileY: [Int]            // per tile: min and max voxel y of its quads (min > max if empty)
+    var mesh: LodMesh
     var size: Int { lodNodeVoxels << level }
 }
 
@@ -318,19 +339,27 @@ enum LodBuild {
     /// vanilla's skylight does. Outside the node counts as air on the sides (skirt walls that hide cracks
     /// between levels) and as solid below the world. Merged quads are capped at `maxMerge` voxels per side
     /// (tiles cap them at 64 anyway).
-    static func mesh(_ grid: LodGrid, maxMerge: Int = 64) -> (quads: [UInt32], counts: [Int], tileY: [Int]) {
+    static func mesh(_ grid: LodGrid, maxMerge: Int = 64) -> LodMesh {
         let n = lodNodeVoxels, h = grid.height
         let kinds = lodKinds
         let airK = MaterialKind.air.rawValue, waterK = MaterialKind.water.rawValue
         let tiles = lodTilesPerSide * lodTilesPerSide
         var buckets = [[UInt32]](repeating: [], count: tiles * lodBucketsPerTile)
+        var aoBuckets = [[UInt32]](repeating: [], count: tiles * lodBucketsPerTile)
+        var ao: [UInt32] = []
+        var aoUnits = 0
+        var rim = [UInt8](repeating: 0, count: 4 * (maxMerge + 1))
         let voxelBlocks = 1 << grid.level
         // Blocks of water above a face with `d` water voxels over it. At level 0 that's d; above, the top
         // voxel holds one block of air at sea level (y 62 is the highest water block; voxels end at 64).
         @inline(__always) func waterDepth(_ d: Int) -> Int { grid.level == 0 ? d : d * voxelBlocks - 1 }
         var tileY = [Int](repeating: 0, count: tiles * 2)
         for t in 0..<tiles { tileY[2 * t] = Int.max; tileY[2 * t + 1] = Int.min }
-        var mask = [UInt32](repeating: 0, count: n * max(n, h))   // material | ambient-occlusion pattern << 8 | water depth << 16
+        var tileYCore = tileY
+        let maskSide = grid.level <= 1 ? lodTileSections(grid.level) : 0
+        let maskWords = grid.level <= 1 ? lodTileSectionWords(grid.level) : 0
+        var sectionMask = [UInt32](repeating: 0, count: tiles * maskWords)
+        var mask = [UInt32](repeating: 0, count: n * max(n, h))   // material | vertex ao pattern << 8 | water depth << 16
 
         grid.v.withUnsafeBufferPointer { g in
             // Highest non-air voxel per column, -1 for a column with no data (a missing chunk). Side faces
@@ -399,7 +428,7 @@ enum LodBuild {
                                     let nx = x + sx, nz = z + sz
                                     if nx >= 0 && nz >= 0 && nx < n && nz < n && top[nz * n + nx] < 0 && y < top[z * n + x] - edgeSkirt { f = 0 }
                                 }
-                                if f != 0 {
+                                if f != 0 && lodVertexAO {
                                     let fx = x + sx, fy = y + sy, fz = z + sz
                                     var pattern: UInt32 = 0
                                     for k in 0..<4 {
@@ -408,7 +437,7 @@ enum LodBuild {
                                         let level = s1 == 1 && s2 == 1 ? 3 : s1 + s2 + solid(fx + o.0 + o.3, fy + o.1 + o.4, fz + o.2 + o.5)
                                         pattern |= UInt32(level) << UInt32(2 * k)
                                     }
-                                    if !lodNoAO { f |= pattern << 8 }
+                                    f |= pattern << 8
                                 }
                             }
                             mask[vv * du + uu] = f
@@ -435,13 +464,77 @@ enum LodBuild {
                             for a in 0..<ht { for k in 0..<w { mask[(vv + a) * du + uu + k] = 0 } }
                             let (x, y, z) = xyz(d, uu, vv)
                             let t = (z / lodTileVoxels) * lodTilesPerSide + x / lodTileVoxels
-                            let b = t * lodBucketsPerTile + (kinds[Int(m & 255)] == waterK ? 6 : 0) + face
+                            let isWater = kinds[Int(m & 255)] == waterK
+                            let b = t * lodBucketsPerTile + (isWater ? 6 : 0) + face
                             buckets[b].append(UInt32(x) | UInt32(z) << 8 | UInt32(y) << 16 | UInt32(face) << 25 | (m >> 16) << 28)
                             buckets[b].append((m & 255) | UInt32(w - 1) << 8 | UInt32(ht - 1) << 16 | ((m >> 8) & 255) << 24)
+                            // Rim ambient occlusion (vanilla's fluids have none). A rim point touches one (a corner
+                            // of the quad) or two voxel faces of the quad; the voxels in front of those are open,
+                            // and the other front voxels around the point decide its level.
+                            var aoOffset = lodNoAOData
+                            if !isWater && !lodVertexAO && !lodNoAO {
+                                @inline(__always) func front(_ ca: Int, _ cb: Int) -> Int {
+                                    if ca >= 0 && cb >= 0 && ca < w && cb < ht { return 0 }
+                                    let (fx, fy, fz) = xyz(d, uu + ca, vv + cb)
+                                    return solid(fx + sx, fy + sy, fz + sz)
+                                }
+                                let np = 2 * (w + ht)
+                                var any = false
+                                for i in 0..<np {
+                                    let (pa, pb): (Int, Int)
+                                    if i <= w { (pa, pb) = (i, 0) }
+                                    else if i <= w + ht { (pa, pb) = (w, i - w) }
+                                    else if i <= 2 * w + ht { (pa, pb) = (2 * w + ht - i, ht) }
+                                    else { (pa, pb) = (0, 2 * w + 2 * ht - i) }
+                                    // The four front voxels around point (pa, pb).
+                                    let c00 = front(pa - 1, pb - 1), c10 = front(pa, pb - 1), c01 = front(pa - 1, pb), c11 = front(pa, pb)
+                                    let corner = (pa == 0 || pa == w) && (pb == 0 || pb == ht)
+                                    var level = c00 + c10 + c01 + c11
+                                    if corner {
+                                        // One voxel face: its own front voxel is open; the two beside it are the
+                                        // sides and the opposite one is the diagonal.
+                                        let (s1, s2) = pa == 0 ? (pb == 0 ? (c10, c01) : (c00, c11)) : (pb == 0 ? (c00, c11) : (c10, c01))
+                                        if s1 == 1 && s2 == 1 { level = 3 }
+                                    }
+                                    rim[i] = UInt8(min(level, 3))
+                                    if level != 0 { any = true }
+                                }
+                                if any {
+                                    aoOffset = UInt32(aoUnits)
+                                    for i in 0..<np {
+                                        let u = aoUnits + i
+                                        if u >> 4 >= ao.count { ao.append(0) }
+                                        ao[u >> 4] |= UInt32(rim[i]) << UInt32((u & 15) * 2)
+                                    }
+                                    aoUnits += np
+                                }
+                            }
+                            aoBuckets[b].append(aoOffset)
                             // Vertical extent of this quad in voxels (X and Z faces extend along y by w or h).
                             let top = y + (axis == 0 ? w : (axis == 2 ? ht : 1))
                             tileY[2 * t] = min(tileY[2 * t], y)
                             tileY[2 * t + 1] = max(tileY[2 * t + 1], top)
+                            let fx = x + sx, fz = z + sz
+                            if fx >= 0 && fz >= 0 && fx < n && fz < n {
+                                tileYCore[2 * t] = min(tileYCore[2 * t], y)
+                                tileYCore[2 * t + 1] = max(tileYCore[2 * t + 1], top)
+                                if maskWords > 0 {
+                                    // Voxel cells behind the quad, in blocks relative to the tile, to sections.
+                                    let ex = axis == 0 ? 1 : w, ey = axis == 0 ? w : (axis == 1 ? 1 : ht), ez = axis == 2 ? 1 : ht
+                                    let tx0 = (x % lodTileVoxels) << grid.level, tz0 = (z % lodTileVoxels) << grid.level
+                                    let bx0 = tx0 >> 4, bx1 = (tx0 + (ex << grid.level) - 1) >> 4
+                                    let bz0 = tz0 >> 4, bz1 = (tz0 + (ez << grid.level) - 1) >> 4
+                                    let by0 = (y << grid.level) >> 4, by1 = (((y + ey) << grid.level) - 1) >> 4
+                                    for by in by0...by1 {
+                                        for bz in bz0...bz1 {
+                                            for bx in bx0...bx1 {
+                                                let bit = (by * maskSide + bz) * maskSide + bx
+                                                sectionMask[t * maskWords + (bit >> 5)] |= 1 << UInt32(bit & 31)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             uu += w
                         }
                     }
@@ -450,12 +543,15 @@ enum LodBuild {
         }
         var out: [UInt32] = []
         out.reserveCapacity(buckets.reduce(0) { $0 + $1.count })
+        var offsets: [UInt32] = []
+        offsets.reserveCapacity(out.capacity / 2)
         var counts = [Int](repeating: 0, count: tiles * lodBucketsPerTile)
         for (i, b) in buckets.enumerated() {
             out.append(contentsOf: b)
+            offsets.append(contentsOf: aoBuckets[i])
             counts[i] = b.count / 2
         }
-        return (out, counts, tileY)
+        return LodMesh(quads: out, counts: counts, tileY: tileY, tileYCore: tileYCore, sectionMask: sectionMask, aoOffsets: offsets, ao: ao)
     }
 
     /// Builds every level from the save's overworld region files. Level-1 nodes are only meshed within
@@ -504,12 +600,12 @@ enum LodBuild {
                     var filled = g
                     filled.fillUnreachable()
                     let m = mesh(filled, maxMerge: 64)
-                    outp[i] = LodNode(level: lvl, x0: x0, z0: z0, quads: m.quads, counts: m.counts, tileY: m.tileY)
+                    outp[i] = LodNode(level: lvl, x0: x0, z0: z0, mesh: m)
                 }
             }
             let made = meshed.compactMap { $0 }
             nodes.append(contentsOf: made)
-            log("LOD: level \(lvl): \(made.count) nodes, \(made.reduce(0) { $0 + $1.quads.count / 2 }) quads (\(String(format: "%.1f", Date().timeIntervalSince(t0))) s)")
+            log("LOD: level \(lvl): \(made.count) nodes, \(made.reduce(0) { $0 + $1.mesh.quads.count / 2 }) quads (\(String(format: "%.1f", Date().timeIntervalSince(t0))) s)")
             if lvl >= maxLevel { break }
             // Next level: 2 x 2 children per parent.
             var parents: [Int64: LodGrid] = [:]

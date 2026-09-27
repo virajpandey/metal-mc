@@ -34,7 +34,9 @@ struct VOut {
     float4 pos [[position]];
     float3 color;
     float3 rel;
-    uint matFace [[flat]];   // base material | face << 8
+    float2 quv;              // position within the quad in voxels, along its (u, v) axes
+    uint matFace [[flat]];   // base material | face << 8 | (w - 1) << 11 | (h - 1) << 17
+    uint ao [[flat]];        // first rim ambient-occlusion value of the quad, or 0xFFFFFFFF for none
 };
 
 // Unit-cube corners per face, counter-clockwise seen from outside. Face order: +X -X +Y -Y +Z -Z.
@@ -57,12 +59,38 @@ static float3 extentScale(uint face, float w, float h) {
 
 // Quads are 8 bytes: word0 = x | z << 8 | y << 16 (9 bits) | face << 25 | water depth << 28 (voxel coordinates
 // within the node; blocks of water above an underwater face, 0 for none), word1 = material | (w - 1) << 8 |
-// (h - 1) << 16 | ao << 24 (greedy extents along the face's u and v axes; ao holds 2 bits per corner: how
-// many of the voxels around that corner occlude it, 0-3).
+// (h - 1) << 16 | ao << 24 (greedy extents along the face's u and v axes; ao is the METALMC_EXP=vertexao
+// variant's 2 bits per corner, 0 otherwise). Ambient occlusion is normally per pixel from the quad's rim
+// values (see lodAO).
 // Brightness for 0, 1, 2 and 3 occluders: vanilla's smooth-lighting steps (1, 0.8, 0.6, 0.4) at 60% strength,
 // because an LOD voxel's corner gradient spans 2+ blocks where vanilla's spans one (measured with the
 // fidelity score: full strength left the LOD 3.5 levels too dark, none 3.5 too bright).
 constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
+
+// Rim point (a, b) of a w x h quad to its index: counterclockwise in (u, v) from (0, 0), as LodBuild.mesh stores them.
+static uint rimIndex(uint a, uint b, uint w, uint h) {
+    if (b == 0) return a;
+    if (a == w) return w + b;
+    if (b == h) return 2 * w + h - a;
+    return 2 * w + 2 * h - b;
+}
+static float rimAO(const device uint* bits, uint base, uint a, uint b, uint w, uint h) {
+    if (a != 0 && b != 0 && a != w && b != h) return 1.0;   // inside the quad: nothing in front occludes
+    uint i = base + rimIndex(a, b, w, h);
+    return kAO[(bits[i >> 4] >> ((i & 15) * 2)) & 3];
+}
+// Ambient occlusion like vanilla's smooth lighting, per pixel: bilinear between the corners of the voxel face
+// under the pixel. Only faces touching the quad's rim can have occluded corners.
+static float lodAO(VOut in, const device uint* bits) {
+    if (in.ao == 0xFFFFFFFFu) return 1.0;
+    uint w = ((in.matFace >> 11) & 63) + 1, h = ((in.matFace >> 17) & 63) + 1;
+    uint i = uint(clamp(floor(in.quv.x), 0.0, float(w - 1))), j = uint(clamp(floor(in.quv.y), 0.0, float(h - 1)));
+    if (i > 0 && j > 0 && i + 1 < w && j + 1 < h) return 1.0;
+    float2 f = clamp(in.quv - float2(i, j), 0.0, 1.0);
+    float a00 = rimAO(bits, in.ao, i, j, w, h), a10 = rimAO(bits, in.ao, i + 1, j, w, h);
+    float a01 = rimAO(bits, in.ao, i, j + 1, w, h), a11 = rimAO(bits, in.ao, i + 1, j + 1, w, h);
+    return mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+}
 // Skylight under d blocks of water (it loses a level per block): vanilla's lightmap brightness for sky light
 // 15 - d, relative to 15 (overworld ambient 0.04, default brightness setting).
 constant float kWaterLight[16] = { 1.0, 0.908, 0.822, 0.747, 0.676, 0.609, 0.544, 0.482,
@@ -74,7 +102,8 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
                    const device uint2* quads [[buffer(18)]],
                    constant LodUniforms& u [[buffer(19)]],
                    const device Xform* xforms [[buffer(20)]],
-                   constant float4* colors [[buffer(21)]]) {
+                   constant float4* colors [[buffer(21)]],
+                   const device uint* aoOffsets [[buffer(22)]]) {
     uint2 q = quads[vid >> 2];
     uint corner = vid & 3;
     uint face = (q.x >> 25) & 7;
@@ -94,7 +123,9 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
         o.pos = float4(0.0, 0.0, 0.0, 1.0);
         o.color = float3(0.0);
         o.rel = float3(0.0);
+        o.quv = float2(0.0);
         o.matFace = 0;
+        o.ao = 0xFFFFFFFFu;
         return o;
     }
     float4 clip = u.proj * (u.view * float4(rel, 1.0));
@@ -105,9 +136,12 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     float ao = kAO[(q.y >> (24 + 2 * corner)) & 3];
     o.color = base * kShade[face] * ao * kWaterLight[(q.x >> 28) & 15] * mix(0.2, 1.0, u.sky);
     o.rel = rel;
+    float3 c = kCorners[face][corner];
+    o.quv = (face < 2 ? c.yz : (face < 4 ? c.xz : c.xy)) * float2(w, h);
     // Biome-tinted variants (64 + t grass, 96 + t leaves, 128 + t water) use their base material's texture.
     uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
-    o.matFace = baseMat | (face << 8);
+    o.matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17);
+    o.ao = aoOffsets[vid >> 2];
     return o;
 }
 
@@ -122,11 +156,11 @@ static float linearFog(float d, float s, float e) {
 // block; mip selection uses the gradients of the continuous block coordinate, so it doesn't break at tile
 // seams, and far away the smallest mips average back to the flat color. Transparent texels (leaves, ice)
 // darken slightly instead of showing whatever color they store.
-static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites,
+static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites, const device uint* aoBits,
                        texture2d<float> atlas, sampler atlasSampler) {
-    float3 color = in.color;
+    float3 color = in.color * lodAO(in, aoBits);
     if (u.camFrac.w > 0.5) {
-        uint face = in.matFace >> 8, mat = in.matFace & 255;
+        uint face = (in.matFace >> 8) & 7, mat = in.matFace & 255;
         float3 wp = in.rel + u.camFrac.xyz;
         float2 bc = face < 2 ? float2(wp.z, -wp.y) : (face < 4 ? wp.xz : float2(wp.x, -wp.y));
         bool top = face == 2 || face == 3;
@@ -145,9 +179,9 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
 }
 
 fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
-                       constant LodSpriteGPU* sprites [[buffer(20)]],
+                       constant LodSpriteGPU* sprites [[buffer(20)]], const device uint* aoBits [[buffer(22)]],
                        texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
-    return lodShade(in, u, sprites, atlas, atlasSampler);
+    return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
 }
 
 // The seam with vanilla: tiles that overlap vanilla's area use this variant, which drops the pixels of LOD
@@ -157,10 +191,10 @@ fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19
 constant float3 kNormal[6] = { float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
 fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
                             constant LodSpriteGPU* sprites [[buffer(20)]],
-                            const device uint* vanilla [[buffer(21)]],
+                            const device uint* vanilla [[buffer(21)]], const device uint* aoBits [[buffer(22)]],
                             texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
     // A point just inside the voxel this face belongs to.
-    float3 p = in.rel + u.camInSection.xyz - kNormal[in.matFace >> 8] * 0.01;
+    float3 p = in.rel + u.camInSection.xyz - kNormal[(in.matFace >> 8) & 7] * 0.01;
     int3 sec = int3(floor(p / 16.0));
     int H = int(u.camInSection.w), W = u.seamInfo.y;
     int ix = sec.x + H, iz = sec.z + H, iy = u.seamInfo.x + sec.y;
@@ -168,7 +202,7 @@ fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buff
         uint bit = uint((iy * W + iz) * W + ix);
         if ((vanilla[bit >> 5] & (1u << (bit & 31))) != 0) discard_fragment();
     }
-    return lodShade(in, u, sprites, atlas, atlasSampler);
+    return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
 }
 
 // Occlusion test. After the LOD is drawn, every candidate tile's bounding box is rasterized in the same
@@ -270,6 +304,11 @@ final class LodRenderer: @unchecked Sendable {
     // The chunk sections vanilla drew this frame (SectionPos.asLong keys), set before each draw, and a ring
     // of bitmap buffers for the seam shader.
     var vanillaSections: [Int64] = []
+    // Every section vanilla has compiled in its view area (drawn or not), and its render distance in chunks:
+    // a tile whose sections are all compiled and in vanilla's range is left to vanilla.
+    var compiledSections: [Int64] = []
+    var vanillaDistance = 0
+    var compiledWords = [UInt32](repeating: 0, count: lodSeamWords)
     var seamBuffers: [MTLBuffer] = []
     var atlasSampler: MTLSamplerState?
     var dummyTexture: MTLTexture?
@@ -281,6 +320,7 @@ final class LodRenderer: @unchecked Sendable {
     var lastCamera = SIMD3<Double>(repeating: .nan)
     var jumpFrame: UInt64 = 0          // last frame the camera jumped; results tested before it are stale
     var coveredTiles = 0               // tiles skipped because vanilla drew all their sections (logged every 1000 frames)
+    var skipDebug = [0, 0, 0, 0, 0]    // seam tiles failing: y range, bitmap bounds, horizontal distance, not compiled; passing
 
     func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false, seam: Bool = false, water: Bool = false) -> MTLRenderPipelineState? {
         let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
@@ -567,7 +607,6 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     u.camInSection = SIMD4(Float(cx - Double(csx * 16)), Float(cy - Double(csy * 16)), Float(cz - Double(csz * 16)), Float(H))
     u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), 0, 0)
     var seamBuffer: MTLBuffer?
-    var seamWords: UnsafeMutablePointer<UInt32>?
     if !r.vanillaSections.isEmpty {
         while r.seamBuffers.count < 3, let b = ctx.device.makeBuffer(length: lodSeamWords * 4, options: [.storageModeShared]) {
             b.label = "MetalMC LOD seam"
@@ -585,27 +624,46 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                 words[bit >> 5] |= 1 << UInt32(bit & 31)
             }
             seamBuffer = b
-            seamWords = words
         }
     }
-    /// True if every chunk section a camera-relative box touches was drawn by vanilla this frame: the seam
-    /// variant would drop all of its pixels, so the tile is skipped.
-    func coveredByVanilla(_ lo: SIMD3<Float>, _ hi: SIMD3<Float>) -> Bool {
-        guard let words = seamWords else { return false }
-        func range(_ a: Float, _ b: Float, _ c: Double) -> (Int, Int) {
-            (Int(((Double(a) + c) / 16).rounded(.down)), Int(((Double(b) + c) / 16 - 1e-4).rounded(.down)))
+    // Sections vanilla has compiled, as a bitmap like the seam's.
+    let rd = r.vanillaDistance
+    var anyCompiled = false
+    if rd > 0 && !r.compiledSections.isEmpty {
+        for i in 0..<lodSeamWords { r.compiledWords[i] = 0 }
+        for k in r.compiledSections {
+            let ix = Int(k >> 42) - csx + H, iz = Int((k << 22) >> 42) - csz + H, iy = Int((k << 44) >> 44) - bottomSection
+            guard ix >= 0, iz >= 0, ix < W, iz < W, iy >= 0, iy < 24 else { continue }
+            let bit = (iy * W + iz) * W + ix
+            r.compiledWords[bit >> 5] |= 1 << UInt32(bit & 31)
         }
-        let (x0, x1) = range(lo.x, hi.x, cx), (y0, y1) = range(lo.y, hi.y, cy), (z0, z1) = range(lo.z, hi.z, cz)
-        if x0 - csx + H < 0 || x1 - csx + H >= W || z0 - csz + H < 0 || z1 - csz + H >= W
-            || y0 - bottomSection < 0 || y1 - bottomSection >= 24 || y1 < y0 { return false }
-        for sy in y0...y1 {
-            for sz in z0...z1 {
-                for sx in x0...x1 {
-                    let bit = ((sy - bottomSection) * W + sz - csz + H) * W + sx - csx + H
-                    if words[bit >> 5] & (1 << UInt32(bit & 31)) == 0 { return false }
-                }
+        anyCompiled = true
+    }
+    /// True if vanilla takes care of every chunk section tile `t` of `n` has quads in (edge skirts aside):
+    /// compiled, within its horizontal view distance (ChunkTrackingView.isWithinDistance) and within its
+    /// vertical range (render distance in sections above and below the camera). Vanilla draws those it can
+    /// see, and nothing in the others can be seen, so the tile is skipped. Vanilla doesn't compile sections
+    /// of only air, which is why the test is per section with LOD geometry rather than per box.
+    func leftToVanilla(_ n: LodMeshNode, _ t: Int) -> Bool {
+        guard anyCompiled, n.level <= 1 else { return false }
+        let side = lodTileSections(n.level), words = lodTileSectionWords(n.level)
+        let tileSX = (n.x0 >> 4) + (t % lodTilesPerSide) * side, tileSZ = (n.z0 >> 4) + (t / lodTilesPerSide) * side
+        for wi in 0..<words {
+            var bits = n.sectionMask[t * words + wi]
+            while bits != 0 {
+                let b = wi * 32 + bits.trailingZeroBitCount
+                bits &= bits - 1
+                let sy = bottomSection + b / (side * side), sz = tileSZ + (b / side) % side, sx = tileSX + b % side
+                if abs(sy - csy) > rd { r.skipDebug[0] += 1; return false }
+                let ix = sx - csx + H, iz = sz - csz + H
+                if ix < 0 || iz < 0 || ix >= W || iz >= W { r.skipDebug[1] += 1; return false }
+                let dx = max(0, abs(sx - csx) - 1), dz = max(0, abs(sz - csz) - 1)
+                if dx * dx + dz * dz >= rd * rd { r.skipDebug[2] += 1; return false }
+                let bit = ((sy - bottomSection) * W + iz) * W + ix
+                if r.compiledWords[bit >> 5] & (1 << UInt32(bit & 31)) == 0 { r.skipDebug[3] += 1; return false }
             }
         }
+        r.skipDebug[4] += 1
         return true
     }
 
@@ -632,7 +690,10 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             let hi = SIMD3(lo.x + tileSize, nodeLo.y + Float(yMax) * voxel, lo.z + tileSize)
             if !visible(lo, hi) { continue }
             let seam = lo.x < vanillaHalf && hi.x > -vanillaHalf && lo.z < vanillaHalf && hi.z > -vanillaHalf
-            if seam && coveredByVanilla(lo, hi) { r.coveredTiles += 1; continue }
+            if seam && leftToVanilla(n, t) {
+                r.coveredTiles += 1
+                continue
+            }
             // Only box faces toward the camera are rasterized, so a camera inside a box would see nothing
             // of it: such tiles are left untested, which keeps them drawn.
             let inside = lo.x - voxel < 0 && hi.x + voxel > 0 && lo.y - voxel < 0 && hi.y + voxel > 0
@@ -667,7 +728,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         }
     }
     if r.frame % 1000 == 0 {
-        log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames")
+        log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames; vanilla drew \(r.vanillaSections.count) sections, compiled \(r.compiledSections.count), distance \(r.vanillaDistance), skip checks \(r.skipDebug)")
+        r.skipDebug = [0, 0, 0, 0, 0]
         r.coveredTiles = 0
     }
     let testBoxes = vis.map { !$0.slots.isEmpty } ?? false
@@ -720,6 +782,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         let id = ObjectIdentifier(d.node)
         if bound != id {
             enc.setVertexBuffer(d.node.buffer, offset: 0, index: 18)
+            enc.setVertexBuffer(d.node.aoOffsets, offset: 0, index: 22)
+            enc.setFragmentBuffer(d.node.ao, offset: 0, index: 22)
             bound = id
         }
         enc.drawIndexedPrimitives(type: .triangle, indexCount: d.count * 6, indexType: .uint32, indexBuffer: ib,
@@ -782,4 +846,13 @@ public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ co
 @_cdecl("mmc_lod_set_vanilla")
 public func mmc_lod_set_vanilla(_ keys: UnsafePointer<Int64>, _ count: Int32) {
     LodRenderer.shared.vanillaSections = Array(UnsafeBufferPointer(start: keys, count: Int(count)))
+}
+
+/// Every section vanilla has compiled in its view area (SectionPos.asLong keys) and its render distance in
+/// chunks. LOD tiles made only of such sections are skipped. Call before mmc_lod_draw each frame.
+@_cdecl("mmc_lod_set_compiled")
+public func mmc_lod_set_compiled(_ keys: UnsafePointer<Int64>, _ count: Int32, _ renderDistance: Int32) {
+    let r = LodRenderer.shared
+    r.compiledSections = Array(UnsafeBufferPointer(start: keys, count: Int(count)))
+    r.vanillaDistance = Int(renderDistance)
 }

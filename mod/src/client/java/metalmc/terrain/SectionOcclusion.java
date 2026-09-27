@@ -34,6 +34,9 @@ public final class SectionOcclusion {
     // Every compiled section vanilla visits this frame, for the LOD's seam (drawn or not, empty or not).
     private static long[] vanilla = new long[8192];
     private static int vanillaCount;
+    // Every compiled section in vanilla's view area, visible or not, for skipping LOD tiles vanilla covers.
+    private static long[] compiled = new long[16384];
+    private static int compiledCount;
 
     /** Start of draw-list building: fetch the newest results and reset the candidate list. */
     public static void beginFrame(double camX, double camY, double camZ) {
@@ -75,6 +78,24 @@ public final class SectionOcclusion {
     public static void recordVanilla(int x, int y, int z) {
         if (vanillaCount == vanilla.length) vanilla = java.util.Arrays.copyOf(vanilla, vanillaCount * 2);
         vanilla[vanillaCount++] = net.minecraft.core.SectionPos.asLong(x >> 4, y >> 4, z >> 4);
+    }
+
+    /** Records every compiled section of vanilla's view area (once per frame, before the LOD draws). */
+    public static void recordCompiled(Iterable<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection> sections) {
+        compiledCount = 0;
+        for (net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection s : sections) {
+            if (s.sectionMesh.get() == net.minecraft.client.renderer.chunk.CompiledSectionMesh.UNCOMPILED) continue;
+            if (compiledCount == compiled.length) compiled = java.util.Arrays.copyOf(compiled, compiledCount * 2);
+            compiled[compiledCount++] = s.getSectionNode();
+        }
+    }
+
+    public static long[] compiledKeys() {
+        return compiled;
+    }
+
+    public static int compiledCount() {
+        return compiledCount;
     }
 
     public static long[] vanillaKeys() {

@@ -34,10 +34,14 @@ abstract class LevelRendererFacingMixin {
     @Final
     private LevelRenderState levelRenderState;
 
+    @Shadow
+    private net.minecraft.client.renderer.ViewArea viewArea;
+
     @Inject(method = "extractSectionDrawGroups", at = @At("HEAD"))
     private void metalmc$beginOcclusion(CallbackInfoReturnable<Integer> cir) {
         Vec3 cam = levelRenderState.cameraRenderState.pos;
         SectionOcclusion.beginFrame(cam.x, cam.y, cam.z);
+        if (viewArea != null && metalmc.lod.Lod.active()) SectionOcclusion.recordCompiled(((ViewAreaAccessor) viewArea).metalmc$sections());
     }
 
     /**

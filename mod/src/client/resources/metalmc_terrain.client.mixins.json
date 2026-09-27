@@ -6,7 +6,8 @@
 		"CompiledSectionMeshMixin",
 		"LevelRendererFacingMixin",
 		"SectionCompilerMixin",
-		"SectionCompilerResultsMixin"
+		"SectionCompilerResultsMixin",
+		"ViewAreaAccessor"
 	],
 	"injectors": {
 		"defaultRequire": 1

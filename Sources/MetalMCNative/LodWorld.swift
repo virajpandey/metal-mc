@@ -76,9 +76,13 @@ final class LodMeshNode {
     let level: Int
     let x0: Int, z0: Int
     let buffer: MTLBuffer
+    let aoOffsets: MTLBuffer    // UInt32 per quad (LodMesh.aoOffsets)
+    let ao: MTLBuffer           // packed rim ambient occlusion (at least one word)
     let quadCount: Int
     let start: [Int]            // prefix offsets of the (tile, face) buckets, 16 * 6 + 1 entries
     let tileY: [Int]            // per tile: min and max voxel y (min > max if the tile is empty)
+    let tileYCore: [Int]        // the same without the node's edge skirts
+    let sectionMask: [UInt32]   // levels 0-1: the chunk sections each tile has quads in (LodMesh.sectionMask)
     // Occlusion results, render thread only: the last frame each tile's box was tested, and the last
     // frame it was found visible.
     var tileTested = [UInt64](repeating: 0, count: 16)
@@ -86,17 +90,25 @@ final class LodMeshNode {
     var size: Int { lodNodeVoxels << level }
 
     init?(node: LodNode) {
-        guard !node.quads.isEmpty,
-              let b = ctx.device.makeBuffer(bytes: node.quads, length: node.quads.count * 4, options: [.storageModeShared]) else { return nil }
+        let m = node.mesh
+        let ao = m.ao.isEmpty ? [UInt32(0)] : m.ao
+        guard !m.quads.isEmpty,
+              let b = ctx.device.makeBuffer(bytes: m.quads, length: m.quads.count * 4, options: [.storageModeShared]),
+              let o = ctx.device.makeBuffer(bytes: m.aoOffsets, length: m.aoOffsets.count * 4, options: [.storageModeShared]),
+              let a = ctx.device.makeBuffer(bytes: ao, length: ao.count * 4, options: [.storageModeShared]) else { return nil }
         level = node.level
         x0 = node.x0
         z0 = node.z0
         buffer = b
-        quadCount = node.quads.count / 2
+        aoOffsets = o
+        self.ao = a
+        quadCount = m.quads.count / 2
         var starts = [0]
-        for c in node.counts { starts.append(starts.last! + c) }
+        for c in m.counts { starts.append(starts.last! + c) }
         start = starts
-        tileY = node.tileY
+        tileY = m.tileY
+        tileYCore = m.tileYCore
+        sectionMask = m.sectionMask
     }
 }
 
@@ -295,7 +307,7 @@ final class LodWorld: @unchecked Sendable {
                     g.fillUnreachable()
                     let m = LodBuild.mesh(g, maxMerge: 64)
                     let size = lodNodeVoxels << parents[i].level
-                    outp[i] = LodNode(level: parents[i].level, x0: parents[i].x * size, z0: parents[i].z * size, quads: m.quads, counts: m.counts, tileY: m.tileY)
+                    outp[i] = LodNode(level: parents[i].level, x0: parents[i].x * size, z0: parents[i].z * size, mesh: m)
                 }
             }
             for (i, p) in parents.enumerated() { install(p, built[i]) }
@@ -349,7 +361,7 @@ final class LodWorld: @unchecked Sendable {
                     guard var g = LodBuild.regionQuarterGrid(path: path, qx: nx & 1, qz: nz & 1) else { return }
                     g.fillUnreachable(deepRadius: 16, deepDepth: 8)
                     let m = LodBuild.mesh(g)
-                    outp[j] = LodNode(level: 0, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, quads: m.quads, counts: m.counts, tileY: m.tileY)
+                    outp[j] = LodNode(level: 0, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, mesh: m)
                 }
             }
             for (j, (nx, nz)) in part.enumerated() { install(LodNodeKey(level: 0, x: nx, z: nz), built[j]) }
@@ -388,7 +400,7 @@ final class LodWorld: @unchecked Sendable {
                     filled.fillUnreachable()
                     let m = LodBuild.mesh(filled, maxMerge: 64)
                     let size = lodNodeVoxels << 1
-                    node = LodNode(level: 1, x0: x * size, z0: z * size, quads: m.quads, counts: m.counts, tileY: m.tileY)
+                    node = LodNode(level: 1, x0: x * size, z0: z * size, mesh: m)
                 }
                 outp[i] = (LodBuild.key(x, z), quadrant, node)
             }
