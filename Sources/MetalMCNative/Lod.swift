@@ -336,6 +336,32 @@ fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buff
     return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
 }
 
+// Level transitions: a tile that appears fades in over a few frames through a screen-door pattern, and the tile
+// it replaces keeps drawing the complementary pattern until then (buffer 24: progress, 1 if fading out, 1 if
+// the seam bitmap is bound at 21). Every
+// pixel shows one of the two. Only fading tiles pay for the discard (and the seam test, which they always run).
+constant float kBayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+fragment float4 lod_fs_fade(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
+                            constant LodSpriteGPU* sprites [[buffer(20)]],
+                            const device uint* vanilla [[buffer(21)]], const device uint* aoBits [[buffer(22)]],
+                            constant float4& fade [[buffer(24)]],
+                            texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
+    uint2 px = uint2(in.pos.xy) & 3u;
+    float t = (kBayer4[px.y * 4 + px.x] + 0.5) / 16.0;
+    if (fade.y > 0.5 ? t < fade.x : t >= fade.x) discard_fragment();
+    if (fade.z > 0.5) {
+        float3 p = in.rel + u.camInSection.xyz - kNormal[(in.matFace >> 8) & 7] * 0.01;
+        int3 sec = int3(floor(p / 16.0));
+        int H = int(u.camInSection.w), W = u.seamInfo.y;
+        int ix = sec.x + H, iz = sec.z + H, iy = u.seamInfo.x + sec.y;
+        if (ix >= 0 && iz >= 0 && ix < W && iz < W && iy >= 0 && iy < 24) {
+            uint bit = uint((iy * W + iz) * W + ix);
+            if ((vanilla[bit >> 5] & (1u << (bit & 31))) != 0) discard_fragment();
+        }
+    }
+    return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
+}
+
 // Occlusion test. After the LOD is drawn, every candidate tile's bounding box is rasterized in the same
 // pass with depth testing and no writes. At that point the depth buffer holds vanilla's solid terrain and
 // the LOD. Fragments that survive mark the tile visible; the CPU reads the marks once the frame completes.
@@ -392,6 +418,10 @@ let lodSeamWords = (lodSeamWidth * lodSeamWidth * 24 + 31) / 32
 /// node size hands a tile to the finer level). METALMC_TILESPLIT sets the factor.
 let lodTileSelection = experiments.contains("tilesel")
 let lodTileSplit = Double(ProcessInfo.processInfo.environment["METALMC_TILESPLIT"] ?? "") ?? 2.8
+
+/// Frames a level transition takes to fade (METALMC_FADE, 0 turns fading off): tiles that appear dither in while
+/// the ones they replace dither out, instead of popping. 24 frames is 0.2 s at 120 Hz.
+let lodFadeFrames = Int(ProcessInfo.processInfo.environment["METALMC_FADE"] ?? "") ?? 24
 
 /// METALMC_EXP=meshshader draws the LOD with a mesh shader (one thread per quad) instead of indexed vertices.
 let lodMeshShaders = experiments.contains("meshshader")
@@ -467,12 +497,17 @@ final class LodRenderer: @unchecked Sendable {
     var lastCamera = SIMD3<Double>(repeating: .nan)
     var jumpFrame: UInt64 = 0          // last frame the camera jumped; results tested before it are stale
     var coveredTiles = 0               // tiles skipped because vanilla drew all their sections (logged every 1000 frames)
+    // Level transitions (render thread): last frame's tiles per node, tiles fading in (and since when) and tiles
+    // fading out (kept alive until their fade ends, even if their node was dropped).
+    var lastSelection: [ObjectIdentifier: (LodMeshNode, UInt16)] = [:]
+    var fadeIn: [ObjectIdentifier: (mask: UInt16, start: UInt64)] = [:]
+    var fadeOut: [(node: LodMeshNode, mask: UInt16, start: UInt64)] = []
     var skipDebug = [0, 0, 0, 0, 0]    // seam tiles failing: y range, bitmap bounds, horizontal distance, not compiled; passing
 
     func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false, seam: Bool = false, water: Bool = false,
-                  mesh: Bool = false) -> MTLRenderPipelineState? {
+                  mesh: Bool = false, fade: Bool = false) -> MTLRenderPipelineState? {
         let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
-            + (seam ? "/seam" : "") + (water ? "/water" : "") + (mesh ? "/mesh" : "")
+            + (seam ? "/seam" : "") + (water ? "/water" : "") + (mesh ? "/mesh" : "") + (fade ? "/fade" : "")
         if let p = pipelines[key] { return p }
         do {
             if library == nil {
@@ -491,7 +526,7 @@ final class LodRenderer: @unchecked Sendable {
                 let d = MTLMeshRenderPipelineDescriptor()
                 d.label = "MetalMC LOD (mesh)"
                 d.meshFunction = library!.makeFunction(name: "lod_mesh")
-                d.fragmentFunction = library!.makeFunction(name: seam ? "lod_fs_seam" : "lod_fs")
+                d.fragmentFunction = library!.makeFunction(name: fade ? "lod_fs_fade" : (seam ? "lod_fs_seam" : "lod_fs"))
                 d.maxTotalThreadsPerMeshThreadgroup = lodMeshQuads
                 for (i, f) in colorFormats.enumerated() {
                     d.colorAttachments[i].pixelFormat = f
@@ -513,7 +548,7 @@ final class LodRenderer: @unchecked Sendable {
             let d = MTLRenderPipelineDescriptor()
             d.label = box ? "MetalMC LOD occlusion boxes" : "MetalMC LOD"
             d.vertexFunction = library!.makeFunction(name: box ? "lod_box_vs" : "lod_vs")
-            d.fragmentFunction = library!.makeFunction(name: box ? "lod_box_fs" : (seam ? "lod_fs_seam" : "lod_fs"))
+            d.fragmentFunction = library!.makeFunction(name: box ? "lod_box_fs" : (fade ? "lod_fs_fade" : (seam ? "lod_fs_seam" : "lod_fs")))
             for (i, f) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = f
                 // Only the main color target gets LOD color; extra targets (OIT) are left untouched.
@@ -881,22 +916,55 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         return true
     }
 
-    struct Draw { var node: LodMeshNode; var slot: Int; var first: Int; var count: Int; var seam: Bool; var water: Bool }
+    struct Draw {
+        var node: LodMeshNode; var slot: Int; var first: Int; var count: Int; var seam: Bool; var water: Bool
+        var fade: Float = 0; var fadeOut = false   // fade progress 0-1 for a tile in transition, 0 otherwise
+    }
     var draws: [Draw] = []
+    // Transitions: compare this frame's tiles with last frame's. Not on the first frame or right after a jump.
+    var current: [ObjectIdentifier: (LodMeshNode, UInt16)] = [:]
+    for (n, m) in chosen { current[ObjectIdentifier(n), default: (n, 0)].1 |= m }
+    let fadeFrames = UInt64(lodFadeFrames)
+    if lodFadeFrames > 0 && !r.lastSelection.isEmpty && r.frame > r.jumpFrame + 1 {
+        for (id, (_, mask)) in current {
+            let appeared = mask & ~(r.lastSelection[id]?.1 ?? 0)
+            if appeared != 0 { r.fadeIn[id] = (appeared | (r.fadeIn[id]?.mask ?? 0), r.frame) }
+        }
+        for (id, (n, prev)) in r.lastSelection {
+            let gone = prev & ~(current[id]?.1 ?? 0)
+            if gone != 0 { r.fadeOut.append((n, gone, r.frame)) }
+        }
+    } else if r.frame <= r.jumpFrame + 1 {
+        r.fadeIn.removeAll()
+        r.fadeOut.removeAll()
+    }
+    r.lastSelection = current
+    r.fadeIn = r.fadeIn.filter { r.frame < $0.value.start + fadeFrames }
+    r.fadeOut.removeAll { r.frame >= $0.start + fadeFrames }
+    var slots: [ObjectIdentifier: Int] = [:]
     var xforms = [SIMD4<Float>]()
     xforms.reserveCapacity(chosen.count)
     // Tiles overlapping vanilla's area (its render distance, as a square) take the seam variant; nothing is
     // skipped for being close any more, since vanilla picks sections by 3D distance.
     let vanillaHalf = u.discardRadius
     u.discardRadius = 0
-    for (n, tileMask) in chosen {
+    // Tiles of one node: culling, the occlusion test's boxes (not for fading-out tiles) and draw ranges.
+    func addTiles(_ n: LodMeshNode, _ tileMask: UInt16, fadeOutStart: UInt64?) {
         let voxel = Float(1 << n.level)
         let nodeLo = SIMD3(Float(Double(n.x0) - cx), Float(Double(lodWorldMinY) - cy), Float(Double(n.z0) - cz))
         let nodeHi = nodeLo + SIMD3(Float(n.size), Float(lodWorldHeight), Float(n.size))
-        if !visible(nodeLo, nodeHi) { continue }
-        var slot = -1
+        if !visible(nodeLo, nodeHi) { return }
+        let id = ObjectIdentifier(n)
+        var slot = slots[id] ?? -1
         let tileSize = Float(lodTileVoxels) * voxel
+        let fadeIn = fadeOutStart == nil ? r.fadeIn[id] : nil
         for t in 0..<(lodTilesPerSide * lodTilesPerSide) where tileMask & (1 << UInt16(t)) != 0 {
+            var fade: Float = 0
+            if let start = fadeOutStart {
+                fade = Float(r.frame - start) / Float(fadeFrames)
+            } else if let fi = fadeIn, fi.mask & (1 << UInt16(t)) != 0 {
+                fade = max(0.001, Float(r.frame - fi.start) / Float(fadeFrames))
+            }
             let yMin = n.tileY[2 * t], yMax = n.tileY[2 * t + 1]
             if yMin > yMax { continue }
             let tx = t % lodTilesPerSide, tz = t / lodTilesPerSide
@@ -912,7 +980,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             // of it: such tiles are left untested, which keeps them drawn.
             let inside = lo.x - voxel < 0 && hi.x + voxel > 0 && lo.y - voxel < 0 && hi.y + voxel > 0
                 && lo.z - voxel < 0 && hi.z + voxel > 0
-            if !inside, let vis, let boxOut, let markOut, vis.slots.count < LodVisSet.capacity {
+            if !inside, fadeOutStart == nil, let vis, let boxOut, let markOut, vis.slots.count < LodVisSet.capacity {
                 // Box grown by one voxel so the tile's own surfaces never hide it.
                 let i = vis.slots.count
                 boxOut[2 * i] = SIMD4(lo - voxel, 0)
@@ -925,6 +993,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             let faceVisible = [0 > lo.x, 0 < hi.x, 0 > lo.y, 0 < hi.y, 0 > lo.z, 0 < hi.z]
             if slot < 0 {
                 slot = xforms.count
+                slots[id] = slot
                 xforms.append(SIMD4(nodeLo.x, nodeLo.y, nodeLo.z, voxel))
             }
             for water in [false, true] {
@@ -935,12 +1004,14 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                     var e = f + 1
                     while e < 6 && (faceVisible[e] || n.start[base + e + 1] == n.start[base + e]) { e += 1 }
                     draws.append(Draw(node: n, slot: slot, first: n.start[base + f], count: n.start[base + e] - n.start[base + f],
-                                      seam: seam, water: water))
+                                      seam: seam, water: water, fade: fade, fadeOut: fadeOutStart != nil))
                     f = e
                 }
             }
         }
     }
+    for (n, tileMask) in chosen { addTiles(n, tileMask, fadeOutStart: nil) }
+    for f in r.fadeOut { addTiles(f.node, f.mask, fadeOutStart: f.start) }
     if r.frame % 1000 == 0 {
         var perLevel = [Int](repeating: 0, count: 9), quadsPerLevel = [Int](repeating: 0, count: 9)
         for c in chosen { perLevel[min(8, c.0.level)] += 1 }
@@ -965,6 +1036,9 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let seamPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, mesh: useMesh)
     let seamWaterPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, water: true, mesh: useMesh)
     let waterPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, water: true, mesh: useMesh)
+    let anyFade = draws.contains { $0.fade > 0 }
+    let fadePipe = anyFade ? r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, mesh: useMesh, fade: true) : nil
+    let fadeWaterPipe = anyFade ? r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, water: true, mesh: useMesh, fade: true) : nil
     if r.lightSampler == nil {
         let d = MTLSamplerDescriptor()
         d.minFilter = .nearest
@@ -999,20 +1073,29 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     ctx.statLodDraws += draws.count
     // Opaque quads first (plain tiles, then the seam tiles with the discarding variant), then water over them
     // with blending and no depth writes, so it never hides what's under it from later tests.
-    let ordered = draws.filter { !$0.water && !$0.seam } + draws.filter { !$0.water && $0.seam }
-        + draws.filter { $0.water && !$0.seam } + draws.filter { $0.water && $0.seam }
-    var state = (seam: false, water: false)
+    // Fading tiles go last in each group, with the dithering variant.
+    let ordered = draws.filter { !$0.water && !$0.seam && $0.fade == 0 } + draws.filter { !$0.water && $0.seam && $0.fade == 0 }
+        + draws.filter { !$0.water && $0.fade > 0 }
+        + draws.filter { $0.water && !$0.seam && $0.fade == 0 } + draws.filter { $0.water && $0.seam && $0.fade == 0 }
+        + draws.filter { $0.water && $0.fade > 0 }
+    var state = (seam: false, water: false, fade: false)
     for d in ordered {
-        if d.seam != state.seam || d.water != state.water {
-            guard let p = d.water ? (d.seam ? seamWaterPipe : waterPipe) : seamPipe else { break }
+        let fading = d.fade > 0
+        if d.seam != state.seam || d.water != state.water || fading != state.fade {
+            let p = fading ? (d.water ? fadeWaterPipe : fadePipe) : (d.water ? (d.seam ? seamWaterPipe : waterPipe) : (d.seam ? seamPipe : pipe))
+            guard let p else { break }
             if d.water && !state.water {
                 enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
                 u.alpha = lodOpaqueWater ? 1 : lodWaterAlpha
                 enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
             }
             enc.setRenderPipelineState(p)
-            if d.seam, let seamBuffer { enc.setFragmentBuffer(seamBuffer, offset: 0, index: 21) }
-            state = (d.seam, d.water)
+            if d.seam || fading, let seamBuffer { enc.setFragmentBuffer(seamBuffer, offset: 0, index: 21) }
+            state = (d.seam, d.water, fading)
+        }
+        if fading {
+            var params = SIMD4<Float>(min(1, d.fade), d.fadeOut ? 1 : 0, seamBuffer != nil ? 1 : 0, 0)
+            enc.setFragmentBytes(&params, length: 16, index: 24)
         }
         ctx.statLodQuads += d.count
         let id = ObjectIdentifier(d.node)

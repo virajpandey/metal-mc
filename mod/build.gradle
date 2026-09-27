@@ -79,6 +79,9 @@ loom {
 			if (project.hasProperty("lod0")) {
 				environmentVariable "METALMC_LOD0", project.findProperty("lod0").toString()
 			}
+			if (project.hasProperty("fade")) {
+				environmentVariable "METALMC_FADE", project.findProperty("fade").toString()
+			}
 			if (project.hasProperty("meshQuads")) {
 				environmentVariable "METALMC_MESHQUADS", project.findProperty("meshQuads").toString()
 			}
