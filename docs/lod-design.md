@@ -77,6 +77,7 @@ Without it, the LOD ends where the world's generated chunks end, at the edge of 
 
 - **Chunk decoding.** `ChunkScan` walks each chunk's NBT once and reads only position, status, block palettes and data, and the surface biome grid; everything else is skipped by length. It inflates with the Compression framework straight into a reusable per-region buffer. It is verified identical to the general NBT decoder (0 mismatches on 3,072 chunks) and takes 0.14–0.21 s per region versus 1.6–2.3 s.
 - **Cache memory.** The cached level-2 quadrants are run-length encoded per column: 31 MB instead of 157 MB for 100 regions.
+- **Between sessions.** A fully generated region's quadrant is saved under `<game dir>/metalmc/lod/regions/<save>-<dimension>/`, LZFSE-compressed and keyed by the region file's modification time and size and a format version. The next session loads it instead of decoding the region, unless the region has live chunks or is within the level-1 mesh radius, where the full grid is needed anyway. A partly explored region isn't cached: its quadrant includes generated terrain.
 
 ## Streaming (v2, `LodWorld.swift`)
 
@@ -174,7 +175,9 @@ A locked 120 Hz frame is 8.33 ms, so the bench reports frames over 8.33 ms and o
 - Together that's 25 → 7 missed frames per minute of flight at the same frame rate. Of the rest, one is the bench's own start screenshot, and some line up with LOD node installs after an update pass.
 - **For players:** add `-XX:+UseZGC` to the launcher's JVM arguments.
 - **Joining.** The first LOD pass reads every region of the save: 21 s on the 8 km test world with every core. Flying right after joining gave 155 frames over 8.33 ms in the first minute.
-  - That pass now runs at background priority, which macOS keeps on the efficiency cores: 24 frames over 8.33 ms. The LOD appears after 27 s instead of 11, and the whole build takes 61 s.
+  - That pass now runs at background priority, which macOS keeps on the efficiency cores: 14 to 24 frames over 8.33 ms. The LOD appears after about 30 s instead of 11, and the whole pass takes about 63 s: regions 28 s, level 0 17 s, parents 15 s.
+  - The update queue itself is background: a queue's priority is a floor that its blocks can raise but not lower. So later passes raise themselves to utility.
+  - Regions are processed nearest first, and each level-1 node is installed as soon as it's built. The terrain around the player appears within seconds of joining; the horizon fills in as the rest of the pass completes. Batches (8, 16, 32...) got the first nodes up just as fast but left cores idle at the end of each batch.
   - Later passes, when the player moves, stay at utility priority: 1–3 s each. At background priority they took 9–11 s, too slow to keep level 0 around a flying player. `METALMC_LODQOS=utility` or `background` sets one priority throughout.
   - The LOD's shader library and its seven pipeline variants compile on a background queue the first time the LOD draws, instead of on the render thread (a 21 ms frame when the LOD first appeared).
 - **With vsync** (FIFO, the way to play at a locked 120 Hz), the game holds 120.0 fps. A 60 s flight drops 3 frames. Intervals measured on the CPU jitter around 8.33 ms, but the display presents on time.

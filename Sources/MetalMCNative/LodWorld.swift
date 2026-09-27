@@ -331,9 +331,19 @@ final class LodWorld: @unchecked Sendable {
         var phases: [(String, Double)] = []
         var phaseStart = Date()
         func phase(_ name: String) { phases.append((name, Date().timeIntervalSince(phaseStart))); phaseStart = Date() }
-        // 1. Changed regions: level-1 grid -> cached level-2 quadrant, and a level-1 mesh if near the player.
+        // 1. Changed regions: level-1 grid -> cached level-2 quadrant, and a level-1 mesh if near the player. Nearest
+        // first, each level-1 node installed as soon as it's built: on the first pass (every region of the save) the
+        // terrain around the player appears within seconds instead of after the whole save.
         var changedKeys = Set<Int64>()
-        let results = rebuildRegions(changed, meshFine: true)
+        let byDistance = changed.sorted { a, b in
+            let da = (a.0 * 512 + 256 - center.x) * (a.0 * 512 + 256 - center.x) + (a.1 * 512 + 256 - center.z) * (a.1 * 512 + 256 - center.z)
+            let db = (b.0 * 512 + 256 - center.x) * (b.0 * 512 + 256 - center.x) + (b.1 * 512 + 256 - center.z) * (b.1 * 512 + 256 - center.z)
+            return da < db
+        }
+        let results = rebuildRegions(byDistance, meshFine: true) { r in
+            let (x, z) = LodBuild.unkey(r.key)
+            self.install(LodNodeKey(level: 1, x: x, z: z), r.node)
+        }
         far.lock.lock()
         for r in results {
             if r.hasData { far.realRegions.insert(r.key) } else { far.realRegions.remove(r.key) }
@@ -344,8 +354,6 @@ final class LodWorld: @unchecked Sendable {
         for r in results {
             changedKeys.insert(r.key)
             quadrants[r.key] = r.quadrant
-            let (x, z) = LodBuild.unkey(r.key)
-            install(LodNodeKey(level: 1, x: x, z: z), r.node)
         }
 
         phase("regions")
@@ -500,7 +508,7 @@ final class LodWorld: @unchecked Sendable {
 
     /// Reads regions in parallel (region file, then live chunks on top): returns each region's level-2
     /// quadrant, level-1 node if within the fine radius, and whether it has real chunks (all or any).
-    private func rebuildRegions(_ list: [(Int, Int)], meshFine: Bool) -> [RegionResult] {
+    private func rebuildRegions(_ list: [(Int, Int)], meshFine: Bool, onResult: ((RegionResult) -> Void)? = nil) -> [RegionResult] {
         var out = [RegionResult?](repeating: nil, count: list.count)
         let c = center
         let liveKeys = Set(live.regionKeys)
@@ -540,7 +548,9 @@ final class LodWorld: @unchecked Sendable {
                     let size = lodNodeVoxels << 1
                     node = LodNode(level: 1, x0: x * size, z0: z * size, mesh: m)
                 }
-                outp[i] = RegionResult(key: LodBuild.key(x, z), quadrant: quadrant, node: node, hasData: true, full: full)
+                let result = RegionResult(key: LodBuild.key(x, z), quadrant: quadrant, node: node, hasData: true, full: full)
+                outp[i] = result
+                onResult?(result)
             }
         }
         return out.compactMap { $0 }
