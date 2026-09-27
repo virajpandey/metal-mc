@@ -6,7 +6,7 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 
 ## Data model (v1)
 
-- **Levels.** A level-L voxel covers 2^L × 2^L × 2^L blocks, for L ≥ 1. Level 0 (full-resolution blocks) is left to vanilla.
+- **Levels.** A level-L voxel covers 2^L × 2^L × 2^L blocks. Level 0 is full resolution: one voxel per block, a quarter region (256 × 256 blocks) per node, built from region files within 512 blocks of the player (`METALMC_LOD0`, `-Plod0`). Past vanilla's render distance, that ring is where voxels are largest on screen: a 2-block voxel at 200 blocks is about 19 px at 4K.
 - **Nodes.** A node is a 256 × 256-voxel column spanning the full world height (y −64 to 320). A level-1 node is exactly one region file (512 × 512 blocks). A level-(L+1) node merges 2 × 2 level-L nodes at half resolution.
 - **Voxels.** Each voxel is one byte, a material id from `MetalMCCore.Mat`, the same flat-color material table the standalone engine uses.
 - **Downsampling keeps the top layer.** A 2 × 2 × 2 group is solid if any child is. Its material is the one most of its 4 columns show from above, so grass, sand and snow survive at a distance and thin features such as trees stay as blobs. `METALMC_EXP=ds_last` (the original rule: the last solid child in memory order) and `ds_half` (solid only if at least 4 of 8 are) are kept for comparisons.
@@ -17,8 +17,8 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 
 - **8-byte quads.** `word0 = x | z<<8 | y<<16 | face<<25 | waterDepth<<28` (voxel coordinates within the node, y 9 bits), `word1 = material | (w−1)<<8 | (h−1)<<16 | ao<<24`. That's 8 bytes per quad, against vanilla's 4 × 28 bytes.
 - **Greedy merging.** Merges are capped at 16 voxels per side at level 1 and at 64 voxels above that. Only faces with the same material, ambient occlusion and water depth merge.
-- **Ambient occlusion.** Each face corner counts the voxels beside it and diagonal to it in the layer in front of the face, like vanilla's smooth lighting (2 bits per corner). The shader uses vanilla's brightness steps at 60% strength, because an LOD corner gradient spans 2 or more blocks where vanilla's spans one. Full strength left the LOD 3.5 levels too dark on the fidelity score, and none left it 3.5 too bright. It adds about 56% level-1 quads, since faces with different corner patterns don't merge.
-- **Per-face colors.** Each material has top, side and bottom colors (grass: tinted top, dirt sides with the tinted fringe, dirt bottom).
+- **Ambient occlusion, per pixel.** Like vanilla's smooth lighting, each face corner counts the voxels beside it and diagonal to it in the layer in front of the face (0–3). Inside a merged quad every voxel in front of it is open, so only corners on the quad's rim can be occluded. Each quad with an occluded rim stores its rim values, 2 bits each and 2 × (w + h) of them, in a per-node buffer. The fragment shader interpolates the four corners of the voxel face under the pixel. Storing a pattern per quad corner instead kept faces with different patterns from merging: 54% more quads at level 0 and 53% at level 1. At level 0 the shader uses vanilla's steps (1, 0.8, 0.6, 0.4) as they are. Coarser levels use 60% strength, because an LOD corner gradient spans 2 or more blocks where vanilla's spans one. `METALMC_EXP=vertexao` keeps the per-corner version.
+- **Per-face colors.** Each material has top, side and bottom colors (grass: tinted top, dirt sides with the tinted fringe, dirt bottom). A full-resolution grass side shows vanilla's fringe: `grass_block_side_overlay`, tinted, over the dirt. Coarser levels keep the average, since the fringe would repeat on every block of a 2-block side.
 - **Water is translucent**, like vanilla's. Solid voxels emit faces toward water as well as air, so lake and sea floors are meshed, and water emits faces only toward air. It draws after the opaque quads with vanilla's blending, at the water texture's mean alpha (0.706), with no depth writes (so the occlusion test sees the floor). A face under water stores how many blocks of water are above it (1–15) and is darkened like vanilla's skylight, which loses one level per block of water: the shader uses vanilla's lightmap curve for sky light 15 − depth. Water tops are lowered to vanilla's surface height, 1/9 block below the top of the highest water block. Coarser voxels end on the grid, so at sea level that's 1 1/9 blocks below the voxel top. Floors add about 39% level-1 quads (28% of all quads end up under water, mostly less than 8 blocks deep). `METALMC_EXP=opaquewater` meshes water the old way.
 - **Skirts.** The node's sides count as air, so every node emits walls along its edges. These hide cracks where neighboring nodes are at different levels.
 
@@ -26,7 +26,8 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 
 - **Where it draws.** In Minecraft's main world pass, right after solid terrain (`LevelRendererLodMixin`), encoded natively into the same `MTLRenderCommandEncoder`. It uses the game's projection and reverse-Z depth, so it depth-tests against vanilla. Afterwards Minecraft's pipeline state is re-applied.
 - **Tiles.** Each node is meshed as 4 × 4 tiles of 64 voxels, and greedy merges don't cross tile edges along x and z. The quads are stored tile-major, then opaque before water, then by face direction, with each tile's vertical range. The draw culls per tile by view frustum and by face directions that can't face the camera. Adjacent visible face ranges merge into one draw.
-- **Selection.** A quadtree per frame on the CPU: a node splits into its four children when the camera is within 2 × the child size. Missing children are drawn with the parent's quarter tiles. Every node without a parent is a root, not just the top level. Levels are built bottom-up, and the top ones come last (18–25 s for 8 km in-game), so finer levels draw first. Before this, nothing drew until the top level existed. The benchmark now waits for the first full build (`first build done`) before timing.
+- **Tiles vanilla covers are skipped.** Each frame the mod also lists every section vanilla has compiled in its view area (`SectionOcclusion.recordCompiled`). A level-0 or level-1 tile is skipped when every chunk section it has quads in meets three conditions: the section is compiled, it's within vanilla's horizontal view distance (`ChunkTrackingView.isWithinDistance`), and it's within render distance sections above or below the camera. Vanilla draws those sections if it can see them, and nothing in the others can be seen. Node-edge skirts don't count. The check is per section with LOD geometry (a bitmask per tile), because vanilla doesn't compile sections that are only air.
+- **Selection.** A quadtree per frame on the CPU: a node splits into its four children when the camera is within 2 × the child size, and a level-1 node splits into level 0 within the level-0 radius. Missing children are drawn with the parent's quarter tiles. Every node without a parent is a root, not just the top level. Levels are built bottom-up, and the top ones come last (18–25 s for 8 km in-game), so finer levels draw first. Before this, nothing drew until the top level existed. The benchmark now waits for the first full build (`first build done`) before timing.
 - **Occlusion culling.** Right after the LOD draws, every candidate tile's bounding box is rasterized in the same render pass. The boxes are grown by one voxel, and only their faces toward the camera are drawn, with depth testing on and no depth or color writes. At that point the depth buffer holds vanilla's solid terrain and the LOD. The fragment function has `[[early_fragment_tests]]` and marks the tile visible in a shared buffer. When the command buffer completes, the CPU reads the marks. Tiles whose box was fully hidden in the newest completed test are skipped. Every candidate tile is tested again each frame, so a tile that comes into view reappears 2–3 frames later.
   - Tiles whose box contains the camera are never tested, so they are always drawn.
   - After the camera jumps more than 16 blocks, results tested before the jump are ignored.
@@ -98,11 +99,32 @@ The band is the set of pixels where A and B differ by more than 24 (terrain from
 | C3 | ambient occlusion at 60% | 13.47 | 8.82 | 0.55% | −1.0 −0.3 +1.5 |
 | C5 | downsampling by top majority | 13.24 | 8.80 | 0.58% | +1.3 +1.1 +4.6 |
 | C6 | exact seam | 13.54 | 8.71 | 1.01% | −0.8 −0.0 +1.7 |
-| C7 | translucent water, floors under it | **12.15** | **7.39** | **0.30%** | +0.3 −1.0 −3.3 |
+| C7 | translucent water, floors under it | 12.15 | 7.39 | 0.30% | +0.3 −1.0 −3.3 |
+| C8 | level 0 within 512 blocks | 6.33 | 4.28 | 0.04% | +1.8 −0.1 −1.2 |
+| C9 | per-pixel ambient occlusion (35% fewer quads) | 6.35 | 4.30 | 0.04% | +1.9 −0.1 −1.2 |
+| C11 | level 0: vanilla's full AO steps, grass side fringe | 5.10 | 3.48 | 0.04% | −0.8 −0.6 −1.5 |
+| C13 | transparent texels darkened for leaves, not water | **4.72** | **3.07** | **0.04%** | −1.5 −2.1 −1.9 |
+
+Level 0 halved the error: the band is terrain from 192 to 512 blocks, and 2-block voxels put every terrace edge, tree and shoreline up to a block off. With full-resolution geometry, vanilla's own shading rules (full AO steps, the grass fringe) apply directly. From the mid-height views the LOD is hard to tell from vanilla at render distance 32.
 
 The exact seam fixed the ring of holes from above (high views: 1.47 → 0.54% and 1.10 → 0.33%), but it exposed water. Opaque LOD water had nothing under it and sat about a block above vanilla's surface. At the edge of vanilla's area, rays through vanilla's water came out under the LOD water and found only sky. Translucent water with meshed floors fixed that and matches the reference's visible lake floors: error −10% and holes −70%.
+
+## Cost of level 0
+
+Fullscreen at 4112 × 2658, render distance 12, 8 km LOD, benchmark orbit (`-PbenchY`, `-Plod0=512` vs `0`):
+
+| View | fps with level 0 | without | p99 frame with level 0 | LOD quads per frame |
+|---|---|---|---|---|
+| ground | 350.8 | 367.9 | 4.49 ms | 309 K (207 K) |
+| mid (y 150) | 210.1 | 243.4 | 6.04 ms | 955 K (675 K) |
+| high (y 260) | 201.7 | 248.3 | 6.17 ms | 1,073 K (733 K) |
+
+Level 0 costs 0.1 to 0.9 ms, and every view stays well under the 8.33 ms of a 120 Hz frame. Building a level-0 node takes about 1 s (fill and mesh), so the ring is built 6 nodes at a time on the update thread. While a node is missing, its level-1 parent draws that quarter.
+
+Benchmarks bring the game window to the front (`mmc_activate_app`). A window the user can't see is paced to the display's refresh by the window server, and every such run reads 119.9 fps whatever the GPU does.
 
 ## Known gaps
 - **Edges of explored areas at node borders.** Inside a node, side faces toward a column with no data (an unexplored or ungenerated chunk) are kept only within 8 voxels of the top of the terrain. That leaves a short skirt instead of the terrain's cross-section down to the world bottom. The deep-cave fill ignores such columns, so caves next to them are filled too. On the multiplayer test strip this removed 24% of quads (442,407 → 337,911). Node borders keep full-depth skirts, since they hide cracks between LOD levels where a cliff meets the border. Where explored terrain ends exactly at a node border, the cross-section still shows.
 - **Edits while a chunk stays loaded** reach the LOD when the chunk unloads (or when the save changes, in single-player), not immediately. They're mostly inside vanilla's range anyway.
-- **Screen-size selection.** Levels switch by distance: a node splits when the camera is closer than its size. That gives voxels of about 4–8 px at 4K. Voxy switches by projected size, 64 px per 32-voxel section. That's finer than ours, so ours already trades detail for speed.
+- **Screen-size selection.** Levels switch by distance: a node splits when the camera is closer than its size. Past the level-0 ring that gives voxels of about 4–8 px at 4K. Voxy switches by projected size, 64 px per 32-voxel section. The fidelity score only covers terrain out to 512 blocks, since vanilla can't render farther to compare against.
+- **Level 0 needs region files.** In multiplayer the LOD keeps live chunks at level-1 resolution only, so there's no level-0 ring.
