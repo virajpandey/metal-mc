@@ -280,6 +280,7 @@ final class LodRenderer: @unchecked Sendable {
     var latestResult: UInt64 = 0       // newest frame whose occlusion results have been read
     var lastCamera = SIMD3<Double>(repeating: .nan)
     var jumpFrame: UInt64 = 0          // last frame the camera jumped; results tested before it are stale
+    var coveredTiles = 0               // tiles skipped because vanilla drew all their sections (logged every 1000 frames)
 
     func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false, seam: Bool = false, water: Bool = false) -> MTLRenderPipelineState? {
         let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
@@ -386,11 +387,12 @@ final class LodRenderer: @unchecked Sendable {
         colorBuffer = ctx.device.makeBuffer(bytes: c, length: c.count * 16, options: [.storageModeShared])
     }
 
-    /// Quadtree selection. A node splits when the camera is closer than `splitFactor` x the child size:
-    /// existing children are visited, and for each missing child the parent draws just the 2 x 2 tiles
-    /// covering that quarter (missing children are either empty or past the finest level's range).
-    /// Returns nodes with a 16-bit mask of the tiles to draw.
-    static func select(_ meshes: [LodNodeKey: LodMeshNode], maxLevel: Int, camX: Double, camZ: Double, splitFactor: Double) -> [(LodMeshNode, UInt16)] {
+    /// Quadtree selection. A node splits when the camera is closer than `splitFactor` x the child size
+    /// (level 1 into level 0 within `level0Radius`): existing children are visited, and for each missing
+    /// child the parent draws just the 2 x 2 tiles covering that quarter (missing children are either empty
+    /// or past the finest level's range). Returns nodes with a 16-bit mask of the tiles to draw.
+    static func select(_ meshes: [LodNodeKey: LodMeshNode], maxLevel: Int, camX: Double, camZ: Double, splitFactor: Double,
+                       level0Radius: Double) -> [(LodMeshNode, UInt16)] {
         var out: [(LodMeshNode, UInt16)] = []
         // Tile masks for each quarter (tiles t = tz * 4 + tx; quarter (qx, qz) covers tx, tz in 2q ..< 2q + 2).
         func quarterMask(_ qx: Int, _ qz: Int) -> UInt16 {
@@ -404,7 +406,7 @@ final class LodRenderer: @unchecked Sendable {
             let x0 = Double(nx) * size, z0 = Double(nz) * size
             let dx = max(x0 - camX, 0, camX - (x0 + size)), dz = max(z0 - camZ, 0, camZ - (z0 + size))
             let dist = (dx * dx + dz * dz).squareRoot()
-            if level > 1 && dist < splitFactor * size / 2 {
+            if level > 1 ? dist < splitFactor * size / 2 : (level == 1 && dist < level0Radius) {
                 var parentMask: UInt16 = 0
                 for qz in 0...1 {
                     for qx in 0...1 {
@@ -519,7 +521,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     guard let pipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat) else { return 0 }
     r.ensureColors()
     let cx = cam[0], cy = cam[1], cz = cam[2]
-    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: 2.0)
+    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: 2.0,
+                                    level0Radius: Double(lodLevel0Radius))
     guard !chosen.isEmpty else { return 0 }
     r.ensureIndexBuffer(quads: chosen.map { $0.0.quadCount }.max() ?? 1)
     guard let ib = r.indexBuffer else { return 0 }
@@ -557,6 +560,55 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let boxOut = vis.map { $0.boxes.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2 * LodVisSet.capacity) }
     let markOut = vis.map { $0.marks.contents().bindMemory(to: UInt32.self, capacity: LodVisSet.capacity) }
 
+    // The seam bitmap: which chunk sections around the camera vanilla drew this frame.
+    let H = lodSeamHalf, W = lodSeamWidth
+    let csx = Int((cx / 16).rounded(.down)), csy = Int((cy / 16).rounded(.down)), csz = Int((cz / 16).rounded(.down))
+    let bottomSection = lodWorldMinY >> 4
+    u.camInSection = SIMD4(Float(cx - Double(csx * 16)), Float(cy - Double(csy * 16)), Float(cz - Double(csz * 16)), Float(H))
+    u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), 0, 0)
+    var seamBuffer: MTLBuffer?
+    var seamWords: UnsafeMutablePointer<UInt32>?
+    if !r.vanillaSections.isEmpty {
+        while r.seamBuffers.count < 3, let b = ctx.device.makeBuffer(length: lodSeamWords * 4, options: [.storageModeShared]) {
+            b.label = "MetalMC LOD seam"
+            r.seamBuffers.append(b)
+        }
+        if r.seamBuffers.count == 3 {
+            let b = r.seamBuffers[Int(r.frame % 3)]
+            let words = b.contents().bindMemory(to: UInt32.self, capacity: lodSeamWords)
+            for i in 0..<lodSeamWords { words[i] = 0 }
+            for k in r.vanillaSections {
+                // SectionPos.asLong: x in bits 42-63, z in bits 20-41, y in bits 0-19 (all signed).
+                let ix = Int(k >> 42) - csx + H, iz = Int((k << 22) >> 42) - csz + H, iy = Int((k << 44) >> 44) - bottomSection
+                guard ix >= 0, iz >= 0, ix < W, iz < W, iy >= 0, iy < 24 else { continue }
+                let bit = (iy * W + iz) * W + ix
+                words[bit >> 5] |= 1 << UInt32(bit & 31)
+            }
+            seamBuffer = b
+            seamWords = words
+        }
+    }
+    /// True if every chunk section a camera-relative box touches was drawn by vanilla this frame: the seam
+    /// variant would drop all of its pixels, so the tile is skipped.
+    func coveredByVanilla(_ lo: SIMD3<Float>, _ hi: SIMD3<Float>) -> Bool {
+        guard let words = seamWords else { return false }
+        func range(_ a: Float, _ b: Float, _ c: Double) -> (Int, Int) {
+            (Int(((Double(a) + c) / 16).rounded(.down)), Int(((Double(b) + c) / 16 - 1e-4).rounded(.down)))
+        }
+        let (x0, x1) = range(lo.x, hi.x, cx), (y0, y1) = range(lo.y, hi.y, cy), (z0, z1) = range(lo.z, hi.z, cz)
+        if x0 - csx + H < 0 || x1 - csx + H >= W || z0 - csz + H < 0 || z1 - csz + H >= W
+            || y0 - bottomSection < 0 || y1 - bottomSection >= 24 || y1 < y0 { return false }
+        for sy in y0...y1 {
+            for sz in z0...z1 {
+                for sx in x0...x1 {
+                    let bit = ((sy - bottomSection) * W + sz - csz + H) * W + sx - csx + H
+                    if words[bit >> 5] & (1 << UInt32(bit & 31)) == 0 { return false }
+                }
+            }
+        }
+        return true
+    }
+
     struct Draw { var node: LodMeshNode; var slot: Int; var first: Int; var count: Int; var seam: Bool; var water: Bool }
     var draws: [Draw] = []
     var xforms = [SIMD4<Float>]()
@@ -579,6 +631,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             let lo = SIMD3(nodeLo.x + Float(tx) * tileSize, nodeLo.y + Float(yMin) * voxel, nodeLo.z + Float(tz) * tileSize)
             let hi = SIMD3(lo.x + tileSize, nodeLo.y + Float(yMax) * voxel, lo.z + tileSize)
             if !visible(lo, hi) { continue }
+            let seam = lo.x < vanillaHalf && hi.x > -vanillaHalf && lo.z < vanillaHalf && hi.z > -vanillaHalf
+            if seam && coveredByVanilla(lo, hi) { r.coveredTiles += 1; continue }
             // Only box faces toward the camera are rasterized, so a camera inside a box would see nothing
             // of it: such tiles are left untested, which keeps them drawn.
             let inside = lo.x - voxel < 0 && hi.x + voxel > 0 && lo.y - voxel < 0 && hi.y + voxel > 0
@@ -594,7 +648,6 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             if latest > 0 && !lodOccNoCull && n.tileTested[t] == latest && n.tileVisible[t] != latest { continue }
             // Face buckets that can face the camera (camera past the tile's nearest plane on that axis).
             let faceVisible = [0 > lo.x, 0 < hi.x, 0 > lo.y, 0 < hi.y, 0 > lo.z, 0 < hi.z]
-            let seam = lo.x < vanillaHalf && hi.x > -vanillaHalf && lo.z < vanillaHalf && hi.z > -vanillaHalf
             if slot < 0 {
                 slot = xforms.count
                 xforms.append(SIMD4(nodeLo.x, nodeLo.y, nodeLo.z, voxel))
@@ -613,6 +666,10 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             }
         }
     }
+    if r.frame % 1000 == 0 {
+        log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames")
+        r.coveredTiles = 0
+    }
     let testBoxes = vis.map { !$0.slots.isEmpty } ?? false
     guard !draws.isEmpty || testBoxes else { return 0 }
 
@@ -625,32 +682,6 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     r.ensureTextureDefaults()
     if !lodFlat, r.atlas != nil, r.spriteBuffer != nil {
         u.camFrac = SIMD4(Float(cx - cx.rounded(.down)), Float(cy - cy.rounded(.down)), Float(cz - cz.rounded(.down)), 1)
-    }
-    // The seam bitmap: which chunk sections around the camera vanilla drew this frame.
-    let H = lodSeamHalf, W = lodSeamWidth
-    let csx = Int((cx / 16).rounded(.down)), csy = Int((cy / 16).rounded(.down)), csz = Int((cz / 16).rounded(.down))
-    let bottomSection = lodWorldMinY >> 4
-    u.camInSection = SIMD4(Float(cx - Double(csx * 16)), Float(cy - Double(csy * 16)), Float(cz - Double(csz * 16)), Float(H))
-    u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), 0, 0)
-    var seamBuffer: MTLBuffer?
-    if draws.contains(where: { $0.seam }) {
-        while r.seamBuffers.count < 3, let b = ctx.device.makeBuffer(length: lodSeamWords * 4, options: [.storageModeShared]) {
-            b.label = "MetalMC LOD seam"
-            r.seamBuffers.append(b)
-        }
-        if r.seamBuffers.count == 3 {
-            let b = r.seamBuffers[Int(r.frame % 3)]
-            let words = b.contents().bindMemory(to: UInt32.self, capacity: lodSeamWords)
-            for i in 0..<lodSeamWords { words[i] = 0 }
-            for k in r.vanillaSections {
-                // SectionPos.asLong: x in bits 42-63, z in bits 20-41, y in bits 0-19 (all signed).
-                let ix = Int(k >> 42) - csx + H, iz = Int((k << 22) >> 42) - csz + H, iy = Int((k << 44) >> 44) - bottomSection
-                guard ix >= 0, iz >= 0, ix < W, iz < W, iy >= 0, iy < 24 else { continue }
-                let bit = (iy * W + iz) * W + ix
-                words[bit >> 5] |= 1 << UInt32(bit & 31)
-            }
-            seamBuffer = b
-        }
     }
     let seamPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true)
     let seamWaterPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, water: true)

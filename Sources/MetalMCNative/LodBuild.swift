@@ -30,6 +30,8 @@ let lodFaceCorners: [[(Int, Int, Int)]] = [
 ]
 /// METALMC_EXP=opaquewater meshes water as before translucency (no floors under it; for A/B comparisons).
 let lodOpaqueWater = experiments.contains("opaquewater")
+/// METALMC_EXP=noao meshes without ambient occlusion (for measuring how much it splits merges).
+let lodNoAO = experiments.contains("noao")
 /// METALMC_EXP=nodeepfill turns off deep-cave filling (for A/B comparisons).
 let lodDeepFill = !(ProcessInfo.processInfo.environment["METALMC_EXP"] ?? "").contains("nodeepfill")
 
@@ -314,9 +316,9 @@ enum LodBuild {
     /// translucent like vanilla's, so lake and sea floors show through it); water only shows faces toward
     /// air. A face under water records how many blocks of water are above it (1-15), which darkens it like
     /// vanilla's skylight does. Outside the node counts as air on the sides (skirt walls that hide cracks
-    /// between levels) and as solid below the world. Merged quads are capped at `maxMerge` voxels per side,
-    /// so each quad stays small enough to be dropped individually where vanilla chunks are drawn.
-    static func mesh(_ grid: LodGrid, maxMerge: Int = 16) -> (quads: [UInt32], counts: [Int], tileY: [Int]) {
+    /// between levels) and as solid below the world. Merged quads are capped at `maxMerge` voxels per side
+    /// (tiles cap them at 64 anyway).
+    static func mesh(_ grid: LodGrid, maxMerge: Int = 64) -> (quads: [UInt32], counts: [Int], tileY: [Int]) {
         let n = lodNodeVoxels, h = grid.height
         let kinds = lodKinds
         let airK = MaterialKind.air.rawValue, waterK = MaterialKind.water.rawValue
@@ -406,7 +408,7 @@ enum LodBuild {
                                         let level = s1 == 1 && s2 == 1 ? 3 : s1 + s2 + solid(fx + o.0 + o.3, fy + o.1 + o.4, fz + o.2 + o.5)
                                         pattern |= UInt32(level) << UInt32(2 * k)
                                     }
-                                    f |= pattern << 8
+                                    if !lodNoAO { f |= pattern << 8 }
                                 }
                             }
                             mask[vv * du + uu] = f
@@ -501,8 +503,7 @@ enum LodBuild {
                     }
                     var filled = g
                     filled.fillUnreachable()
-                    // Level-1 quads stay small so they can be dropped one by one where vanilla draws.
-                    let m = mesh(filled, maxMerge: lvl == 1 ? 16 : 64)
+                    let m = mesh(filled, maxMerge: 64)
                     outp[i] = LodNode(level: lvl, x0: x0, z0: z0, quads: m.quads, counts: m.counts, tileY: m.tileY)
                 }
             }
@@ -581,6 +582,24 @@ public func mmc_debug_compare_decoders(_ path: UnsafePointer<CChar>, _ out: Unsa
 /// out[9] = quads under water, out[10] = quads under more than 8 blocks of water.
 @_cdecl("mmc_debug_lod_mesh_stats")
 public func mmc_debug_lod_mesh_stats(_ path: UnsafePointer<CChar>, _ level: Int32, _ mode: Int32, _ out: UnsafeMutablePointer<Int64>) {
+    if level == 0 {
+        // Level 0: the region's four quarters, summed.
+        for q in 0..<4 {
+            guard var g = LodBuild.regionQuarterGrid(path: String(cString: path), qx: q & 1, qz: q >> 1) else { continue }
+            let t0 = Date()
+            g.fillUnreachable(deepRadius: 16, deepDepth: 8)
+            let m = LodBuild.mesh(g, maxMerge: 64)
+            out[8] += Int64(Date().timeIntervalSince(t0) * 1000)
+            for i in 0..<(m.quads.count / 2) {
+                let w0 = m.quads[2 * i]
+                out[2 + Int((w0 >> 25) & 7)] += 1
+                let wd = Int((w0 >> 28) & 15)
+                if wd > 0 { out[9] += 1; if wd > 8 { out[10] += 1 } }
+            }
+            out[0] += Int64(m.quads.count / 2)
+        }
+        return
+    }
     guard var g = LodBuild.regionGrid(path: String(cString: path)) else { return }
     while g.level < Int(level) {
         var p = LodGrid(level: g.level + 1)
@@ -594,7 +613,7 @@ public func mmc_debug_lod_mesh_stats(_ path: UnsafePointer<CChar>, _ level: Int3
     case 2: g.fillUnreachable(deepRadius: 4, deepDepth: 8)
     default: g.fillUnreachable(deepRadius: 16, deepDepth: 4)
     }
-    let m = LodBuild.mesh(g, maxMerge: g.level == 1 ? 16 : 64)
+    let m = LodBuild.mesh(g, maxMerge: 64)
     out[8] = Int64(Date().timeIntervalSince(t0) * 1000)
     let n = lodNodeVoxels, h = g.height
     // Highest solid voxel per column (-1 if none).

@@ -9,9 +9,12 @@ import MetalMCCore
 // level around the player's current position. Live chunks replace the region file's version of a chunk.
 //
 // Per region it caches the level-2 quadrant (128 x 128 x 96 voxels), so parents can be rebuilt without
-// re-reading sibling regions from disk.
+// re-reading sibling regions from disk. Level 0 (full resolution, a quarter region per node) is built from
+// region files only, in a ring around the player just past vanilla's render distance.
 
 let lodQuadrantVoxels = lodNodeVoxels / 2
+/// Level-0 nodes are meshed within this many blocks of the player (METALMC_LOD0=<blocks>, 0 for none).
+let lodLevel0Radius = Int(ProcessInfo.processInfo.environment["METALMC_LOD0"] ?? "") ?? 512
 
 /// A region's level-2 quadrant (128 x 128 columns of 96 voxels), run-length encoded per column:
 /// `offsets[c] ..< offsets[c + 1]` indexes (material, count) byte pairs from the bottom up.
@@ -276,6 +279,9 @@ final class LodWorld: @unchecked Sendable {
             meshedCenter = center
         }
 
+        // 2b. Level 0 around the player: nodes that came into range, and those of changed regions.
+        if lodLevel0Radius > 0, regionDir != nil { updateLevel0(seen: seen, changed: changedKeys) }
+
         // 3. Parents of changed regions, level by level.
         var dirty = Set(changedKeys.map { LodBuild.unkey($0) }.map { LodNodeKey(level: 1, x: $0.0, z: $0.1) })
         var level = 2
@@ -306,6 +312,57 @@ final class LodWorld: @unchecked Sendable {
         return true
     }
 
+    private func level0Near(_ nx: Int, _ nz: Int, radius: Int) -> Bool {
+        let size = lodNodeVoxels
+        let x0 = nx * size, z0 = nz * size
+        let dx = Double(max(x0 - center.x, 0, center.x - (x0 + size))), dz = Double(max(z0 - center.z, 0, center.z - (z0 + size)))
+        return (dx * dx + dz * dz).squareRoot() <= Double(radius)
+    }
+
+    /// Meshes the level-0 nodes within `lodLevel0Radius` that are missing or whose region changed, and drops
+    /// the ones more than 256 blocks past it. A few at a time: each needs about 75 MB while it's built.
+    private func updateLevel0(seen: Set<Int64>, changed: Set<Int64>) {
+        guard let regionDir else { return }
+        lock.lock()
+        let have = Set(meshes.keys.filter { $0.level == 0 }.map { LodBuild.key($0.x, $0.z) })
+        lock.unlock()
+        var need: [(Int, Int)] = []
+        for k in seen {
+            let (rx, rz) = LodBuild.unkey(k)
+            for q in 0..<4 {
+                let nx = 2 * rx + (q & 1), nz = 2 * rz + (q >> 1)
+                if level0Near(nx, nz, radius: lodLevel0Radius) && (!have.contains(LodBuild.key(nx, nz)) || changed.contains(k)) {
+                    need.append((nx, nz))
+                }
+            }
+        }
+        let batch = 6
+        var i = 0
+        while i < need.count {
+            let part = Array(need[i..<min(need.count, i + batch)])
+            var built = [LodNode?](repeating: nil, count: part.count)
+            built.withUnsafeMutableBufferPointer { out in
+                let outp = out.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: part.count) { j in
+                    let (nx, nz) = part[j]
+                    let path = regionDir.appendingPathComponent("r.\(nx >> 1).\(nz >> 1).mca").path
+                    guard var g = LodBuild.regionQuarterGrid(path: path, qx: nx & 1, qz: nz & 1) else { return }
+                    g.fillUnreachable(deepRadius: 16, deepDepth: 8)
+                    let m = LodBuild.mesh(g)
+                    outp[j] = LodNode(level: 0, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, quads: m.quads, counts: m.counts, tileY: m.tileY)
+                }
+            }
+            for (j, (nx, nz)) in part.enumerated() { install(LodNodeKey(level: 0, x: nx, z: nz), built[j]) }
+            i += batch
+        }
+        lock.lock()
+        for k in meshes.keys where k.level == 0 && !level0Near(k.x, k.z, radius: lodLevel0Radius + 256) {
+            meshes[k] = nil
+            generation += 1
+        }
+        lock.unlock()
+    }
+
     /// Reads regions in parallel (region file, then live chunks on top): returns (key, level-2 quadrant,
     /// level-1 node if within the fine radius).
     private func rebuildRegions(_ list: [(Int, Int)], meshFine: Bool) -> [(Int64, LodQuadrant, LodNode?)] {
@@ -329,7 +386,7 @@ final class LodWorld: @unchecked Sendable {
                 if meshFine && self.withinFine(regionX: x, regionZ: z, cx: c.x, cz: c.z) {
                     var filled = g
                     filled.fillUnreachable()
-                    let m = LodBuild.mesh(filled, maxMerge: 16)
+                    let m = LodBuild.mesh(filled, maxMerge: 64)
                     let size = lodNodeVoxels << 1
                     node = LodNode(level: 1, x0: x * size, z0: z * size, quads: m.quads, counts: m.counts, tileY: m.tileY)
                 }

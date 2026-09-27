@@ -68,6 +68,10 @@ loom {
 			if (project.hasProperty("metalExp")) {
 				environmentVariable "METALMC_EXP", project.findProperty("metalExp").toString()
 			}
+			// -Plod0=<blocks>: radius of the full-resolution LOD level around the player (0 turns it off).
+			if (project.hasProperty("lod0")) {
+				environmentVariable "METALMC_LOD0", project.findProperty("lod0").toString()
+			}
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
 				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"
