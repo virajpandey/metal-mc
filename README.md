@@ -18,14 +18,15 @@ Screenshots of the same pose match Vulkan's (95% of pixels within 15/255; the re
 
 ### Far-terrain LOD (Voxy-style, clean-room)
 
-With `-Plod=1`, the mod draws far terrain past vanilla's render distance. It has voxel levels built from the world's region files and from chunks as the game loads them, streamed as the world changes, and drawn inside Minecraft's main pass with the game's own projection and fog. On servers it builds from the chunks you've seen there and saves them per server. In single-player, terrain the world hasn't generated yet is sampled from the world generator's own noise (heights and biomes) in the background, so the horizon shows the world's real mountains, coasts and forests before you've been there ([design](docs/lod-design.md)). On the pregenerated 8 km world, fullscreen M3 Pro, orbiting 150 blocks up:
+With `-Plod=1`, the mod draws far terrain past vanilla's render distance. It has voxel levels built from the world's region files and from chunks as the game loads them, streamed as the world changes, and drawn inside Minecraft's main pass with the game's own projection and fog. On servers it builds from the chunks you've seen there and saves them per server. In single-player, terrain the world hasn't generated yet is sampled from the world generator's own noise (heights and biomes) in the background, so the horizon shows the world's real mountains, coasts and forests before you've been there ([design](docs/lod-design.md)). On the pregenerated 8 km world, M3 Pro, fullscreen at the panel's native 3456 × 2234, 150 blocks up:
 
-| Setup | Terrain visible to | FPS | p99 frame |
-|---|---|---|---|
-| Vanilla, render distance 32 | 512 blocks | 216 | 7.1 ms |
-| **Render distance 12 + LOD** (generated past the saved world) | **32,768 blocks** | **187** | **6.6 ms** |
+| Setup | Terrain visible to | FPS | p99 frame | Frames over 8.3 ms per minute |
+|---|---|---|---|---|
+| Vanilla, render distance 32 (orbit) | 512 blocks | 248 | 6.1 ms | 28 |
+| **Render distance 12 + LOD** (orbit, generated past the saved world) | **32,768 blocks** | **212** | **6.3 ms** | **5** |
+| Render distance 12 + LOD, flying 20 blocks/s | 32,768 blocks | 228 | 5.9 ms | 5 |
 
-That's 64× the view distance with a better p99 frame time, well inside a 120 Hz frame (8.3 ms).
+That's 64× the view distance, and it's smoother at 120 Hz than render distance 32: vanilla at 32 streams four times as many chunks. Two settings help any setup on this Mac. In the launcher's JVM arguments, `-XX:+UseZGC` removes G1's 5–10 ms collections while chunks stream in. Setting the fullscreen resolution to 1728 × 1117 at 120 Hz renders the panel's native pixels instead of a scaled 4112 × 2658, for 16% more frame rate ([details](docs/lod-design.md#frame-pacing)).
 
 **Fidelity is measured, not eyeballed.** A fidelity tour takes the same 10 screenshots with fog off three times: vanilla at render distance 32 (the reference), vanilla at 12 (to find the band from 192 to 512 blocks the LOD has to fill), and 12 plus LOD. `tools/fidscore.swift` scores the LOD against the reference inside that band. Guided by the score:
 
@@ -35,7 +36,7 @@ That's 64× the view distance with a better p99 frame time, well inside a 120 Hz
 - the grass-side fringe
 - an exact per-chunk-section seam
 
-Together they took the mean error from 14.1 to 4.7 and holes from 0.53% to 0.04% of the band.
+Together they took the mean error from 14.1 to 4.7 and holes from 0.53% to 0.04% of the band. The LOD samples vanilla's lightmap, so it matches vanilla through dusk and night: the midnight tour's error went from 10.2 to 1.6.
 
 | Vanilla, render distance 32 | Render distance 12 + LOD |
 |---|---|
