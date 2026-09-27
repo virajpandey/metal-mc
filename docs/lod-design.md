@@ -38,6 +38,19 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 - **Far plane and fog.** The camera's far plane is pushed to 1.5 × the LOD distance; reverse-Z float depth keeps precision. Vanilla's render-distance fog moves from the chunk edge to the LOD edge. The LOD shader reproduces vanilla's fog formula, so it blends into the same sky.
 - **Environmental haze.** The overworld's clear-weather haze (`FOG_END_DISTANCE`) defaults to a linear 0 → 1,024 blocks, which fully hides anything past 1 km; vanilla never draws that far, so it never shows. With LOD active, that default haze is stretched to the LOD distance. Shorter fogs (rain, water, lava, blindness, the Nether's 96 blocks) are unchanged.
 
+## Far terrain from the world generator
+
+Without it, the LOD ends where the world's generated chunks end, at the edge of what the player has explored. In single-player (`lod.generate`, on by default), the mod samples the world generator's own noise for the rest, out to `lod.far`:
+
+- **Requests.** The LOD lists nodes of levels 3 and up that the quadtree can draw around the player (children of nodes that split, and top-level nodes within `lod.far`). It skips nodes whose regions are all fully generated and returns the rest nearest first (`mmc_lod_far_wanted`).
+- **Columns.** `FarTerrain.java` samples 256 × 256 columns per node on 3 low-priority threads, one column per voxel column of the node's level.
+  - **Ground height.** The noise router's `chunk_surface_level` is a cheap surface estimate (6 µs), but it runs about 14 blocks low and is off by up to 67. So the search starts 96 blocks above it and marches down the terrain-shape density (`overworld/sloped_cheese`: no caves, aquifers or structures) until it's solid, then bisects. Against the generator's exact height on the 4 km test world, it's 1.3 blocks off on average and within 4 blocks 96% of the time. It costs about 85 µs per column. The exact column scan (`getBaseHeight`) costs 712 µs. These are the samplers vanilla's parallel chunk generation shares.
+  - **Biome** at that height (7 µs).
+- **Surfaces** (`LodFar.swift`). Biome names map to surface materials, tints, dense-forest canopy (leaves 5–13 blocks above the ground), frozen water, and stone on steep slopes in mountain biomes. Below sea level the column fills with the biome's water, and grass and snow give way to the bed under them. Real chunks always win, column by column: generated columns only fill columns with no data.
+- **Cache.** Generated nodes are saved per save and seed under `<game dir>/metalmc/lod/far/` (never in the save), about 53 KB per node. Later sessions load them and only generate what's missing.
+- **Cost.** 32 km needs about 190 nodes, about 4 minutes of background generation the first time on the 4 km test world. Rendering to 32 km from the high orbit runs at 177 fps with a 6.8 ms p99 frame, against 202 fps for 8 km without generation. Generating during the run didn't change the frame rate.
+- **Limits.** Heights come from the terrain-shape density, so caves and structures don't exist, and surface materials are per-biome approximations. Rivers, coasts and mountains land where the real ones will, and the real chunks replace them as the player explores. Multiplayer has no generator on the client.
+
 ## Ingestion speed and memory
 
 - **Chunk decoding.** `ChunkScan` walks each chunk's NBT once and reads only position, status, block palettes and data, and the surface biome grid; everything else is skipped by length. It inflates with the Compression framework straight into a reusable per-region buffer. It is verified identical to the general NBT decoder (0 mismatches on 3,072 chunks) and takes 0.14–0.21 s per region versus 1.6–2.3 s.
@@ -128,3 +141,4 @@ Benchmarks bring the game window to the front (`mmc_activate_app`). A window the
 - **Edits while a chunk stays loaded** reach the LOD when the chunk unloads (or when the save changes, in single-player), not immediately. They're mostly inside vanilla's range anyway.
 - **Screen-size selection.** Levels switch by distance: a node splits when the camera is closer than its size. Past the level-0 ring that gives voxels of about 4–8 px at 4K. Voxy switches by projected size, 64 px per 32-voxel section. The fidelity score only covers terrain out to 512 blocks, since vanilla can't render farther to compare against.
 - **Level 0 needs region files.** In multiplayer the LOD keeps live chunks at level-1 resolution only, so there's no level-0 ring.
+- **Explored edges at levels 1–2.** Generated columns fill levels 3 and up. Within about 2 km of the player, a level-1 or level-2 node that is partly explored still ends where its chunks end. A node with no chunks at all falls back to its generated level-3 parent.

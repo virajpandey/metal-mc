@@ -18,23 +18,38 @@ Screenshots of the same pose match Vulkan's (95% of pixels within 15/255; the re
 
 ### Far-terrain LOD (Voxy-style, clean-room)
 
-With `-Plod=1`, the mod draws far terrain past vanilla's render distance: voxel levels built from the world's region files and from chunks as the game loads them, streamed as the world changes, and drawn inside Minecraft's main pass with the game's own projection and fog. On servers it builds from the chunks you've seen there and saves them per server ([design](docs/lod-design.md), [results](results/lod-v1/README.md)). On a pregenerated 4 km world, fullscreen M3 Pro:
+With `-Plod=1`, the mod draws far terrain past vanilla's render distance. It has voxel levels built from the world's region files and from chunks as the game loads them, streamed as the world changes, and drawn inside Minecraft's main pass with the game's own projection and fog. On servers it builds from the chunks you've seen there and saves them per server. In single-player, terrain the world hasn't generated yet is sampled from the world generator's own noise (heights and biomes) in the background, so the horizon shows the world's real mountains, coasts and forests before you've been there ([design](docs/lod-design.md)). On the pregenerated 8 km world, fullscreen M3 Pro, orbiting 150 blocks up:
 
-| Setup | Terrain visible to | FPS |
-|---|---|---|
-| Vanilla, render distance 32 | 512 blocks | 185 |
-| **Render distance 12 + LOD** | **2,048 blocks** | **315** |
-| **Render distance 12 + LOD** (8.2 km world) | **8,192 blocks** | **310** |
+| Setup | Terrain visible to | FPS | p99 frame |
+|---|---|---|---|
+| Vanilla, render distance 32 | 512 blocks | 216 | 7.1 ms |
+| **Render distance 12 + LOD** (generated past the saved world) | **32,768 blocks** | **187** | **6.6 ms** |
 
-That is 4–16× the view distance at 68–70% higher FPS. The LOD numbers include block texture detail (about 2%) and come from an orbit 150 blocks up. At ground level, occlusion culling skips LOD hidden behind hills: before texture detail, the 8 km LOD ran at 362 fps there, against 382 with no LOD. LOD surfaces use Minecraft's block textures, with colors calibrated to each texture's average and per-biome grass, foliage and water tints, so the seam with vanilla chunks is hard to see.
+That's 64× the view distance with a better p99 frame time, well inside a 120 Hz frame (8.3 ms).
 
-![Render distance 12 with LOD to 8 km](results/lod-v1/rd12-lod8192-start.png)
+**Fidelity is measured, not eyeballed.** A fidelity tour takes the same 10 screenshots with fog off three times: vanilla at render distance 32 (the reference), vanilla at 12 (to find the band from 192 to 512 blocks the LOD has to fill), and 12 plus LOD. `tools/fidscore.swift` scores the LOD against the reference inside that band. Guided by the score:
+
+- a full-resolution LOD level in a ring out to 512 blocks
+- translucent water over meshed lake and sea floors
+- vanilla's ambient-occlusion steps, applied per pixel
+- the grass-side fringe
+- an exact per-chunk-section seam
+
+Together they took the mean error from 14.1 to 4.7 and holes from 0.53% to 0.04% of the band.
+
+| Vanilla, render distance 32 | Render distance 12 + LOD |
+|---|---|
+| ![vanilla](results/lod-v2/fidelity-vanilla-rd32-mid-north.jpg) | ![lod](results/lod-v2/fidelity-rd12-lod-mid-north.jpg) |
+
+A world explored only 600 blocks around spawn, with the rest generated from its seed:
+
+![Explored 600 blocks, then generated](results/lod-v2/explored-600-then-generated.jpg)
 
 ### Install (Minecraft 26.3, Apple Silicon)
 
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) 0.19.5+ for Minecraft 26.3, and put [Fabric API](https://modrinth.com/mod/fabric-api) in your `mods` folder.
 2. Build the mod: `cd mod && ./gradlew build` (needs Xcode's Swift toolchain and JDK 25). Copy `mod/build/libs/metalmc-0.1.0.jar` into `mods`. The jar bundles the Metal library, which is extracted to `<game dir>/metalmc/natives/` on first launch.
-3. Settings are in `config/metalmc.properties`, created on first launch: `backend=metal|off`, `facingCulling`, `occlusionCulling`, `lod`, `lod.far` (blocks), `lod.live`, `lod.multiplayer`, and `lod.textures`. If Metal can't start, Minecraft falls back to its own backends.
+3. Settings are in `config/metalmc.properties`, created on first launch: `backend=metal|off`, `facingCulling`, `occlusionCulling`, `lod`, `lod.far` (blocks), `lod.live`, `lod.multiplayer`, `lod.textures` and `lod.generate`. If Metal can't start, Minecraft falls back to its own backends.
 
 It's experimental. It has been tested on one M3 Pro, in single-player and on a local server, and it isn't compatible with other rendering mods (Sodium, Iris).
 
