@@ -32,6 +32,8 @@ let lodFaceCorners: [[(Int, Int, Int)]] = [
 let lodOpaqueWater = experiments.contains("opaquewater")
 /// METALMC_EXP=deepfloors keeps floors under deep water at every level (for A/B comparisons).
 let lodKeepDeepFloors = experiments.contains("deepfloors")
+/// METALMC_EXP=slowmesh scans every voxel of every slice (the mesher before its per-column bands; A/B check).
+let lodSlowMesh = experiments.contains("slowmesh")
 /// METALMC_EXP=noao turns ambient occlusion off; vertexao stores it per quad corner instead of per pixel, as
 /// before (faces with different corner patterns can't merge, which cost about 54% more quads).
 let lodNoAO = experiments.contains("noao")
@@ -168,8 +170,31 @@ struct LodGrid {
                 @inline(__always) func push(_ i: Int) {
                     if !s[i] && passable(i) { s[i] = true; stack.append(Int32(i)) }
                 }
-                // Seeds: the top layer and the four side walls.
-                for z in 0..<n { for x in 0..<n { push(((h - 1) * n + z) * n + x) } }
+                if lodSlowMesh {
+                    // Seeds: the top layer and the four side walls.
+                    for z in 0..<n { for x in 0..<n { push(((h - 1) * n + z) * n + x) } }
+                } else {
+                    // Air above a column's highest non-air voxel is open to the sky: mark it directly instead of
+                    // flooding it (most of a node's volume). Then seed the flood only where that open air touches
+                    // passable voxels at or below a column top: the top itself (water) and the sides of taller
+                    // neighbors (cave mouths in cliffs), so the flood only walks caves and water.
+                    var colTop = [Int](repeating: -1, count: n * n)
+                    for y in 0..<h { for i in 0..<(n * n) where g[y * n * n + i] != 0 { colTop[i] = y } }
+                    for i in 0..<(n * n) { for y in (colTop[i] + 1)..<h { s[y * n * n + i] = true } }
+                    for z in 0..<n {
+                        for x in 0..<n {
+                            let i = z * n + x, t = colTop[i]
+                            if t >= 0 { push(t * n * n + i) }
+                            // Open air of this column beside a taller neighbor's voxels.
+                            for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                                let nx = x + dx, nz = z + dz
+                                if nx < 0 || nz < 0 || nx >= n || nz >= n { continue }
+                                let j = nz * n + nx
+                                if colTop[j] > t { for y in (t + 1)...colTop[j] { push(y * n * n + j) } }
+                            }
+                        }
+                    }
+                }
                 for y in 0..<h where seedSides {
                     for k in 0..<n {
                         push((y * n + 0) * n + k); push((y * n + (n - 1)) * n + k)
@@ -374,6 +399,20 @@ enum LodBuild {
             // the terrain down to the world bottom at the edge of explored or generated terrain.
             var top = [Int](repeating: -1, count: n * n)
             for y in 0..<h { for i in 0..<(n * n) where g[y * n * n + i] != 0 { top[i] = y } }
+            // Lowest open (air or water) voxel per column; 0 for a column with no data, which is all air. A face
+            // toward an open neighbor lies between the neighbor's lowest open voxel and the column's top, so each
+            // slice only scans that band (most of a column is solid below it or air above it): about 5x faster.
+            var floorOpen = [Int](repeating: 0, count: n * n)
+            for i in 0..<(n * n) where top[i] >= 0 {
+                var y = 0
+                while y < h {
+                    let k = kinds[Int(g[y * n * n + i])]
+                    if k == airK || k == waterK { break }
+                    y += 1
+                }
+                floorOpen[i] = y
+            }
+            var bandLo = [Int](repeating: 0, count: max(n, h)), bandHi = [Int](repeating: -1, count: max(n, h))
             let edgeSkirt = 8
             @inline(__always) func at(_ x: Int, _ y: Int, _ z: Int) -> UInt8 {
                 if y < 0 { return Mat.stone.rawValue }
@@ -415,8 +454,45 @@ enum LodBuild {
                 }
                 for d in 0..<dn {
                     var anyFace = false
-                    for vv in 0..<dv {
-                        for uu in 0..<du {
+                    // The window of this slice that can hold faces: for X faces the y band of each z (u = y), for Z
+                    // faces the y band of each x (v = y), for Y faces the whole slice, skipped outside every band.
+                    var uuMin = 0, uuMax = du - 1, vvMin = 0, vvMax = dv - 1
+                    if !lodSlowMesh {
+                        if axis == 1 {
+                            var any = false
+                            for i in 0..<(n * n) where top[i] >= 0 {
+                                let lo = dir > 0 ? floorOpen[i] - 1 : floorOpen[i] + 1
+                                if d >= lo && d <= top[i] { any = true; break }
+                            }
+                            if !any { continue }
+                        } else {
+                            var lo = Int.max, hi = -1
+                            for j in 0..<n {
+                                // Column j along the slice (z for X faces, x for Z faces) and its neighbor across the face.
+                                let (cx, cz) = axis == 0 ? (d, j) : (j, d)
+                                let nx = cx + sx, nz = cz + sz
+                                let floor = nx < 0 || nz < 0 || nx >= n || nz >= n ? 0 : floorOpen[nz * n + nx]
+                                bandLo[j] = floor
+                                bandHi[j] = top[cz * n + cx]
+                                if bandHi[j] >= floor { lo = min(lo, floor); hi = max(hi, bandHi[j]) }
+                            }
+                            if hi < 0 { continue }
+                            if axis == 0 { uuMin = lo; uuMax = hi } else { vvMin = lo; vvMax = hi }
+                        }
+                    }
+                    for vv in vvMin...vvMax {
+                        for uu in uuMin...uuMax {
+                            if !lodSlowMesh {
+                                let j = axis == 0 ? vv : uu, y = axis == 0 ? uu : vv
+                                if axis == 1 {
+                                    let i = vv * n + uu
+                                    let lo = dir > 0 ? floorOpen[i] - 1 : floorOpen[i] + 1
+                                    if top[i] < 0 || d < lo || d > top[i] { mask[vv * du + uu] = 0; continue }
+                                } else if y < bandLo[j] || y > bandHi[j] {
+                                    mask[vv * du + uu] = 0
+                                    continue
+                                }
+                            }
                             let (x, y, z) = xyz(d, uu, vv)
                             let m = at(x, y, z)
                             var f: UInt32 = 0
@@ -463,15 +539,15 @@ enum LodBuild {
                         }
                     }
                     if !anyFace { continue }
-                    // Greedy rectangles over the (u, v) mask.
-                    for vv in 0..<dv {
-                        var uu = 0
-                        while uu < du {
+                    // Greedy rectangles over the (u, v) mask, inside the window written above.
+                    for vv in vvMin...vvMax {
+                        var uu = uuMin
+                        while uu <= uuMax {
                             let m = mask[vv * du + uu]
                             if m == 0 { uu += 1; continue }
                             // Merges stay inside a tile along x and z (u is y for X faces; v is y for Z faces).
-                            let uLimit = axis == 0 ? du : min(du, (uu / lodTileVoxels + 1) * lodTileVoxels)
-                            let vLimit = axis == 2 ? dv : min(dv, (vv / lodTileVoxels + 1) * lodTileVoxels)
+                            let uLimit = min(uuMax + 1, axis == 0 ? du : min(du, (uu / lodTileVoxels + 1) * lodTileVoxels))
+                            let vLimit = min(vvMax + 1, axis == 2 ? dv : min(dv, (vv / lodTileVoxels + 1) * lodTileVoxels))
                             var w = 1
                             while w < maxMerge && uu + w < uLimit && mask[vv * du + uu + w] == m { w += 1 }
                             var ht = 1
@@ -699,18 +775,26 @@ public func mmc_debug_lod_mesh_stats(_ path: UnsafePointer<CChar>, _ level: Int3
     if level == 0 {
         // Level 0: the region's four quarters, summed.
         for q in 0..<4 {
+            let tDecode = Date()
             guard var g = LodBuild.regionQuarterGrid(path: String(cString: path), qx: q & 1, qz: q >> 1) else { continue }
             let t0 = Date()
             g.fillUnreachable(deepRadius: 16, deepDepth: 8)
+            let t1 = Date()
             let m = LodBuild.mesh(g, maxMerge: 64)
             out[8] += Int64(Date().timeIntervalSince(t0) * 1000)
+            // Level 0 only: out[1] = decode ms, out[9] = fill ms (instead of the buried/underwater counts).
+            out[1] += Int64(t0.timeIntervalSince(tDecode) * 1000)
+            out[9] += Int64(t1.timeIntervalSince(t0) * 1000)
             for i in 0..<(m.quads.count / 2) {
                 let w0 = m.quads[2 * i]
                 out[2 + Int((w0 >> 25) & 7)] += 1
-                let wd = Int((w0 >> 28) & 15)
-                if wd > 0 { out[9] += 1; if wd > 8 { out[10] += 1 } }
             }
             out[0] += Int64(m.quads.count / 2)
+            // out[2...7] get the per-face counts; fold a checksum of the quads into out[10] for A/B identity checks.
+            var hsum: UInt64 = 14695981039346656037
+            for w in m.quads { hsum = (hsum ^ UInt64(w)) &* 1099511628211 }
+            for c in m.counts { hsum = (hsum ^ UInt64(c)) &* 1099511628211 }
+            out[10] = Int64(bitPattern: UInt64(bitPattern: out[10]) &+ hsum)
         }
         return
     }
