@@ -85,16 +85,26 @@ let lodKinds: [UInt8] = {
     return m
 }
 
+/// LOD colors, three per material id (top, side, bottom): material * 3 + face class.
 func lodColorTable() -> [SIMD4<Float>] {
-    var c = [SIMD4<Float>](repeating: SIMD4(0.492, 0.492, 0.492, 1), count: 256)
-    for (i, color) in lodMaterialColors.enumerated() { c[i] = color }
+    var c = [SIMD4<Float>](repeating: SIMD4(0.492, 0.492, 0.492, 1), count: 256 * 3)
+    for (i, color) in lodMaterialFaceColors.enumerated() { c[i] = color }
     func rgb(_ v: UInt32, _ gray: Float) -> SIMD4<Float> {
         SIMD4(Float((v >> 16) & 255) / 255 * gray, Float((v >> 8) & 255) / 255 * gray, Float(v & 255) / 255 * gray, 1)
     }
+    let dirt = c[Int(Mat.dirt.rawValue) * 3]
     for (t, tint) in lodTints.enumerated() {
-        c[Int(lodGrassBase) + t] = rgb(tint.grass, lodGrassGray)
-        c[Int(lodLeavesBase) + t] = rgb(tint.foliage, lodLeavesGray)
-        c[Int(lodWaterBase) + t] = rgb(tint.water, lodWaterGray)
+        let g = Int(lodGrassBase) + t, l = Int(lodLeavesBase) + t, w = Int(lodWaterBase) + t
+        // Grass: tinted top; sides are dirt with the tinted fringe; bottom is dirt.
+        let fringe = SIMD3(Float((tint.grass >> 16) & 255), Float((tint.grass >> 8) & 255), Float(tint.grass & 255)) / 255
+        let side = (1 - lodGrassSideFringe) * lodGrassSideBase + lodGrassSideFringe * lodGrassOverlayGray * fringe
+        c[3 * g] = rgb(tint.grass, lodGrassGray)
+        c[3 * g + 1] = SIMD4(side, 1)
+        c[3 * g + 2] = dirt
+        for f in 0..<3 {
+            c[3 * l + f] = rgb(tint.foliage, lodLeavesGray)
+            c[3 * w + f] = rgb(tint.water, lodWaterGray)
+        }
     }
     return c
 }

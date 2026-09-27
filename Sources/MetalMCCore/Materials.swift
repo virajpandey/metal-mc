@@ -82,7 +82,10 @@ public enum Materials {
             return .air
         case "water", "bubble_column", "seagrass", "tall_seagrass", "kelp", "kelp_plant":
             return .water
-        case "snow", "short_grass", "tall_grass", "grass", "fern", "large_fern", "brown_mushroom", "red_mushroom",
+        case "snow":
+            // Snow layers: thin, but they make the ground white, which is what matters from a distance.
+            return .snow
+        case "short_grass", "tall_grass", "grass", "fern", "large_fern", "brown_mushroom", "red_mushroom",
              "short_dry_grass", "tall_dry_grass", "azalea", "flowering_azalea", "big_dripleaf", "big_dripleaf_stem",
              "small_dripleaf", "fire", "soul_fire", "spore_blossom", "hanging_roots", "cactus_flower":
             return .air

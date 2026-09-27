@@ -48,8 +48,9 @@ abstract class LevelRendererFacingMixin {
         target = "Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection;getSectionMesh()Lnet/minecraft/client/renderer/chunk/SectionMesh;"))
     private SectionMesh metalmc$skipHidden(SectionRenderDispatcher.RenderSection section, Operation<SectionMesh> original) {
         SectionMesh mesh = original.call(section);
-        if (!mesh.hasRenderableLayers()) return mesh;
         BlockPos o = section.getRenderOrigin();
+        if (mesh != CompiledSectionMesh.UNCOMPILED) SectionOcclusion.recordVanilla(o.getX(), o.getY(), o.getZ());
+        if (!mesh.hasRenderableLayers()) return mesh;
         Vec3 c = levelRenderState.cameraRenderState.pos;
         return SectionOcclusion.skip(o.getX(), o.getY(), o.getZ(), c.x, c.y, c.z) ? CompiledSectionMesh.EMPTY : mesh;
     }

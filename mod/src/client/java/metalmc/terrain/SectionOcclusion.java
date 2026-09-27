@@ -31,10 +31,14 @@ public final class SectionOcclusion {
     private static int candidateCount;
     private static long lastKey = Long.MIN_VALUE;
     private static boolean active;
+    // Every compiled section vanilla visits this frame, for the LOD's seam (drawn or not, empty or not).
+    private static long[] vanilla = new long[8192];
+    private static int vanillaCount;
 
     /** Start of draw-list building: fetch the newest results and reset the candidate list. */
     public static void beginFrame(double camX, double camY, double camZ) {
         candidateCount = 0;
+        vanillaCount = 0;
         lastKey = Long.MIN_VALUE;
         frame++;
         HIDDEN.clear();
@@ -65,6 +69,20 @@ public final class SectionOcclusion {
             }
         }
         return hidden;
+    }
+
+    /** Records a compiled section vanilla visited this frame (block origin x, y, z). */
+    public static void recordVanilla(int x, int y, int z) {
+        if (vanillaCount == vanilla.length) vanilla = java.util.Arrays.copyOf(vanilla, vanillaCount * 2);
+        vanilla[vanillaCount++] = net.minecraft.core.SectionPos.asLong(x >> 4, y >> 4, z >> 4);
+    }
+
+    public static long[] vanillaKeys() {
+        return vanilla;
+    }
+
+    public static int vanillaCount() {
+        return vanillaCount;
     }
 
     /** After solid terrain, inside the main pass: test this frame's candidates. */

@@ -6,6 +6,7 @@ import net.minecraft.client.renderer.fog.FogRenderer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
@@ -14,8 +15,25 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(FogRenderer.class)
 abstract class FogRendererMixin {
+    /**
+     * Fidelity measurement (-Pfidelity=1): every run computes fog and sky colors as if at render distance 32,
+     * and terrain fog is off, so runs at different render distances differ only in the terrain they draw.
+     */
+    private static final boolean FIDELITY = "1".equals(System.getProperty("metalmc.fidelity"));
+
+    @ModifyVariable(method = "setupFog", at = @At("HEAD"), argsOnly = true, ordinal = 0)
+    private int metalmc$fidelityRenderDistance(int renderDistanceInChunks) {
+        return FIDELITY ? 32 : renderDistanceInChunks;
+    }
+
     @Inject(method = "setupFog", at = @At("RETURN"))
     private void metalmc$extendFog(CallbackInfoReturnable<FogData> cir) {
+        if (FIDELITY) {
+            FogData fog = cir.getReturnValue();
+            fog.environmentalStart = fog.environmentalEnd = 1e6f;
+            fog.renderDistanceStart = fog.renderDistanceEnd = 1e6f;
+            return;
+        }
         if (!Lod.active()) return;
         FogData fog = cir.getReturnValue();
         float oldEnd = fog.renderDistanceEnd;

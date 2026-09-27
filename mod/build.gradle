@@ -62,6 +62,7 @@ loom {
 			property "metalmc.lod.live", (project.findProperty("lodLive") ?: "1").toString()
 			property "metalmc.lod.textures", (project.findProperty("lodTextures") ?: "1").toString()
 			property "metalmc.tour", (project.findProperty("benchTour") ?: "0").toString()
+			property "metalmc.fidelity", (project.findProperty("fidelity") ?: "0").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
 			if (project.hasProperty("metalExp")) {

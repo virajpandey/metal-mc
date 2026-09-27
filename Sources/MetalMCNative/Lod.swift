@@ -19,8 +19,11 @@ struct LodUniforms {
     float envStart, envEnd, rdStart, rdEnd;
     float discardRadius;   // horizontal distance inside which vanilla chunks are drawn instead
     float sky;             // daylight factor 0..1
-    float2 pad;
+    float alpha;           // output alpha: 1 for opaque quads, vanilla's water texture alpha for water
+    float pad;
     float4 camFrac;        // xyz: fractional part of the camera position; w: 1 if texture detail is on
+    float4 camInSection;   // xyz: camera position within its chunk section (0-16); w: seam bitmap half-size H
+    int4 seamInfo;         // x: camera section y - world bottom section; y: bitmap width W (2H + 1)
 };
 // Per base material: top and side sprite rectangles in the block atlas (u0, v0, u1, v1), and the mean luma
 // of each texture (x = top, y = side).
@@ -52,8 +55,21 @@ static float3 extentScale(uint face, float w, float h) {
     return float3(w, h, 1);
 }
 
-// Quads are 8 bytes: word0 = x | z << 8 | y << 16 | face << 24 (voxel coordinates within the node),
-// word1 = material | (w - 1) << 8 | (h - 1) << 16 (greedy extents along the face's u and v axes).
+// Quads are 8 bytes: word0 = x | z << 8 | y << 16 (9 bits) | face << 25 | water depth << 28 (voxel coordinates
+// within the node; blocks of water above an underwater face, 0 for none), word1 = material | (w - 1) << 8 |
+// (h - 1) << 16 | ao << 24 (greedy extents along the face's u and v axes; ao holds 2 bits per corner: how
+// many of the voxels around that corner occlude it, 0-3).
+// Brightness for 0, 1, 2 and 3 occluders: vanilla's smooth-lighting steps (1, 0.8, 0.6, 0.4) at 60% strength,
+// because an LOD voxel's corner gradient spans 2+ blocks where vanilla's spans one (measured with the
+// fidelity score: full strength left the LOD 3.5 levels too dark, none 3.5 too bright).
+constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
+// Skylight under d blocks of water (it loses a level per block): vanilla's lightmap brightness for sky light
+// 15 - d, relative to 15 (overworld ambient 0.04, default brightness setting).
+constant float kWaterLight[16] = { 1.0, 0.908, 0.822, 0.747, 0.676, 0.609, 0.544, 0.482,
+                                   0.423, 0.367, 0.315, 0.265, 0.218, 0.174, 0.133, 0.094 };
+// Vanilla's water surface is 1/9 block below the top of the highest water block. A level-0 voxel is that block;
+// coarser voxels end on the grid, and at sea level (y 62) the block's top is 1 block below a voxel boundary.
+constant float kWaterSurfaceDrop0 = 1.0 / 9.0, kWaterSurfaceDrop = 10.0 / 9.0;
 vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
                    const device uint2* quads [[buffer(18)]],
                    constant LodUniforms& u [[buffer(19)]],
@@ -61,12 +77,15 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
                    constant float4* colors [[buffer(21)]]) {
     uint2 q = quads[vid >> 2];
     uint corner = vid & 3;
-    uint face = (q.x >> 24) & 7;
-    float3 local = float3(q.x & 255, (q.x >> 16) & 255, (q.x >> 8) & 255);
+    uint face = (q.x >> 25) & 7;
+    float3 local = float3(q.x & 255, (q.x >> 16) & 511, (q.x >> 8) & 255);
     float w = float(((q.y >> 8) & 255) + 1), h = float(((q.y >> 16) & 255) + 1);
     float3 ext = extentScale(face, w, h);
     float4 xs = xforms[draw].offsetScale;
+    uint m = q.y & 255;
+    bool water = (m >= 128u && m < 160u) || m == MAT_WATER;
     float3 rel = xs.xyz + (local + kCorners[face][corner] * ext) * xs.w;
+    if (water && kCorners[face][corner].y > 0.5) rel.y -= xs.w < 1.5 ? kWaterSurfaceDrop0 : kWaterSurfaceDrop;
     // Drop whole quads inside the range vanilla draws: decide by the quad's center so all four corners
     // agree, and collapse the quad to a point (no fragment discard, which would disable hidden-surface removal).
     float3 center = xs.xyz + (local + 0.5 * (kCorners[face][0] + kCorners[face][2]) * ext) * xs.w;
@@ -81,9 +100,10 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     float4 clip = u.proj * (u.view * float4(rel, 1.0));
     clip.y = -clip.y;   // same vertical flip as every translated Minecraft shader (flip_vert_y)
     o.pos = clip;
-    uint m = q.y & 255;
-    float3 base = colors[m].rgb;
-    o.color = base * kShade[face] * mix(0.2, 1.0, u.sky);
+    uint faceClass = face == 2 ? 0u : (face == 3 ? 2u : 1u);   // top, side, bottom
+    float3 base = colors[m * 3 + faceClass].rgb;
+    float ao = kAO[(q.y >> (24 + 2 * corner)) & 3];
+    o.color = base * kShade[face] * ao * kWaterLight[(q.x >> 28) & 15] * mix(0.2, 1.0, u.sky);
     o.rel = rel;
     // Biome-tinted variants (64 + t grass, 96 + t leaves, 128 + t water) use their base material's texture.
     uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
@@ -102,9 +122,8 @@ static float linearFog(float d, float s, float e) {
 // block; mip selection uses the gradients of the continuous block coordinate, so it doesn't break at tile
 // seams, and far away the smallest mips average back to the flat color. Transparent texels (leaves, ice)
 // darken slightly instead of showing whatever color they store.
-fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
-                       constant LodSpriteGPU* sprites [[buffer(20)]],
-                       texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
+static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites,
+                       texture2d<float> atlas, sampler atlasSampler) {
     float3 color = in.color;
     if (u.camFrac.w > 0.5) {
         uint face = in.matFace >> 8, mat = in.matFace & 255;
@@ -122,7 +141,34 @@ fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19
     float spherical = length(in.rel);
     float cylindrical = max(horiz, abs(in.rel.y));
     float fog = max(linearFog(spherical, u.envStart, u.envEnd), linearFog(cylindrical, u.rdStart, u.rdEnd));
-    return float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), 1.0);
+    return float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), u.alpha);
+}
+
+fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
+                       constant LodSpriteGPU* sprites [[buffer(20)]],
+                       texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
+    return lodShade(in, u, sprites, atlas, atlasSampler);
+}
+
+// The seam with vanilla: tiles that overlap vanilla's area use this variant, which drops the pixels of LOD
+// voxels whose chunk section vanilla drew this frame (a bitmap of sections around the camera). It's exact
+// at any camera height (vanilla picks sections by 3D distance), leaves no gap and never draws LOD over
+// vanilla terrain. Only these tiles pay for the discard, which turns off hidden-surface removal for them.
+constant float3 kNormal[6] = { float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
+fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
+                            constant LodSpriteGPU* sprites [[buffer(20)]],
+                            const device uint* vanilla [[buffer(21)]],
+                            texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
+    // A point just inside the voxel this face belongs to.
+    float3 p = in.rel + u.camInSection.xyz - kNormal[in.matFace >> 8] * 0.01;
+    int3 sec = int3(floor(p / 16.0));
+    int H = int(u.camInSection.w), W = u.seamInfo.y;
+    int ix = sec.x + H, iz = sec.z + H, iy = u.seamInfo.x + sec.y;
+    if (ix >= 0 && iz >= 0 && ix < W && iz < W && iy >= 0 && iy < 24) {
+        uint bit = uint((iy * W + iz) * W + ix);
+        if ((vanilla[bit >> 5] & (1u << (bit & 31))) != 0) discard_fragment();
+    }
+    return lodShade(in, u, sprites, atlas, atlasSampler);
 }
 
 // Occlusion test. After the LOD is drawn, every candidate tile's bounding box is rasterized in the same
@@ -165,9 +211,20 @@ struct LodUniforms {
     var envStart: Float, envEnd: Float, rdStart: Float, rdEnd: Float
     var discardRadius: Float
     var sky: Float
-    var pad: SIMD2<Float> = .zero
+    var alpha: Float = 1
+    var pad: Float = 0
     var camFrac: SIMD4<Float> = .zero
+    var camInSection: SIMD4<Float> = .zero
+    var seamInfo: SIMD4<Int32> = .zero
 }
+
+/// Half-size of the vanilla-section bitmap around the camera section (render distance 32 plus margin).
+let lodSeamHalf = 34
+let lodSeamWidth = 2 * lodSeamHalf + 1
+let lodSeamWords = (lodSeamWidth * lodSeamWidth * 24 + 31) / 32
+
+/// Mean alpha of vanilla's water texture (water_still), the LOD water's opacity.
+let lodWaterAlpha: Float = 0.706
 
 /// METALMC_EXP=lodflat turns off LOD texture detail (flat colors, for A/B comparisons).
 let lodFlat = experiments.contains("lodflat")
@@ -210,6 +267,10 @@ final class LodRenderer: @unchecked Sendable {
     // Texture detail: Minecraft's block atlas and the sprite table (render thread).
     var atlas: MTLTexture?
     var spriteBuffer: MTLBuffer?
+    // The chunk sections vanilla drew this frame (SectionPos.asLong keys), set before each draw, and a ring
+    // of bitmap buffers for the seam shader.
+    var vanillaSections: [Int64] = []
+    var seamBuffers: [MTLBuffer] = []
     var atlasSampler: MTLSamplerState?
     var dummyTexture: MTLTexture?
     // Occlusion culling (render thread, except LodVisSet.done).
@@ -220,8 +281,9 @@ final class LodRenderer: @unchecked Sendable {
     var lastCamera = SIMD3<Double>(repeating: .nan)
     var jumpFrame: UInt64 = 0          // last frame the camera jumped; results tested before it are stale
 
-    func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false) -> MTLRenderPipelineState? {
+    func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false, seam: Bool = false, water: Bool = false) -> MTLRenderPipelineState? {
         let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
+            + (seam ? "/seam" : "") + (water ? "/water" : "")
         if let p = pipelines[key] { return p }
         do {
             if library == nil {
@@ -234,12 +296,21 @@ final class LodRenderer: @unchecked Sendable {
             let d = MTLRenderPipelineDescriptor()
             d.label = box ? "MetalMC LOD occlusion boxes" : "MetalMC LOD"
             d.vertexFunction = library!.makeFunction(name: box ? "lod_box_vs" : "lod_vs")
-            d.fragmentFunction = library!.makeFunction(name: box ? "lod_box_fs" : "lod_fs")
+            d.fragmentFunction = library!.makeFunction(name: box ? "lod_box_fs" : (seam ? "lod_fs_seam" : "lod_fs"))
             for (i, f) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = f
                 // Only the main color target gets LOD color; extra targets (OIT) are left untouched.
                 // The occlusion boxes write no color at all.
                 if i > 0 || box { d.colorAttachments[i].writeMask = [] }
+            }
+            if water {
+                // Vanilla's translucent blending.
+                let a = d.colorAttachments[0]!
+                a.isBlendingEnabled = true
+                a.sourceRGBBlendFactor = .sourceAlpha
+                a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+                a.sourceAlphaBlendFactor = .one
+                a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             }
             d.depthAttachmentPixelFormat = depth
             let p = try ctx.device.makeRenderPipelineState(descriptor: d)
@@ -486,11 +557,14 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let boxOut = vis.map { $0.boxes.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2 * LodVisSet.capacity) }
     let markOut = vis.map { $0.marks.contents().bindMemory(to: UInt32.self, capacity: LodVisSet.capacity) }
 
-    struct Draw { var node: LodMeshNode; var slot: Int; var first: Int; var count: Int }
+    struct Draw { var node: LodMeshNode; var slot: Int; var first: Int; var count: Int; var seam: Bool; var water: Bool }
     var draws: [Draw] = []
     var xforms = [SIMD4<Float>]()
     xforms.reserveCapacity(chosen.count)
-    let discard = u.discardRadius
+    // Tiles overlapping vanilla's area (its render distance, as a square) take the seam variant; nothing is
+    // skipped for being close any more, since vanilla picks sections by 3D distance.
+    let vanillaHalf = u.discardRadius
+    u.discardRadius = 0
     for (n, tileMask) in chosen {
         let voxel = Float(1 << n.level)
         let nodeLo = SIMD3(Float(Double(n.x0) - cx), Float(Double(lodWorldMinY) - cy), Float(Double(n.z0) - cz))
@@ -504,10 +578,6 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             let tx = t % lodTilesPerSide, tz = t / lodTilesPerSide
             let lo = SIMD3(nodeLo.x + Float(tx) * tileSize, nodeLo.y + Float(yMin) * voxel, nodeLo.z + Float(tz) * tileSize)
             let hi = SIMD3(lo.x + tileSize, nodeLo.y + Float(yMax) * voxel, lo.z + tileSize)
-            // Tiles entirely inside the range vanilla draws: every point of the tile's footprint is closer
-            // than the discard radius (its farthest corner is).
-            let fx = max(abs(lo.x), abs(hi.x)), fz = max(abs(lo.z), abs(hi.z))
-            if fx * fx + fz * fz < discard * discard { continue }
             if !visible(lo, hi) { continue }
             // Only box faces toward the camera are rasterized, so a camera inside a box would see nothing
             // of it: such tiles are left untested, which keeps them drawn.
@@ -524,18 +594,22 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             if latest > 0 && !lodOccNoCull && n.tileTested[t] == latest && n.tileVisible[t] != latest { continue }
             // Face buckets that can face the camera (camera past the tile's nearest plane on that axis).
             let faceVisible = [0 > lo.x, 0 < hi.x, 0 > lo.y, 0 < hi.y, 0 > lo.z, 0 < hi.z]
+            let seam = lo.x < vanillaHalf && hi.x > -vanillaHalf && lo.z < vanillaHalf && hi.z > -vanillaHalf
             if slot < 0 {
                 slot = xforms.count
                 xforms.append(SIMD4(nodeLo.x, nodeLo.y, nodeLo.z, voxel))
             }
-            let base = t * 6
-            var f = 0
-            while f < 6 {
-                if !faceVisible[f] || n.start[base + f + 1] == n.start[base + f] { f += 1; continue }
-                var e = f + 1
-                while e < 6 && (faceVisible[e] || n.start[base + e + 1] == n.start[base + e]) { e += 1 }
-                draws.append(Draw(node: n, slot: slot, first: n.start[base + f], count: n.start[base + e] - n.start[base + f]))
-                f = e
+            for water in [false, true] {
+                let base = t * lodBucketsPerTile + (water ? 6 : 0)
+                var f = 0
+                while f < 6 {
+                    if !faceVisible[f] || n.start[base + f + 1] == n.start[base + f] { f += 1; continue }
+                    var e = f + 1
+                    while e < 6 && (faceVisible[e] || n.start[base + e + 1] == n.start[base + e]) { e += 1 }
+                    draws.append(Draw(node: n, slot: slot, first: n.start[base + f], count: n.start[base + e] - n.start[base + f],
+                                      seam: seam, water: water))
+                    f = e
+                }
             }
         }
     }
@@ -552,6 +626,35 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     if !lodFlat, r.atlas != nil, r.spriteBuffer != nil {
         u.camFrac = SIMD4(Float(cx - cx.rounded(.down)), Float(cy - cy.rounded(.down)), Float(cz - cz.rounded(.down)), 1)
     }
+    // The seam bitmap: which chunk sections around the camera vanilla drew this frame.
+    let H = lodSeamHalf, W = lodSeamWidth
+    let csx = Int((cx / 16).rounded(.down)), csy = Int((cy / 16).rounded(.down)), csz = Int((cz / 16).rounded(.down))
+    let bottomSection = lodWorldMinY >> 4
+    u.camInSection = SIMD4(Float(cx - Double(csx * 16)), Float(cy - Double(csy * 16)), Float(cz - Double(csz * 16)), Float(H))
+    u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), 0, 0)
+    var seamBuffer: MTLBuffer?
+    if draws.contains(where: { $0.seam }) {
+        while r.seamBuffers.count < 3, let b = ctx.device.makeBuffer(length: lodSeamWords * 4, options: [.storageModeShared]) {
+            b.label = "MetalMC LOD seam"
+            r.seamBuffers.append(b)
+        }
+        if r.seamBuffers.count == 3 {
+            let b = r.seamBuffers[Int(r.frame % 3)]
+            let words = b.contents().bindMemory(to: UInt32.self, capacity: lodSeamWords)
+            for i in 0..<lodSeamWords { words[i] = 0 }
+            for k in r.vanillaSections {
+                // SectionPos.asLong: x in bits 42-63, z in bits 20-41, y in bits 0-19 (all signed).
+                let ix = Int(k >> 42) - csx + H, iz = Int((k << 22) >> 42) - csz + H, iy = Int((k << 44) >> 44) - bottomSection
+                guard ix >= 0, iz >= 0, ix < W, iz < W, iy >= 0, iy < 24 else { continue }
+                let bit = (iy * W + iz) * W + ix
+                words[bit >> 5] |= 1 << UInt32(bit & 31)
+            }
+            seamBuffer = b
+        }
+    }
+    let seamPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true)
+    let seamWaterPipe = seamBuffer == nil ? nil : r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, seam: true, water: true)
+    let waterPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, water: true)
     enc.setFragmentTexture(r.atlas ?? r.dummyTexture, index: 30)
     enc.setFragmentSamplerState(r.atlasSampler, index: 15)
     enc.setFragmentBuffer(r.spriteBuffer ?? r.colorBuffer, offset: 0, index: 20)
@@ -565,7 +668,23 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     enc.setVertexBuffer(r.colorBuffer!, offset: 0, index: 21)
     var bound: ObjectIdentifier?
     ctx.statLodDraws += draws.count
-    for d in draws {
+    // Opaque quads first (plain tiles, then the seam tiles with the discarding variant), then water over them
+    // with blending and no depth writes, so it never hides what's under it from later tests.
+    let ordered = draws.filter { !$0.water && !$0.seam } + draws.filter { !$0.water && $0.seam }
+        + draws.filter { $0.water && !$0.seam } + draws.filter { $0.water && $0.seam }
+    var state = (seam: false, water: false)
+    for d in ordered {
+        if d.seam != state.seam || d.water != state.water {
+            guard let p = d.water ? (d.seam ? seamWaterPipe : waterPipe) : seamPipe else { break }
+            if d.water && !state.water {
+                enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
+                u.alpha = lodOpaqueWater ? 1 : lodWaterAlpha
+                enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
+            }
+            enc.setRenderPipelineState(p)
+            if d.seam, let seamBuffer { enc.setFragmentBuffer(seamBuffer, offset: 0, index: 21) }
+            state = (d.seam, d.water)
+        }
         ctx.statLodQuads += d.count
         let id = ObjectIdentifier(d.node)
         if bound != id {
@@ -625,4 +744,11 @@ public func mmc_lod_set_atlas(_ view: Int64, _ rects: UnsafePointer<Float>, _ co
     r.spriteBuffer = ctx.device.makeBuffer(bytes: table, length: table.count * 16, options: [.storageModeShared])
     r.atlas = view == 0 ? nil : (from(view) as TextureBox).texture
     if let a = r.atlas { log("LOD: texture detail from the block atlas \(a.width)x\(a.height), \(a.mipmapLevelCount) mips, \(n) materials") }
+}
+
+/// The chunk sections vanilla drew this frame (SectionPos.asLong keys, compiled sections only), for the LOD's
+/// seam: LOD pixels inside them are dropped. Call before mmc_lod_draw each frame.
+@_cdecl("mmc_lod_set_vanilla")
+public func mmc_lod_set_vanilla(_ keys: UnsafePointer<Int64>, _ count: Int32) {
+    LodRenderer.shared.vanillaSections = Array(UnsafeBufferPointer(start: keys, count: Int(count)))
 }

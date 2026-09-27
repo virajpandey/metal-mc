@@ -147,7 +147,35 @@ final class Tour {
         new Step("mp-overview", null, 300, mc -> cmd(mc, "gamemode creative", "time set 6000", "weather clear", OVERVIEW))
     );
 
+    /**
+     * Fidelity measurement (-PbenchTour=fidelity with -Pfidelity=1): fixed poses with no HUD, no mobs, frozen
+     * noon and clear weather. Rendered once as vanilla RD 32 (the reference), once as vanilla RD 12 (the mask of
+     * what the LOD must fill) and once per LOD variant; tools/fidscore.py compares them. The first step waits
+     * 30 s so RD 32's chunks load and compile.
+     */
+    static final boolean FIDELITY_TOUR = "fidelity".equals(System.getProperty("metalmc.tour"));
+    private static Pose at(double y, float yaw, float pitch) {
+        return new Pose(Bench.CENTER_X, y, Bench.CENTER_Z, yaw, pitch);
+    }
+    static final List<Step> FIDELITY_STEPS = List.of(
+        new Step("ground-north", ground(180f), 600, mc -> {
+            cmd(mc, "time set 6000", "weather clear", "gamerule advance_time false", "gamerule advance_weather false",
+                "gamerule spawn_mobs false", "kill @e[type=!player]");
+            if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();   // F1: no HUD, no hand
+        }),
+        new Step("ground-east", ground(270f), 80, mc -> {}),
+        new Step("ground-south", ground(0f), 80, mc -> {}),
+        new Step("ground-west", ground(90f), 80, mc -> {}),
+        new Step("mid-north", at(150, 180f, 20f), 80, mc -> {}),
+        new Step("mid-east", at(150, 270f, 20f), 80, mc -> {}),
+        new Step("mid-south", at(150, 0f, 20f), 80, mc -> {}),
+        new Step("mid-west", at(150, 90f, 20f), 80, mc -> {}),
+        new Step("high-north", at(260, 180f, 12f), 80, mc -> {}),
+        new Step("high-south", at(260, 0f, 12f), 80, mc -> {})
+    );
+
     static List<Step> steps() {
+        if (FIDELITY_TOUR) return FIDELITY_STEPS;
         if (MP_TOUR) return "mp2".equals(System.getProperty("metalmc.tour")) ? MP2_STEPS : MP_STEPS;
         return LOD_TOUR ? LOD_STEPS : STEPS;
     }

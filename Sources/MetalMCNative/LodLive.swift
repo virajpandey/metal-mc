@@ -204,18 +204,7 @@ public func mmc_lod_ingest(_ cx: Int32, _ cz: Int32, _ blocks: UnsafePointer<UIn
     guard let w else { return }
     let n = lodChunkVoxels, h = lodColumnHeight
     var v = [UInt8](repeating: 0, count: n * n * h)
-    for by in 0..<lodWorldHeight {
-        let vy = by >> 1
-        for bz in 0..<16 {
-            let row = (vy * n + (bz >> 1)) * n
-            let src = (by * 16 + bz) * 16
-            let trow = (bz >> 2) * 4
-            for bx in 0..<16 {
-                let m = blocks[src + bx]
-                if m != 0 { v[row + (bx >> 1)] = lodTinted(m, tints[trow + (bx >> 2)]) }
-            }
-        }
-    }
+    v.withUnsafeMutableBufferPointer { lodReduceChunk(blocks, tints, into: $0.baseAddress!) }
     let cols = v.withUnsafeBufferPointer { LodChunkColumns(voxels: $0) }
     if lodLiveCheck, let dir = w.regionDir { liveCheck(dir: dir, cx: Int(cx), cz: Int(cz), live: v) }
     w.live.put(cx: Int(cx), cz: Int(cz), cols)
@@ -243,17 +232,9 @@ private func liveCheck(dir: URL, cx: Int, cz: Int, live: [UInt8]) {
     var file = [UInt8](repeating: 0, count: n * n * lodColumnHeight)
     var tint = [UInt8](repeating: 0, count: 16)
     if chunk.surfaceBiomes.count == 16 { for i in 0..<16 { tint[i] = lodTintIndex(chunk.surfaceBiomes[i]) } }
-    for (sy, blocks) in chunk.sections.sorted(by: { $0.sy < $1.sy }) {
-        for by in 0..<16 {
-            let vy = (sy * 16 + by) >> 1
-            for bz in 0..<16 {
-                for bx in 0..<16 {
-                    let m = blocks[(by << 8) | (bz << 4) | bx]
-                    if m != 0 { file[(vy * n + (bz >> 1)) * n + (bx >> 1)] = lodTinted(m, tint[(bz >> 2) * 4 + (bx >> 2)]) }
-                }
-            }
-        }
-    }
+    var blocks = [UInt8](repeating: 0, count: 16 * 16 * lodWorldHeight)
+    for (sy, b) in chunk.sections where sy >= 0 && sy < lodWorldHeight / 16 { for k in 0..<4096 { blocks[sy * 4096 + k] = b[k] } }
+    blocks.withUnsafeBufferPointer { bp in tint.withUnsafeBufferPointer { tp in file.withUnsafeMutableBufferPointer { lodReduceChunk(bp.baseAddress!, tp.baseAddress!, into: $0.baseAddress!) } } }
     var bad = 0
     for i in 0..<file.count where file[i] != live[i] {
         if bad < 3 && liveCheckStats.badChunks < 5 {

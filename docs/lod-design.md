@@ -9,21 +9,23 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
 - **Levels.** A level-L voxel covers 2^L × 2^L × 2^L blocks, for L ≥ 1. Level 0 (full-resolution blocks) is left to vanilla.
 - **Nodes.** A node is a 256 × 256-voxel column spanning the full world height (y −64 to 320). A level-1 node is exactly one region file (512 × 512 blocks). A level-(L+1) node merges 2 × 2 level-L nodes at half resolution.
 - **Voxels.** Each voxel is one byte, a material id from `MetalMCCore.Mat`, the same flat-color material table the standalone engine uses.
-- **Downsampling keeps the top layer.** In each 2 × 2 × 2 group, the highest non-air child wins, so grass, sand and snow survive at a distance and thin features such as trees stay as blobs.
+- **Downsampling keeps the top layer.** A 2 × 2 × 2 group is solid if any child is. Its material is the one most of its 4 columns show from above, so grass, sand and snow survive at a distance and thin features such as trees stay as blobs. `METALMC_EXP=ds_last` (the original rule: the last solid child in memory order) and `ds_half` (solid only if at least 4 of 8 are) are kept for comparisons.
 - **Deep air is filled.** Before meshing, air and water more than 4 voxels below the lowest open ground within 8 voxels is filled with stone. "Open ground" is the height from which a column is open to the sky, and the lowest one in the neighborhood is taken. This removes cave networks under hills even when they connect to a surface entrance somewhere. They were 49% of all quads, measured on six level-1 regions of the 8 km world (`mmc_debug_lod_mesh_stats`). Entrances stay open to that depth, and arches and overhangs stay open because the ground beside them is open. `METALMC_EXP=nodeepfill` turns it off for comparisons.
 - **Unreachable air is filled.** Then air and water that can't be reached from the sky or the node's sides is filled with stone as well (sealed caves).
 
 ## Mesh
 
-- **8-byte quads.** `word0 = x | z<<8 | y<<16 | face<<24` (voxel coordinates within the node), `word1 = material | (w−1)<<8 | (h−1)<<16`. That's 8 bytes per quad, against vanilla's 4 × 28 bytes.
-- **Greedy merging.** Merges are capped at 16 voxels per side at level 1, so quads can be dropped individually near vanilla's edge, and at 64 voxels above that.
-- **Water.** LOD water is opaque: only water faces toward air are emitted, and nothing under the water is.
+- **8-byte quads.** `word0 = x | z<<8 | y<<16 | face<<25 | waterDepth<<28` (voxel coordinates within the node, y 9 bits), `word1 = material | (w−1)<<8 | (h−1)<<16 | ao<<24`. That's 8 bytes per quad, against vanilla's 4 × 28 bytes.
+- **Greedy merging.** Merges are capped at 16 voxels per side at level 1 and at 64 voxels above that. Only faces with the same material, ambient occlusion and water depth merge.
+- **Ambient occlusion.** Each face corner counts the voxels beside it and diagonal to it in the layer in front of the face, like vanilla's smooth lighting (2 bits per corner). The shader uses vanilla's brightness steps at 60% strength, because an LOD corner gradient spans 2 or more blocks where vanilla's spans one. Full strength left the LOD 3.5 levels too dark on the fidelity score, and none left it 3.5 too bright. It adds about 56% level-1 quads, since faces with different corner patterns don't merge.
+- **Per-face colors.** Each material has top, side and bottom colors (grass: tinted top, dirt sides with the tinted fringe, dirt bottom).
+- **Water is translucent**, like vanilla's. Solid voxels emit faces toward water as well as air, so lake and sea floors are meshed, and water emits faces only toward air. It draws after the opaque quads with vanilla's blending, at the water texture's mean alpha (0.706), with no depth writes (so the occlusion test sees the floor). A face under water stores how many blocks of water are above it (1–15) and is darkened like vanilla's skylight, which loses one level per block of water: the shader uses vanilla's lightmap curve for sky light 15 − depth. Water tops are lowered to vanilla's surface height, 1/9 block below the top of the highest water block. Coarser voxels end on the grid, so at sea level that's 1 1/9 blocks below the voxel top. Floors add about 39% level-1 quads (28% of all quads end up under water, mostly less than 8 blocks deep). `METALMC_EXP=opaquewater` meshes water the old way.
 - **Skirts.** The node's sides count as air, so every node emits walls along its edges. These hide cracks where neighboring nodes are at different levels.
 
 ## Rendering
 
 - **Where it draws.** In Minecraft's main world pass, right after solid terrain (`LevelRendererLodMixin`), encoded natively into the same `MTLRenderCommandEncoder`. It uses the game's projection and reverse-Z depth, so it depth-tests against vanilla. Afterwards Minecraft's pipeline state is re-applied.
-- **Tiles.** Each node is meshed as 4 × 4 tiles of 64 voxels, and greedy merges don't cross tile edges along x and z. The quads are stored tile-major, then by face direction, with each tile's vertical range. The draw culls per tile: view frustum, "entirely inside vanilla's range", and face directions that can't face the camera. Adjacent visible face ranges merge into one draw.
+- **Tiles.** Each node is meshed as 4 × 4 tiles of 64 voxels, and greedy merges don't cross tile edges along x and z. The quads are stored tile-major, then opaque before water, then by face direction, with each tile's vertical range. The draw culls per tile by view frustum and by face directions that can't face the camera. Adjacent visible face ranges merge into one draw.
 - **Selection.** A quadtree per frame on the CPU: a node splits into its four children when the camera is within 2 × the child size. Missing children are drawn with the parent's quarter tiles. Every node without a parent is a root, not just the top level. Levels are built bottom-up, and the top ones come last (18–25 s for 8 km in-game), so finer levels draw first. Before this, nothing drew until the top level existed. The benchmark now waits for the first full build (`first build done`) before timing.
 - **Occlusion culling.** Right after the LOD draws, every candidate tile's bounding box is rasterized in the same render pass. The boxes are grown by one voxel, and only their faces toward the camera are drawn, with depth testing on and no depth or color writes. At that point the depth buffer holds vanilla's solid terrain and the LOD. The fragment function has `[[early_fragment_tests]]` and marks the tile visible in a shared buffer. When the command buffer completes, the CPU reads the marks. Tiles whose box was fully hidden in the newest completed test are skipped. Every candidate tile is tested again each frame, so a tile that comes into view reappears 2–3 frames later.
   - Tiles whose box contains the camera are never tested, so they are always drawn.
@@ -31,7 +33,7 @@ Voxy (All Rights Reserved) and its public discussion were studied for techniques
   - There's no render pass break and no depth readback, which matters on a tile-based GPU.
   - Translucent terrain, entities and clouds are drawn later in the pass, so they never act as occluders.
   - `METALMC_EXP=noocc` turns it off, and `occnocull` runs the test without skipping anything.
-- **Seam.** Quads whose center lies within `(renderDistance − 1) × 16` blocks horizontally are collapsed in the vertex shader. There's no fragment `discard`, which would turn off Apple GPUs' hidden-surface removal for the whole pipeline.
+- **Seam, exact per chunk section.** Each frame the mod records the chunk sections vanilla draws, and the LOD gets them as a bitmap (69 × 69 sections around the camera by 24 high). Tiles overlapping vanilla's area use a fragment variant that drops LOD pixels whose voxel lies in one of those sections. Vanilla picks sections by distance in 3D, so this is exact at any camera height. It leaves no gap and never draws LOD over vanilla terrain. Only seam tiles pay for the `discard`, which turns off Apple GPUs' hidden-surface removal. The earlier seam dropped quads by horizontal distance in the vertex shader. That left a ring between vanilla's round area and the LOD's cut, which showed as holes from above.
 - **Far plane and fog.** The camera's far plane is pushed to 1.5 × the LOD distance; reverse-Z float depth keeps precision. Vanilla's render-distance fog moves from the chunk edge to the LOD edge. The LOD shader reproduces vanilla's fog formula, so it blends into the same sky.
 - **Environmental haze.** The overworld's clear-weather haze (`FOG_END_DISTANCE`) defaults to a linear 0 → 1,024 blocks, which fully hides anything past 1 km; vanilla never draws that far, so it never shows. With LOD active, that default haze is stretched to the LOD distance. Shorter fogs (rain, water, lava, blindness, the Nether's 96 blocks) are unchanged.
 
@@ -70,6 +72,35 @@ Per-frame counters from `-PbenchTrace=1` runs: `per_frame_lod_draws`, `per_frame
 - **The GPU cost is quads.** At 8 km, the LOD submitted 896 K quads per frame and added 0.95 ms of vertex time and 0.55 ms of fragment time to the main pass (1.05 → 2.55 ms). On a tile-based GPU, vertex shading and tiling scale with primitive count, and fragment cost includes per-tile primitive processing. Cutting the quads drawn is what pays.
 - **Deep-cave filling** took the 8 km LOD from 896 K to 567 K quads per frame and 267 to 320 fps. It also cut total quads from 11.8 M to 7.7 M and GPU memory from 95 to 62 MB. The screenshots are pixel-identical apart from moving animals.
 - **Occlusion culling** matters most at ground level, where hills hide most far terrain. On an 8 km LOD at ground level it cut quads per frame from 579 K to 170 K and draws from 430 to 79. That took the LOD from 337 to 362 fps, against 382 with no LOD at all. From 150 blocks up, only about a quarter of the LOD is hidden. The test costs about as much as it saves there (318–325 fps with it, 320 without). Drawing every box face instead of only camera-facing ones doubled the test's cost and made that view 4% slower.
+
+## Fidelity score
+
+`tools/fidscore.swift` measures how close the LOD comes to real terrain. The fidelity tour (`-PbenchTour=fidelity -Pfidelity=1`: fog off, no clouds, HUD or mobs, noon, clear weather) takes 10 screenshots on the 4 km world. There are 4 at ground level, 4 at y 150 looking down 20°, and 2 at y 260. It runs three times:
+
+- **A:** vanilla at render distance 32, the reference (real terrain out to 512 blocks).
+- **B:** vanilla at render distance 12, to find the band the LOD has to fill.
+- **C:** render distance 12 plus LOD.
+
+The band is the set of pixels where A and B differ by more than 24 (terrain from about 192 to 512 blocks). Inside it the tool reports:
+
+- **error:** mean color error of C against A after a 4× box downsample.
+- **err16x:** the same at 16×, which measures overall color and shading and ignores exact edge positions.
+- **holes:** the share of band pixels where C still shows what B shows, meaning no terrain.
+- **big:** the share with errors over 48.
+- **bias:** the mean signed RGB error.
+
+`FIDSCORE_HEATMAP=<dir>` writes per-view maps: yellow for holes, red where the LOD is brighter, blue where it's darker.
+
+| Run | Change | error | err16x | holes | bias RGB |
+|---|---|---|---|---|---|
+| C0 | baseline (average colors, flat shading) | 14.10 | 9.87 | 0.53% | −4.2 +6.3 +2.0 |
+| C1 | per-face colors, snow layers | 14.25 | 10.40 | | too bright |
+| C3 | ambient occlusion at 60% | 13.47 | 8.82 | 0.55% | −1.0 −0.3 +1.5 |
+| C5 | downsampling by top majority | 13.24 | 8.80 | 0.58% | +1.3 +1.1 +4.6 |
+| C6 | exact seam | 13.54 | 8.71 | 1.01% | −0.8 −0.0 +1.7 |
+| C7 | translucent water, floors under it | **12.15** | **7.39** | **0.30%** | +0.3 −1.0 −3.3 |
+
+The exact seam fixed the ring of holes from above (high views: 1.47 → 0.54% and 1.10 → 0.33%), but it exposed water. Opaque LOD water had nothing under it and sat about a block above vanilla's surface. At the edge of vanilla's area, rays through vanilla's water came out under the LOD water and found only sky. Translucent water with meshed floors fixed that and matches the reference's visible lake floors: error −10% and holes −70%.
 
 ## Known gaps
 - **Edges of explored areas at node borders.** Inside a node, side faces toward a column with no data (an unexplored or ungenerated chunk) are kept only within 8 voxels of the top of the terrain. That leaves a short skirt instead of the terrain's cross-section down to the world bottom. The deep-cave fill ignores such columns, so caves next to them are filled too. On the multiplayer test strip this removed 24% of quads (442,407 → 337,911). Node borders keep full-depth skirts, since they hide cracks between LOD levels where a cliff meets the border. Where explored terrain ends exactly at a node border, the cross-section still shows.

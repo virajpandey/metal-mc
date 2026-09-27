@@ -126,6 +126,18 @@ public final class MetalLod {
         return true;
     }
 
+    /** The chunk sections vanilla drew this frame (SectionPos.asLong keys), for the LOD's seam. */
+    public static void setVanilla(long[] keys, int count) {
+        if (!available()) return;
+        long addr = MemoryUtil.nmemAlloc(8L * Math.max(1, count));
+        try {
+            for (int i = 0; i < count; i++) MemoryUtil.memPutLong(addr + 8L * i, keys[i]);
+            Mtl.lodSetVanilla(addr, count);
+        } finally {
+            MemoryUtil.nmemFree(addr);
+        }
+    }
+
     /** Stops streaming and releases the LOD (the player left the world). */
     public static void close() {
         if (available()) Mtl.lodClose();
