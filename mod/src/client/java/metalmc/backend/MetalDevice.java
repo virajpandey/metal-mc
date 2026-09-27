@@ -87,7 +87,9 @@ public final class MetalDevice implements GpuDeviceBackend {
 
     @Override
     public GpuTexture createTexture(@Nullable String label, @GpuTexture.Usage int usage, GpuFormat format, int width, int height, int depthOrLayers, int mipLevels) {
+        net.minecraft.util.profiling.Profiler.get().push("mtl.createTexture");
         MetalTexture t = new MetalTexture(this, usage, label != null ? label : "", format, width, height, depthOrLayers, mipLevels);
+        net.minecraft.util.profiling.Profiler.get().pop();
         if (debug && label != null) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 Mtl.textureLabel(t.handle, MemoryUtil.memAddress(stack.UTF8(label)));
@@ -103,7 +105,9 @@ public final class MetalDevice implements GpuDeviceBackend {
 
     @Override
     public GpuBuffer createBuffer(@Nullable Supplier<String> label, @GpuBuffer.Usage int usage, long size) {
+        net.minecraft.util.profiling.Profiler.get().push("mtl.createBuffer");
         MetalBuffer b = MetalBuffer.create(this, usage, size);
+        net.minecraft.util.profiling.Profiler.get().pop();
         if (debug && label != null) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 Mtl.bufferLabel(b.handle, MemoryUtil.memAddress(stack.UTF8(label.get())));

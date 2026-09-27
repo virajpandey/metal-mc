@@ -45,7 +45,9 @@ final class MetalTransientMemory implements TransientMemory {
     }
 
     private Block allocateBlock(long size) {
+        net.minecraft.util.profiling.Profiler.get().push("mtl.newStagingBuffer");
         long handle = Mtl.bufferCreate(size);
+        net.minecraft.util.profiling.Profiler.get().pop();
         if (handle == 0) throw new IllegalStateException("Metal transient block allocation failed (" + size + " bytes)");
         return new Block(handle, Mtl.bufferContents(handle), size);
     }

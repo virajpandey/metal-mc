@@ -171,8 +171,10 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
     public void writeToBuffer(GpuBufferSlice destination, ByteBuffer data) {
         int size = data.remaining();
         if (size == 0) return;
+        net.minecraft.util.profiling.Profiler.get().push("mtl.writeToBuffer");
         GpuBufferSlice staging = transientMemory.uploadStaging(data, 4L, GpuBuffer.USAGE_COPY_SRC);
         Mtl.copyBuffer(((MetalBuffer) staging.buffer()).handle, staging.offset(), ((MetalBuffer) destination.buffer()).handle, destination.offset(), size);
+        net.minecraft.util.profiling.Profiler.get().pop();
     }
 
     @Override
@@ -182,10 +184,12 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void writeToTexture(GpuTexture destination, ByteBuffer source, int mipLevel, int depthOrLayer, int destX, int destY, int width, int height) {
+        net.minecraft.util.profiling.Profiler.get().push("mtl.writeToTexture");
         GpuBufferSlice staging = transientMemory.uploadStaging(source, 16L, GpuBuffer.USAGE_COPY_SRC);
         int bpp = destination.getFormat().blockSize();
         Mtl.copyBufferToTexture(((MetalBuffer) staging.buffer()).handle, staging.offset(), width * bpp, ((MetalTexture) destination).handle,
             mipLevel, depthOrLayer, destX, destY, width, height);
+        net.minecraft.util.profiling.Profiler.get().pop();
     }
 
     @Override

@@ -89,6 +89,19 @@ final class MetalRenderPipeline implements BackendRenderPipeline {
     }
 
     static BackendRenderPipeline.Pending compile(MetalDevice device, BackendRenderPipeline.CreateInfo info) {
+        // Compiling on the render thread is a hitch; log the slow ones (and they show in the bench's slow-frame log).
+        long t0 = System.nanoTime();
+        net.minecraft.util.profiling.Profiler.get().push("mtl.compilePipeline");
+        try {
+            return compileNow(device, info);
+        } finally {
+            net.minecraft.util.profiling.Profiler.get().pop();
+            long ms = (System.nanoTime() - t0) / 1_000_000L;
+            if (ms >= 1) LOGGER.info("Metal pipeline {} compiled in {} ms", info.name(), ms);
+        }
+    }
+
+    private static BackendRenderPipeline.Pending compileNow(MetalDevice device, BackendRenderPipeline.CreateInfo info) {
         if (info.uniforms().size() > PUSH_CONSTANTS_INDEX || info.uniforms().size() > 16) {
             LOGGER.error("Pipeline {} has {} uniforms; the Metal backend supports 16", info.name(), info.uniforms().size());
             return BackendRenderPipeline.Pending.NULL;

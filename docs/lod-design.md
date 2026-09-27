@@ -68,7 +68,7 @@ Without it, the LOD ends where the world's generated chunks end, at the edge of 
 - **Undersides.** Air under an island gets sky light only from the side: vanilla's falls off one level per block from the nearest open column. That's why its island undersides are the End's grey-green ambient color, with a pink rim.
   - The mesher reproduces this ("sky cover"). A breadth-first walk from open air through covered air, stopping where the light runs out, gives each covered voxel its light: 15 minus the distance, measured to the voxel's middle at coarse levels.
   - Faces toward covered air carry 15 minus that light in the 4 bits that water depth uses on faces toward water. The shader's existing lightmap lookup then gives vanilla's color.
-  - It's on in the End; `METALMC_EXP=skycover` turns it on in the overworld.
+  - Overworld too: forest floors, the undersides of canopies and overhangs darken as in vanilla. The near-band error against vanilla went 4.79 → 4.65. Light is rounded to steps of 3 so neighboring faces still merge: +5% quads, where exact values cost +12% for 4.59. `METALMC_EXP=noskycover` turns it off outside the End, and `coverexact` uses unrounded values.
 - **Test.** `-PbenchTour=end` goes to the End, kills the dragon, and takes the main island in four directions, a high view, and the outer islands 1.5 km out from 110 and 300 blocks up.
 - **The dragon.** While the dragon fight's boss bar is up, vanilla fogs the End to 96 blocks, which hides the LOD. After the fight, the islands reach the horizon.
 

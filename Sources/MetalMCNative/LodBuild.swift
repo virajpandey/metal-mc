@@ -37,8 +37,10 @@ let lodSlowMesh = experiments.contains("slowmesh")
 /// METALMC_EXP=noao turns ambient occlusion off; vertexao stores it per quad corner instead of per pixel, as
 /// before (faces with different corner patterns can't merge, which cost about 54% more quads).
 let lodNoAO = experiments.contains("noao")
-/// Sky light under cover in the overworld too (METALMC_EXP=skycover); the End always has it (LodWorld).
-let lodSkyCover = experiments.contains("skycover")
+/// Sky light under cover (LodBuild.mesh): on everywhere; METALMC_EXP=noskycover turns it off outside the End.
+let lodSkyCover = !experiments.contains("noskycover")
+/// 15 - light, rounded to the nearest multiple of 3 (METALMC_EXP=coverexact: unrounded).
+let lodCoverSteps: [UInt8] = (0...15).map { d in experiments.contains("coverexact") ? UInt8(d) : UInt8(min(15, (d + 1) / 3 * 3)) }
 let lodVertexAO = experiments.contains("vertexao")
 /// No ambient occlusion data for a quad (its whole rim is unoccluded).
 let lodNoAOData = UInt32.max
@@ -490,11 +492,12 @@ enum LodBuild {
                     d += 1
                 }
             }
-            /// 15 - sky light of the air in front of a face at (x, y, z): 0 in open air (and outside the node).
+            /// 15 - sky light of the air in front of a face at (x, y, z): 0 in open air (and outside the node). In steps
+            /// of 3 (15, 12, ... 0 light), so faces a level apart still merge: each distinct level splits quads.
             @inline(__always) func coverDepth(_ x: Int, _ y: Int, _ z: Int) -> UInt32 {
                 if !skyCover || x < 0 || z < 0 || x >= n || z >= n || y < 0 || y >= h || y > top[z * n + x] { return 0 }
                 let c = cover[(y * n + z) * n + x]
-                return c == 255 ? 15 : UInt32(c)
+                return c == 255 ? 15 : UInt32(lodCoverSteps[Int(c)])
             }
             var bandLo = [Int](repeating: 0, count: max(n, h)), bandHi = [Int](repeating: -1, count: max(n, h))
             let edgeSkirt = 8

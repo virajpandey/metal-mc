@@ -3,7 +3,8 @@
 	"package": "metalmc.bench.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
-		"FrameHookMixin"
+		"FrameHookMixin",
+		"ProfilerHookMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

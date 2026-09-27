@@ -508,7 +508,7 @@ final class LodWorld: @unchecked Sendable {
         g.fillUnreachable(deepRadius: floating ? -1 : deepRadius, deepDepth: deepDepth)
     }
 
-    /// Greedy mesh of a node grid, with sky light under cover in floating dimensions (METALMC_EXP=skycover: everywhere).
+    /// Greedy mesh of a node grid, with sky light under cover (always in floating dimensions: their undersides need it).
     func meshNode(_ g: LodGrid) -> LodMesh {
         LodBuild.mesh(g, maxMerge: 64, skyCover: floating || lodSkyCover)
     }
