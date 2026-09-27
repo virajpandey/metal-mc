@@ -43,12 +43,22 @@ let lodNoAOData = UInt32.max
 /// METALMC_EXP=nodeepfill turns off deep-cave filling (for A/B comparisons).
 let lodDeepFill = !(ProcessInfo.processInfo.environment["METALMC_EXP"] ?? "").contains("nodeepfill")
 
-/// How a 2 x 2 x 2 group of blocks (or voxels) becomes one voxel. METALMC_EXP picks: ds_last (the original:
-/// any solid block makes the voxel solid, and the last one in memory order sets its material), ds_top (any
-/// solid; material = majority of what's visible from above in the group's 4 columns) or ds_half (solid only
-/// if at least 4 of the 8 are, which keeps volume unbiased; same material rule).
-enum LodDownsampleRule { case last, top, half }
-let lodDownsampleRule: LodDownsampleRule = experiments.contains("ds_last") ? .last : (experiments.contains("ds_half") ? .half : .top)
+/// How a 2 x 2 x 2 group of blocks (or voxels) becomes one voxel. The default, hybrid, is solid if at least 4
+/// of the 8 are (terrain rounds to the nearer voxel instead of up) or if any of them is a tree (logs, leaves),
+/// with the material most of the group's 4 columns show from above. Against a full-resolution reference past
+/// 768 blocks it scored far error 5.13, err16x 2.99, holes 0.19%, versus 5.33 / 3.49 / 0.16% for ds_top (any
+/// solid) and 4.92 / 3.22 / 0.34% for ds_half (no tree exception: small trees vanish). METALMC_EXP: ds_last
+/// (the original: any solid, last child's material), ds_top, ds_half.
+enum LodDownsampleRule { case last, top, half, hybrid }
+let lodDownsampleRule: LodDownsampleRule = experiments.contains("ds_last") ? .last
+    : (experiments.contains("ds_half") ? .half : (experiments.contains("ds_top") ? .top : .hybrid))
+/// Tree materials (logs and every leaf tint), which ds_hybrid keeps even when they fill less than half a group.
+let lodTreeMaterial: [Bool] = {
+    var t = [Bool](repeating: false, count: 256)
+    for m in [Mat.log, Mat.leaves, Mat.cherryLeaves, Mat.cherryWood] { t[Int(m.rawValue)] = true }
+    for i in 0..<32 { t[Int(lodLeavesBase) + i] = true }
+    return t
+}()
 
 /// Reduces a group indexed dy << 2 | dz << 1 | dx.
 @inline(__always) func lodReduce(_ c: SIMD8<UInt8>) -> UInt8 {
@@ -60,6 +70,13 @@ let lodDownsampleRule: LodDownsampleRule = experiments.contains("ds_last") ? .la
     var solid = 0
     for i in 0..<8 where c[i] != 0 { solid += 1 }
     if solid == 0 || (lodDownsampleRule == .half && solid < 4) { return 0 }
+    if lodDownsampleRule == .hybrid && solid < 4 {
+        // Terrain rounds to the nearer voxel (half the group or more is solid), but trees stay: a single
+        // trunk or small canopy is less than half of any group.
+        var tree = false
+        for i in 0..<8 where lodTreeMaterial[Int(c[i])] { tree = true }
+        if !tree { return 0 }
+    }
     // What each of the 4 columns shows from above; the most common one wins (ties: the later column).
     var tops = SIMD4<UInt8>(0, 0, 0, 0)
     for i in 0..<4 { tops[i] = c[4 + i] != 0 ? c[4 + i] : c[i] }
