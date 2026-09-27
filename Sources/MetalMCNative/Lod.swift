@@ -35,7 +35,8 @@ struct VOut {
     float3 color;
     float3 rel;
     float2 quv;              // position within the quad in voxels, along its (u, v) axes
-    uint matFace [[flat]];   // base material | face << 8 | (w - 1) << 11 | (h - 1) << 17
+    float3 color2;           // full-resolution grass sides: the biome-tinted grass color, shaded like `color`
+    uint matFace [[flat]];   // base material | face << 8 | (w - 1) << 11 | (h - 1) << 17 | grass side << 23 | level 0 << 24
     uint ao [[flat]];        // first rim ambient-occlusion value of the quad, or 0xFFFFFFFF for none
 };
 
@@ -66,6 +67,8 @@ static float3 extentScale(uint face, float w, float h) {
 // because an LOD voxel's corner gradient spans 2+ blocks where vanilla's spans one (measured with the
 // fidelity score: full strength left the LOD 3.5 levels too dark, none 3.5 too bright).
 constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
+// At full resolution a voxel is a block, so vanilla's steps apply as they are.
+constant float kAO0[4] = { 1.0, 0.8, 0.6, 0.4 };
 
 // Rim point (a, b) of a w x h quad to its index: counterclockwise in (u, v) from (0, 0), as LodBuild.mesh stores them.
 static uint rimIndex(uint a, uint b, uint w, uint h) {
@@ -74,10 +77,11 @@ static uint rimIndex(uint a, uint b, uint w, uint h) {
     if (b == h) return 2 * w + h - a;
     return 2 * w + 2 * h - b;
 }
-static float rimAO(const device uint* bits, uint base, uint a, uint b, uint w, uint h) {
+static float rimAO(const device uint* bits, uint base, uint a, uint b, uint w, uint h, bool full) {
     if (a != 0 && b != 0 && a != w && b != h) return 1.0;   // inside the quad: nothing in front occludes
     uint i = base + rimIndex(a, b, w, h);
-    return kAO[(bits[i >> 4] >> ((i & 15) * 2)) & 3];
+    uint level = (bits[i >> 4] >> ((i & 15) * 2)) & 3;
+    return full ? kAO0[level] : kAO[level];
 }
 // Ambient occlusion like vanilla's smooth lighting, per pixel: bilinear between the corners of the voxel face
 // under the pixel. Only faces touching the quad's rim can have occluded corners.
@@ -87,8 +91,9 @@ static float lodAO(VOut in, const device uint* bits) {
     uint i = uint(clamp(floor(in.quv.x), 0.0, float(w - 1))), j = uint(clamp(floor(in.quv.y), 0.0, float(h - 1)));
     if (i > 0 && j > 0 && i + 1 < w && j + 1 < h) return 1.0;
     float2 f = clamp(in.quv - float2(i, j), 0.0, 1.0);
-    float a00 = rimAO(bits, in.ao, i, j, w, h), a10 = rimAO(bits, in.ao, i + 1, j, w, h);
-    float a01 = rimAO(bits, in.ao, i, j + 1, w, h), a11 = rimAO(bits, in.ao, i + 1, j + 1, w, h);
+    bool full = (in.matFace >> 24) & 1;
+    float a00 = rimAO(bits, in.ao, i, j, w, h, full), a10 = rimAO(bits, in.ao, i + 1, j, w, h, full);
+    float a01 = rimAO(bits, in.ao, i, j + 1, w, h, full), a11 = rimAO(bits, in.ao, i + 1, j + 1, w, h, full);
     return mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
 }
 // Skylight under d blocks of water (it loses a level per block): vanilla's lightmap brightness for sky light
@@ -124,6 +129,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
         o.color = float3(0.0);
         o.rel = float3(0.0);
         o.quv = float2(0.0);
+        o.color2 = float3(0.0);
         o.matFace = 0;
         o.ao = 0xFFFFFFFFu;
         return o;
@@ -132,15 +138,19 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     clip.y = -clip.y;   // same vertical flip as every translated Minecraft shader (flip_vert_y)
     o.pos = clip;
     uint faceClass = face == 2 ? 0u : (face == 3 ? 2u : 1u);   // top, side, bottom
-    float3 base = colors[m * 3 + faceClass].rgb;
     float ao = kAO[(q.y >> (24 + 2 * corner)) & 3];
-    o.color = base * kShade[face] * ao * kWaterLight[(q.x >> 28) & 15] * mix(0.2, 1.0, u.sky);
+    float k = kShade[face] * ao * kWaterLight[(q.x >> 28) & 15] * mix(0.2, 1.0, u.sky);
+    // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
+    // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
+    bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
+    o.color = (grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k;
+    o.color2 = grassSide ? colors[m * 3].rgb * k : float3(0.0);
     o.rel = rel;
     float3 c = kCorners[face][corner];
     o.quv = (face < 2 ? c.yz : (face < 4 ? c.xz : c.xy)) * float2(w, h);
     // Biome-tinted variants (64 + t grass, 96 + t leaves, 128 + t water) use their base material's texture.
     uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
-    o.matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17);
+    o.matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17) | (grassSide ? 1u << 23 : 0u) | (xs.w < 1.5 ? 1u << 24 : 0u);
     o.ao = aoOffsets[vid >> 2];
     return o;
 }
@@ -155,10 +165,13 @@ static float linearFog(float d, float s, float e) {
 // so colors (and biome tints) stay calibrated while blocks show their texture. The texture repeats once per
 // block; mip selection uses the gradients of the continuous block coordinate, so it doesn't break at tile
 // seams, and far away the smallest mips average back to the flat color. Transparent texels (leaves, ice)
-// darken slightly instead of showing whatever color they store.
+// darken slightly instead of showing whatever color they store (through vanilla's cutout leaves you see
+// shaded leaves further in); water's texels are all translucent and keep the flat color, since water blends.
+// Full-resolution grass sides blend vanilla's tinted fringe (grass_block_side_overlay) over the dirt.
 static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites, const device uint* aoBits,
                        texture2d<float> atlas, sampler atlasSampler) {
-    float3 color = in.color * lodAO(in, aoBits);
+    float ao = lodAO(in, aoBits);
+    float3 color = in.color * ao;
     if (u.camFrac.w > 0.5) {
         uint face = (in.matFace >> 8) & 7, mat = in.matFace & 255;
         float3 wp = in.rel + u.camFrac.xyz;
@@ -169,7 +182,13 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
         float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size, dfdy(bc) * size));
         float luma = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
         float mean = top ? sprites[mat].luma.x : sprites[mat].luma.y;
-        color *= clamp(mix(0.75, luma / max(mean, 0.02), t.a), 0.0, 2.0);
+        color *= clamp(mix(mat == MAT_WATER ? 1.0 : 0.75, luma / max(mean, 0.02), t.a), 0.0, 2.0);
+        if ((in.matFace >> 23) & 1) {
+            float4 orect = sprites[GRASS_SIDE_SPRITE].top;
+            float2 osize = orect.zw - orect.xy;
+            float4 o = atlas.sample(atlasSampler, orect.xy + fract(bc) * osize, gradient2d(dfdx(bc) * osize, dfdy(bc) * osize));
+            color = mix(color, in.color2 * ao * (o.r / GRASS_GRAY), o.a);
+        }
     }
     float horiz = length(in.rel.xz);
     float spherical = length(in.rel);
@@ -332,6 +351,9 @@ final class LodRenderer: @unchecked Sendable {
                     .replacingOccurrences(of: "MAT_WATER", with: "\(Mat.water.rawValue)u")
                     .replacingOccurrences(of: "MAT_LEAVES", with: "\(Mat.leaves.rawValue)u")
                     .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
+                    .replacingOccurrences(of: "MAT_DIRT", with: "\(Mat.dirt.rawValue)u")
+                    .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
+                    .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")
                 library = try ctx.device.makeLibrary(source: src, options: nil)
             }
             let d = MTLRenderPipelineDescriptor()

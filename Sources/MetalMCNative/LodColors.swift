@@ -87,4 +87,5 @@ let lodMaterialSprites: [LodSprite] = [
     LodSprite(top: "mud", side: "mud", topLuma: 0.229, sideLuma: 0.229),   // mud
     LodSprite(top: "amethyst_block", side: "amethyst_block", topLuma: 0.441, sideLuma: 0.441),   // amethyst
     LodSprite(top: "pumpkin_top", side: "pumpkin_side", topLuma: 0.505, sideLuma: 0.492),   // pumpkin
+    LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: 0.606, sideLuma: 0.425),   // grass side (not a material)
 ]

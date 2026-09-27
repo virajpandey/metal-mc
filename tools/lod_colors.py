@@ -130,6 +130,9 @@ for name, top, side in sprites:
         sprite_lines.append(f'    LodSprite(top: "", side: "", topLuma: 1, sideLuma: 1),   // {name}')
     else:
         sprite_lines.append(f'    LodSprite(top: "{top}", side: "{side}", topLuma: {luma(top):.3f}, sideLuma: {luma(side):.3f}),   // {name}')
+# Past the materials: the grass side overlay (top) and base (side), for full-resolution grass sides, which
+# show vanilla's fringe (lodGrassSideSprite).
+sprite_lines.append(f'    LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: {luma("grass_block_side_overlay"):.3f}, sideLuma: {luma("grass_block_side"):.3f}),   // grass side (not a material)')
 
 # Grass block sides are dirt with a biome-tinted grass fringe on top (grass_block_side_overlay). The side
 # color for tint T is (1 - f) * base + f * gray * T, with f the overlay's share of the texture.
