@@ -4,8 +4,8 @@ import org.joml.Matrix4f;
 
 /**
  * Temporal anti-aliasing (config taa): each frame the level's projection is shifted by a sub-pixel jitter (an
- * 8-step Halton 2,3 sequence) and, after the level is drawn, MetalFX blends it with the previous frames
- * (MetalTaa). The LOD draws with the same jittered projection.
+ * 8-step Halton 2,3 sequence) and, after the level is drawn, a resolve pass blends it with the previous frames
+ * (MetalTaa, Taa.swift). The LOD draws with the same jittered projection.
  */
 public final class TemporalAA {
     private TemporalAA() {

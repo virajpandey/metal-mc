@@ -49,6 +49,11 @@ public final class MetalMCConfig {
         # Single-player: past the terrain the world has generated, show terrain sampled from the world's own
         # generator (heights and biomes, on a coarse grid in the background) out to lod.far.
         lod.generate=true
+
+        # Temporal anti-aliasing (Metal backend, experimental): smooths jagged and shimmering edges, most visible
+        # on far terrain, by blending each frame with the ones before it. About 1 ms per frame at the panel's
+        # native resolution.
+        taa=false
         """;
 
     private static final Properties FILE = load();
@@ -125,7 +130,7 @@ public final class MetalMCConfig {
         return flag("lod.generate", true);
     }
 
-    /** Experimental temporal anti-aliasing (MetalFX; -Dmetalmc.taa=true): 9 ms per frame at the panel's resolution. */
+    /** Temporal anti-aliasing (experimental, off by default): Taa.swift's resolve, about 1.1 ms per frame at the panel's resolution. */
     public static boolean taa() {
         return flag("taa", false);
     }

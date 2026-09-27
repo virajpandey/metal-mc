@@ -12,7 +12,7 @@ public final class MetalTaa {
     }
 
     /**
-     * Blends the level just drawn into {@code color} with its history (MetalFX). {@code projection} is this frame's
+     * Blends the level just drawn into {@code color} with its history. {@code projection} is this frame's
      * projection without the jitter, {@code jitterX/Y} the jitter it was drawn with, in pixels.
      */
     public static boolean apply(com.mojang.renderpearl.api.textures.GpuTexture color, com.mojang.renderpearl.api.textures.GpuTexture depth,

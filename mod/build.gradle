@@ -85,8 +85,8 @@ loom {
 			if (project.hasProperty("fade")) {
 				environmentVariable "METALMC_FADE", project.findProperty("fade").toString()
 			}
-			if (project.hasProperty("taaSign")) {
-				environmentVariable "METALMC_TAASIGN", project.findProperty("taaSign").toString()
+			if (project.hasProperty("taaBlend")) {
+				environmentVariable "METALMC_TAABLEND", project.findProperty("taaBlend").toString()
 			}
 			if (project.hasProperty("lodQos")) {
 				environmentVariable "METALMC_LODQOS", project.findProperty("lodQos").toString()
