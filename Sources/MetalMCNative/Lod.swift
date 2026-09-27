@@ -32,10 +32,10 @@ struct LodSpriteGPU { float4 top; float4 side; float4 luma; };
 struct Xform { float4 offsetScale; };
 struct VOut {
     float4 pos [[position]];
-    float3 color;
+    uint color [[flat]];     // shaded material color (RGB8): constant over a quad, since ambient occlusion is per pixel
     float3 rel;
     float2 quv;              // position within the quad in voxels, along its (u, v) axes
-    float3 color2;           // full-resolution grass sides: the biome-tinted grass color, shaded like `color`
+    uint color2 [[flat]];    // full-resolution grass sides: the biome-tinted grass color, shaded like `color` (RGB8)
     uint matFace [[flat]];   // base material | face << 8 | (w - 1) << 11 | (h - 1) << 17 | grass side << 23 | level 0 << 24
     uint ao [[flat]];        // first rim ambient-occlusion value of the quad, or 0xFFFFFFFF for none
 };
@@ -126,10 +126,10 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     VOut o;
     if (length(center.xz) < u.discardRadius) {
         o.pos = float4(0.0, 0.0, 0.0, 1.0);
-        o.color = float3(0.0);
+        o.color = 0;
         o.rel = float3(0.0);
         o.quv = float2(0.0);
-        o.color2 = float3(0.0);
+        o.color2 = 0;
         o.matFace = 0;
         o.ao = 0xFFFFFFFFu;
         return o;
@@ -143,8 +143,11 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
     // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
-    o.color = (grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k;
-    o.color2 = grassSide ? colors[m * 3].rgb * k : float3(0.0);
+    // Varyings cost vertex output bandwidth on this tile-based GPU (a float3 color2 cost 9% of the frame at a
+    // million quads), so the colors are flat and packed. METALMC_EXP=vertexao shades per quad here, not per corner.
+    o.color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
+    // Flat: per-pixel AO is applied in the fragment shader and the rest of k is constant over the quad.
+    o.color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0)) : 0u;
     o.rel = rel;
     float3 c = kCorners[face][corner];
     o.quv = (face < 2 ? c.yz : (face < 4 ? c.xz : c.xy)) * float2(w, h);
@@ -171,7 +174,7 @@ static float linearFog(float d, float s, float e) {
 static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites, const device uint* aoBits,
                        texture2d<float> atlas, sampler atlasSampler) {
     float ao = lodAO(in, aoBits);
-    float3 color = in.color * ao;
+    float3 color = unpack_unorm4x8_to_float(in.color).rgb * ao;
     if (u.camFrac.w > 0.5) {
         uint face = (in.matFace >> 8) & 7, mat = in.matFace & 255;
         float3 wp = in.rel + u.camFrac.xyz;
@@ -187,7 +190,7 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
             float4 orect = sprites[GRASS_SIDE_SPRITE].top;
             float2 osize = orect.zw - orect.xy;
             float4 o = atlas.sample(atlasSampler, orect.xy + fract(bc) * osize, gradient2d(dfdx(bc) * osize, dfdy(bc) * osize));
-            color = mix(color, in.color2 * ao * (o.r / GRASS_GRAY), o.a);
+            color = mix(color, unpack_unorm4x8_to_float(in.color2).rgb * ao * (o.r / GRASS_GRAY), o.a);
         }
     }
     float horiz = length(in.rel.xz);
