@@ -66,6 +66,7 @@ loom {
 			property "metalmc.fidelity", (project.findProperty("fidelity") ?: "0").toString()
 			property "metalmc.farProbe", (project.findProperty("farProbe") ?: "0").toString()
 			property "metalmc.bench.extraWait", (project.findProperty("benchExtraWait") ?: "0").toString()
+			property "metalmc.bench.fly", (project.findProperty("benchFly") ?: "0").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
 			if (project.hasProperty("metalExp")) {

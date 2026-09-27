@@ -30,6 +30,8 @@ let lodFaceCorners: [[(Int, Int, Int)]] = [
 ]
 /// METALMC_EXP=opaquewater meshes water as before translucency (no floors under it; for A/B comparisons).
 let lodOpaqueWater = experiments.contains("opaquewater")
+/// METALMC_EXP=deepfloors keeps floors under deep water at every level (for A/B comparisons).
+let lodKeepDeepFloors = experiments.contains("deepfloors")
 /// METALMC_EXP=noao turns ambient occlusion off; vertexao stores it per quad corner instead of per pixel, as
 /// before (faces with different corner patterns can't merge, which cost about 54% more quads).
 let lodNoAO = experiments.contains("noao")
@@ -353,6 +355,11 @@ enum LodBuild {
         // Blocks of water above a face with `d` water voxels over it. At level 0 that's d; above, the top
         // voxel holds one block of air at sea level (y 62 is the highest water block; voxels end at 64).
         @inline(__always) func waterDepth(_ d: Int) -> Int { grid.level == 0 ? d : d * voxelBlocks - 1 }
+        // From level 2 (a kilometer out) floors under 12+ blocks of water aren't meshed: through vanilla's
+        // translucent water they'd add under 3/255 of color, and they were a sixth of those levels' quads. The
+        // water above them is marked deep (depth 15) and drawn opaque with the floor's share blended in. Levels
+        // 0-1 keep every floor, so rays through vanilla's water at the seam always find one.
+        let deepWater = grid.level >= 2 && !lodOpaqueWater && !lodKeepDeepFloors, deepBlocks = 12
         var tileY = [Int](repeating: 0, count: tiles * 2)
         for t in 0..<tiles { tileY[2 * t] = Int.max; tileY[2 * t + 1] = Int.min }
         var tileYCore = tileY
@@ -416,13 +423,24 @@ enum LodBuild {
                             if m != 0 {
                                 let nk = kinds[Int(at(x + sx, y + sy, z + sz))]
                                 let k = kinds[Int(m)]
-                                if k == waterK { if nk == airK { f = UInt32(m) } }
+                                if k == waterK {
+                                    if nk == airK {
+                                        f = UInt32(m)
+                                        if deepWater && face == 2 {
+                                            // Water voxels from this one down to the floor.
+                                            var d = 0, yy = y
+                                            while yy >= 0 && waterDepth(d) < deepBlocks && kinds[Int(at(x, yy, z))] == waterK { d += 1; yy -= 1 }
+                                            if waterDepth(d) >= deepBlocks { f |= 15 << 16 }
+                                        }
+                                    }
+                                }
                                 else if nk == airK { f = UInt32(m) }
                                 else if nk == waterK && !lodOpaqueWater {
                                     // Water voxels from the one in front of the face up.
                                     var d = 0, yy = y + sy
                                     while yy < h && waterDepth(d) < 15 && kinds[Int(at(x + sx, yy, z + sz))] == waterK { d += 1; yy += 1 }
-                                    f = UInt32(m) | UInt32(min(15, max(1, waterDepth(d)))) << 16
+                                    let depth = min(15, max(1, waterDepth(d)))
+                                    if !(deepWater && depth >= deepBlocks) { f = UInt32(m) | UInt32(depth) << 16 }
                                 }
                                 if f != 0 && axis != 1 {
                                     let nx = x + sx, nz = z + sz

@@ -36,7 +36,7 @@ struct VOut {
     float3 rel;
     float2 quv;              // position within the quad in voxels, along its (u, v) axes
     uint color2 [[flat]];    // full-resolution grass sides: the biome-tinted grass color, shaded like `color` (RGB8)
-    uint matFace [[flat]];   // base material | face << 8 | (w - 1) << 11 | (h - 1) << 17 | grass side << 23 | level 0 << 24
+    uint matFace [[flat]];   // base material | face << 8 | (w - 1) << 11 | (h - 1) << 17 | grass side << 23 | level 0 << 24 | deep water << 25
     uint ao [[flat]];        // first rim ambient-occlusion value of the quad, or 0xFFFFFFFF for none
 };
 
@@ -139,7 +139,10 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     o.pos = clip;
     uint faceClass = face == 2 ? 0u : (face == 3 ? 2u : 1u);   // top, side, bottom
     float ao = kAO[(q.y >> (24 + 2 * corner)) & 3];
-    float k = kShade[face] * ao * kWaterLight[(q.x >> 28) & 15] * mix(0.2, 1.0, u.sky);
+    // An underwater face's depth darkens it; on water, depth 15 marks deep water (drawn opaque, no floor meshed).
+    uint depthField = (q.x >> 28) & 15;
+    bool deep = water && depthField == 15;
+    float k = kShade[face] * ao * (water ? 1.0 : kWaterLight[depthField]) * mix(0.2, 1.0, u.sky);
     // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
     // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
@@ -153,7 +156,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     o.quv = (face < 2 ? c.yz : (face < 4 ? c.xz : c.xy)) * float2(w, h);
     // Biome-tinted variants (64 + t grass, 96 + t leaves, 128 + t water) use their base material's texture.
     uint baseMat = m >= 128 ? MAT_WATER : (m >= 96 ? MAT_LEAVES : (m >= 64 ? MAT_GRASS : m));
-    o.matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17) | (grassSide ? 1u << 23 : 0u) | (xs.w < 1.5 ? 1u << 24 : 0u);
+    o.matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17) | (grassSide ? 1u << 23 : 0u) | (xs.w < 1.5 ? 1u << 24 : 0u) | (deep ? 1u << 25 : 0u);
     o.ao = aoOffsets[vid >> 2];
     return o;
 }
@@ -197,7 +200,14 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
     float spherical = length(in.rel);
     float cylindrical = max(horiz, abs(in.rel.y));
     float fog = max(linearFog(spherical, u.envStart, u.envEnd), linearFog(cylindrical, u.rdStart, u.rdEnd));
-    return float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), u.alpha);
+    // Deep water: opaque, with what the skipped floor would have added through the water (a sand-gravel floor
+    // under 12+ blocks of water, at vanilla's lightmap brightness for sky light 0-3).
+    float alpha = u.alpha;
+    if ((in.matFace >> 25) & 1) {
+        color = color * alpha + float3(0.085, 0.080, 0.068) * mix(0.2, 1.0, u.sky) * (1.0 - alpha);
+        alpha = 1.0;
+    }
+    return float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), alpha);
 }
 
 fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
@@ -278,6 +288,11 @@ struct LodUniforms {
 let lodSeamHalf = 34
 let lodSeamWidth = 2 * lodSeamHalf + 1
 let lodSeamWords = (lodSeamWidth * lodSeamWidth * 24 + 31) / 32
+
+/// METALMC_EXP=tilesel picks levels per tile instead of per node (tile distance < lodTileSplit x half the
+/// node size hands a tile to the finer level). METALMC_TILESPLIT sets the factor.
+let lodTileSelection = experiments.contains("tilesel")
+let lodTileSplit = Double(ProcessInfo.processInfo.environment["METALMC_TILESPLIT"] ?? "") ?? 2.8
 
 /// Mean alpha of vanilla's water texture (water_still), the LOD water's opacity.
 let lodWaterAlpha: Float = 0.706
@@ -491,6 +506,36 @@ final class LodRenderer: @unchecked Sendable {
         }
         // A missing node may still have finer descendants (never happens today, but keep the recursion honest).
         func hasDescendant(_ level: Int, _ nx: Int, _ nz: Int) -> Bool { false }
+        if lodTileSelection {
+            // Per tile: a tile of level L hands its area to level L - 1 (the 2 x 2 child tiles covering it) when
+            // it's within the finer level's reach, measured to the tile rather than the node.
+            func visitTiles(_ level: Int, _ nx: Int, _ nz: Int, _ mask: UInt16) {
+                let node = meshes[LodNodeKey(level: level, x: nx, z: nz)]
+                let size = Double(lodNodeVoxels << level), tile = size / Double(lodTilesPerSide)
+                let reach = level > 1 ? max(lodTileSplit * size / 2, level0Radius) : level0Radius
+                var draw: UInt16 = 0
+                var childMask = [UInt16](repeating: 0, count: 4)
+                for t in 0..<16 where mask & (1 << UInt16(t)) != 0 {
+                    let tx = t % 4, tz = t / 4
+                    let x0 = Double(nx) * size + Double(tx) * tile, z0 = Double(nz) * size + Double(tz) * tile
+                    let dx = max(x0 - camX, 0, camX - (x0 + tile)), dz = max(z0 - camZ, 0, camZ - (z0 + tile))
+                    let q = (tz / 2) * 2 + tx / 2
+                    if level >= 1 && (dx * dx + dz * dz).squareRoot() < reach
+                        && meshes[LodNodeKey(level: level - 1, x: 2 * nx + tx / 2, z: 2 * nz + tz / 2)] != nil {
+                        let cx = (tx % 2) * 2, cz = (tz % 2) * 2
+                        for j in 0...1 { for i in 0...1 { childMask[q] |= 1 << UInt16((cz + j) * 4 + cx + i) } }
+                    } else {
+                        draw |= 1 << UInt16(t)
+                    }
+                }
+                if let node, draw != 0 { out.append((node, draw)) }
+                for q in 0..<4 where childMask[q] != 0 { visitTiles(level - 1, 2 * nx + q % 2, 2 * nz + q / 2, childMask[q]) }
+            }
+            for k in meshes.keys where k.level == maxLevel || meshes[LodNodeKey(level: k.level + 1, x: k.x >> 1, z: k.z >> 1)] == nil {
+                visitTiles(k.level, k.x, k.z, 0xFFFF)
+            }
+            return out
+        }
         // Roots: every node whose parent doesn't exist, not just the top level. Levels are built bottom-up,
         // so while the coarse levels are still building (18-25 s for 8 km), the finer ones already draw.
         for k in meshes.keys where k.level == maxLevel || meshes[LodNodeKey(level: k.level + 1, x: k.x >> 1, z: k.z >> 1)] == nil {
@@ -756,9 +801,10 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         }
     }
     if r.frame % 1000 == 0 {
-        var perLevel = [Int](repeating: 0, count: 9)
+        var perLevel = [Int](repeating: 0, count: 9), quadsPerLevel = [Int](repeating: 0, count: 9)
         for c in chosen { perLevel[min(8, c.0.level)] += 1 }
-        log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, chosen per level \(perLevel), \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames; vanilla drew \(r.vanillaSections.count) sections, compiled \(r.compiledSections.count), distance \(r.vanillaDistance), skip checks \(r.skipDebug)")
+        for d in draws { quadsPerLevel[min(8, d.node.level)] += d.count }
+        log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, chosen per level \(perLevel), K quads per level \(quadsPerLevel.map { $0 / 1000 }), \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames; vanilla drew \(r.vanillaSections.count) sections, compiled \(r.compiledSections.count), distance \(r.vanillaDistance), skip checks \(r.skipDebug)")
         r.skipDebug = [0, 0, 0, 0, 0]
         r.coveredTiles = 0
     }

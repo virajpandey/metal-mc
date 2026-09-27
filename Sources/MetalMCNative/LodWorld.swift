@@ -13,8 +13,15 @@ import MetalMCCore
 // region files only, in a ring around the player just past vanilla's render distance.
 
 let lodQuadrantVoxels = lodNodeVoxels / 2
-/// Level-0 nodes are meshed within this many blocks of the player (METALMC_LOD0=<blocks>, 0 for none).
-let lodLevel0Radius = Int(ProcessInfo.processInfo.environment["METALMC_LOD0"] ?? "") ?? 512
+/// Level-0 nodes are meshed within this many blocks of the player (lod.detail, METALMC_LOD0 overrides; 0 for
+/// none). 768 took the far-band fidelity error from 6.9 to 5.3 for 0.6 ms at the mid orbit (native res).
+var lodLevel0Radius = Int(ProcessInfo.processInfo.environment["METALMC_LOD0"] ?? "") ?? 768
+
+/// Sets the level-0 radius before the LOD opens (METALMC_LOD0 still wins, for experiments).
+@_cdecl("mmc_lod_set_detail")
+public func mmc_lod_set_detail(_ radius: Int32) {
+    if ProcessInfo.processInfo.environment["METALMC_LOD0"] == nil { lodLevel0Radius = max(0, Int(radius)) }
+}
 
 /// A region's level-2 quadrant (128 x 128 columns of 96 voxels), run-length encoded per column:
 /// `offsets[c] ..< offsets[c + 1]` indexes (material, count) byte pairs from the bottom up.

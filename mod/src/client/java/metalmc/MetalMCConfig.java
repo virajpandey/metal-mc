@@ -43,6 +43,8 @@ public final class MetalMCConfig {
         lod.multiplayer=true
         # Block texture detail on LOD terrain (about 2% slower than flat colors).
         lod.textures=true
+        # Radius in blocks of full-resolution LOD (one voxel per block) past the render distance; 0 for none.
+        lod.detail=768
         # Single-player: past the terrain the world has generated, show terrain sampled from the world's own
         # generator (heights and biomes, on a coarse grid in the background) out to lod.far.
         lod.generate=true
@@ -108,6 +110,14 @@ public final class MetalMCConfig {
 
     public static boolean lodTextures() {
         return flag("lod.textures", true);
+    }
+
+    public static int lodDetail() {
+        try {
+            return Math.max(0, Integer.parseInt(get("lod.detail", "768")));
+        } catch (NumberFormatException e) {
+            return 768;
+        }
     }
 
     public static boolean lodGenerate() {

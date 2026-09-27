@@ -27,6 +27,9 @@ public final class Bench {
     static final int WARMUP_TICKS = Integer.getInteger("metalmc.bench.warmupTicks", 400);   // 20 s
     static final int RUN_TICKS = Integer.getInteger("metalmc.bench.runTicks", 1200);        // 60 s
     static final int EXTRA_WAIT = Integer.getInteger("metalmc.bench.extraWait", 0);
+    // -PbenchFly=<blocks per second>: fly a straight line along +X through the center (at the bench height,
+    // looking 10 degrees down) instead of orbiting, so chunks and LOD stream in as they would in play.
+    static final double FLY = Double.parseDouble(System.getProperty("metalmc.bench.fly", "0"));
     private static int extraWaitTicks;
     /** Vanilla's GPU timer needs its debug-screen line enabled, which itself costs frame time; opt-in. */
     static final boolean GPU_TIMER = "1".equals(System.getProperty("metalmc.bench.gpuTimer", "0"));
@@ -174,6 +177,14 @@ public final class Bench {
 
     /** Orbit pose at tick t: radius RADIUS around (CENTER_X, CENTER_Z), looking at the center, 25 degrees down. */
     private static void place(LocalPlayer p, int t) {
+        if (FLY > 0) {
+            double length = FLY * RUN_TICKS / 20.0;
+            p.getAbilities().mayfly = true;
+            p.getAbilities().flying = true;
+            p.snapTo(CENTER_X - length / 2 + FLY * t / 20.0, Double.isNaN(HEIGHT) ? 150 : HEIGHT, CENTER_Z, -90f, 10f);
+            p.setDeltaMovement(0, 0, 0);
+            return;
+        }
         double a = 2 * Math.PI * t / RUN_TICKS;
         double x = CENTER_X + RADIUS * Math.cos(a);
         double z = CENTER_Z + RADIUS * Math.sin(a);
@@ -209,6 +220,12 @@ public final class Bench {
         double maxMs = sorted.length == 0 ? 0 : sorted[sorted.length - 1] / 1e6;
         int stutters = 0;
         for (long v : f) if (v / 1e6 > 2 * p50) stutters++;
+        // Frames that miss a 120 Hz (and a 60 Hz) refresh: what a display-locked player actually sees as hitches.
+        int over8 = 0, over16 = 0;
+        for (long v : f) {
+            if (v > 8_333_333L) over8++;
+            if (v > 16_666_667L) over16++;
+        }
         double seconds = sumMs / 1000;
         // GPU time estimate per frame = utilization% x frame time (utilization is relative to CPU frame duration).
         double[] gpuMs = new double[f.length];
@@ -248,11 +265,11 @@ public final class Bench {
         }
         String summary = String.format(Locale.ROOT,
             "METALMC_BENCH label=%s backend=%s gpu=\"%s\" driver=\"%s\" frames=%d seconds=%.1f fps_mean=%.1f "
-                + "ms_mean=%.3f ms_p50=%.3f ms_p95=%.3f ms_p99=%.3f ms_max=%.3f stutters_gt2x_median=%d "
+                + "ms_mean=%.3f ms_p50=%.3f ms_p95=%.3f ms_p99=%.3f ms_max=%.3f stutters_gt2x_median=%d frames_over_8ms=%d frames_over_16ms=%d "
                 + "gpu_timer=%s gpu_util_mean=%.1f gpu_ms_est_mean=%.3f gpu_ms_est_p95=%.3f render_distance=%d "
                 + "fullscreen=%s window=%dx%d %s facing_culling=%s lod=%s lod_far=%d",
             LABEL, info.backendName(), info.name(), info.driverInfo(), f.length, seconds,
-            seconds > 0 ? f.length / seconds : 0, meanMs, p50, p95, p99, maxMs, stutters,
+            seconds > 0 ? f.length / seconds : 0, meanMs, p50, p95, p99, maxMs, stutters, over8, over16,
             GPU_TIMER, utilMean, gpuMean, gpuP95, mc.options.renderDistance().get(),
             mc.options.fullscreen().get(), mc.getWindow().getWidth(), mc.getWindow().getHeight(), presentInfo(mc), metalmc.terrain.FacingSorter.ENABLED,
             metalmc.lod.Lod.active(), metalmc.lod.Lod.ENABLED ? metalmc.lod.Lod.FAR : 0) + metalGpu;
