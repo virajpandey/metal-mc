@@ -70,6 +70,15 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     return s
 }
 
+/// Deterministic hash of a block position, in [0, 1).
+@inline(__always) func lodHash(_ x: Int, _ z: Int, _ salt: UInt64 = 0) -> Double {
+    var h = UInt64(bitPattern: Int64(x)) &* 0x9E37_79B9_7F4A_7C15 ^ UInt64(bitPattern: Int64(z)) &* 0xC2B2_AE3D_27D4_EB4F ^ salt
+    h ^= h >> 29
+    h &*= 0xBF58_476D_1CE4_E5B9
+    h ^= h >> 32
+    return Double(h >> 11) / Double(UInt64(1) << 53)
+}
+
 final class LodFarStore: @unchecked Sendable {
     let lock = NSLock()
     var surfaces: [UInt16: LodFarSurface] = [:]
@@ -159,7 +168,7 @@ final class LodFarStore: @unchecked Sendable {
     /// the surface's under material, the surface block, and water up to sea level or tree canopy above it.
     /// `height` is the first block above the ground; `steep` puts stone on the surface in mountain biomes.
     static func writeColumn(_ v: UnsafeMutableBufferPointer<UInt8>, col: Int, n: Int, h: Int, L: Int,
-                            height: Int, s: LodFarSurface, steep: Bool) {
+                            height: Int, s: LodFarSurface, steep: Bool, bx: Int, bz: Int) {
         let top = height - 1                                  // the ground's top block
         let surfaceMat = s.mountain && steep ? Mat.stone.rawValue : s.top
         let vyTop = min(h - 1, max(0, (top + 64) >> L))
@@ -176,7 +185,11 @@ final class LodFarStore: @unchecked Sendable {
                 if s.frozen { v[vyWater * n * n + col] = Mat.ice.rawValue }
             }
         } else if s.canopy > 0 {
-            let vyCanopy = min(h - 1, (top + s.canopy + 64) >> L)
+            // Forest canopy isn't a flat sheet: tree height varies by 8-block patch (-2 to +2 blocks), and up close
+            // (voxels under 8 blocks) one 4-block cell in six is a clearing.
+            if L < 3 && lodHash(bx >> 2, bz >> 2, 1) < 1.0 / 6.0 { return }
+            let canopy = s.canopy + Int(lodHash(bx >> 3, bz >> 3, 2) * 5) - 2
+            let vyCanopy = min(h - 1, (top + canopy + 64) >> L)
             if vyCanopy > vyTop { for y in (vyTop + 1)...vyCanopy { v[y * n * n + col] = s.leaves } }
             else { v[vyTop * n * n + col] = s.leaves }
         }
@@ -209,7 +222,8 @@ final class LodFarStore: @unchecked Sendable {
                         slope = max(slope, abs(Int(cols.height[nz * n + nx]) - Int(cols.height[col])))
                     }
                     Self.writeColumn(v, col: col, n: n, h: h, L: L, height: Int(cols.height[col]),
-                                     s: table[cols.biome[col]] ?? Self.defaultSurface, steep: slope * 2 > 3 << L)
+                                     s: table[cols.biome[col]] ?? Self.defaultSurface, steep: slope * 2 > 3 << L,
+                                     bx: key.x * (n << L) + (x << L), bz: key.z * (n << L) + (z << L))
                     filled += 1
                 }
             }
@@ -260,7 +274,8 @@ final class LodFarStore: @unchecked Sendable {
                     let nearest = (tz < 0.5 ? iz : iz + 1) * n + (tx < 0.5 ? ix : ix + 1)
                     let slope = max(abs(h10 - h00), abs(h01 - h00), abs(h11 - h10), abs(h11 - h01)) / s
                     Self.writeColumn(v, col: col, n: n, h: h, L: L, height: height,
-                                     s: table[c.biome[nearest]] ?? Self.defaultSurface, steep: slope > 1.5)
+                                     s: table[c.biome[nearest]] ?? Self.defaultSurface, steep: slope > 1.5,
+                                     bx: x0 + x * voxel, bz: z0 + z * voxel)
                     filled += 1
                 }
             }
