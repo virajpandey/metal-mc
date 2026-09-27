@@ -379,7 +379,10 @@ final class LodWorld: @unchecked Sendable {
 
         phase("level 1")
         // 2b. Level 0 around the player: nodes that came into range, and those of changed regions.
-        if lodLevel0Radius > 0, regionDir != nil { updateLevel0(seen: seen, changed: changedKeys) }
+        if lodLevel0Radius > 0 {
+            live.evictFull(centerX: center.x, centerZ: center.z, radius: lodLevel0Radius + 512)
+            updateLevel0(seen: seen, changed: changedKeys)
+        }
 
         phase("level 0")
         // 3. Parents of changed regions, level by level.
@@ -456,7 +459,6 @@ final class LodWorld: @unchecked Sendable {
     /// Meshes the level-0 nodes within `lodLevel0Radius` that are missing or whose region changed, and drops
     /// the ones more than 256 blocks past it. A few at a time: each needs about 75 MB while it's built.
     private func updateLevel0(seen: Set<Int64>, changed: Set<Int64>) {
-        guard let regionDir else { return }
         lock.lock()
         let have = Set(meshes.keys.filter { $0.level == 0 }.map { LodBuild.key($0.x, $0.z) })
         lock.unlock()
@@ -479,8 +481,14 @@ final class LodWorld: @unchecked Sendable {
                 let outp = out.baseAddress!
                 DispatchQueue.concurrentPerform(iterations: part.count) { j in
                     let (nx, nz) = part[j]
-                    let path = regionDir.appendingPathComponent("r.\(nx >> 1).\(nz >> 1).mca").path
-                    guard var g = LodBuild.regionQuarterGrid(path: path, qx: nx & 1, qz: nz & 1, floating: self.floating) else { return }
+                    // The region file's quarter (single-player), then the live chunks kept at full resolution on top
+                    // (newer; on a server the only source).
+                    let fromFile = self.regionDir.flatMap {
+                        LodBuild.regionQuarterGrid(path: $0.appendingPathComponent("r.\(nx >> 1).\(nz >> 1).mca").path, qx: nx & 1, qz: nz & 1, floating: self.floating)
+                    }
+                    var g = fromFile ?? LodGrid(level: 0)
+                    let live = self.live.overlayFull(nodeX: nx, nodeZ: nz, into: &g, floating: self.floating)
+                    guard fromFile != nil || live > 0 else { return }
                     _ = self.far.fillFromAncestors(&g, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, maxLevel: self.maxLevel)
                     self.fillHidden(&g, deepRadius: 16, deepDepth: 8)
                     let m = self.meshNode(g)

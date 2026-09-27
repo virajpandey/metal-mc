@@ -68,6 +68,10 @@ struct LodChunkColumns {
 final class LodLiveStore: @unchecked Sendable {
     private let lock = NSLock()
     private var regions: [Int64: [Int: LodChunkColumns]] = [:]   // region -> chunk index (z * 32 + x) -> columns
+    /// Full-resolution copies (16 x 16 x 384 tinted materials, LZFSE) of the chunks near the player, for level 0:
+    /// the only source there is on a server, and newer than the region file in single-player. In memory only.
+    private var full: [Int64: [UInt8]] = [:]
+    static let fullBytes = 16 * 16 * lodWorldHeight
     private var dirty = Set<Int64>()
     private var unsaved = Set<Int64>()
     let saveDir: URL?
@@ -83,6 +87,72 @@ final class LodLiveStore: @unchecked Sendable {
         dirty.insert(rk)
         unsaved.insert(rk)
         lock.unlock()
+    }
+
+    /// Keeps a chunk's blocks at full resolution (`blocks`: 16 x 16 x 384 materials, y then z then x, tints applied).
+    func putFull(cx: Int, cz: Int, _ blocks: UnsafeBufferPointer<UInt8>) {
+        var packed = [UInt8](repeating: 0, count: Self.fullBytes / 2 + 4096)
+        var n = compression_encode_buffer(&packed, packed.count, blocks.baseAddress!, blocks.count, nil, COMPRESSION_LZFSE)
+        if n == 0 {   // didn't fit in half (noisy terrain): try the full size
+            packed = [UInt8](repeating: 0, count: Self.fullBytes + 4096)
+            n = compression_encode_buffer(&packed, packed.count, blocks.baseAddress!, blocks.count, nil, COMPRESSION_LZFSE)
+            if n == 0 { return }
+        }
+        lock.lock(); full[LodBuild.key(cx, cz)] = Array(packed[0..<n]); lock.unlock()
+    }
+
+    /// Writes the full-resolution live chunks of level-0 node (nx, nz) over `g`, recording their light sources.
+    /// Returns the number of chunks written.
+    func overlayFull(nodeX nx: Int, nodeZ nz: Int, into g: inout LodGrid, floating: Bool) -> Int {
+        lock.lock()
+        var chunks: [(Int, Int, [UInt8])] = []
+        for lz in 0..<16 {
+            for lx in 0..<16 {
+                let cx = nx * 16 + lx, cz = nz * 16 + lz
+                if let p = full[LodBuild.key(cx, cz)] { chunks.append((lx, lz, p)) }
+            }
+        }
+        lock.unlock()
+        if chunks.isEmpty { return 0 }
+        let n = lodNodeVoxels, h = lodWorldHeight
+        var blocks = [UInt8](repeating: 0, count: Self.fullBytes)
+        var written = 0
+        for (lx, lz, packed) in chunks {
+            let got = packed.withUnsafeBufferPointer { compression_decode_buffer(&blocks, blocks.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
+            guard got == blocks.count else { continue }
+            let x0 = lx * 16, z0 = lz * 16
+            g.v.withUnsafeMutableBufferPointer { dst in
+                for y in 0..<h {
+                    for z in 0..<16 {
+                        let row = (y * n + z0 + z) * n + x0, src = (y * 16 + z) * 16
+                        for x in 0..<16 {
+                            let m = blocks[src + x]
+                            dst[row + x] = m
+                            if lodEmission[Int(m)] != 0 { g.emitters.append(Int32(row + x)) }
+                        }
+                    }
+                }
+                if floating { for z in 0..<16 { for x in 0..<16 { dst[(z0 + z) * n + x0 + x] = lodChunkMarker } } }
+            }
+            written += 1
+        }
+        return written
+    }
+
+    /// Drops full-resolution chunks more than `radius` blocks from (x, z).
+    func evictFull(centerX x: Int, centerZ z: Int, radius: Int) {
+        lock.lock(); defer { lock.unlock() }
+        let r = radius + 8
+        full = full.filter { k, _ in
+            let (cx, cz) = LodBuild.unkey(k)
+            let dx = cx * 16 + 8 - x, dz = cz * 16 + 8 - z
+            return dx * dx + dz * dz <= r * r
+        }
+    }
+
+    var fullCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return full.count
     }
 
     /// Regions that received chunks since the last call.
@@ -215,6 +285,17 @@ public func mmc_lod_ingest2(_ id: Int64, _ cx: Int32, _ cz: Int32, _ blocks: Uns
 
 private func lodIngest(_ w: LodWorld, _ cx: Int32, _ cz: Int32, _ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8>) {
     let n = lodChunkVoxels, h = lodColumnHeight
+    // Full resolution with the biome tints applied, for level 0.
+    var tinted = [UInt8](repeating: 0, count: LodLiveStore.fullBytes)
+    for y in 0..<lodWorldHeight {
+        for z in 0..<16 {
+            for x in 0..<16 {
+                let i = (y * 16 + z) * 16 + x, m = blocks[i]
+                tinted[i] = m == 0 ? 0 : lodTinted(m, tints[(z >> 2) * 4 + (x >> 2)])
+            }
+        }
+    }
+    tinted.withUnsafeBufferPointer { w.live.putFull(cx: Int(cx), cz: Int(cz), $0) }
     var v = [UInt8](repeating: 0, count: n * n * h)
     v.withUnsafeMutableBufferPointer { lodReduceChunk(blocks, tints, into: $0.baseAddress!, rule: w.downsampleRule) }
     if w.floating { for k in 0..<(n * n) { v[k] = lodChunkMarker } }
