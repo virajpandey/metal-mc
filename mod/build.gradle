@@ -71,6 +71,8 @@ loom {
 			property "metalmc.bench.fly", (project.findProperty("benchFly") ?: "0").toString()
 			property "metalmc.bench.hitches", (project.findProperty("benchHitches") ?: "0").toString()
 			if (project.hasProperty("submitsInFlight")) property "metalmc.submitsInFlight", project.findProperty("submitsInFlight").toString()
+			if (project.hasProperty("benchNoLodWait")) property "metalmc.bench.noLodWait", project.findProperty("benchNoLodWait").toString()
+			if (project.hasProperty("taa")) property "metalmc.taa", project.findProperty("taa").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
 			if (project.hasProperty("metalExp")) {
@@ -82,6 +84,12 @@ loom {
 			}
 			if (project.hasProperty("fade")) {
 				environmentVariable "METALMC_FADE", project.findProperty("fade").toString()
+			}
+			if (project.hasProperty("taaSign")) {
+				environmentVariable "METALMC_TAASIGN", project.findProperty("taaSign").toString()
+			}
+			if (project.hasProperty("lodQos")) {
+				environmentVariable "METALMC_LODQOS", project.findProperty("lodQos").toString()
 			}
 			if (project.hasProperty("meshQuads")) {
 				environmentVariable "METALMC_MESHQUADS", project.findProperty("meshQuads").toString()

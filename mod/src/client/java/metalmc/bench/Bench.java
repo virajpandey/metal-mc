@@ -27,6 +27,8 @@ public final class Bench {
     static final int WARMUP_TICKS = Integer.getInteger("metalmc.bench.warmupTicks", 400);   // 20 s
     static final int RUN_TICKS = Integer.getInteger("metalmc.bench.runTicks", 1200);        // 60 s
     static final int EXTRA_WAIT = Integer.getInteger("metalmc.bench.extraWait", 0);
+    /** -PbenchNoLodWait=1: start timing without waiting for the LOD build (what a player joining sees). */
+    static final boolean NO_LOD_WAIT = "1".equals(System.getProperty("metalmc.bench.noLodWait", "0"));
     // -PbenchFly=<blocks per second>: fly a straight line along +X through the center (at the bench height,
     // looking 10 degrees down) instead of orbiting, so chunks and LOD stream in as they would in play.
     static final double FLY = Double.parseDouble(System.getProperty("metalmc.bench.fly", "0"));
@@ -127,7 +129,7 @@ public final class Bench {
             case WARMUP -> {
                 if (!Tour.MP_TOUR) place(player, 0);
                 // With LOD on, don't start timing until every LOD level has been built (up to 2 extra minutes).
-                if (metalmc.lod.Lod.ENABLED && !metalmc.lod.Lod.built() && lodWaitTicks++ < 2400) {
+                if (!NO_LOD_WAIT && metalmc.lod.Lod.ENABLED && !metalmc.lod.Lod.built() && lodWaitTicks++ < 2400) {
                     if (lodWaitTicks % 200 == 0) log("waiting for the LOD build (" + lodWaitTicks / 20 + " s)");
                     break;
                 }

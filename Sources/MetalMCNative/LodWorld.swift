@@ -152,6 +152,13 @@ final class LodWorld: @unchecked Sendable {
     private var vanillaRadius = 0                      // blocks; regions this close to the player are drawn by vanilla
     private var deferred = Set<Int64>()                // changed regions waiting until the player leaves them
     private let queue = DispatchQueue(label: "metalmc.lod.update", qos: .utility)
+    /// The first pass (every region of the save, 20+ s on the 8 km test world) runs at background priority: macOS
+    /// keeps it on the efficiency cores, so the game keeps the performance cores while the player starts playing.
+    /// Joining that world and flying at once gave 24 frames over 8.33 ms in the first minute instead of 155 at
+    /// utility priority, but the LOD appeared after 27 s instead of 11. Later passes (the player moved: 1-3 s)
+    /// run at utility priority; at background they took 9-11 s, too slow to keep level 0 around a flying
+    /// player. METALMC_LODQOS=utility or background for one priority throughout.
+    private static let qosSetting = ProcessInfo.processInfo.environment["METALMC_LODQOS"] ?? ""
     private var running = true
     private var paused = false   // the player is in another dimension: keep the meshes, stop updating
     var status = "starting"
@@ -200,16 +207,22 @@ final class LodWorld: @unchecked Sendable {
     func start() {
         queue.async { [self] in
             if live.saveDir != nil { log("LOD: loaded \(live.load()) saved regions from \(live.saveDir!.path)") }
-            while true {
-                lock.lock(); let go = running, idle = paused; lock.unlock()
-                if !go { return }
-                if idle { Thread.sleep(forTimeInterval: 0.5); continue }
-                let t0 = Date()
-                let did = poll()
-                firstPassDone = true
-                if did { log("LOD: update \(status) in \(String(format: "%.1f", Date().timeIntervalSince(t0))) s") }
-                Thread.sleep(forTimeInterval: 2.0)
-            }
+            schedule(after: 0)
+        }
+    }
+
+    /// One update pass per block (so each gets its own priority; the parallel work inside inherits it), every 2 s.
+    private func schedule(after seconds: Double) {
+        let background = Self.qosSetting == "background" || (Self.qosSetting != "utility" && !firstPassDone)
+        queue.asyncAfter(deadline: .now() + seconds, qos: background ? .background : .utility, flags: .enforceQoS) { [self] in
+            lock.lock(); let go = running, idle = paused; lock.unlock()
+            if !go { return }
+            if idle { schedule(after: 0.5); return }
+            let t0 = Date()
+            let did = poll()
+            firstPassDone = true
+            if did { log("LOD: update \(status) in \(String(format: "%.1f", Date().timeIntervalSince(t0))) s") }
+            schedule(after: 2.0)
         }
     }
 
@@ -304,6 +317,9 @@ final class LodWorld: @unchecked Sendable {
         if changed.isEmpty && !moved && farKeys.isEmpty { return false }
         center = want
 
+        var phases: [(String, Double)] = []
+        var phaseStart = Date()
+        func phase(_ name: String) { phases.append((name, Date().timeIntervalSince(phaseStart))); phaseStart = Date() }
         // 1. Changed regions: level-1 grid -> cached level-2 quadrant, and a level-1 mesh if near the player.
         var changedKeys = Set<Int64>()
         let results = rebuildRegions(changed, meshFine: true)
@@ -321,6 +337,7 @@ final class LodWorld: @unchecked Sendable {
             install(LodNodeKey(level: 1, x: x, z: z), r.node)
         }
 
+        phase("regions")
         // 2. The player moved: mesh level-1 nodes that came into range (from disk), drop the ones that left.
         if moved {
             var need: [(Int, Int)] = []
@@ -341,9 +358,11 @@ final class LodWorld: @unchecked Sendable {
             meshedCenter = center
         }
 
+        phase("level 1")
         // 2b. Level 0 around the player: nodes that came into range, and those of changed regions.
         if lodLevel0Radius > 0, regionDir != nil { updateLevel0(seen: seen, changed: changedKeys) }
 
+        phase("level 0")
         // 3. Parents of changed regions, level by level.
         var dirty = Set(changedKeys.map { LodBuild.unkey($0) }.map { LodNodeKey(level: 1, x: $0.0, z: $0.1) })
         var level = 2
@@ -372,6 +391,7 @@ final class LodWorld: @unchecked Sendable {
             level += 1
         }
 
+        phase("parents")
         // 4. Nodes whose generated columns arrived (and weren't just rebuilt above).
         if !farKeys.isEmpty {
             let keys = Array(farKeys)
@@ -395,13 +415,15 @@ final class LodWorld: @unchecked Sendable {
             }
             for (i, k) in keys.enumerated() { install(k, built[i]) }
         }
+        phase("generated")
         live.saveUnsaved()
         lock.lock()
         let count = meshes.count
         let quads = meshes.values.reduce(0) { $0 + $1.quadCount }
         lock.unlock()
         let cacheMB = quadrants.values.reduce(0) { $0 + $1.bytes } / 1_000_000
-        status = "\(changed.count) changed regions, moved \(moved), \(farKeys.count) generated: \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB, \(live.chunkCount) live chunks"
+        let timing = phases.filter { $0.1 >= 0.05 }.map { "\($0.0) \(String(format: "%.1f", $0.1))" }.joined(separator: ", ")
+        status = "\(changed.count) changed regions, moved \(moved), \(farKeys.count) generated: \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB, \(live.chunkCount) live chunks [\(timing) s]"
         return true
     }
 

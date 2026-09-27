@@ -509,12 +509,55 @@ final class LodRenderer: @unchecked Sendable {
     var fadeOut: [(node: LodMeshNode, mask: UInt16, start: UInt64)] = []
     var skipDebug = [0, 0, 0, 0, 0]    // seam tiles failing: y range, bitmap bounds, horizontal distance, not compiled; passing
 
+    private let pipelineLock = NSLock()
+    private let libraryLock = NSLock()      // held while the shader library is compiled and pipelines are made from it
+    private var compiling = Set<String>()   // pass formats whose variants are being compiled in the background
+    private var compiled = Set<String>()    // pass formats whose variants are all compiled
+    private let compileQueue = DispatchQueue(label: "metalmc.lod.compile", qos: .userInitiated)
+
+    /// The pipeline for one variant, or nil while it's being compiled. The first request for a pass's formats
+    /// compiles every variant the LOD draws with them on a background queue (the shader library alone takes tens of
+    /// milliseconds), so none of them compiles on the render thread: the LOD appears a few frames later instead of
+    /// the frame it first draws (or first fades a tile) taking 10+ ms longer.
     func pipeline(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool = false, seam: Bool = false, water: Bool = false,
                   mesh: Bool = false, fade: Bool = false) -> MTLRenderPipelineState? {
-        let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (box ? "/box" : "")
-            + (seam ? "/seam" : "") + (water ? "/water" : "") + (mesh ? "/mesh" : "") + (fade ? "/fade" : "")
-        if let p = pipelines[key] { return p }
+        let formats = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)"
+        let key = formats + (box ? "/box" : "") + (seam ? "/seam" : "") + (water ? "/water" : "") + (mesh ? "/mesh" : "") + (fade ? "/fade" : "")
+        pipelineLock.lock()
+        if let p = pipelines[key] { pipelineLock.unlock(); return p }
+        let done = compiled.contains(formats), start = !done && !compiling.contains(formats)
+        if start { compiling.insert(formats) }
+        pipelineLock.unlock()
+        if done {
+            // A variant outside the warm-up set: compile it here.
+            return makePipeline(key: key, colorFormats: colorFormats, depth: depth, box: box, seam: seam, water: water, mesh: mesh, fade: fade)
+        }
+        if start {
+            compileQueue.async { [self] in
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                for mesh in lodMeshShaders ? [false, true] : [false] {
+                    for (box, seam, water, fade) in [(false, false, false, false), (false, true, false, false), (false, false, true, false),
+                                                     (false, true, true, false), (false, false, false, true), (false, false, true, true),
+                                                     (true, false, false, false)] where !(box && mesh) {
+                        let k = formats + (box ? "/box" : "") + (seam ? "/seam" : "") + (water ? "/water" : "") + (mesh ? "/mesh" : "") + (fade ? "/fade" : "")
+                        _ = makePipeline(key: k, colorFormats: colorFormats, depth: depth, box: box, seam: seam, water: water, mesh: mesh, fade: fade)
+                    }
+                }
+                pipelineLock.lock(); compiling.remove(formats); compiled.insert(formats); pipelineLock.unlock()
+                log("LOD: pipelines for \(formats) compiled in \((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) ms")
+            }
+        }
+        return nil
+    }
+
+    private func makePipeline(key: String, colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, box: Bool, seam: Bool, water: Bool,
+                              mesh: Bool, fade: Bool) -> MTLRenderPipelineState? {
+        pipelineLock.lock()
+        if let p = pipelines[key] { pipelineLock.unlock(); return p }
+        pipelineLock.unlock()
         do {
+            libraryLock.lock()
+            defer { libraryLock.unlock() }
             if library == nil {
                 let src = lodShaderSource
                     .replacingOccurrences(of: "MAT_WATER", with: "\(Mat.water.rawValue)u")
@@ -549,7 +592,7 @@ final class LodRenderer: @unchecked Sendable {
                 }
                 d.depthAttachmentPixelFormat = depth
                 let (p, _) = try ctx.device.makeRenderPipelineState(descriptor: d, options: [])
-                pipelines[key] = p
+                pipelineLock.lock(); pipelines[key] = p; pipelineLock.unlock()
                 return p
             }
             let d = MTLRenderPipelineDescriptor()
@@ -573,7 +616,7 @@ final class LodRenderer: @unchecked Sendable {
             }
             d.depthAttachmentPixelFormat = depth
             let p = try ctx.device.makeRenderPipelineState(descriptor: d)
-            pipelines[key] = p
+            pipelineLock.lock(); pipelines[key] = p; pipelineLock.unlock()
             return p
         } catch {
             log("LOD pipeline failed: \(error)")

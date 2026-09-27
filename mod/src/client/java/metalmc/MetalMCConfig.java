@@ -125,6 +125,11 @@ public final class MetalMCConfig {
         return flag("lod.generate", true);
     }
 
+    /** Experimental temporal anti-aliasing (MetalFX; -Dmetalmc.taa=true): 9 ms per frame at the panel's resolution. */
+    public static boolean taa() {
+        return flag("taa", false);
+    }
+
     public static boolean lodMultiplayer() {
         return flag("lod.multiplayer", true);
     }

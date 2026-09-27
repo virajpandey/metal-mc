@@ -90,6 +90,7 @@ final class Mtl {
     private static final MethodHandle LOD_TINT_INDEX = h("mmc_lod_tint_index", false, JAVA_INT, JAVA_LONG);
     private static final MethodHandle LOD_INGEST = h("mmc_lod_ingest", false, null, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle LOD_INGEST2 = h("mmc_lod_ingest2", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle TAA_APPLY = h("mmc_taa_apply", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_FLOAT, JAVA_FLOAT, JAVA_INT);
     private static final MethodHandle LOD_OPEN3 = h("mmc_lod_open3", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
     private static final MethodHandle OCC_HIDDEN = h("mmc_occ_hidden", true, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle OCC_TEST = h("mmc_occ_test", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
@@ -330,6 +331,10 @@ final class Mtl {
 
     static void lodIngest2(long world, int cx, int cz, long blocks, long tints) {
         try { LOD_INGEST2.invokeExact(world, cx, cz, blocks, tints); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int taaApply(long color, long depth, long params, long cam, float jitterX, float jitterY, int reset) {
+        try { return (int) TAA_APPLY.invokeExact(color, depth, params, cam, jitterX, jitterY, reset); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static long lodOpen3(long worldDir, long storeDir, long dimension, int far, int centerX, int centerZ) {
