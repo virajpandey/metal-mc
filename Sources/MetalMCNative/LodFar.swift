@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 import MetalMCCore
 
@@ -7,6 +8,9 @@ import MetalMCCore
 // 1.3 blocks from the real surface) and the surface biome. Levels 3 and up are built from those columns
 // wherever a column has no real data, so the horizon shows the world's real mountains, coasts and forests
 // before the player has been there. Real chunks always win, column by column.
+//
+// Generated nodes are cached per world and seed under <game dir>/metalmc/lod/far/ (not in the save), so the
+// ~85 us per column is paid once: one file per node, heights and a biome-name palette, LZFSE-compressed.
 
 let lodFarMinLevel = 3
 let lodFarDebug = experiments.contains("fardebug")
@@ -69,11 +73,86 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
 final class LodFarStore: @unchecked Sendable {
     let lock = NSLock()
     var surfaces: [UInt16: LodFarSurface] = [:]
+    var biomeIds: [String: UInt16] = [:]
+    var biomeNames: [UInt16: String] = [:]
+    var cacheDir: URL?
+    var cached = Set<LodNodeKey>()          // nodes with a cache file not yet loaded
     var columns: [LodNodeKey: LodFarColumns] = [:]
     var dirty = Set<LodNodeKey>()          // received, not yet built into their node
     var requested = Set<LodNodeKey>()      // handed to the generator, not yet received
     var realRegions = Set<Int64>()         // regions with any real chunk
     var fullRegions = Set<Int64>()         // regions with every chunk generated
+
+    /// Id for a biome name, registering it (with its surface) on first use. Caller holds `lock`.
+    func biomeId(_ name: String) -> UInt16 {
+        if let id = biomeIds[name] { return id }
+        let id = UInt16(biomeIds.count)
+        biomeIds[name] = id
+        biomeNames[id] = name
+        surfaces[id] = lodFarSurface(name)
+        return id
+    }
+
+    static func fileName(_ k: LodNodeKey) -> String { "\(k.level).\(k.x).\(k.z).far" }
+
+    /// Writes a node's columns to the cache: "MMCF" 1, then LZFSE of: palette count, names (length-prefixed
+    /// UTF-8), heights (Int16) and palette indices (UInt16), 256 x 256 each. Caller holds no lock.
+    func save(_ k: LodNodeKey, _ c: LodFarColumns) {
+        lock.lock(); let dir = cacheDir; let names = biomeNames; lock.unlock()
+        guard let dir else { return }
+        var palette: [UInt16: UInt16] = [:]
+        var paletteNames: [String] = []
+        var body: [UInt8] = []
+        body.reserveCapacity(c.height.count * 4 + 1024)
+        var idx = [UInt16](repeating: 0, count: c.biome.count)
+        for (i, b) in c.biome.enumerated() {
+            if let p = palette[b] { idx[i] = p; continue }
+            let p = UInt16(paletteNames.count)
+            palette[b] = p
+            paletteNames.append(names[b] ?? "minecraft:plains")
+            idx[i] = p
+        }
+        body += [UInt8(paletteNames.count & 255), UInt8(paletteNames.count >> 8)]
+        for n in paletteNames { let u = Array(n.utf8); body.append(UInt8(u.count)); body += u }
+        for h in c.height { body += [UInt8(UInt16(bitPattern: h) & 255), UInt8(UInt16(bitPattern: h) >> 8)] }
+        for p in idx { body += [UInt8(p & 255), UInt8(p >> 8)] }
+        var packed = [UInt8](repeating: 0, count: body.count + 1024)
+        let n = body.withUnsafeBufferPointer { compression_encode_buffer(&packed, packed.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
+        guard n > 0 else { return }
+        let len = body.count
+        let out = Data(Array("MMCF".utf8) + [1, UInt8(len & 255), UInt8((len >> 8) & 255), UInt8((len >> 16) & 255), UInt8(len >> 24)] + packed[0..<n])
+        try? out.write(to: dir.appendingPathComponent(Self.fileName(k)), options: .atomic)
+    }
+
+    /// Reads a node from the cache. Caller holds `lock` (biome names are registered).
+    func load(_ k: LodNodeKey) -> LodFarColumns? {
+        guard let dir = cacheDir, let d = try? Data(contentsOf: dir.appendingPathComponent(Self.fileName(k))), d.count > 9 else { return nil }
+        let raw = [UInt8](d)
+        guard raw[0...3] == Array("MMCF".utf8)[0...3], raw[4] == 1 else { return nil }
+        let len = Int(raw[5]) | Int(raw[6]) << 8 | Int(raw[7]) << 16 | Int(raw[8]) << 24
+        var body = [UInt8](repeating: 0, count: len)
+        let got = raw.withUnsafeBufferPointer { compression_decode_buffer(&body, len, $0.baseAddress! + 9, $0.count - 9, nil, COMPRESSION_LZFSE) }
+        let cols = lodNodeVoxels * lodNodeVoxels
+        guard got == len, len >= 2 else { return nil }
+        let count = Int(body[0]) | Int(body[1]) << 8
+        var i = 2
+        var ids: [UInt16] = []
+        for _ in 0..<count {
+            guard i < len else { return nil }
+            let l = Int(body[i]); i += 1
+            guard i + l <= len, let name = String(bytes: body[i..<(i + l)], encoding: .utf8) else { return nil }
+            ids.append(biomeId(name)); i += l
+        }
+        guard len - i == cols * 4 else { return nil }
+        var height = [Int16](repeating: 0, count: cols), biome = [UInt16](repeating: 0, count: cols)
+        for c in 0..<cols { height[c] = Int16(bitPattern: UInt16(body[i + 2 * c]) | UInt16(body[i + 2 * c + 1]) << 8) }
+        i += cols * 2
+        for c in 0..<cols {
+            let p = Int(UInt16(body[i + 2 * c]) | UInt16(body[i + 2 * c + 1]) << 8)
+            biome[c] = p < ids.count ? ids[p] : 0
+        }
+        return LodFarColumns(height: height, biome: biome)
+    }
 
     func surface(_ id: UInt16) -> LodFarSurface {
         surfaces[id] ?? LodFarSurface(top: Mat.grass.rawValue, under: Mat.dirt.rawValue, canopy: 0, leaves: Mat.leaves.rawValue, frozen: false, mountain: false)
@@ -151,14 +230,33 @@ public func mmc_lod_far_wanted(_ out: UnsafeMutablePointer<Int32>, _ max: Int32)
     return Int32(list.count)
 }
 
-/// Registers biome `name` (e.g. minecraft:forest) under a small id used by mmc_lod_far_put.
+/// The id mmc_lod_far_put uses for biome `name` (e.g. minecraft:forest), or -1 with no LOD open.
 @_cdecl("mmc_lod_far_biome")
-public func mmc_lod_far_biome(_ id: Int32, _ name: UnsafePointer<CChar>) {
+public func mmc_lod_far_biome(_ name: UnsafePointer<CChar>) -> Int32 {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { return -1 }
+    w.far.lock.lock(); defer { w.far.lock.unlock() }
+    return Int32(w.far.biomeId(String(cString: name)))
+}
+
+/// Where generated nodes are cached for this world and seed (created if missing); "" for no cache.
+@_cdecl("mmc_lod_far_cache")
+public func mmc_lod_far_cache(_ dir: UnsafePointer<CChar>) {
     let r = LodRenderer.shared
     r.lock.lock(); let w = r.world; r.lock.unlock()
     guard let w else { return }
-    let s = lodFarSurface(String(cString: name))
-    w.far.lock.lock(); w.far.surfaces[UInt16(truncatingIfNeeded: id)] = s; w.far.lock.unlock()
+    let path = String(cString: dir)
+    guard !path.isEmpty else { return }
+    let url = URL(fileURLWithPath: path)
+    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    var keys = Set<LodNodeKey>()
+    for f in (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? [] where f.hasSuffix(".far") {
+        let p = f.dropLast(4).split(separator: ".")
+        if p.count == 3, let l = Int(p[0]), let x = Int(p[1]), let z = Int(p[2]) { keys.insert(LodNodeKey(level: l, x: x, z: z)) }
+    }
+    w.far.lock.lock(); w.far.cacheDir = url; w.far.cached = keys; w.far.lock.unlock()
+    log("LOD: far terrain cache \(path): \(keys.count) nodes")
 }
 
 /// Generated columns for node (level, x, z): 256 x 256 ground heights (first block above the ground) and
@@ -176,4 +274,5 @@ public func mmc_lod_far_put(_ level: Int32, _ x: Int32, _ z: Int32, _ heights: U
     w.far.requested.remove(key)
     w.far.dirty.insert(key)
     w.far.lock.unlock()
+    w.far.save(key, cols)
 }

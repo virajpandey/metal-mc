@@ -4,7 +4,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicInteger;
 import metalmc.backend.MetalLod;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.Registries;
@@ -45,7 +44,6 @@ public final class FarTerrain {
     private static volatile Thread loop;
     private static volatile boolean running;
     private static final ConcurrentHashMap<Holder<Biome>, Integer> BIOME_IDS = new ConcurrentHashMap<>();
-    private static final AtomicInteger NEXT_ID = new AtomicInteger();
 
     public static synchronized void start(MinecraftServer server) {
         stop();
@@ -67,7 +65,12 @@ public final class FarTerrain {
         DensitySampler cheese = rs.getSampler(cheeseFn);
         int minY = level.getMinY(), maxY = level.getMaxY();
         BIOME_IDS.clear();
-        NEXT_ID.set(0);
+        // Cache per save and seed, outside the save: <game dir>/metalmc/lod/far/<save>-<seed>.
+        java.nio.file.Path save = server.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).toAbsolutePath().normalize();
+        String name = (save.getFileName() == null ? "world" : save.getFileName().toString()).replaceAll("[^A-Za-z0-9._-]", "_");
+        java.nio.file.Path cache = net.minecraft.client.Minecraft.getInstance().gameDirectory.toPath()
+            .resolve("metalmc").resolve("lod").resolve("far").resolve(name + "-" + Long.toHexString(level.getSeed()));
+        MetalLod.farCache(cache.toAbsolutePath().toString());
         running = true;
         Thread t = new Thread(() -> run(gen, rs, surface, cheese, minY, maxY), "metalmc-far-terrain");
         t.setDaemon(true);
@@ -155,15 +158,6 @@ public final class FarTerrain {
     }
 
     private static Integer biomeId(Holder<Biome> b) {
-        Integer id = BIOME_IDS.get(b);
-        if (id != null) return id;
-        synchronized (BIOME_IDS) {
-            id = BIOME_IDS.get(b);
-            if (id != null) return id;
-            id = NEXT_ID.getAndIncrement();
-            MetalLod.farBiome(id, b.getRegisteredName());
-            BIOME_IDS.put(b, id);
-            return id;
-        }
+        return BIOME_IDS.computeIfAbsent(b, h -> Math.max(0, MetalLod.farBiome(h.getRegisteredName())));
     }
 }

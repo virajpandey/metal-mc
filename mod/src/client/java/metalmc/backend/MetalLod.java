@@ -175,11 +175,19 @@ public final class MetalLod {
         }
     }
 
-    /** Registers a biome name under a small id for farPut. Any thread. */
-    public static void farBiome(int id, String name) {
+    /** The id farPut uses for a biome name, or -1 with no LOD open. Any thread. */
+    public static int farBiome(String name) {
+        if (!available()) return -1;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            return Mtl.lodFarBiome(MemoryUtil.memAddress(stack.UTF8(name)));
+        }
+    }
+
+    /** Directory where generated far terrain is cached for this world and seed. */
+    public static void farCache(String dir) {
         if (!available()) return;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            Mtl.lodFarBiome(id, MemoryUtil.memAddress(stack.UTF8(name)));
+            Mtl.lodFarCache(MemoryUtil.memAddress(stack.UTF8(dir)));
         }
     }
 

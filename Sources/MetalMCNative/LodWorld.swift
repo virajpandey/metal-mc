@@ -494,6 +494,15 @@ final class LodWorld: @unchecked Sendable {
                 for nx in (cx - r)...(cx + r) {
                     let key = LodNodeKey(level: level, x: nx, z: nz)
                     if far.columns[key] != nil || far.requested.contains(key) { continue }
+                    if far.cached.contains(key) {
+                        // Generated in an earlier session: load it instead of asking for it.
+                        far.cached.remove(key)
+                        if let cols = far.load(key) {
+                            far.columns[key] = cols
+                            far.dirty.insert(key)
+                            continue
+                        }
+                    }
                     let d = level == maxLevel ? dist(nx * size, nz * size, size) : dist((nx >> 1) * psize, (nz >> 1) * psize, psize)
                     if d > reach { continue }
                     let span = 1 << (level - 1)
