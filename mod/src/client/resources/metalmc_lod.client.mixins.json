@@ -5,6 +5,7 @@
 	"client": [
 		"CameraMixin",
 		"FogRendererMixin",
+		"GameRendererLodMixin",
 		"LevelRendererLodMixin"
 	],
 	"injectors": {

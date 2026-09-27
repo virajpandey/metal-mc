@@ -28,6 +28,8 @@ public final class Lod implements ClientModInitializer {
     public static final boolean MULTIPLAYER = metalmc.MetalMCConfig.lodMultiplayer();
     public static final boolean TEXTURES = metalmc.MetalMCConfig.lodTextures();
     public static final boolean GENERATE = metalmc.MetalMCConfig.lodGenerate();
+    /** The projection vanilla draws the level with this frame, view bobbing included (GameRendererLodMixin). */
+    public static final org.joml.Matrix4f LEVEL_PROJECTION = new org.joml.Matrix4f();
 
     private static boolean opened;
     private static volatile boolean ready;

@@ -33,7 +33,7 @@ abstract class LevelRendererLodMixin {
     private void metalmc$drawLod(ChunkSectionsToRender chunks, FeatureRenderDispatcher.PreparedFrame featureFrame, RenderPass renderPass, CallbackInfo ci) {
         CameraRenderState cam = levelRenderState.cameraRenderState;
         if (Lod.active()) drawLod(cam);
-        metalmc.terrain.SectionOcclusion.test(cam.projectionMatrix, cam.viewRotationMatrix, cam.pos.x, cam.pos.y, cam.pos.z);
+        metalmc.terrain.SectionOcclusion.test(Lod.LEVEL_PROJECTION, cam.viewRotationMatrix, cam.pos.x, cam.pos.y, cam.pos.z);
     }
 
     private static void drawLod(CameraRenderState cam) {
@@ -47,7 +47,7 @@ abstract class LevelRendererLodMixin {
         MetalLod.setVanilla(metalmc.terrain.SectionOcclusion.vanillaKeys(), metalmc.terrain.SectionOcclusion.vanillaCount());
         MetalLod.setCompiled(metalmc.terrain.SectionOcclusion.compiledKeys(), metalmc.terrain.SectionOcclusion.compiledCount(), renderDistance);
         float sky = mc.level == null ? 1f : 1f - mc.level.getSkyDarken() / 15f;
-        MetalLod.draw(cam.projectionMatrix, cam.viewRotationMatrix, cam.pos.x, cam.pos.y, cam.pos.z,
+        MetalLod.draw(Lod.LEVEL_PROJECTION, cam.viewRotationMatrix, cam.pos.x, cam.pos.y, cam.pos.z,
             fog.color.x(), fog.color.y(), fog.color.z(), fog.color.w(), fog.environmentalStart, fog.environmentalEnd,
             fog.renderDistanceStart, fog.renderDistanceEnd, discard, sky);
     }

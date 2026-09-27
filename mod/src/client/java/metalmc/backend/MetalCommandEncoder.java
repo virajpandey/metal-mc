@@ -29,7 +29,8 @@ import org.lwjgl.system.MemoryUtil;
  * submits are in flight, and destruction is deferred two submits.
  */
 final class MetalCommandEncoder implements CommandEncoderBackend {
-    static final int MAX_SUBMITS_IN_FLIGHT = 2;
+    /** Frames the CPU may run ahead of the GPU (-PsubmitsInFlight, default 2). */
+    static final int MAX_SUBMITS_IN_FLIGHT = Math.max(1, Integer.getInteger("metalmc.submitsInFlight", 2));
 
     private final MetalDevice device;
     private final MetalTransientMemory transientMemory;

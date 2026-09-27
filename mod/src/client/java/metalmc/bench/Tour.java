@@ -200,9 +200,36 @@ final class Tour {
         new Step("end-back", end(0.5, 90, 270f, 6f), 300, mc -> cmd(mc, "execute in minecraft:the_end run tp @a 0.5 90 0.5"))
     );
 
+    /**
+     * View bobbing check (-PbenchTour=walk): walks north on the ground (toward open land) with bobbing on, screenshots at several points
+     * of the walk cycle. Vanilla bobs by tilting its projection; the LOD has to tilt with it.
+     */
+    static final boolean WALK_TOUR = "walk".equals(System.getProperty("metalmc.tour"));
+    private static void walk(Minecraft mc, boolean on) {
+        if (mc.player != null) {
+            mc.player.getAbilities().flying = false;
+            mc.player.getAbilities().mayfly = false;
+        }
+        mc.options.keyUp.setDown(on);
+    }
+    static final List<Step> WALK_STEPS = List.of(
+        new Step("walk-start", ground(180f), 200, mc -> {
+            cmd(mc, "time set 6000", "weather clear", "gamerule advance_time false", "gamerule advance_weather false");
+            mc.options.bobView().set(true);
+            if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();
+        }),
+        new Step("walk-0", null, 30, mc -> walk(mc, true)),
+        new Step("walk-1", null, 5, mc -> walk(mc, true)),
+        new Step("walk-2", null, 4, mc -> walk(mc, true)),
+        new Step("walk-3", null, 5, mc -> walk(mc, true)),
+        new Step("walk-4", null, 4, mc -> walk(mc, true)),
+        new Step("walk-end", null, 20, mc -> walk(mc, false))
+    );
+
     static List<Step> steps() {
         if (FIDELITY_TOUR) return FIDELITY_STEPS;
         if (END_TOUR) return END_STEPS;
+        if (WALK_TOUR) return WALK_STEPS;
         if (MP_TOUR) return "mp2".equals(System.getProperty("metalmc.tour")) ? MP2_STEPS : MP_STEPS;
         return LOD_TOUR ? LOD_STEPS : STEPS;
     }
