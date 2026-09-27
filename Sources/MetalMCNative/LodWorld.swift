@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 import Metal
 import MetalMCCore
@@ -28,6 +29,11 @@ public func mmc_lod_set_detail(_ radius: Int32) {
 struct LodQuadrant {
     var offsets: [UInt32]
     var runs: [UInt8]
+
+    init(offsets: [UInt32], runs: [UInt8]) {
+        self.offsets = offsets
+        self.runs = runs
+    }
 
     init(grid g: LodGrid) {
         let q = lodQuadrantVoxels, h = g.height
@@ -134,6 +140,7 @@ final class LodWorld: @unchecked Sendable {
     let hasSkyLight: Bool       // open surfaces get sky light 15 (vanilla's lightmap then gives the dimension's color)
     var downsampleRule: LodDownsampleRule { floating ? .top : lodDownsampleRule }
     let regionDir: URL?
+    let cacheDir: URL?          // where fully generated regions' quadrants are kept between sessions (single-player)
     let live: LodLiveStore
     let maxLevel: Int
     let fineRadius: Int
@@ -151,7 +158,9 @@ final class LodWorld: @unchecked Sendable {
     private var requestedCenter: (x: Int, z: Int)
     private var vanillaRadius = 0                      // blocks; regions this close to the player are drawn by vanilla
     private var deferred = Set<Int64>()                // changed regions waiting until the player leaves them
-    private let queue = DispatchQueue(label: "metalmc.lod.update", qos: .utility)
+    // The queue's own priority is a floor (a block can only raise it), so it's background and later passes
+    // raise themselves to utility.
+    private let queue = DispatchQueue(label: "metalmc.lod.update", qos: .background)
     /// The first pass (every region of the save, 20+ s on the 8 km test world) runs at background priority: macOS
     /// keeps it on the efficiency cores, so the game keeps the performance cores while the player starts playing.
     /// Joining that world and flying at once gave 24 frames over 8.33 ms in the first minute instead of 155 at
@@ -164,8 +173,10 @@ final class LodWorld: @unchecked Sendable {
     var status = "starting"
     private(set) var firstPassDone = false   // the first build of every level has finished
 
-    init(id: Int, dimension: String, floating: Bool, hasSkyLight: Bool, regionDir: URL?, storeDir: URL?, maxLevel: Int,
-         fineRadius: Int, centerX: Int, centerZ: Int) {
+    init(id: Int, dimension: String, floating: Bool, hasSkyLight: Bool, regionDir: URL?, storeDir: URL?, cacheDir: URL? = nil,
+         maxLevel: Int, fineRadius: Int, centerX: Int, centerZ: Int) {
+        self.cacheDir = cacheDir
+        if let cacheDir { try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true) }
         self.id = id
         self.dimension = dimension
         self.floating = floating
@@ -214,7 +225,7 @@ final class LodWorld: @unchecked Sendable {
     /// One update pass per block (so each gets its own priority; the parallel work inside inherits it), every 2 s.
     private func schedule(after seconds: Double) {
         let background = Self.qosSetting == "background" || (Self.qosSetting != "utility" && !firstPassDone)
-        queue.asyncAfter(deadline: .now() + seconds, qos: background ? .background : .utility, flags: .enforceQoS) { [self] in
+        queue.asyncAfter(deadline: .now() + seconds, qos: background ? .background : .utility, flags: background ? [] : .enforceQoS) { [self] in
             lock.lock(); let go = running, idle = paused; lock.unlock()
             if !go { return }
             if idle { schedule(after: 0.5); return }
@@ -492,10 +503,18 @@ final class LodWorld: @unchecked Sendable {
     private func rebuildRegions(_ list: [(Int, Int)], meshFine: Bool) -> [RegionResult] {
         var out = [RegionResult?](repeating: nil, count: list.count)
         let c = center
+        let liveKeys = Set(live.regionKeys)
         out.withUnsafeMutableBufferPointer { buf in
             let outp = buf.baseAddress!
             DispatchQueue.concurrentPerform(iterations: list.count) { i in
                 let (x, z) = list[i]
+                let key = LodBuild.key(x, z)
+                let near = meshFine && self.withinFine(regionX: x, regionZ: z, cx: c.x, cz: c.z)
+                // Unchanged since an earlier session: the region's quadrant from the cache instead of decoding it.
+                if !near, !liveKeys.contains(key), let cached = self.cachedQuadrant(x: x, z: z) {
+                    outp[i] = RegionResult(key: key, quadrant: cached, node: nil, hasData: true, full: true)
+                    return
+                }
                 let fromFile = self.regionDir.flatMap { LodBuild.regionGrid(path: $0.appendingPathComponent("r.\(x).\(z).mca").path, floating: self.floating) }
                 var g = fromFile ?? LodGrid(level: 1)
                 let hasLive = self.live.overlay(regionX: x, regionZ: z, into: &g)
@@ -510,8 +529,11 @@ final class LodWorld: @unchecked Sendable {
                 var q = LodGrid(level: 2)
                 g.downsample(into: &q, qx: 0, qz: 0, rule: self.downsampleRule)   // the quadrant occupies the low corner
                 let quadrant = LodQuadrant(grid: q)
+                // Only a fully generated region's quadrant depends on nothing but its file (a partly explored one is
+                // filled from generated terrain, a region with live chunks has edits the file may not have).
+                if fromFile != nil && !hasLive && full { self.saveQuadrant(x: x, z: z, quadrant) }
                 var node: LodNode?
-                if meshFine && self.withinFine(regionX: x, regionZ: z, cx: c.x, cz: c.z) {
+                if near {
                     var filled = g
                     self.fillHidden(&filled)
                     let m = self.meshNode(filled)
@@ -533,6 +555,55 @@ final class LodWorld: @unchecked Sendable {
     /// Greedy mesh of a node grid, with sky light under cover (always in floating dimensions: their undersides need it).
     func meshNode(_ g: LodGrid) -> LodMesh {
         LodBuild.mesh(g, maxMerge: 64, skyCover: floating || lodSkyCover)
+    }
+
+    // MARK: - Region cache
+
+    /// Bump when what a quadrant holds changes (materials, downsampling), so older cache files are rebuilt.
+    static let cacheVersion: UInt8 = 1
+
+    private func cacheURL(_ x: Int, _ z: Int) -> URL? { cacheDir?.appendingPathComponent("r.\(x).\(z).lq") }
+
+    /// The region file's stamp as stored in cache files: modification time (ms) and size.
+    private func stamp(_ x: Int, _ z: Int) -> (Int64, Int64)? {
+        guard let s = fileStamps[LodBuild.key(x, z)] else { return nil }
+        return (Int64((s.0.timeIntervalSince1970 * 1000).rounded()), Int64(s.1))
+    }
+
+    /// A fully generated region's quadrant from an earlier session, if its region file hasn't changed since.
+    /// File: "MMCQ", version, region file stamp (ms, bytes), body length, then LZFSE of the offsets (UInt32) and runs.
+    func cachedQuadrant(x: Int, z: Int) -> LodQuadrant? {
+        guard let url = cacheURL(x, z), let st = stamp(x, z), let d = try? Data(contentsOf: url), d.count > 29 else { return nil }
+        let raw = [UInt8](d)
+        func i64(_ o: Int) -> Int64 { var v: Int64 = 0; for k in 0..<8 { v |= Int64(raw[o + k]) << (8 * k) }; return v }
+        guard raw[0...3] == Array("MMCQ".utf8)[0...3], raw[4] == Self.cacheVersion, i64(5) == st.0, i64(13) == st.1 else { return nil }
+        let len = Int(i64(21))
+        let q = lodQuadrantVoxels
+        guard len >= (q * q + 1) * 4 else { return nil }
+        var body = [UInt8](repeating: 0, count: len)
+        let got = raw.withUnsafeBufferPointer { compression_decode_buffer(&body, len, $0.baseAddress! + 29, $0.count - 29, nil, COMPRESSION_LZFSE) }
+        guard got == len else { return nil }
+        var offsets = [UInt32](repeating: 0, count: q * q + 1)
+        for k in 0..<offsets.count {
+            offsets[k] = UInt32(body[4 * k]) | UInt32(body[4 * k + 1]) << 8 | UInt32(body[4 * k + 2]) << 16 | UInt32(body[4 * k + 3]) << 24
+        }
+        let runs = Array(body[(offsets.count * 4)...])
+        guard Int(offsets[q * q]) == runs.count else { return nil }
+        return LodQuadrant(offsets: offsets, runs: runs)
+    }
+
+    func saveQuadrant(x: Int, z: Int, _ quadrant: LodQuadrant) {
+        guard let url = cacheURL(x, z), let st = stamp(x, z) else { return }
+        var body = [UInt8]()
+        body.reserveCapacity(quadrant.offsets.count * 4 + quadrant.runs.count)
+        for o in quadrant.offsets { body += [UInt8(o & 255), UInt8((o >> 8) & 255), UInt8((o >> 16) & 255), UInt8(o >> 24)] }
+        body += quadrant.runs
+        var packed = [UInt8](repeating: 0, count: body.count + 1024)
+        let n = body.withUnsafeBufferPointer { compression_encode_buffer(&packed, packed.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
+        guard n > 0 else { return }
+        func le(_ v: Int64) -> [UInt8] { (0..<8).map { UInt8((v >> (8 * $0)) & 255) } }
+        let out = Data(Array("MMCQ".utf8) + [Self.cacheVersion] + le(st.0) + le(st.1) + le(Int64(body.count)) + packed[0..<n])
+        try? out.write(to: url, options: .atomic)
     }
 
     /// True if any region under node (level, x, z) has real chunks.

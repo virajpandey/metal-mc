@@ -46,14 +46,16 @@ public final class MetalLod {
      * was; the one the player left is paused. Returns the dimension's LOD id for ingest and the far-terrain
      * calls, or 0 if there's nothing to build from.
      */
-    public static long open3(String worldDir, String storeDir, String dimension, int farBlocks, int centerX, int centerZ) {
+    public static long open3(String worldDir, String storeDir, String cacheDir, String dimension, int farBlocks, int centerX, int centerZ) {
         if (!available()) return 0;
         Mtl.lodSetDetail(metalmc.MetalMCConfig.lodDetail());
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer world = stack.UTF8(worldDir);
             ByteBuffer store = stack.UTF8(storeDir);
+            ByteBuffer cache = stack.UTF8(cacheDir);
             ByteBuffer dim = stack.UTF8(dimension);
-            return Mtl.lodOpen3(MemoryUtil.memAddress(world), MemoryUtil.memAddress(store), MemoryUtil.memAddress(dim), farBlocks, centerX, centerZ);
+            return Mtl.lodOpen3(MemoryUtil.memAddress(world), MemoryUtil.memAddress(store), MemoryUtil.memAddress(cache), MemoryUtil.memAddress(dim),
+                farBlocks, centerX, centerZ);
         }
     }
 

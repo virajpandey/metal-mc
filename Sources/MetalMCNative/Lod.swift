@@ -802,9 +802,10 @@ public func mmc_lod_open2(_ worldDir: UnsafePointer<CChar>, _ storeDir: UnsafePo
 /// (mmc_lod_close drops them all, for a different save or server). Returns the world's id, which the calls
 /// that feed it (ingest, far terrain) pass back, or 0 if there's nothing to build from.
 @_cdecl("mmc_lod_open3")
-public func mmc_lod_open3(_ worldDir: UnsafePointer<CChar>, _ storeDir: UnsafePointer<CChar>, _ dimension: UnsafePointer<CChar>,
-                          _ far: Int32, _ centerX: Int32, _ centerZ: Int32) -> Int64 {
+public func mmc_lod_open3(_ worldDir: UnsafePointer<CChar>, _ storeDir: UnsafePointer<CChar>, _ cacheDir: UnsafePointer<CChar>,
+                          _ dimension: UnsafePointer<CChar>, _ far: Int32, _ centerX: Int32, _ centerZ: Int32) -> Int64 {
     let dir = String(cString: worldDir), store = String(cString: storeDir), dim = String(cString: dimension)
+    let cache = String(cString: cacheDir)
     let regionDir = dir.isEmpty ? nil : Anvil.regionDirectory(URL(fileURLWithPath: dir), dimension: dim)
     let storeURL = store.isEmpty ? nil : URL(fileURLWithPath: store)
     if regionDir == nil && storeURL == nil { return 0 }
@@ -821,10 +822,11 @@ public func mmc_lod_open3(_ worldDir: UnsafePointer<CChar>, _ storeDir: UnsafePo
         return Int64(w.id)
     }
     r.lock.unlock()
-    return Int64(lodOpen(regionDir: regionDir, storeDir: storeURL, dimension: dim, far: Int(far), centerX: Int(centerX), centerZ: Int(centerZ)))
+    return Int64(lodOpen(regionDir: regionDir, storeDir: storeURL, cacheDir: cache.isEmpty ? nil : URL(fileURLWithPath: cache), dimension: dim,
+                         far: Int(far), centerX: Int(centerX), centerZ: Int(centerZ)))
 }
 
-private func lodOpen(regionDir: URL?, storeDir: URL?, dimension: String, far: Int, centerX: Int, centerZ: Int) -> Int {
+private func lodOpen(regionDir: URL?, storeDir: URL?, cacheDir: URL? = nil, dimension: String, far: Int, centerX: Int, centerZ: Int) -> Int {
     let r = LodRenderer.shared
     var maxLevel = 1
     while (lodNodeVoxels << maxLevel) < far && maxLevel < 8 { maxLevel += 1 }
@@ -835,7 +837,7 @@ private func lodOpen(regionDir: URL?, storeDir: URL?, dimension: String, far: In
     r.nextWorldId += 1
     // 26.x's End has sky light (sky_light_color #ac60cd is what tints its end stone pink); the Nether has none.
     let w = LodWorld(id: id, dimension: dimension, floating: dimension == "minecraft:the_end",
-                     hasSkyLight: dimension != "minecraft:the_nether", regionDir: regionDir, storeDir: storeDir,
+                     hasSkyLight: dimension != "minecraft:the_nether", regionDir: regionDir, storeDir: storeDir, cacheDir: cacheDir,
                      maxLevel: maxLevel, fineRadius: fine, centerX: centerX, centerZ: centerZ)
     r.worlds[dimension]?.stop()
     r.world?.setPaused(true)

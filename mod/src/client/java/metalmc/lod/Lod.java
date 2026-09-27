@@ -80,6 +80,18 @@ public final class Lod implements ClientModInitializer {
             "server:" + name};
     }
 
+    /**
+     * Single-player: where fully generated regions' LOD data is kept between sessions, so the next join doesn't decode
+     * them again: <game dir>/metalmc/lod/regions/<save>-<dimension>. "" in multiplayer.
+     */
+    private static String regionCache(Minecraft mc, String worldDir, ResourceKey<Level> dim) {
+        if (worldDir.isEmpty()) return "";
+        java.nio.file.Path save = java.nio.file.Path.of(worldDir);
+        String name = (save.getFileName() == null ? "world" : save.getFileName().toString()).replaceAll("[^A-Za-z0-9._-]", "_");
+        String d = dim.identifier().getPath().replaceAll("[^a-z0-9._-]", "_");
+        return mc.gameDirectory.toPath().resolve("metalmc").resolve("lod").resolve("regions").resolve(name + "-" + d).toAbsolutePath().toString();
+    }
+
     /** A server's store for one dimension: <game dir>/metalmc/lod/<server>/overworld (the_end, ...). */
     private static String store(String serverDir, ResourceKey<Level> dim) {
         if (serverDir.isEmpty()) return "";
@@ -109,7 +121,7 @@ public final class Lod implements ClientModInitializer {
             LiveIngest.setEnabled(false);
             FarTerrain.stop();
             int cx = mc.player != null ? mc.player.getBlockX() : 0, cz = mc.player != null ? mc.player.getBlockZ() : 0;
-            long world = MetalLod.open3(src[0], store(src[1], dim), dim.identifier().toString(), FAR, cx, cz);
+            long world = MetalLod.open3(src[0], store(src[1], dim), regionCache(mc, src[0], dim), dim.identifier().toString(), FAR, cx, cz);
             System.out.println("[metalmc-lod] opening " + current + " " + dim.identifier() + " far=" + FAR + " live=" + LIVE + ": " + world);
             // Nothing to build from: drop every dimension's LOD, so the last one can't be drawn here.
             if (world == 0) MetalLod.close();
