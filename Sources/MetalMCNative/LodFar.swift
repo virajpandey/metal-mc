@@ -82,6 +82,7 @@ final class LodFarStore: @unchecked Sendable {
     var requested = Set<LodNodeKey>()      // handed to the generator, not yet received
     var realRegions = Set<Int64>()         // regions with any real chunk
     var fullRegions = Set<Int64>()         // regions with every chunk generated
+    var holeRegions = Set<Int64>()         // regions with some chunks (their levels 0-1 fill from generated nodes)
 
     /// Id for a biome name, registering it (with its surface) on first use. Caller holds `lock`.
     func biomeId(_ name: String) -> UInt16 {
@@ -154,9 +155,35 @@ final class LodFarStore: @unchecked Sendable {
         return LodFarColumns(height: height, biome: biome)
     }
 
-    func surface(_ id: UInt16) -> LodFarSurface {
-        surfaces[id] ?? LodFarSurface(top: Mat.grass.rawValue, under: Mat.dirt.rawValue, canopy: 0, leaves: Mat.leaves.rawValue, frozen: false, mountain: false)
+    /// Writes one generated column into grid column `col` (voxels of level `L`, `h` voxels tall): stone, then
+    /// the surface's under material, the surface block, and water up to sea level or tree canopy above it.
+    /// `height` is the first block above the ground; `steep` puts stone on the surface in mountain biomes.
+    static func writeColumn(_ v: UnsafeMutableBufferPointer<UInt8>, col: Int, n: Int, h: Int, L: Int,
+                            height: Int, s: LodFarSurface, steep: Bool) {
+        let top = height - 1                                  // the ground's top block
+        let surfaceMat = s.mountain && steep ? Mat.stone.rawValue : s.top
+        let vyTop = min(h - 1, max(0, (top + 64) >> L))
+        for y in 0..<vyTop { v[y * n * n + col] = y + 2 >= vyTop ? s.under : Mat.stone.rawValue }
+        // Under water, grass and snow give way to what's under them (lake and river beds).
+        let wet = top + 1 < lodSeaLevel
+        let vegetation = surfaceMat == Mat.grass.rawValue || surfaceMat == Mat.snow.rawValue
+            || (surfaceMat >= lodGrassBase && surfaceMat < lodGrassBase + 32)
+        v[vyTop * n * n + col] = wet && vegetation ? s.under : surfaceMat
+        if wet {
+            let vyWater = min(h - 1, (lodSeaLevel - 1 + 64) >> L)
+            if vyWater > vyTop {
+                for y in (vyTop + 1)...vyWater { v[y * n * n + col] = s.water }
+                if s.frozen { v[vyWater * n * n + col] = Mat.ice.rawValue }
+            }
+        } else if s.canopy > 0 {
+            let vyCanopy = min(h - 1, (top + s.canopy + 64) >> L)
+            if vyCanopy > vyTop { for y in (vyTop + 1)...vyCanopy { v[y * n * n + col] = s.leaves } }
+            else { v[vyTop * n * n + col] = s.leaves }
+        }
     }
+
+    static let defaultSurface = LodFarSurface(top: Mat.grass.rawValue, under: Mat.dirt.rawValue, canopy: 0, leaves: Mat.leaves.rawValue,
+                                              frozen: false, mountain: false)
 
     /// Writes the far columns of `key` into `g` wherever the grid's column has no data (all air). Returns the
     /// number of columns filled. Caller holds no lock.
@@ -166,7 +193,6 @@ final class LodFarStore: @unchecked Sendable {
         let table = surfaces
         lock.unlock()
         let n = lodNodeVoxels, h = g.height, L = g.level
-        let stone = Mat.stone.rawValue, ice = Mat.ice.rawValue
         var filled = 0
         g.v.withUnsafeMutableBufferPointer { v in
             for z in 0..<n {
@@ -175,39 +201,66 @@ final class LodFarStore: @unchecked Sendable {
                     var empty = true
                     for y in 0..<h where v[y * n * n + col] != 0 { empty = false; break }
                     if !empty { continue }
-                    let top = Int(cols.height[col]) - 1          // the ground's top block
-                    let bid = cols.biome[col]
-                    let s = table[bid] ?? LodFarSurface(top: Mat.grass.rawValue, under: Mat.dirt.rawValue, canopy: 0, leaves: Mat.leaves.rawValue, frozen: false, mountain: false)
-                    // Steep ground (more than 1.5 blocks up or down per block to a neighbor) shows stone in
-                    // mountain biomes, as vanilla's surface rules do on cliffs.
-                    var surfaceMat = s.top
-                    if s.mountain {
-                        var slope = 0
-                        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                            let nx = x + dx, nz = z + dz
-                            if nx < 0 || nz < 0 || nx >= n || nz >= n { continue }
-                            slope = max(slope, abs(Int(cols.height[nz * n + nx]) - Int(cols.height[col])))
-                        }
-                        if slope * 2 > 3 << L { surfaceMat = stone }
+                    // Steep: more than 1.5 blocks up or down per block to a neighbor, as on cliffs.
+                    var slope = 0
+                    for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                        let nx = x + dx, nz = z + dz
+                        if nx < 0 || nz < 0 || nx >= n || nz >= n { continue }
+                        slope = max(slope, abs(Int(cols.height[nz * n + nx]) - Int(cols.height[col])))
                     }
-                    let vyTop = min(h - 1, max(0, (top + 64) >> L))
-                    for y in 0..<vyTop { v[y * n * n + col] = y + 2 >= vyTop ? s.under : stone }
-                    // Under water, grass and snow give way to what's under them (lake and river beds).
-                    let wet = top + 1 < lodSeaLevel
-                    let vegetation = surfaceMat == Mat.grass.rawValue || surfaceMat == Mat.snow.rawValue
-                        || (surfaceMat >= lodGrassBase && surfaceMat < lodGrassBase + 32)
-                    v[vyTop * n * n + col] = wet && vegetation ? s.under : surfaceMat
-                    if wet {
-                        let vyWater = min(h - 1, (lodSeaLevel - 1 + 64) >> L)
-                        if vyWater > vyTop {
-                            for y in (vyTop + 1)...vyWater { v[y * n * n + col] = s.water }
-                            if s.frozen { v[vyWater * n * n + col] = ice }
-                        }
-                    } else if s.canopy > 0 {
-                        let vyCanopy = min(h - 1, (top + s.canopy + 64) >> L)
-                        if vyCanopy > vyTop { for y in (vyTop + 1)...vyCanopy { v[y * n * n + col] = s.leaves } }
-                        else { v[vyTop * n * n + col] = s.leaves }
+                    Self.writeColumn(v, col: col, n: n, h: h, L: L, height: Int(cols.height[col]),
+                                     s: table[cols.biome[col]] ?? Self.defaultSurface, steep: slope * 2 > 3 << L)
+                    filled += 1
+                }
+            }
+        }
+        return filled
+    }
+
+    /// For grids finer than level 3 (levels 0-2, near the player): fills columns with no data from the finest
+    /// generated node that covers them, heights interpolated between its columns. That's where explored terrain
+    /// ends; without it the LOD shows a ledge down to nothing there. Returns the number of columns filled.
+    func fillFromAncestors(_ g: inout LodGrid, x0: Int, z0: Int, maxLevel: Int) -> Int {
+        guard maxLevel >= lodFarMinLevel else { return 0 }
+        lock.lock()
+        let cols = columns, table = surfaces
+        lock.unlock()
+        if cols.isEmpty { return 0 }
+        let n = lodNodeVoxels, h = g.height, L = g.level
+        let voxel = 1 << L
+        var filled = 0
+        var lastKey: LodNodeKey?
+        var last: LodFarColumns?
+        g.v.withUnsafeMutableBufferPointer { v in
+            for z in 0..<n {
+                for x in 0..<n {
+                    let col = z * n + x
+                    var empty = true
+                    for y in 0..<h where v[y * n * n + col] != 0 { empty = false; break }
+                    if !empty { continue }
+                    let bx = Double(x0 + x * voxel) + Double(voxel) / 2, bz = Double(z0 + z * voxel) + Double(voxel) / 2
+                    // The finest generated node covering the column.
+                    var found: (LodNodeKey, LodFarColumns)?
+                    for lv in lodFarMinLevel...maxLevel {
+                        let size = Double(lodNodeVoxels << lv)
+                        let k = LodNodeKey(level: lv, x: Int((bx / size).rounded(.down)), z: Int((bz / size).rounded(.down)))
+                        if k == lastKey, let last { found = (k, last); break }
+                        if let c = cols[k] { found = (k, c); lastKey = k; last = c; break }
                     }
+                    guard let (k, c) = found else { continue }
+                    let s = Double(1 << k.level)
+                    // Column coordinates within the node, centers at half a column.
+                    let fx = (bx - Double(k.x * (lodNodeVoxels << k.level))) / s - 0.5
+                    let fz = (bz - Double(k.z * (lodNodeVoxels << k.level))) / s - 0.5
+                    let ix = min(n - 2, max(0, Int(fx.rounded(.down)))), iz = min(n - 2, max(0, Int(fz.rounded(.down))))
+                    let tx = min(1, max(0, fx - Double(ix))), tz = min(1, max(0, fz - Double(iz)))
+                    let h00 = Double(c.height[iz * n + ix]), h10 = Double(c.height[iz * n + ix + 1])
+                    let h01 = Double(c.height[(iz + 1) * n + ix]), h11 = Double(c.height[(iz + 1) * n + ix + 1])
+                    let height = Int(((h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz).rounded())
+                    let nearest = (tz < 0.5 ? iz : iz + 1) * n + (tx < 0.5 ? ix : ix + 1)
+                    let slope = max(abs(h10 - h00), abs(h01 - h00), abs(h11 - h10), abs(h11 - h01)) / s
+                    Self.writeColumn(v, col: col, n: n, h: h, L: L, height: height,
+                                     s: table[c.biome[nearest]] ?? Self.defaultSurface, steep: slope > 1.5)
                     filled += 1
                 }
             }

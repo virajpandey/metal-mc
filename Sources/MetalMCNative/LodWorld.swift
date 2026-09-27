@@ -259,7 +259,22 @@ final class LodWorld: @unchecked Sendable {
             changed = keep
         }
         let moved = meshedCenter.map { abs($0.x - want.x) > 128 || abs($0.z - want.z) > 128 } ?? true
-        far.lock.lock(); var farKeys = far.dirty; far.dirty.removeAll(); far.lock.unlock()
+        far.lock.lock(); var farKeys = far.dirty; far.dirty.removeAll(); let holes = far.holeRegions; far.lock.unlock()
+        // Partly explored regions under newly generated nodes are read again, so their levels 0-1 fill the
+        // unexplored columns (even near the player, where changed regions otherwise wait).
+        if !farKeys.isEmpty && !holes.isEmpty {
+            var have = Set(changed.map { LodBuild.key($0.0, $0.1) })
+            for k in farKeys {
+                let span = 1 << (k.level - 1)
+                for r in holes where !have.contains(r) {
+                    let (rx, rz) = LodBuild.unkey(r)
+                    if rx >= k.x * span && rx < (k.x + 1) * span && rz >= k.z * span && rz < (k.z + 1) * span {
+                        changed.append((rx, rz))
+                        have.insert(r)
+                    }
+                }
+            }
+        }
         if changed.isEmpty && !moved && farKeys.isEmpty { return false }
         center = want
 
@@ -270,6 +285,7 @@ final class LodWorld: @unchecked Sendable {
         for r in results {
             if r.hasData { far.realRegions.insert(r.key) } else { far.realRegions.remove(r.key) }
             if r.full { far.fullRegions.insert(r.key) } else { far.fullRegions.remove(r.key) }
+            if r.hasData && !r.full { far.holeRegions.insert(r.key) } else { far.holeRegions.remove(r.key) }
         }
         far.lock.unlock()
         for r in results {
@@ -312,10 +328,15 @@ final class LodWorld: @unchecked Sendable {
                 let outp = out.baseAddress!
                 DispatchQueue.concurrentPerform(iterations: parents.count) { i in
                     var g = self.grid(level: parents[i].level, x: parents[i].x, z: parents[i].z)
-                    if parents[i].level >= lodFarMinLevel { _ = self.far.fill(&g, key: parents[i]) }
+                    let size = lodNodeVoxels << parents[i].level
+                    if parents[i].level >= lodFarMinLevel {
+                        _ = self.far.fill(&g, key: parents[i])
+                    } else {
+                        // Level 2: regions without any chunks are empty in the quadrants it's built from.
+                        _ = self.far.fillFromAncestors(&g, x0: parents[i].x * size, z0: parents[i].z * size, maxLevel: self.maxLevel)
+                    }
                     g.fillUnreachable()
                     let m = LodBuild.mesh(g, maxMerge: 64)
-                    let size = lodNodeVoxels << parents[i].level
                     outp[i] = LodNode(level: parents[i].level, x0: parents[i].x * size, z0: parents[i].z * size, mesh: m)
                 }
             }
@@ -393,6 +414,7 @@ final class LodWorld: @unchecked Sendable {
                     let (nx, nz) = part[j]
                     let path = regionDir.appendingPathComponent("r.\(nx >> 1).\(nz >> 1).mca").path
                     guard var g = LodBuild.regionQuarterGrid(path: path, qx: nx & 1, qz: nz & 1) else { return }
+                    _ = self.far.fillFromAncestors(&g, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, maxLevel: self.maxLevel)
                     g.fillUnreachable(deepRadius: 16, deepDepth: 8)
                     let m = LodBuild.mesh(g)
                     outp[j] = LodNode(level: 0, x0: nx * lodNodeVoxels, z0: nz * lodNodeVoxels, mesh: m)
@@ -436,6 +458,7 @@ final class LodWorld: @unchecked Sendable {
                 // Every generated column has something (bedrock) in its bottom voxel.
                 var full = true
                 g.v.withUnsafeBufferPointer { v in for c in 0..<(lodNodeVoxels * lodNodeVoxels) where v[c] == 0 { full = false; break } }
+                if !full { _ = self.far.fillFromAncestors(&g, x0: x * 512, z0: z * 512, maxLevel: self.maxLevel) }
                 var q = LodGrid(level: 2)
                 g.downsample(into: &q, qx: 0, qz: 0)   // the quadrant occupies the low corner
                 let quadrant = LodQuadrant(grid: q)
