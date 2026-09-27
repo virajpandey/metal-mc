@@ -35,8 +35,9 @@ public final class MetalMCConfig {
         # Far-terrain LOD beyond the render distance (Metal backend). In single-player it shows terrain the
         # world has already generated; on servers, terrain you've already seen there. It follows the player.
         lod=true
-        # How far the LOD reaches, in blocks.
-        lod.far=4096
+        # How far the LOD reaches, in blocks. 32 km costs about 2% more than 8 km (most of it is past the
+        # saved world, generated from the seed in single-player; see lod.generate).
+        lod.far=32768
         # Also build the LOD from chunks as the game loads them (keeps it current without waiting for saves).
         lod.live=true
         # LOD on servers, built from the chunks you've seen there and saved under metalmc/lod/ (needs lod.live).
@@ -130,9 +131,9 @@ public final class MetalMCConfig {
 
     public static int lodFar() {
         try {
-            return Math.max(512, Integer.parseInt(get("lod.far", "4096")));
+            return Math.max(512, Integer.parseInt(get("lod.far", "32768")));
         } catch (NumberFormatException e) {
-            return 4096;
+            return 32768;
         }
     }
 }
