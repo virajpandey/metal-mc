@@ -39,6 +39,8 @@ struct LodFarSurface {
     var mountain: Bool       // steep slopes show stone
     var bands = false        // badlands: terracotta in horizontal color bands by height
     var water: UInt8 = lodTinted(Mat.water.rawValue, 0)   // tinted water
+    var coverage: Double = 0 // share of the ground under trees in sparse woods (cherry groves); 0 for a closed forest
+    var leafMix: [UInt8] = []   // canopy materials picked per tree-sized cell instead of `leaves` (dappled forests)
 }
 
 /// Surface rules approximated per biome name (vanilla's surface rules and tree density, simplified).
@@ -56,8 +58,11 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     case "taiga": s.canopy = 8
     case "old_growth_pine_taiga", "old_growth_spruce_taiga": s.canopy = 11
     case "jungle", "bamboo_jungle": s.canopy = 13
-    case "cherry_grove": s.canopy = 5; s.leaves = Mat.cherryLeaves.rawValue
-    case "dappled_forest": s.canopy = 8; s.leaves = Mat.orangePoplarLeaves.rawValue   // poplars: yellow, orange and red
+    case "cherry_grove": s.canopy = 5; s.leaves = Mat.cherryLeaves.rawValue; s.coverage = 0.35   // scattered trees on grass
+    case "dappled_forest":
+        // Poplars in three autumn colors (orange the most common, then red, then yellow).
+        s.canopy = 8; s.leaves = Mat.orangePoplarLeaves.rawValue
+        s.leafMix = [Mat.orangePoplarLeaves, .orangePoplarLeaves, .orangePoplarLeaves, .redPoplarLeaves, .redPoplarLeaves, .yellowPoplarLeaves].map(\.rawValue)
     case "mangrove_swamp": s.canopy = 6; s.top = Mat.mud.rawValue; s.under = Mat.mud.rawValue
     case "snowy_taiga", "grove": s.canopy = 7; s.top = snow
     case "snowy_plains", "ice_spikes": s.top = snow; s.frozen = true
@@ -70,7 +75,7 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     case "beach": s.top = sand; s.under = sand
     case "snowy_beach": s.top = snow; s.under = sand; s.frozen = true
     case "badlands", "eroded_badlands": s.top = Mat.terracotta.rawValue; s.under = Mat.terracotta.rawValue; s.bands = true
-    case "wooded_badlands": s.top = Mat.terracotta.rawValue; s.under = Mat.terracotta.rawValue; s.canopy = 4; s.bands = true
+    case "wooded_badlands": s.top = Mat.terracotta.rawValue; s.under = Mat.terracotta.rawValue; s.canopy = 4; s.bands = true; s.coverage = 0.3
     case "warm_ocean", "lukewarm_ocean", "deep_lukewarm_ocean", "beach_ocean": s.top = sand; s.under = sand
     case "ocean", "deep_ocean", "cold_ocean", "deep_cold_ocean", "river": s.top = gravel; s.under = gravel
     case "frozen_ocean", "deep_frozen_ocean", "frozen_river": s.top = gravel; s.under = gravel; s.frozen = true
@@ -245,12 +250,16 @@ final class LodFarStore: @unchecked Sendable {
             }
         } else if s.canopy > 0 {
             // Forest canopy isn't a flat sheet: tree height varies by 8-block patch (-2 to +2 blocks), and up close
-            // (voxels under 8 blocks) one 4-block cell in six is a clearing.
-            if L < 3 && lodHash(bx >> 2, bz >> 2, 1) < 1.0 / 6.0 { return }
+            // (voxels under 8 blocks) one 4-block cell in six is a clearing. Sparse woods keep trees on only
+            // `coverage` of their tree-sized cells, at every level (a solid canopy there reads as a carpet).
+            if s.coverage > 0 {
+                if lodHash(bx >> max(2, L), bz >> max(2, L), 1) >= s.coverage { return }
+            } else if L < 3 && lodHash(bx >> 2, bz >> 2, 1) < 1.0 / 6.0 { return }
+            let leaves = s.leafMix.isEmpty ? s.leaves : s.leafMix[min(s.leafMix.count - 1, Int(lodHash(bx >> 2, bz >> 2, 3) * Double(s.leafMix.count)))]
             let canopy = s.canopy + Int(lodHash(bx >> 3, bz >> 3, 2) * 5) - 2
             let vyCanopy = min(h - 1, (top + canopy + 64) >> L)
-            if vyCanopy > vyTop { for y in (vyTop + 1)...vyCanopy { v[y * n * n + col] = s.leaves } }
-            else { v[vyTop * n * n + col] = s.leaves }
+            if vyCanopy > vyTop { for y in (vyTop + 1)...vyCanopy { v[y * n * n + col] = leaves } }
+            else { v[vyTop * n * n + col] = leaves }
         }
     }
 
