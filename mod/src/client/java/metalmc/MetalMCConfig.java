@@ -50,10 +50,10 @@ public final class MetalMCConfig {
         # generator (heights and biomes, on a coarse grid in the background) out to lod.far.
         lod.generate=true
 
-        # Temporal anti-aliasing (Metal backend, experimental): smooths jagged and shimmering edges, most visible
-        # on far terrain, by blending each frame with the ones before it. About 1 ms per frame at the panel's
-        # native resolution.
-        taa=false
+        # Temporal anti-aliasing (Metal backend): smooths jagged and shimmering edges, most visible on far
+        # terrain, by blending each frame with the ones before it. About 1.8 ms of GPU per frame at the panel's
+        # native resolution; a 120 Hz flight still drops no frames. Set to false for the raw image.
+        taa=true
         """;
 
     private static final Properties FILE = load();
@@ -130,9 +130,9 @@ public final class MetalMCConfig {
         return flag("lod.generate", true);
     }
 
-    /** Temporal anti-aliasing (experimental, off by default): Taa.swift's resolve, about 1.1 ms per frame at the panel's resolution. */
+    /** Temporal anti-aliasing (on by default): Taa.swift's resolve, about 1.8 ms of GPU per frame at the panel's resolution. */
     public static boolean taa() {
-        return flag("taa", false);
+        return flag("taa", true);
     }
 
     public static boolean lodMultiplayer() {

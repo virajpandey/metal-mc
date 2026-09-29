@@ -72,7 +72,8 @@ loom {
 			property "metalmc.bench.hitches", (project.findProperty("benchHitches") ?: "0").toString()
 			if (project.hasProperty("submitsInFlight")) property "metalmc.submitsInFlight", project.findProperty("submitsInFlight").toString()
 			if (project.hasProperty("benchNoLodWait")) property "metalmc.bench.noLodWait", project.findProperty("benchNoLodWait").toString()
-			if (project.hasProperty("taa")) property "metalmc.taa", project.findProperty("taa").toString()
+			// Bench and fidelity runs keep TAA off unless asked (-Ptaa=true): the references were taken without it.
+			property "metalmc.taa", (project.findProperty("taa") ?: "false").toString()
 			property "metalmc.dumpMsl", (project.findProperty("dumpMsl") ?: "").toString()
 			property "metalmc.backend.debug", (project.findProperty("metalDebug") ?: "0").toString()
 			if (project.hasProperty("metalExp")) {
