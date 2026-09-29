@@ -39,6 +39,10 @@ let lodSlowMesh = experiments.contains("slowmesh")
 let lodNoAO = experiments.contains("noao")
 /// Sky light under cover (LodBuild.mesh): on everywhere; METALMC_EXP=noskycover turns it off outside the End.
 let lodSkyCover = !experiments.contains("noskycover")
+/// Light sources at levels 1 and up (METALMC_EXP=nofarlight turns them off).
+let lodFarLight = !experiments.contains("nofarlight")
+/// The coarsest level light can show at: a light starts at its level minus half a voxel (8 blocks at level 4).
+let lodMaxLightLevel = 4
 /// 15 - light, rounded to the nearest multiple of 3 (METALMC_EXP=coverexact: unrounded).
 let lodCoverSteps: [UInt8] = (0...15).map { d in experiments.contains("coverexact") ? UInt8(d) : UInt8(min(15, (d + 1) / 3 * 3)) }
 /// No ambient occlusion data for a quad (its whole rim is unoccluded).
@@ -104,22 +108,42 @@ let lodReduceInput: [UInt8] = (0..<256).map { m in
 
 /// One chunk's blocks (16 x 16 x 384 material ids, laid out y, z, x from the world bottom) to its level-1
 /// voxels (8 x 8 x 192, laid out y, z, x), with each 4 x 4-block cell's biome tint (tints[z * 4 + x]).
+/// `emission`, if given, gets each voxel's brightest light source (lodEmission, 0 for none), same layout. A solid
+/// source (lava, glowstone, magma) only counts where its light can get out: a face on air or water inside the chunk.
+/// Buried lava would otherwise light the ground above it once downsampling merges it into the stone around it, and
+/// the insides of lava lakes are most of a world's light sources.
 func lodReduceChunk(_ blocks: UnsafePointer<UInt8>, _ tints: UnsafePointer<UInt8>, into out: UnsafeMutablePointer<UInt8>,
-                    rule: LodDownsampleRule = lodDownsampleRule) {
-    let n = lodChunkVoxels
+                    rule: LodDownsampleRule = lodDownsampleRule, emission: UnsafeMutablePointer<UInt8>? = nil) {
+    let n = lodChunkVoxels, h = lodWorldHeight
+    let airK = MaterialKind.air.rawValue, waterK = MaterialKind.water.rawValue
+    @inline(__always) func light(_ i: Int, _ x: Int, _ y: Int, _ z: Int) -> UInt8 {
+        let m = Int(blocks[i]), l = lodEmission[m]
+        if l == 0 || lodKinds[m] == airK { return l }
+        @inline(__always) func open(_ j: Int) -> Bool { let k = lodKinds[Int(blocks[j])]; return k == airK || k == waterK }
+        if (x > 0 && open(i - 1)) || (x < 15 && open(i + 1)) || (z > 0 && open(i - 16)) || (z < 15 && open(i + 16))
+            || (y > 0 && open(i - 256)) || (y < h - 1 && open(i + 256)) { return l }
+        return 0
+    }
     for vy in 0..<(lodWorldHeight >> 1) {
         for vz in 0..<n {
             for vx in 0..<n {
                 var c = SIMD8<UInt8>(repeating: 0)
+                var e: UInt8 = 0
                 for dy in 0..<2 {
                     for dz in 0..<2 {
                         let row = ((vy * 2 + dy) * 16 + vz * 2 + dz) * 16 + vx * 2
-                        c[dy << 2 | dz << 1] = lodReduceInput[Int(blocks[row])]
-                        c[dy << 2 | dz << 1 | 1] = lodReduceInput[Int(blocks[row + 1])]
+                        let b0 = Int(blocks[row]), b1 = Int(blocks[row + 1])
+                        c[dy << 2 | dz << 1] = lodReduceInput[b0]
+                        c[dy << 2 | dz << 1 | 1] = lodReduceInput[b1]
+                        if emission != nil && (lodEmission[b0] | lodEmission[b1]) != 0 {
+                            let y = vy * 2 + dy, z = vz * 2 + dz
+                            e = max(e, light(row, vx * 2, y, z), light(row + 1, vx * 2 + 1, y, z))
+                        }
                     }
                 }
                 let m = lodReduce(c, rule: rule)
                 out[(vy * n + vz) * n + vx] = m == 0 ? 0 : lodTinted(m, tints[(vz >> 1) * 4 + (vx >> 1)])
+                emission?[(vy * n + vz) * n + vx] = e
             }
         }
     }
@@ -132,6 +156,9 @@ struct LodGrid {
     var v: [UInt8]
     /// Level 0: voxels holding light sources (lodEmission), found while decoding; the mesher spreads their light.
     var emitters: [Int32] = []
+    /// Levels 1 and up: light sources as voxel index << 4 | light level, the brightest in each voxel. Torches and
+    /// lanterns are dropped from the voxels themselves (they'd be too small to see), so this keeps their light.
+    var lights: [UInt32] = []
 
     init(level: Int) {
         self.level = level
@@ -277,6 +304,19 @@ struct LodGrid {
                 }
             }
         }
+        // The brightest light of each 2 x 2 x 2 group, keeping only lights that can still show at the parent's level
+        // (the mesher starts a light at its level minus half a voxel: nothing survives past level 4).
+        let minLevel = UInt32((1 << parent.level) / 2)
+        if !lights.isEmpty && parent.level <= lodMaxLightLevel {
+            var merged: [UInt32: UInt32] = [:]
+            for l in lights where l & 15 > minLevel {
+                let i = Int(l >> 4), x = i % n, z = (i / n) % n, y = i / (n * n)
+                if y / 2 >= ph { continue }
+                let p = UInt32(((y / 2) * n + qz * half + z / 2) * n + qx * half + x / 2)
+                merged[p] = max(merged[p] ?? 0, l & 15)
+            }
+            for (p, level) in merged { parent.lights.append(p << 4 | level) }
+        }
     }
 }
 
@@ -319,6 +359,8 @@ enum LodBuild {
         let scratch = ChunkScan.Scratch()
         var blocks = [UInt8](repeating: 0, count: 16 * 16 * lodWorldHeight)
         var voxels = [UInt8](repeating: 0, count: lodChunkVoxels * lodChunkVoxels * (lodWorldHeight >> 1))
+        var emission = [UInt8](repeating: 0, count: voxels.count)
+        var lights: [UInt32] = []
         var tint = [UInt8](repeating: 0, count: 16)
         let n = lodNodeVoxels, cv = lodChunkVoxels
         r.withUnsafeBufferPointer { rb in
@@ -337,7 +379,10 @@ enum LodBuild {
                 blocks.withUnsafeBufferPointer { bp in
                     tint.withUnsafeBufferPointer { tp in
                         voxels.withUnsafeMutableBufferPointer { vp in
-                            lodReduceChunk(bp.baseAddress!, tp.baseAddress!, into: vp.baseAddress!, rule: floating ? .top : lodDownsampleRule)
+                            emission.withUnsafeMutableBufferPointer { ep in
+                                lodReduceChunk(bp.baseAddress!, tp.baseAddress!, into: vp.baseAddress!, rule: floating ? .top : lodDownsampleRule,
+                                               emission: ep.baseAddress!)
+                            }
                         }
                     }
                 }
@@ -345,12 +390,16 @@ enum LodBuild {
                 for vy in 0..<(lodWorldHeight >> 1) {
                     for vz in 0..<cv {
                         let src = (vy * cv + vz) * cv, dst = (vy * n + lz0 + vz) * n + lx0
-                        for vx in 0..<cv { g[dst + vx] = voxels[src + vx] }
+                        for vx in 0..<cv {
+                            g[dst + vx] = voxels[src + vx]
+                            if emission[src + vx] != 0 { lights.append(UInt32(dst + vx) << 4 | UInt32(emission[src + vx])) }
+                        }
                     }
                 }
             }
         }
         }
+        grid.lights = lights
         return any ? grid : nil
     }
 
@@ -512,12 +561,16 @@ enum LodBuild {
                 let c = cover[(y * n + z) * n + x]
                 return c == 255 ? 15 : UInt32(lodCoverSteps[Int(c)])
             }
-            // Block light (level 0): vanilla's, spread from the light sources found while decoding through air and
-            // water, one level less per block. Torches and lanterns hold their light in their own (air) voxel;
-            // glowstone and the like light the air around them. A face carries the light of the voxel in front of
-            // it (mask bits 20-23, quad word1 bits 24-27), which the shader passes to vanilla's lightmap.
+            // Block light: vanilla's, spread from the light sources through air and water, one level less per block.
+            // Torches and lanterns hold their light in their own (air) voxel; glowstone and the like light the air
+            // around them. A face carries the light of the voxel in front of it (mask bits 20-23, quad word1 bits
+            // 24-27), which the shader passes to vanilla's lightmap. At level L a voxel is 2^L blocks, so light
+            // drops 2^L per voxel, and a source starts at the average over its voxel rather than its peak (a torch
+            // lights the ground next to it, not the whole 8 x 8 face of a level-3 voxel): its level minus half the
+            // voxel's size. Past level 3 only the brightest sources show at all.
             var blockLight: [UInt8] = []
-            if grid.level == 0 && !grid.emitters.isEmpty {
+            let lightStep = 1 << grid.level
+            if (grid.level == 0 && !grid.emitters.isEmpty) || (grid.level > 0 && grid.level <= lodMaxLightLevel && lodFarLight && !grid.lights.isEmpty) {
                 blockLight = [UInt8](repeating: 0, count: n * n * h)
                 var queue = [[Int32]](repeating: [], count: 16)
                 @inline(__always) func clear(_ v: Int) -> Bool { let k = kinds[Int(g[v])]; return k == airK || k == waterK }
@@ -533,14 +586,25 @@ enum LodBuild {
                     if y > 0 && clear(v - n * n) { seed(v - n * n, l) }
                     if y < h - 1 && clear(v + n * n) { seed(v + n * n, l) }
                 }
-                for e32 in grid.emitters {
-                    let e = Int(e32), l = lodEmission[Int(g[e])]
-                    if l == 0 { continue }
-                    if clear(e) { seed(e, l) } else { spread(e, l - 1) }
+                if grid.level == 0 {
+                    for e32 in grid.emitters {
+                        let e = Int(e32), l = lodEmission[Int(g[e])]
+                        if l == 0 { continue }
+                        if clear(e) { seed(e, l) } else { spread(e, l - 1) }
+                    }
+                } else {
+                    for p in grid.lights {
+                        let e = Int(p >> 4), l = Int(p & 15) - lightStep / 2
+                        if l <= 0 || e >= g.count { continue }
+                        // A source in a voxel that became solid when downsampled lights the air around it, a voxel
+                        // further on (it could be anywhere inside: lava a few blocks under the ground shouldn't light
+                        // the ground's top face).
+                        if clear(e) { seed(e, UInt8(l)) } else if l > lightStep { spread(e, UInt8(l - lightStep)) }
+                    }
                 }
                 var level = 15
-                while level > 1 {
-                    for v32 in queue[level] where blockLight[Int(v32)] == level { spread(Int(v32), UInt8(level - 1)) }
+                while level > lightStep {
+                    for v32 in queue[level] where blockLight[Int(v32)] == level { spread(Int(v32), UInt8(level - lightStep)) }
                     queue[level].removeAll()
                     level -= 1
                 }
@@ -981,5 +1045,14 @@ public func mmc_debug_region_quad_materials(_ path: UnsafePointer<CChar>, _ out:
         g.fillUnreachable(deepRadius: 16, deepDepth: 8)
         let m = LodBuild.mesh(g, maxMerge: 64)
         for i in 0..<(m.quads.count / 2) { out[Int(m.quads[2 * i + 1] & 255)] += 1 }
+    }
+}
+
+/// Debug: light sources per material id in one region file at full resolution: out[256].
+@_cdecl("mmc_debug_region_emitter_materials")
+public func mmc_debug_region_emitter_materials(_ path: UnsafePointer<CChar>, _ out: UnsafeMutablePointer<Int64>) {
+    for q in 0..<4 {
+        guard let g = LodBuild.regionQuarterGrid(path: String(cString: path), qx: q & 1, qz: q >> 1) else { continue }
+        for e in g.emitters { out[Int(g.v[Int(e)])] += 1 }
     }
 }

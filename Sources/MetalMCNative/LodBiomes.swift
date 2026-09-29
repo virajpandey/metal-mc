@@ -99,6 +99,7 @@ let lodEmission: [UInt8] = {
     e[Int(Mat.light14.rawValue)] = 14
     e[Int(Mat.light10.rawValue)] = 10
     e[Int(Mat.light7.rawValue)] = 7
+    e[Int(Mat.magma.rawValue)] = 3
     return e
 }()
 

@@ -173,6 +173,7 @@ let lodMaterialFaceColors: [SIMD4<Float>] = [
     SIMD4(0.797, 0.771, 0.728, 1), SIMD4(0.797, 0.771, 0.728, 1), SIMD4(0.797, 0.771, 0.728, 1),   // mushroomStem
     SIMD4(0.390, 0.613, 0.592, 1), SIMD4(0.390, 0.613, 0.592, 1), SIMD4(0.390, 0.613, 0.592, 1),   // prismarine
     SIMD4(0.203, 0.359, 0.298, 1), SIMD4(0.203, 0.359, 0.298, 1), SIMD4(0.203, 0.359, 0.298, 1),   // darkPrismarine
+    SIMD4(0.560, 0.249, 0.124, 1), SIMD4(0.560, 0.249, 0.124, 1), SIMD4(0.560, 0.249, 0.124, 1),   // magma
 ]
 
 /// Grass block sides: the untinted dirt part's mean color, the tinted fringe's share of the texture, and the
@@ -362,5 +363,6 @@ let lodMaterialSprites: [LodSprite] = [
     LodSprite(top: "mushroom_stem", side: "mushroom_stem", topLuma: 0.773, sideLuma: 0.773, topMean: SIMD3(0.797, 0.771, 0.728), sideMean: SIMD3(0.797, 0.771, 0.728)),   // mushroomStem
     LodSprite(top: "prismarine", side: "prismarine", topLuma: 0.564, sideLuma: 0.564, topMean: SIMD3(0.390, 0.613, 0.592), sideMean: SIMD3(0.390, 0.613, 0.592)),   // prismarine
     LodSprite(top: "dark_prismarine", side: "dark_prismarine", topLuma: 0.322, sideLuma: 0.322, topMean: SIMD3(0.203, 0.359, 0.298), sideMean: SIMD3(0.203, 0.359, 0.298)),   // darkPrismarine
+    LodSprite(top: "magma", side: "magma", topLuma: 0.306, sideLuma: 0.306, topMean: SIMD3(0.560, 0.249, 0.124), sideMean: SIMD3(0.560, 0.249, 0.124)),   // magma
     LodSprite(top: "grass_block_side_overlay", side: "grass_block_side", topLuma: 0.606, sideLuma: 0.425, topMean: SIMD3(0.606, 0.606, 0.606), sideMean: SIMD3(0.497, 0.420, 0.257)),   // grass side (not a material)
 ]

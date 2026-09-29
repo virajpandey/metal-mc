@@ -29,13 +29,16 @@ public func mmc_lod_set_detail(_ radius: Int32) {
 struct LodQuadrant {
     var offsets: [UInt32]
     var runs: [UInt8]
+    var lights: [UInt32] = []   // LodGrid.lights of the quadrant, as if it sat in the low corner of a level-2 grid
 
-    init(offsets: [UInt32], runs: [UInt8]) {
+    init(offsets: [UInt32], runs: [UInt8], lights: [UInt32] = []) {
         self.offsets = offsets
         self.runs = runs
+        self.lights = lights
     }
 
     init(grid g: LodGrid) {
+        lights = g.lights
         let q = lodQuadrantVoxels, h = g.height
         offsets = [UInt32](repeating: 0, count: q * q + 1)
         runs = []
@@ -61,6 +64,11 @@ struct LodQuadrant {
     /// Writes the quadrant into quadrant (qx, qz) of a level-2 grid.
     func expand(into g: inout LodGrid, qx: Int, qz: Int) {
         let q = lodQuadrantVoxels
+        let n = lodNodeVoxels
+        for l in lights {
+            let i = Int(l >> 4)
+            g.lights.append(UInt32(i + (qz * q) * n + qx * q) << 4 | (l & 15))
+        }
         g.v.withUnsafeMutableBufferPointer { dst in
             runs.withUnsafeBufferPointer { r in
                 for z in 0..<q {
@@ -81,7 +89,7 @@ struct LodQuadrant {
         }
     }
 
-    var bytes: Int { offsets.count * 4 + runs.count }
+    var bytes: Int { offsets.count * 4 + runs.count + lights.count * 4 }
 }
 
 /// A meshed node on the GPU.
@@ -578,8 +586,9 @@ final class LodWorld: @unchecked Sendable {
     // MARK: - Region cache
 
     /// Bump when what a quadrant holds changes (materials, downsampling), so older cache files are rebuilt.
-    /// 2: 26.3's poplar leaves got their own materials. 3: huge mushrooms, prismarine.
-    static let cacheVersion: UInt8 = 3
+    /// 2: 26.3's poplar leaves got their own materials. 3: huge mushrooms, prismarine. 4: light sources, magma.
+    /// 5: only light sources whose light can get out.
+    static let cacheVersion: UInt8 = 5
 
     private func cacheURL(_ x: Int, _ z: Int) -> URL? { cacheDir?.appendingPathComponent("r.\(x).\(z).lq") }
 
@@ -590,7 +599,8 @@ final class LodWorld: @unchecked Sendable {
     }
 
     /// A fully generated region's quadrant from an earlier session, if its region file hasn't changed since.
-    /// File: "MMCQ", version, region file stamp (ms, bytes), body length, then LZFSE of the offsets (UInt32) and runs.
+    /// File: "MMCQ", version, region file stamp (ms, bytes), body length, then LZFSE of the offsets (UInt32), the runs
+    /// and the lights (UInt32 each).
     func cachedQuadrant(x: Int, z: Int) -> LodQuadrant? {
         guard let url = cacheURL(x, z), let st = stamp(x, z), let d = try? Data(contentsOf: url), d.count > 29 else { return nil }
         let raw = [UInt8](d)
@@ -606,9 +616,15 @@ final class LodWorld: @unchecked Sendable {
         for k in 0..<offsets.count {
             offsets[k] = UInt32(body[4 * k]) | UInt32(body[4 * k + 1]) << 8 | UInt32(body[4 * k + 2]) << 16 | UInt32(body[4 * k + 3]) << 24
         }
-        let runs = Array(body[(offsets.count * 4)...])
-        guard Int(offsets[q * q]) == runs.count else { return nil }
-        return LodQuadrant(offsets: offsets, runs: runs)
+        let runStart = offsets.count * 4, runEnd = runStart + Int(offsets[q * q])
+        guard runEnd <= body.count, (body.count - runEnd) % 4 == 0 else { return nil }
+        let runs = Array(body[runStart..<runEnd])
+        var lights = [UInt32](repeating: 0, count: (body.count - runEnd) / 4)
+        for k in 0..<lights.count {
+            let o = runEnd + 4 * k
+            lights[k] = UInt32(body[o]) | UInt32(body[o + 1]) << 8 | UInt32(body[o + 2]) << 16 | UInt32(body[o + 3]) << 24
+        }
+        return LodQuadrant(offsets: offsets, runs: runs, lights: lights)
     }
 
     func saveQuadrant(x: Int, z: Int, _ quadrant: LodQuadrant) {
@@ -617,6 +633,7 @@ final class LodWorld: @unchecked Sendable {
         body.reserveCapacity(quadrant.offsets.count * 4 + quadrant.runs.count)
         for o in quadrant.offsets { body += [UInt8(o & 255), UInt8((o >> 8) & 255), UInt8((o >> 16) & 255), UInt8(o >> 24)] }
         body += quadrant.runs
+        for l in quadrant.lights { body += [UInt8(l & 255), UInt8((l >> 8) & 255), UInt8((l >> 16) & 255), UInt8(l >> 24)] }
         var packed = [UInt8](repeating: 0, count: body.count + 1024)
         let n = body.withUnsafeBufferPointer { compression_encode_buffer(&packed, packed.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
         guard n > 0 else { return }
@@ -656,9 +673,9 @@ final class LodWorld: @unchecked Sendable {
         far.lock.lock(); defer { far.lock.unlock() }
         for level in lodFarMinLevel...maxLevel {
             let size = lodNodeVoxels << level
-            // A node is drawn when its parent splits (the parent's nearest point within 2 x this node's size)
-            // or, at the top level, anywhere within the LOD distance.
-            let reach = level == maxLevel ? Double(size) : 2.0 * Double(size)
+            // A node is drawn when its parent splits (the parent's nearest point within the split factor x this
+            // node's size) or, at the top level, anywhere within the LOD distance.
+            let reach = level == maxLevel ? Double(size) : lodSplitFactor * Double(size)
             let psize = size * 2
             let cx = Int((Double(c.x) / Double(size)).rounded(.down)), cz = Int((Double(c.z) / Double(size)).rounded(.down))
             let r = Int(reach) / size + 2

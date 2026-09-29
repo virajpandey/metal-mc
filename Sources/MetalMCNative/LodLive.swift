@@ -14,14 +14,17 @@ let lodChunkVoxels = 8                                   // level-1 voxels per c
 let lodColumnHeight = lodWorldHeight >> 1                // level-1 voxels per column
 
 /// One chunk's level-1 voxels, run-length encoded: 64 UInt16 column offsets (plus the end) into
-/// (material, count) byte pairs, bottom up.
+/// (material, count) byte pairs, bottom up. `lights`: the chunk's light sources as LodGrid.lights, with voxel
+/// indices inside the chunk ((y * 8 + z) * 8 + x).
 struct LodChunkColumns {
     var data: [UInt8]
+    var lights: [UInt32] = []
 
-    init(data: [UInt8]) { self.data = data }
+    init(data: [UInt8], lights: [UInt32] = []) { self.data = data; self.lights = lights }
 
-    /// Encodes 8 x 8 x 192 voxels laid out (y, z, x).
-    init(voxels v: UnsafeBufferPointer<UInt8>) {
+    /// Encodes 8 x 8 x 192 voxels laid out (y, z, x); `emission` (same layout, optional) gives their light sources.
+    init(voxels v: UnsafeBufferPointer<UInt8>, emission: UnsafeBufferPointer<UInt8>? = nil) {
+        if let emission { for i in 0..<emission.count where emission[i] != 0 { lights.append(UInt32(i) << 4 | UInt32(emission[i])) } }
         let n = lodChunkVoxels, h = lodColumnHeight
         var offsets = [UInt16](repeating: 0, count: n * n + 1)
         var runs: [UInt8] = []
@@ -43,9 +46,14 @@ struct LodChunkColumns {
         data = out + runs
     }
 
-    /// Replaces this chunk's columns in a level-1 grid (the chunk's corner at voxel (x0, z0)).
+    /// Replaces this chunk's columns in a level-1 grid (the chunk's corner at voxel (x0, z0)) and adds its lights
+    /// (the caller removes the lights the grid had there).
     func write(into g: inout LodGrid, x0: Int, z0: Int) {
         let n = lodChunkVoxels, h = lodColumnHeight, header = (n * n + 1) * 2
+        for l in lights {
+            let i = Int(l >> 4), x = i % n, z = (i / n) % n, y = i / (n * n)
+            g.lights.append(UInt32((y * lodNodeVoxels + z0 + z) * lodNodeVoxels + x0 + x) << 4 | (l & 15))
+        }
         data.withUnsafeBufferPointer { d in
             g.v.withUnsafeMutableBufferPointer { dst in
                 for c in 0..<(n * n) {
@@ -179,12 +187,22 @@ final class LodLiveStore: @unchecked Sendable {
         let chunks = regions[LodBuild.key(regionX, regionZ)]
         lock.unlock()
         guard let chunks, !chunks.isEmpty else { return false }
+        // Live chunks replace the region file's: drop the file's lights in them first (a torch the player broke since
+        // the last save would keep lighting the far terrain).
+        if !g.lights.isEmpty {
+            let n = lodNodeVoxels, cv = lodChunkVoxels
+            g.lights.removeAll { l in
+                let i = Int(l >> 4)
+                return chunks[((i / n) % n / cv) * 32 + (i % n) / cv] != nil
+            }
+        }
         for (ci, cols) in chunks { cols.write(into: &g, x0: (ci % 32) * lodChunkVoxels, z0: (ci / 32) * lodChunkVoxels) }
         return true
     }
 
-    // MARK: - Persistence (multiplayer): one file per region: "MMCL", version 2, the body's length (u32), then
-    // the body compressed with LZFSE. The body is (chunk index u16, length u32, column data)*.
+    // MARK: - Persistence (multiplayer): one file per region: "MMCL", version 3, the body's length (u32), then
+    // the body compressed with LZFSE. The body is (chunk index u16, length u32, column data, light count u32,
+    // lights u32 each)*. Version 2 files (no lights) still load.
 
     func saveUnsaved() {
         guard let saveDir else { return }
@@ -200,6 +218,9 @@ final class LodLiveStore: @unchecked Sendable {
                 let n = cols.data.count
                 body += [UInt8(ci & 255), UInt8(ci >> 8), UInt8(n & 255), UInt8((n >> 8) & 255), UInt8((n >> 16) & 255), UInt8(n >> 24)]
                 body += cols.data
+                let c = cols.lights.count
+                body += [UInt8(c & 255), UInt8((c >> 8) & 255), UInt8((c >> 16) & 255), UInt8(c >> 24)]
+                for l in cols.lights { body += [UInt8(l & 255), UInt8((l >> 8) & 255), UInt8((l >> 16) & 255), UInt8(l >> 24)] }
             }
             var packed = [UInt8](repeating: 0, count: body.count + 4096)
             let packedCount = body.withUnsafeBufferPointer { src in
@@ -207,7 +228,7 @@ final class LodLiveStore: @unchecked Sendable {
             }
             guard packedCount > 0 else { log("LOD: couldn't compress a saved region"); continue }
             let n = body.count
-            let out: [UInt8] = Array("MMCL".utf8) + [2, UInt8(n & 255), UInt8((n >> 8) & 255), UInt8((n >> 16) & 255), UInt8(n >> 24)]
+            let out: [UInt8] = Array("MMCL".utf8) + [3, UInt8(n & 255), UInt8((n >> 8) & 255), UInt8((n >> 16) & 255), UInt8(n >> 24)]
                 + packed[0..<packedCount]
             let (x, z) = LodBuild.unkey(k)
             let url = saveDir.appendingPathComponent("r.\(x).\(z).lod")
@@ -224,7 +245,8 @@ final class LodLiveStore: @unchecked Sendable {
             guard parts.count == 4, let x = Int(parts[1]), let z = Int(parts[2]),
                   let d = FileManager.default.contents(atPath: saveDir.appendingPathComponent(f).path) else { continue }
             let raw = [UInt8](d)
-            guard raw.count >= 9, raw[0..<4].elementsEqual("MMCL".utf8), raw[4] == 2 else { continue }
+            guard raw.count >= 9, raw[0..<4].elementsEqual("MMCL".utf8), raw[4] == 2 || raw[4] == 3 else { continue }
+            let version = raw[4]
             let n = Int(raw[5]) | Int(raw[6]) << 8 | Int(raw[7]) << 16 | Int(raw[8]) << 24
             var b = [UInt8](repeating: 0, count: n)
             let got = raw.withUnsafeBufferPointer { src in
@@ -238,8 +260,22 @@ final class LodLiveStore: @unchecked Sendable {
                 let n = Int(b[i + 2]) | Int(b[i + 3]) << 8 | Int(b[i + 4]) << 16 | Int(b[i + 5]) << 24
                 i += 6
                 guard ci < 1024, n >= (lodChunkVoxels * lodChunkVoxels + 1) * 2, i + n <= b.count else { break }
-                chunks[ci] = LodChunkColumns(data: Array(b[i..<(i + n)]))
+                let data = Array(b[i..<(i + n)])
                 i += n
+                var lights: [UInt32] = []
+                if version >= 3 {
+                    guard i + 4 <= b.count else { break }
+                    let c = Int(b[i]) | Int(b[i + 1]) << 8 | Int(b[i + 2]) << 16 | Int(b[i + 3]) << 24
+                    i += 4
+                    guard i + 4 * c <= b.count else { break }
+                    lights.reserveCapacity(c)
+                    for k in 0..<c {
+                        let o = i + 4 * k
+                        lights.append(UInt32(b[o]) | UInt32(b[o + 1]) << 8 | UInt32(b[o + 2]) << 16 | UInt32(b[o + 3]) << 24)
+                    }
+                    i += 4 * c
+                }
+                chunks[ci] = LodChunkColumns(data: data, lights: lights)
             }
             let k = LodBuild.key(x, z)
             lock.lock()
@@ -297,9 +333,12 @@ private func lodIngest(_ w: LodWorld, _ cx: Int32, _ cz: Int32, _ blocks: Unsafe
     }
     tinted.withUnsafeBufferPointer { w.live.putFull(cx: Int(cx), cz: Int(cz), $0) }
     var v = [UInt8](repeating: 0, count: n * n * h)
-    v.withUnsafeMutableBufferPointer { lodReduceChunk(blocks, tints, into: $0.baseAddress!, rule: w.downsampleRule) }
+    var e = [UInt8](repeating: 0, count: n * n * h)
+    v.withUnsafeMutableBufferPointer { vp in
+        e.withUnsafeMutableBufferPointer { lodReduceChunk(blocks, tints, into: vp.baseAddress!, rule: w.downsampleRule, emission: $0.baseAddress!) }
+    }
     if w.floating { for k in 0..<(n * n) { v[k] = lodChunkMarker } }
-    let cols = v.withUnsafeBufferPointer { LodChunkColumns(voxels: $0) }
+    let cols = v.withUnsafeBufferPointer { vp in e.withUnsafeBufferPointer { LodChunkColumns(voxels: vp, emission: $0) } }
     if lodLiveCheck, let dir = w.regionDir { liveCheck(dir: dir, cx: Int(cx), cz: Int(cz), live: v) }
     w.live.put(cx: Int(cx), cz: Int(cz), cols)
 }

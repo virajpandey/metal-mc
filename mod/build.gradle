@@ -88,6 +88,9 @@ loom {
 			if (project.hasProperty("taaBlend")) {
 				environmentVariable "METALMC_TAABLEND", project.findProperty("taaBlend").toString()
 			}
+			if (project.hasProperty("lodSplit")) {
+				environmentVariable "METALMC_SPLIT", project.findProperty("lodSplit").toString()
+			}
 			if (project.hasProperty("lodQos")) {
 				environmentVariable "METALMC_LODQOS", project.findProperty("lodQos").toString()
 			}

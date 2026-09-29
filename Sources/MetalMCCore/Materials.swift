@@ -27,6 +27,9 @@ public enum Mat: UInt8, CaseIterable {
     case yellowPoplarLeaves = 160, redPoplarLeaves, orangePoplarLeaves
     // Huge mushrooms (dark forests, mushroom fields) and ocean monuments.
     case redMushroomBlock, brownMushroomBlock, mushroomStem, prismarine, darkPrismarine
+    // Magma blocks (ocean floors, the Nether): drawn full-bright like vanilla's (emissive), but they only give off
+    // light level 3, where lava gives 15.
+    case magma
 
     public var kind: MaterialKind {
         switch self {
@@ -105,6 +108,7 @@ public enum Mat: UInt8, CaseIterable {
         case .mushroomStem: return SIMD4(0.80, 0.77, 0.70, 1)
         case .prismarine: return SIMD4(0.39, 0.63, 0.58, 1)
         case .darkPrismarine: return SIMD4(0.20, 0.36, 0.30, 1)
+        case .magma: return SIMD4(0.55, 0.25, 0.10, 1)
         }
     }
 }
@@ -184,7 +188,7 @@ public enum Materials {
         if any(decorative) { return .air }
         if has("moss") { return .moss }
         if has("amethyst") { return .amethyst }
-        if has("magma") { return .lava }
+        if has("magma") { return .magma }
         if has("pumpkin") || has("melon") { return .pumpkin }
         if n.hasPrefix("raw_") || n == "spawner" { return .stone }
         if has("dirt_path") { return .path }

@@ -157,7 +157,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     uint depth = water ? 0u : depthField;
     // Block light: lava and solid light sources glow at night like vanilla's; other faces get the light of the
     // air in front of them (torches, lanterns).
-    float blockLevel = (m == MAT_LAVA || (m >= MAT_GLOW_FIRST && m <= MAT_GLOW_LAST)) ? 15.0 : float((q.y >> 24) & 15u);
+    float blockLevel = (m == MAT_LAVA || m == MAT_MAGMA || (m >= MAT_GLOW_FIRST && m <= MAT_GLOW_LAST)) ? 15.0 : float((q.y >> 24) & 15u);
     float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, blockLevel);
     // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
     // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
@@ -213,7 +213,7 @@ using LodMeshOut = metal::mesh<VOut, LodPrim, 4 * MESH_QUADS, 2 * MESH_QUADS, me
     uint depthField = (q.x >> 28) & 15;
     bool deep = water && depthField == 15;
     uint depth = water ? 0u : depthField;
-    float blockLevel = (m == MAT_LAVA || (m >= MAT_GLOW_FIRST && m <= MAT_GLOW_LAST)) ? 15.0 : float((q.y >> 24) & 15u);
+    float blockLevel = (m == MAT_LAVA || m == MAT_MAGMA || (m >= MAT_GLOW_FIRST && m <= MAT_GLOW_LAST)) ? 15.0 : float((q.y >> 24) & 15u);
     float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, blockLevel);
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
     uint color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
@@ -426,6 +426,9 @@ let lodTileSplit = Double(ProcessInfo.processInfo.environment["METALMC_TILESPLIT
 /// the ones they replace dither out, instead of popping. 24 frames is 0.2 s at 120 Hz.
 /// METALMC_EXP=nozoomlod: levels by distance alone, even zoomed in.
 let lodNoZoom = experiments.contains("nozoomlod")
+/// A node splits into finer children when the camera is closer than this times the child's size (METALMC_SPLIT;
+/// default 2). Higher values keep finer levels farther out: smaller voxels on screen, more quads.
+let lodSplitFactor: Double = Double(ProcessInfo.processInfo.environment["METALMC_SPLIT"] ?? "") ?? 2.0
 let lodFadeFrames = Int(ProcessInfo.processInfo.environment["METALMC_FADE"] ?? "") ?? 24
 
 /// METALMC_EXP=meshshader draws the LOD with a mesh shader (one thread per quad) instead of indexed vertices.
@@ -567,6 +570,7 @@ final class LodRenderer: @unchecked Sendable {
                     .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
                     .replacingOccurrences(of: "MAT_DIRT", with: "\(Mat.dirt.rawValue)u")
                     .replacingOccurrences(of: "MAT_LAVA", with: "\(Mat.lava.rawValue)u")
+                    .replacingOccurrences(of: "MAT_MAGMA", with: "\(Mat.magma.rawValue)u")
                     .replacingOccurrences(of: "MAT_GLOW_FIRST", with: "\(Mat.glowstone.rawValue)u")
                     .replacingOccurrences(of: "MAT_GLOW_LAST", with: "\(Mat.froglight.rawValue)u")
                     .replacingOccurrences(of: "MESH_QUADS", with: "\(lodMeshQuads)")
@@ -839,8 +843,9 @@ private func lodOpen(regionDir: URL?, storeDir: URL?, cacheDir: URL? = nil, dime
     let r = LodRenderer.shared
     var maxLevel = 1
     while (lodNodeVoxels << maxLevel) < far && maxLevel < 8 { maxLevel += 1 }
-    // Level-1 nodes exist far enough out for level 0's parents (METALMC_LOD0 can reach past 1.5 km).
-    let fine = max(1536, lodLevel0Radius + 512)
+    // Level-1 nodes exist far enough out for the level-2 nodes that split into them (within the split factor x 512
+    // blocks; 1536 at the default 2) and for level 0's parents (METALMC_LOD0 can reach past 1.5 km).
+    let fine = max(Int(768 * lodSplitFactor), lodLevel0Radius + 512)
     r.lock.lock()
     let id = r.nextWorldId
     r.nextWorldId += 1
@@ -924,7 +929,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     // Zoom relative to vanilla's default 70-degree field of view (proj[1][1] = cot(35 degrees)), counted only when it's
     // clearly zoomed (the spyglass is about 10x; sprinting widens the view a little, which changes nothing).
     let fovZoom = Double(p[5]) / 1.4281
-    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: 2.0,
+    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: lodSplitFactor,
                                     level0Radius: Double(lodLevel0Radius), zoom: fovZoom > 1.25 && !lodNoZoom ? fovZoom : 1)
     guard !chosen.isEmpty else { return 0 }
     r.ensureIndexBuffer(quads: chosen.map { $0.0.quadCount }.max() ?? 1)
@@ -1403,16 +1408,25 @@ public func mmc_debug_lod_nodes(_ out: UnsafeMutablePointer<Int64>, _ max: Int32
 /// mask, quads) per chosen node, at most `max`; returns the count.
 @_cdecl("mmc_debug_lod_select")
 public func mmc_debug_lod_select(_ camX: Double, _ camZ: Double, _ out: UnsafeMutablePointer<Int64>, _ max: Int32) -> Int32 {
+    mmc_debug_lod_select2(camX, camZ, lodSplitFactor, out, max)
+}
+
+/// Debug: mmc_debug_lod_select with a given split factor. Quads count only the chosen tiles.
+@_cdecl("mmc_debug_lod_select2")
+public func mmc_debug_lod_select2(_ camX: Double, _ camZ: Double, _ splitFactor: Double, _ out: UnsafeMutablePointer<Int64>, _ max: Int32) -> Int32 {
     let r = LodRenderer.shared
     r.lock.lock(); let w = r.world; r.lock.unlock()
     guard let w else { return 0 }
     let snap = w.snapshot()
-    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: camX, camZ: camZ, splitFactor: 2.0,
+    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: camX, camZ: camZ, splitFactor: splitFactor,
                                     level0Radius: Double(lodLevel0Radius))
     var i = 0
     for (n, mask) in chosen where i < Int(max) {
         out[5 * i] = Int64(n.level); out[5 * i + 1] = Int64(n.x0 >> (8 + n.level)); out[5 * i + 2] = Int64(n.z0 >> (8 + n.level))
-        out[5 * i + 3] = Int64(mask); out[5 * i + 4] = Int64(n.quadCount)
+        out[5 * i + 3] = Int64(mask)
+        var quads = 0
+        for t in 0..<16 where mask & (1 << UInt16(t)) != 0 { quads += n.start[(t + 1) * lodBucketsPerTile] - n.start[t * lodBucketsPerTile] }
+        out[5 * i + 4] = Int64(quads)
         i += 1
     }
     return Int32(i)
@@ -1442,4 +1456,20 @@ public func mmc_debug_lod_bottom_quads(_ out: UnsafeMutablePointer<Int64>, _ max
         i += 1
     }
     return Int32(i)
+}
+
+/// Debug: quads per level of the active world, and how many carry block light: out[2 * level] = quads,
+/// out[2 * level + 1] = lit quads (levels 0-15).
+@_cdecl("mmc_debug_lod_lit_quads")
+public func mmc_debug_lod_lit_quads(_ out: UnsafeMutablePointer<Int64>) {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { return }
+    for (k, n) in w.snapshot().meshes where k.level < 16 {
+        let q = n.buffer.contents().bindMemory(to: UInt32.self, capacity: 2 * n.quadCount)
+        var lit = 0
+        for i in 0..<n.quadCount where (q[2 * i + 1] >> 24) & 15 != 0 { lit += 1 }
+        out[2 * k.level] += Int64(n.quadCount)
+        out[2 * k.level + 1] += Int64(lit)
+    }
 }
