@@ -64,7 +64,7 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
         s.canopy = 8; s.leaves = Mat.orangePoplarLeaves.rawValue; s.coverage = 0.45   // grass shows between them
         s.leafMix = [Mat.orangePoplarLeaves, .orangePoplarLeaves, .orangePoplarLeaves, .redPoplarLeaves, .redPoplarLeaves, .yellowPoplarLeaves].map(\.rawValue)
     case "mangrove_swamp": s.canopy = 6; s.top = Mat.mud.rawValue; s.under = Mat.mud.rawValue
-    case "snowy_taiga", "grove": s.canopy = 7; s.top = snow
+    case "snowy_taiga", "grove": s.canopy = 7; s.top = snow; s.coverage = 0.55   // snow shows between the spruces
     case "snowy_plains", "ice_spikes": s.top = snow; s.frozen = true
     case "snowy_slopes", "frozen_peaks", "jagged_peaks": s.top = snow; s.under = stone; s.frozen = true; s.mountain = true
     case "stony_peaks": s.top = stone; s.under = stone; s.mountain = true
