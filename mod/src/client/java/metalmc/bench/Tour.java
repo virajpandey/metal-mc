@@ -237,7 +237,26 @@ final class Tour {
         new Step("zoom-back", at(150, 180f, 8f), 20, mc -> mc.options.fov().set(70))
     );
 
+    /**
+     * TAA check (-PbenchTour=taa, with and without -Ptaa=true): rain, campfire smoke with animals nearby, third
+     * person, and a fast turn (the camera turns 5 degrees per tick through the last step, screenshot mid-turn).
+     */
+    static final boolean TAA_TOUR = "taa".equals(System.getProperty("metalmc.tour"));
+    static final List<Step> TAA_STEPS = List.of(
+        new Step("taa-rain", ground(180f), 200, mc -> {
+            cmd(mc, "time set 6000", "gamerule advance_time false", "gamerule advance_weather false", "weather rain");
+            if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();
+        }),
+        new Step("taa-smoke-mobs", ground(180f), 160, mc -> cmd(mc, "weather clear",
+            "execute at @p run setblock ~1 ~-3 ~-5 minecraft:campfire",
+            "execute at @p run summon minecraft:horse ~3 ~-3 ~-7", "execute at @p run summon minecraft:pig ~-2 ~-3 ~-6",
+            "execute at @p run summon minecraft:sheep ~0 ~-3 ~-9")),
+        new Step("taa-third", ground(180f), 60, mc -> mc.options.setCameraType(net.minecraft.client.CameraType.THIRD_PERSON_BACK)),
+        new Step("taa-turn", ground(180f), 30, mc -> mc.options.setCameraType(net.minecraft.client.CameraType.FIRST_PERSON))
+    );
+
     static List<Step> steps() {
+        if (TAA_TOUR) return TAA_STEPS;
         if (FIDELITY_TOUR) return FIDELITY_STEPS;
         if (ZOOM_TOUR) return ZOOM_STEPS;
         if (END_TOUR) return END_STEPS;
@@ -267,6 +286,7 @@ final class Tour {
         }
         Pose p = steps.get(step).pose();
         if (p == null) return false;   // the server places the player
+        if (steps.get(step).name().equals("taa-turn")) p = new Pose(p.x(), p.y(), p.z(), p.yaw() + 5f * tick, p.pitch());
         if (Double.isNaN(p.y()) && mc.level != null) {
             // Ground pose: 3 blocks above the highest block at the center column.
             int top = mc.level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, (int) Math.floor(p.x()), (int) Math.floor(p.z()));
