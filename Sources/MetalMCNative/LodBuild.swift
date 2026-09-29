@@ -30,8 +30,9 @@ let lodFaceCorners: [[(Int, Int, Int)]] = [
 ]
 /// METALMC_EXP=opaquewater meshes water as before translucency (no floors under it; for A/B comparisons).
 let lodOpaqueWater = experiments.contains("opaquewater")
-/// METALMC_EXP=deepfloors keeps floors under deep water at every level (for A/B comparisons).
-let lodKeepDeepFloors = experiments.contains("deepfloors")
+/// Floors under deep water are kept at every level; METALMC_EXP=skipdeepfloors skips them from level 2 (the deep-water
+/// shortcut, which drew generated oceans too light; see docs/lod-design.md).
+let lodKeepDeepFloors = !experiments.contains("skipdeepfloors")
 /// METALMC_EXP=slowmesh scans every voxel of every slice (the mesher before its per-column bands; A/B check).
 let lodSlowMesh = experiments.contains("slowmesh")
 /// METALMC_EXP=noao turns ambient occlusion off; vertexao stores it per quad corner instead of per pixel, as
