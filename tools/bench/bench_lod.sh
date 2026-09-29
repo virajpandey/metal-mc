@@ -11,7 +11,8 @@ cd "$ROOT" || exit 1
 OPT=mod/run/options.txt
 RD=${BENCH_RD:-12}
 # Never write a non-numeric renderDistance: Minecraft stops reading options at a bad line and resets the rest.
-sed -i '' "s/^fullscreen:.*/fullscreen:true/; s/^renderDistance:.*/renderDistance:$RD/; s/^pauseOnLostFocus:.*/pauseOnLostFocus:false/" $OPT
+# BENCH_VSYNC=true: a real 120 Hz run (count frames_over_16ms as dropped frames); default off (uncapped).
+sed -i '' "s/^fullscreen:.*/fullscreen:true/; s/^renderDistance:.*/renderDistance:$RD/; s/^pauseOnLostFocus:.*/pauseOnLostFocus:false/; s/^enableVsync:.*/enableVsync:${BENCH_VSYNC:-false}/" $OPT
 if [ "$FAR" = "0" ]; then LODARGS="-Plod=0"; else LODARGS="-Plod=1 -PlodFar=$FAR"; fi
 FIXTURE=${BENCH_FIXTURE:-claudeworld-huge} caffeinate -di bash "$ROOT/tools/bench/run_mc.sh" "$OUT/run_$LABEL.log" ${BENCH_TIMEOUT:-300} \
   -PmetalBackend=metal -PbenchNoon=1 -PbenchLabel=$LABEL $LODARGS "$@"

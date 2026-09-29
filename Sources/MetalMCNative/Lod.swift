@@ -426,9 +426,11 @@ let lodTileSplit = Double(ProcessInfo.processInfo.environment["METALMC_TILESPLIT
 /// the ones they replace dither out, instead of popping. 24 frames is 0.2 s at 120 Hz.
 /// METALMC_EXP=nozoomlod: levels by distance alone, even zoomed in.
 let lodNoZoom = experiments.contains("nozoomlod")
-/// A node splits into finer children when the camera is closer than this times the child's size (METALMC_SPLIT;
-/// default 2). Higher values keep finer levels farther out: smaller voxels on screen, more quads.
-let lodSplitFactor: Double = Double(ProcessInfo.processInfo.environment["METALMC_SPLIT"] ?? "") ?? 2.0
+/// A node splits into finer children when the camera is closer than this times the child's size (METALMC_SPLIT).
+/// Higher values keep finer levels farther out: smaller voxels on screen, more quads. 3 keeps voxels past the
+/// level-0 ring under about 4 px at the panel's resolution (6 px at 2) for 18% more quads, and a 120 Hz flight
+/// still dropped 1-2 frames, as at 2.
+let lodSplitFactor: Double = Double(ProcessInfo.processInfo.environment["METALMC_SPLIT"] ?? "") ?? 3.0
 let lodFadeFrames = Int(ProcessInfo.processInfo.environment["METALMC_FADE"] ?? "") ?? 24
 
 /// METALMC_EXP=meshshader draws the LOD with a mesh shader (one thread per quad) instead of indexed vertices.
