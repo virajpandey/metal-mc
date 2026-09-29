@@ -12,7 +12,11 @@ import MetalMCCore
 // Generated nodes are cached per world and seed under <game dir>/metalmc/lod/far/ (not in the save), so the
 // ~85 us per column is paid once: one file per node, heights and a biome-name palette, LZFSE-compressed.
 
+/// The finest level the generator fills. The overworld's noise varies over about 4 blocks horizontally, so level 2
+/// (4-block columns) is the finest that adds shape; the End samples its density on an 8-block grid, so it starts at
+/// level 3. METALMC_FARMIN overrides the overworld's.
 let lodFarMinLevel = 3
+let lodFarMinLevelOverworld = Int(ProcessInfo.processInfo.environment["METALMC_FARMIN"] ?? "") ?? 2
 let lodFarDebug = experiments.contains("fardebug")
 let lodSeaLevel = 63
 
@@ -116,6 +120,7 @@ final class LodFarStore: @unchecked Sendable {
     var realRegions = Set<Int64>()         // regions with any real chunk
     var fullRegions = Set<Int64>()         // regions with every chunk generated
     var holeRegions = Set<Int64>()         // regions with some chunks (their levels 0-1 fill from generated nodes)
+    var minLevel = lodFarMinLevel          // the finest level generated for this world (LodWorld sets it)
 
     /// Id for a biome name, registering it (with its surface) on first use. Caller holds `lock`.
     func biomeId(_ name: String) -> UInt16 {
@@ -290,7 +295,7 @@ final class LodFarStore: @unchecked Sendable {
     /// generated node that covers them, heights interpolated between its columns. That's where explored terrain
     /// ends; without it the LOD shows a ledge down to nothing there. Returns the number of columns filled.
     func fillFromAncestors(_ g: inout LodGrid, x0: Int, z0: Int, maxLevel: Int) -> Int {
-        guard maxLevel >= lodFarMinLevel else { return 0 }
+        guard maxLevel >= minLevel else { return 0 }
         lock.lock()
         let cols = columns, table = surfaces
         lock.unlock()
@@ -310,7 +315,7 @@ final class LodFarStore: @unchecked Sendable {
                     let bx = Double(x0 + x * voxel) + Double(voxel) / 2, bz = Double(z0 + z * voxel) + Double(voxel) / 2
                     // The finest generated node covering the column.
                     var found: (LodNodeKey, LodFarColumns)?
-                    for lv in lodFarMinLevel...maxLevel {
+                    for lv in minLevel...maxLevel {
                         let size = Double(lodNodeVoxels << lv)
                         let k = LodNodeKey(level: lv, x: Int((bx / size).rounded(.down)), z: Int((bz / size).rounded(.down)))
                         if k == lastKey, let last { found = (k, last); break }

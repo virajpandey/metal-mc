@@ -195,6 +195,7 @@ final class LodWorld: @unchecked Sendable {
         self.fineRadius = fineRadius
         center = (centerX, centerZ)
         requestedCenter = (centerX, centerZ)
+        far.minLevel = floating ? lodFarMinLevel : lodFarMinLevelOverworld
     }
 
     func snapshot() -> (meshes: [LodNodeKey: LodMeshNode], generation: Int) {
@@ -404,10 +405,12 @@ final class LodWorld: @unchecked Sendable {
                 DispatchQueue.concurrentPerform(iterations: parents.count) { i in
                     var g = self.grid(level: parents[i].level, x: parents[i].x, z: parents[i].z)
                     let size = lodNodeVoxels << parents[i].level
-                    if parents[i].level >= lodFarMinLevel {
+                    if parents[i].level >= 3 {
                         _ = self.far.fill(&g, key: parents[i])
                     } else {
-                        // Level 2: regions without any chunks are empty in the quadrants it's built from.
+                        // Level 2: regions without any chunks are empty in the quadrants it's built from. Its own
+                        // generated columns fill them if they've arrived (the overworld generates level 2), else a
+                        // coarser generated node's, interpolated.
                         _ = self.far.fillFromAncestors(&g, x0: parents[i].x * size, z0: parents[i].z * size, maxLevel: self.maxLevel)
                     }
                     self.fillHidden(&g)
@@ -664,14 +667,14 @@ final class LodWorld: @unchecked Sendable {
     /// somewhere, nearest first, not yet generated or requested. Marks them requested.
     func farWanted(max: Int) -> [LodNodeKey] {
         lock.lock(); let c = requestedCenter; lock.unlock()
-        guard maxLevel >= lodFarMinLevel else { return [] }
+        guard maxLevel >= far.minLevel else { return [] }
         func dist(_ x0: Int, _ z0: Int, _ size: Int) -> Double {
             let dx = Double(Swift.max(x0 - c.x, 0, c.x - (x0 + size))), dz = Double(Swift.max(z0 - c.z, 0, c.z - (z0 + size)))
             return (dx * dx + dz * dz).squareRoot()
         }
         var found: [(Double, LodNodeKey)] = []
         far.lock.lock(); defer { far.lock.unlock() }
-        for level in lodFarMinLevel...maxLevel {
+        for level in far.minLevel...maxLevel {
             let size = lodNodeVoxels << level
             // A node is drawn when its parent splits (the parent's nearest point within the split factor x this
             // node's size) or, at the top level, anywhere within the LOD distance.
