@@ -15,8 +15,13 @@ let lodNodeVoxels = 256
 let lodTileVoxels = 64
 let lodTilesPerSide = lodNodeVoxels / lodTileVoxels   // 4 x 4 tiles per node
 /// Quad buckets per tile: the six faces of opaque quads (+X -X +Y -Y +Z -Z), then the six of water quads,
-/// which draw afterwards with blending.
-let lodBucketsPerTile = 12
+/// which draw afterwards with blending, then the tile-edge skirts of the -X, +X, -Z and +Z edges (levels 1 and
+/// up), drawn only next to a tile of the node that a finer level draws instead.
+let lodBucketsPerTile = 16
+/// Voxels of a tile-edge skirt, down from the top of the column.
+let lodTileSkirt = 2
+/// METALMC_EXP=notileskirts: no tile-edge skirts (A/B).
+let lodTileSkirts = !experiments.contains("notileskirts")
 let lodWorldMinY = -64
 let lodWorldHeight = 384
 /// Unit-cube corners of each face, counter-clockwise from outside; must match kCorners in the LOD shader.
@@ -842,6 +847,70 @@ enum LodBuild {
                                 }
                             }
                             uu += w
+                        }
+                    }
+                }
+            }
+            // Tile-edge skirts. Inside a node, a tile whose neighbor tile a finer level draws meets that level's
+            // terrain, which can lie a block or two lower (a coarse voxel's top is the top of the highest block
+            // it holds). Nothing faced the camera across that step, so a thin line of sky showed along the tile
+            // edge wherever the levels met. Each tile of levels 1 and up keeps the top voxels of its edge columns
+            // as side faces toward the neighbor tile, in buckets of their own drawn only when that tile isn't.
+            if grid.level >= 1 && lodTileSkirts {
+                let tv = lodTileVoxels
+                var edge = [UInt32](repeating: 0, count: tv * h)
+                let faces = [1, 0, 5, 4], steps = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                for t in 0..<tiles {
+                    let tx = t % lodTilesPerSide, tz = t / lodTilesPerSide
+                    for e in 0..<4 {
+                        let (sx, sz) = steps[e]
+                        let ntx = tx + sx, ntz = tz + sz
+                        if ntx < 0 || ntz < 0 || ntx >= lodTilesPerSide || ntz >= lodTilesPerSide { continue }
+                        // The tile's columns along edge e: j runs along the edge.
+                        @inline(__always) func column(_ j: Int) -> (Int, Int) {
+                            e < 2 ? (e == 0 ? tx * tv : tx * tv + tv - 1, tz * tv + j) : (tx * tv + j, e == 2 ? tz * tv : tz * tv + tv - 1)
+                        }
+                        var yLo = Int.max, yHi = -1
+                        for j in 0..<tv {
+                            let (x, z) = column(j)
+                            let t0 = top[z * n + x]
+                            if t0 < 0 { continue }
+                            for y in max(0, t0 - lodTileSkirt + 1)...t0 {
+                                let m = at(x, y, z), k = kinds[Int(m)]
+                                if k == airK || k == waterK { continue }
+                                // Toward open space the mesh already has a face.
+                                let nk = kinds[Int(at(x + sx, y, z + sz))]
+                                if nk == airK || nk == waterK { continue }
+                                edge[j * h + y] = UInt32(m)
+                                yLo = min(yLo, y); yHi = max(yHi, y)
+                            }
+                        }
+                        if yHi < 0 { continue }
+                        let face = faces[e], b = t * lodBucketsPerTile + 12 + e
+                        // Greedy rectangles over (j, y); every entry set above is cleared here.
+                        for y in yLo...yHi {
+                            var j = 0
+                            while j < tv {
+                                let m = edge[j * h + y]
+                                if m == 0 { j += 1; continue }
+                                var rj = 1
+                                while j + rj < tv && edge[(j + rj) * h + y] == m { rj += 1 }
+                                var ry = 1
+                                grow: while ry < maxMerge && y + ry <= yHi {
+                                    for k in 0..<rj where edge[(j + k) * h + y + ry] != m { break grow }
+                                    ry += 1
+                                }
+                                for a in 0..<ry { for k in 0..<rj { edge[(j + k) * h + y + a] = 0 } }
+                                let (x, z) = column(j)
+                                // X faces: w along y, h along z; Z faces: w along x, h along y.
+                                let (qw, qh) = e < 2 ? (ry, rj) : (rj, ry)
+                                buckets[b].append(UInt32(x) | UInt32(z) << 8 | UInt32(y) << 16 | UInt32(face) << 25)
+                                buckets[b].append(m | UInt32(qw - 1) << 8 | UInt32(qh - 1) << 16)
+                                aoBuckets[b].append(lodNoAOData)
+                                tileY[2 * t] = min(tileY[2 * t], y)
+                                tileY[2 * t + 1] = max(tileY[2 * t + 1], y + ry)
+                                j += rj
+                            }
                         }
                     }
                 }

@@ -39,6 +39,17 @@ abstract class GameRendererLodMixin {
         return projection;
     }
 
+    /**
+     * No section fade-in while the LOD draws. Vanilla fades a new section in from the fog color over
+     * chunkSectionFadeInTime (0.75 s by default), which hides pop-in at the edge of its render distance. With the
+     * LOD that edge is mid-landscape and the LOD already shows the terrain, so fading sections flashed as fog-colored
+     * ghosts while flying; drawn at once, a section replaces the LOD's nearly identical level-0 geometry.
+     */
+    @Inject(method = "extractOptions", at = @At("TAIL"))
+    private void metalmc$noSectionFade(CallbackInfo ci) {
+        if (Lod.active()) ((GameRenderer) (Object) this).gameRenderState().optionsRenderState.chunkSectionFadeInTime = 0.0;
+    }
+
     @Inject(method = "render3dHud", at = @At("HEAD"))
     private void metalmc$temporalAA(CameraRenderState cameraState, PlayerRenderState playerState, OptionsRenderState optionsState,
                                     boolean consistentDepthRequired, CallbackInfo ci) {

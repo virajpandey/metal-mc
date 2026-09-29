@@ -934,6 +934,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: lodSplitFactor,
                                     level0Radius: Double(lodLevel0Radius), zoom: fovZoom > 1.25 && !lodNoZoom ? fovZoom : 1)
     guard !chosen.isEmpty else { return 0 }
+    if let spec = lodDumpSpec, !lodDumpDone, cx >= spec[0] { lodDumpDone = true; lodDumpChosen(chosen, spec) }
     r.ensureIndexBuffer(quads: chosen.map { $0.0.quadCount }.max() ?? 1)
     guard let ib = r.indexBuffer else { return 0 }
 
@@ -1131,6 +1132,16 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                                       seam: seam, water: water, fade: fade, fadeOut: fadeOutStart != nil))
                     f = e
                 }
+            }
+            // Tile-edge skirts toward neighbor tiles of this node that it doesn't draw (a finer level does).
+            for (e, (dx, dz, face)) in [(-1, 0, 1), (1, 0, 0), (0, -1, 5), (0, 1, 4)].enumerated() {
+                let ntx = tx + dx, ntz = tz + dz
+                if ntx < 0 || ntz < 0 || ntx >= lodTilesPerSide || ntz >= lodTilesPerSide || !faceVisible[face] { continue }
+                if tileMask & (1 << UInt16(ntz * lodTilesPerSide + ntx)) != 0 { continue }
+                let b = t * lodBucketsPerTile + 12 + e
+                if n.start[b + 1] == n.start[b] { continue }
+                draws.append(Draw(node: n, slot: slot, first: n.start[b], count: n.start[b + 1] - n.start[b],
+                                  seam: seam, water: false, fade: fade, fadeOut: fadeOutStart != nil))
             }
         }
     }
@@ -1474,4 +1485,81 @@ public func mmc_debug_lod_lit_quads(_ out: UnsafeMutablePointer<Int64>) {
         out[2 * k.level] += Int64(n.quadCount)
         out[2 * k.level + 1] += Int64(lit)
     }
+}
+
+/// Debug: the active world's quads that overlap the world-space rectangle [x0, x1) x [z0, z1), at every level,
+/// in world blocks: out[8 * i ...] = level, x, y, z (the quad's min corner), face, extent along x, y, z. Returns
+/// the count (at most cap).
+@_cdecl("mmc_debug_lod_quads_in")
+public func mmc_debug_lod_quads_in(_ x0: Int32, _ z0: Int32, _ x1: Int32, _ z1: Int32, _ out: UnsafeMutablePointer<Int64>, _ cap: Int32) -> Int32 {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w else { return 0 }
+    var i = 0
+    for (k, n) in w.snapshot().meshes {
+        let s = 1 << k.level, size = lodNodeVoxels << k.level
+        let ox = k.x * size, oz = k.z * size
+        if ox >= Int(x1) || oz >= Int(z1) || ox + size <= Int(x0) || oz + size <= Int(z0) { continue }
+        let q = n.buffer.contents().bindMemory(to: UInt32.self, capacity: 2 * n.quadCount)
+        for j in 0..<n.quadCount where i < Int(cap) {
+            let w0 = q[2 * j], w1 = q[2 * j + 1]
+            let lx = Int(w0 & 255), lz = Int((w0 >> 8) & 255), ly = Int((w0 >> 16) & 511), face = Int((w0 >> 25) & 7)
+            let qw = Int((w1 >> 8) & 255) + 1, qh = Int((w1 >> 16) & 255) + 1
+            // Extents per face: X faces u = y, v = z; Y faces u = x, v = z; Z faces u = x, v = y. The face lies on
+            // the voxel's far side for + faces.
+            var ex = 0, ey = 0, ez = 0, px = lx, py = ly, pz = lz
+            switch face / 2 {
+            case 0: ey = qw; ez = qh; if face == 0 { px += 1 }
+            case 1: ex = qw; ez = qh; if face == 2 { py += 1 }
+            default: ex = qw; ey = qh; if face == 4 { pz += 1 }
+            }
+            let wx = ox + px * s, wz = oz + pz * s, wy = py * s + lodWorldMinY
+            if wx >= Int(x1) || wz >= Int(z1) || wx + max(ex, 0) * s < Int(x0) || wz + max(ez, 0) * s < Int(z0) { continue }
+            let o = out + 8 * i
+            o[0] = Int64(k.level); o[1] = Int64(wx); o[2] = Int64(wy); o[3] = Int64(wz)
+            o[4] = Int64(face); o[5] = Int64(ex * s); o[6] = Int64(ey * s); o[7] = Int64(ez * s)
+            i += 1
+        }
+    }
+    return Int32(i)
+}
+
+/// Debug (METALMC_DUMPQUADS="triggerX,x0,z0,x1,z1,path"): once the camera reaches triggerX, writes the chosen
+/// nodes and tile masks overlapping [x0, x1) x [z0, z1) ("N level x0 z0 mask") and their quads there ("Q level x y z
+/// face ex ey ez tile", world blocks) to path.
+let lodDumpSpec: [Double]? = {
+    guard let v = ProcessInfo.processInfo.environment["METALMC_DUMPQUADS"] else { return nil }
+    let parts = v.split(separator: ",")
+    guard parts.count == 6 else { return nil }
+    lodDumpPath = String(parts[5])
+    return parts[0..<5].compactMap { Double($0) }
+}()
+nonisolated(unsafe) var lodDumpPath = ""
+nonisolated(unsafe) var lodDumpDone = false
+
+func lodDumpChosen(_ chosen: [(LodMeshNode, UInt16)], _ spec: [Double]) {
+    let x0 = Int(spec[1]), z0 = Int(spec[2]), x1 = Int(spec[3]), z1 = Int(spec[4])
+    var lines: [String] = []
+    for (n, mask) in chosen {
+        let s = 1 << n.level, size = lodNodeVoxels << n.level
+        if n.x0 >= x1 || n.z0 >= z1 || n.x0 + size <= x0 || n.z0 + size <= z0 { continue }
+        lines.append("N \(n.level) \(n.x0) \(n.z0) \(mask)")
+        let q = n.buffer.contents().bindMemory(to: UInt32.self, capacity: 2 * n.quadCount)
+        for j in 0..<n.quadCount {
+            let w0 = q[2 * j], w1 = q[2 * j + 1]
+            let lx = Int(w0 & 255), lz = Int((w0 >> 8) & 255), ly = Int((w0 >> 16) & 511), face = Int((w0 >> 25) & 7)
+            let qw = Int((w1 >> 8) & 255) + 1, qh = Int((w1 >> 16) & 255) + 1
+            var ex = 0, ey = 0, ez = 0, px = lx, py = ly, pz = lz
+            switch face / 2 {
+            case 0: ey = qw; ez = qh; if face == 0 { px += 1 }
+            case 1: ex = qw; ez = qh; if face == 2 { py += 1 }
+            default: ex = qw; ey = qh; if face == 4 { pz += 1 }
+            }
+            let wx = n.x0 + px * s, wz = n.z0 + pz * s, wy = py * s + lodWorldMinY
+            if wx >= x1 || wz >= z1 || wx + ex * s < x0 || wz + ez * s < z0 { continue }
+            let tile = (lz / lodTileVoxels) * lodTilesPerSide + lx / lodTileVoxels
+            lines.append("Q \(n.level) \(wx) \(wy) \(wz) \(face) \(ex * s) \(ey * s) \(ez * s) \(tile) \(w1 & 255)")
+        }
+    }
+    try? lines.joined(separator: "\n").write(toFile: lodDumpPath, atomically: true, encoding: .utf8)
 }
