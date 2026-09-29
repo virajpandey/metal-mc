@@ -61,7 +61,7 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     case "cherry_grove": s.canopy = 5; s.leaves = Mat.cherryLeaves.rawValue; s.coverage = 0.35   // scattered trees on grass
     case "dappled_forest":
         // Poplars in three autumn colors (orange the most common, then red, then yellow).
-        s.canopy = 8; s.leaves = Mat.orangePoplarLeaves.rawValue
+        s.canopy = 8; s.leaves = Mat.orangePoplarLeaves.rawValue; s.coverage = 0.45   // grass shows between them
         s.leafMix = [Mat.orangePoplarLeaves, .orangePoplarLeaves, .orangePoplarLeaves, .redPoplarLeaves, .redPoplarLeaves, .yellowPoplarLeaves].map(\.rawValue)
     case "mangrove_swamp": s.canopy = 6; s.top = Mat.mud.rawValue; s.under = Mat.mud.rawValue
     case "snowy_taiga", "grove": s.canopy = 7; s.top = snow
