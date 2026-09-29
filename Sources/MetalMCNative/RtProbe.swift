@@ -65,7 +65,7 @@ private struct ProbeParams {
 ///
 /// First results (M3 Pro, the 4 km test world, 26.2 M triangles in 129 nodes, 360 degrees): primary + sun shadow
 /// ray per pixel 1.9-2.9 ms at 1728 x 1117 and 6.4-7.4 ms at 3456 x 2234; instance structure 0.11 ms; node
-/// structures about 2.3 ms each to build; 2.4 GB of acceleration structures.
+/// structures about 2.3 ms each to build; 2.4 GB of acceleration structures before compaction.
 @_cdecl("mmc_debug_rt_probe")
 public func mmc_debug_rt_probe(_ camX: Double, _ camY: Double, _ camZ: Double, _ yawDeg: Float, _ pitchDeg: Float,
                                _ width: Int32, _ height: Int32, _ out: UnsafeMutablePointer<Double>) -> Int32 {
@@ -127,12 +127,25 @@ public func mmc_debug_rt_probe(_ camX: Double, _ camY: Double, _ camZ: Double, _
               let scratch = dev.makeBuffer(length: max(sizes.buildScratchBufferSize, 16), options: .storageModePrivate),
               let cb = queue.makeCommandBuffer(), let enc = cb.makeAccelerationStructureCommandEncoder() else { continue }
         enc.build(accelerationStructure: accel, descriptor: d, scratchBuffer: scratch, scratchBufferOffset: 0)
+        guard let sizeBuf = dev.makeBuffer(length: 8, options: .storageModeShared) else { continue }
+        enc.writeCompactedSize(accelerationStructure: accel, buffer: sizeBuf, offset: 0, sizeDataType: .ulong)
         enc.endEncoding()
         cb.commit(); cb.waitUntilCompleted()
         blasMs += (cb.gpuEndTime - cb.gpuStartTime) * 1000
-        blases.append(accel)
+        // Compacted copy (METALMC_EXP=nortcompact keeps the uncompacted one).
+        var final = accel
+        let compacted = Int(sizeBuf.contents().load(as: UInt64.self))
+        if !experiments.contains("nortcompact"), compacted > 0, let small = dev.makeAccelerationStructure(size: compacted),
+           let ccb = queue.makeCommandBuffer(), let cenc = ccb.makeAccelerationStructureCommandEncoder() {
+            cenc.copyAndCompact(sourceAccelerationStructure: accel, destinationAccelerationStructure: small)
+            cenc.endEncoding()
+            ccb.commit(); ccb.waitUntilCompleted()
+            blasMs += (ccb.gpuEndTime - ccb.gpuStartTime) * 1000
+            final = small
+        }
+        blases.append(final)
         triangles += idx.count / 3
-        blasBytes += sizes.accelerationStructureSize
+        blasBytes += final.size
     }
     guard !blases.isEmpty else { return 0 }
     // Instance structure: identity transforms (the vertices are already camera-relative).
