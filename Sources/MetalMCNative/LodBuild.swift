@@ -616,6 +616,7 @@ enum LodBuild {
             }
             var bandLo = [Int](repeating: 0, count: max(n, h)), bandHi = [Int](repeating: -1, count: max(n, h))
             let edgeSkirt = 8
+            let seaVoxel = (lodSeaLevel - 1 + 64) >> grid.level   // the voxel holding the sea's top water block
             @inline(__always) func at(_ x: Int, _ y: Int, _ z: Int) -> UInt8 {
                 if y < 0 { return Mat.stone.rawValue }
                 if x < 0 || z < 0 || x >= n || z >= n || y >= h { return 0 }
@@ -689,8 +690,26 @@ enum LodBuild {
                             let k = kinds[Int(m)]
                             if k != airK {   // air, and lodChunkMarker (air that records an explored End chunk)
                                 let nk = kinds[Int(at(x + sx, y + sy, z + sz))]
+                                let outside = axis != 1 && (x + sx < 0 || z + sz < 0 || x + sx >= n || z + sz >= n)
                                 if k == waterK {
-                                    if nk == airK {
+                                    if outside && kinds[Int(at(x, y + 1, z))] == waterK {
+                                        // Under the surface, the skirt toward the next node stands in for the floor
+                                        // beyond it: the column's floor, lit as that floor is. As water, the wall
+                                        // put a second layer of water in front of every node edge facing the camera
+                                        // (the far sea showed the node grid as bands), and rays under the surface
+                                        // that missed it found the sky under the sea.
+                                        var fy = y - 1
+                                        while fy >= 0 && kinds[Int(at(x, fy, z))] == waterK { fy -= 1 }
+                                        let fm = at(x, fy, z)
+                                        if kinds[Int(fm)] != airK {
+                                            var dw = 0, yy = fy + 1
+                                            while yy < h && waterDepth(dw) < 15 && kinds[Int(at(x, yy, z))] == waterK { dw += 1; yy += 1 }
+                                            f = UInt32(fm) | UInt32(min(15, max(1, waterDepth(dw)))) << 16
+                                        }
+                                    }
+                                    // The top voxel's skirt stays water, and there's none at sea level, where every
+                                    // level's surface lies at the same height.
+                                    else if nk == airK && !(outside && y == seaVoxel) {
                                         f = UInt32(m) | blockLightAt(x + sx, y + sy, z + sz) << 20
                                         if deepWater && face == 2 {
                                             // Water voxels from this one down to the floor.
@@ -702,7 +721,18 @@ enum LodBuild {
                                 }
                                 else if nk == airK {
                                     let fx = x + sx, fy = y + sy, fz = z + sz
-                                    f = UInt32(m) | coverDepth(fx, fy, fz) << 16 | blockLightAt(fx, fy, fz) << 20
+                                    // A skirt wall under water (where the next node's floor lies lower) is lit
+                                    // like the floor, by the water above it (under ice too): lit as open air, sand
+                                    // walls showed through the sea as bright dashes along node edges.
+                                    var wy = y + 1
+                                    if outside { while wy < h && kinds[Int(at(x, wy, z))] != waterK && kinds[Int(at(x, wy, z))] != airK { wy += 1 } }
+                                    if outside && wy < h && kinds[Int(at(x, wy, z))] == waterK {
+                                        var wt = wy
+                                        while wt + 1 < h && kinds[Int(at(x, wt + 1, z))] == waterK { wt += 1 }
+                                        f = UInt32(m) | UInt32(min(15, max(1, waterDepth(wt - y + 1)))) << 16
+                                    } else {
+                                        f = UInt32(m) | coverDepth(fx, fy, fz) << 16 | blockLightAt(fx, fy, fz) << 20
+                                    }
                                 }
                                 else if nk == waterK && !lodOpaqueWater {
                                     // Water voxels from the one in front of the face up.
