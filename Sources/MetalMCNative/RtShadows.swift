@@ -10,7 +10,13 @@ import simd
 // darkens the shadowed pixels before the temporal anti-aliasing, which smooths the half-resolution result and, with
 // the ray jittered across the sun's disk every frame, softens the shadows' edges.
 
-let lodRtShadows = experiments.contains("rtshadows")
+/// On with `shadows=true` in config/metalmc.properties (mmc_set_rt_shadows at startup) or METALMC_EXP=rtshadows.
+nonisolated(unsafe) var lodRtShadows = experiments.contains("rtshadows")
+
+@_cdecl("mmc_set_rt_shadows")
+public func mmc_set_rt_shadows(_ on: Int32) {
+    if on != 0 { lodRtShadows = true }
+}
 
 private let rtShadowSource = """
 #include <metal_stdlib>

@@ -103,6 +103,7 @@ final class Mtl {
     private static final MethodHandle LOD_SET_COMPILED = h("mmc_lod_set_compiled", false, null, JAVA_LONG, JAVA_INT, JAVA_INT);
     private static final MethodHandle ACTIVATE_APP = h("mmc_activate_app", false, JAVA_INT);
     private static final MethodHandle LOD_SET_DETAIL = h("mmc_lod_set_detail", false, null, JAVA_INT);
+    private static final MethodHandle SET_RT_SHADOWS = h("mmc_set_rt_shadows", false, null, JAVA_INT);
     private static final MethodHandle LOD_SET_LIGHTMAP = h("mmc_lod_set_lightmap", false, null, JAVA_LONG);
     private static final MethodHandle LOD_FAR_WANTED = h("mmc_lod_far_wanted", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle LOD_FAR_BIOME = h("mmc_lod_far_biome", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
@@ -394,6 +395,10 @@ final class Mtl {
 
     static void lodSetLightmap(long view) {
         try { LOD_SET_LIGHTMAP.invokeExact(view); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void setRtShadows(int on) {
+        try { SET_RT_SHADOWS.invokeExact(on); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static void lodSetDetail(int radius) {

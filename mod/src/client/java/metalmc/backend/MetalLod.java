@@ -33,6 +33,7 @@ public final class MetalLod {
     public static boolean open2(String worldDir, String storeDir, int farBlocks, int centerX, int centerZ) {
         if (!available()) return false;
         Mtl.lodSetDetail(metalmc.MetalMCConfig.lodDetail());
+        Mtl.setRtShadows(metalmc.MetalMCConfig.shadows() ? 1 : 0);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer world = stack.UTF8(worldDir);
             ByteBuffer store = stack.UTF8(storeDir);
@@ -49,6 +50,7 @@ public final class MetalLod {
     public static long open3(String worldDir, String storeDir, String cacheDir, String dimension, int farBlocks, int centerX, int centerZ) {
         if (!available()) return 0;
         Mtl.lodSetDetail(metalmc.MetalMCConfig.lodDetail());
+        Mtl.setRtShadows(metalmc.MetalMCConfig.shadows() ? 1 : 0);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer world = stack.UTF8(worldDir);
             ByteBuffer store = stack.UTF8(storeDir);

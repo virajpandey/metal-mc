@@ -54,6 +54,11 @@ public final class MetalMCConfig {
         # terrain, by blending each frame with the ones before it. About 1.8 ms of GPU per frame at the panel's
         # native resolution; a 120 Hz flight still drops no frames. Set to false for the raw image.
         taa=true
+
+        # Ray-traced sun shadows (Metal backend, prototype): terrain, trees and mountains cast shadows from the sun, out
+        # to the LOD's far terrain. About 1 ms of GPU per frame at the panel's native resolution (enough to drop some
+        # frames at a locked 120 Hz), so off by default.
+        shadows=false
         """;
 
     private static final Properties FILE = load();
@@ -133,6 +138,11 @@ public final class MetalMCConfig {
     /** Temporal anti-aliasing (on by default): Taa.swift's resolve, about 1.8 ms of GPU per frame at the panel's resolution. */
     public static boolean taa() {
         return flag("taa", true);
+    }
+
+    /** Ray-traced sun shadows (off by default): RtShadows.swift, about 1 ms of GPU per frame at the panel's resolution. */
+    public static boolean shadows() {
+        return flag("shadows", false);
     }
 
     public static boolean lodMultiplayer() {
