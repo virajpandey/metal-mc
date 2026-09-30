@@ -5,3 +5,4 @@ bench_out/
 .DS_Store
 fixtures/
 .build-dev/
+.claude/worktrees/
