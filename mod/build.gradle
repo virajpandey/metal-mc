@@ -89,6 +89,9 @@ loom {
 			if (project.hasProperty("taaBlend")) {
 				environmentVariable "METALMC_TAABLEND", project.findProperty("taaBlend").toString()
 			}
+			if (project.hasProperty("visBias")) {
+				environmentVariable "METALMC_VISBIAS", project.findProperty("visBias").toString()
+			}
 			if (project.hasProperty("dumpQuads")) {
 				environmentVariable "METALMC_DUMPQUADS", project.findProperty("dumpQuads").toString()
 			}

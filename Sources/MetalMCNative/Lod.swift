@@ -319,6 +319,42 @@ fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19
     return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
 }
 
+// Position-only vertex function, used by the quad-visibility measurement (METALMC_EXP=quadvis). A full "slim" path
+// built on it (vertex outputs cut from 52 to 24 bytes, the fragment shader rebuilding color, light and AO from the quad)
+// measured no faster (main pass 4.21 vs 4.22 ms at 1.8 M quads): the LOD's vertex-stage cost is the number of
+// triangles, not the size of their outputs.
+struct VOutSlim {
+    float4 pos [[position]];
+    uint quad [[flat]];
+    uint slot [[flat]];
+};
+
+vertex VOutSlim lod_vs_slim(uint vid [[vertex_id]], uint draw [[base_instance]],
+                            const device uint2* quads [[buffer(18)]],
+                            constant LodUniforms& u [[buffer(19)]],
+                            const device Xform* xforms [[buffer(20)]]) {
+    uint2 q = quads[vid >> 2];
+    uint face = (q.x >> 25) & 7;
+    float3 local = float3(q.x & 255, (q.x >> 16) & 511, (q.x >> 8) & 255);
+    float w = float(((q.y >> 8) & 255) + 1), h = float(((q.y >> 16) & 255) + 1);
+    float4 xs = xforms[draw].offsetScale;
+    float3 rel = xs.xyz + (local + kCorners[face][vid & 3] * extentScale(face, w, h)) * xs.w;
+    VOutSlim o;
+    float4 clip = u.proj * (u.view * float4(rel, 1.0));
+    clip.y = -clip.y;
+    o.pos = clip;
+    o.quad = vid >> 2;
+    o.slot = draw;
+    return o;
+}
+
+// Debug (METALMC_EXP=quadvis): re-drawn with depth test "equal" after the LOD, marks every quad that owns a final
+// pixel. buffer 27: one byte per submitted quad; buffer 28: this draw's first index into it.
+[[early_fragment_tests]] fragment void lod_fs_vis(VOutSlim in [[stage_in]], device uchar* marks [[buffer(27)]],
+                                                  constant uint& base [[buffer(28)]], constant uint& first [[buffer(24)]]) {
+    marks[base + in.quad - first] = 1;
+}
+
 // The seam with vanilla: tiles that overlap vanilla's area use this variant, which drops the pixels of LOD
 // voxels whose chunk section vanilla drew this frame (a bitmap of sections around the camera). It's exact
 // at any camera height (vanilla picks sections by 3D distance), leaves no gap and never draws LOD over
@@ -435,6 +471,9 @@ let lodFadeFrames = Int(ProcessInfo.processInfo.environment["METALMC_FADE"] ?? "
 
 /// METALMC_EXP=meshshader draws the LOD with a mesh shader (one thread per quad) instead of indexed vertices.
 let lodMeshShaders = experiments.contains("meshshader")
+/// METALMC_EXP=quadvis: every 240 frames, count the drawn opaque LOD quads that own at least one final pixel (per level).
+let lodQuadVis = experiments.contains("quadvis")
+nonisolated(unsafe) var lodVisPipe: MTLRenderPipelineState?
 /// Quads per mesh threadgroup (METALMC_MESHQUADS, default 32).
 let lodMeshQuads = Int(ProcessInfo.processInfo.environment["METALMC_MESHQUADS"] ?? "") ?? 32
 
@@ -1256,6 +1295,10 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                                       indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * d.first, baseInstance: d.slot)
         }
     }
+    if lodQuadVis && r.frame % 240 == 0 && !useMesh {
+        lodVisSlot = slots
+        lodMeasureVisibility(enc, ordered.filter { !$0.water && $0.fade == 0 }.map { ($0.node, $0.first, $0.count) }, ib)
+    }
     if let vis, testBoxes, let boxPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, box: true),
        let cb = ctx.cb {
         enc.setRenderPipelineState(boxPipe)
@@ -1563,3 +1606,68 @@ func lodDumpChosen(_ chosen: [(LodMeshNode, UInt16)], _ spec: [Double]) {
     }
     try? lines.joined(separator: "\n").write(toFile: lodDumpPath, atomically: true, encoding: .utf8)
 }
+
+/// Debug (lodQuadVis): re-draws `draws` with depth test "equal" and no color, marking quads that own a final pixel,
+/// then logs visible / submitted per level once the GPU finishes.
+func lodMeasureVisibility(_ enc: MTLRenderCommandEncoder, _ draws: [(LodMeshNode, Int, Int)], _ ib: MTLBuffer) {
+    let r = LodRenderer.shared
+    if lodVisPipe == nil {
+        guard let lib = r.library, let vs = lib.makeFunction(name: "lod_vs_slim"), let fs = lib.makeFunction(name: "lod_fs_vis") else { return }
+        let d = MTLRenderPipelineDescriptor()
+        d.vertexFunction = vs
+        d.fragmentFunction = fs
+        for (i, f) in ctx.passColorFormats.enumerated() { d.colorAttachments[i].pixelFormat = f; d.colorAttachments[i].writeMask = [] }
+        d.depthAttachmentPixelFormat = ctx.passDepthFormat
+        lodVisPipe = try? ctx.device.makeRenderPipelineState(descriptor: d)
+    }
+    guard let pipe = lodVisPipe, let cb = ctx.cb else { return }
+    let total = draws.reduce(0) { $0 + $1.2 }
+    guard total > 0, let marks = ctx.device.makeBuffer(length: total, options: [.storageModeShared]) else { return }
+    memset(marks.contents(), 0, total)
+    enc.setRenderPipelineState(pipe)
+    // Nearer-or-equal with a small bias toward the camera (reverse-Z: larger is nearer), so rounding differences between
+    // this vertex function and the main one don't reject the front surface.
+    enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
+    let bias = Float(ProcessInfo.processInfo.environment["METALMC_VISBIAS"] ?? "") ?? 2
+    enc.setDepthBias(bias, slopeScale: bias, clamp: 0)
+    enc.setFragmentBuffer(marks, offset: 0, index: 27)
+    var base: UInt32 = 0
+    var spans: [(level: Int, base: Int, count: Int)] = []
+    var bound: ObjectIdentifier?
+    for (node, first, count) in draws {
+        let id = ObjectIdentifier(node)
+        if bound != id { enc.setVertexBuffer(node.buffer, offset: 0, index: 18); bound = id }
+        var b = base, f = UInt32(first)
+        enc.setFragmentBytes(&b, length: 4, index: 28)
+        enc.setFragmentBytes(&f, length: 4, index: 24)
+        // baseInstance selects the node's transform slot, as in the main draw.
+        enc.drawIndexedPrimitives(type: .triangle, indexCount: count * 6, indexType: .uint32, indexBuffer: ib,
+                                  indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * first, baseInstance: lodVisSlot[id] ?? 0)
+        spans.append((node.level, Int(base), count))
+        base += UInt32(count)
+    }
+    enc.setDepthBias(0, slopeScale: 0, clamp: 0)
+    cb.addCompletedHandler { _ in
+        let p = marks.contents().bindMemory(to: UInt8.self, capacity: total)
+        var sub = [Int](repeating: 0, count: 16), vis = [Int](repeating: 0, count: 16)
+        for sp in spans where sp.level < 16 {
+            sub[sp.level] += sp.count
+            var v = 0
+            for i in sp.base..<(sp.base + sp.count) where p[i] != 0 { v += 1 }
+            vis[sp.level] += v
+        }
+        // Draws (a tile's facing buckets) with no visible quad at all: waste the tile-level culling could remove.
+        var deadDraws = 0, deadQuads = 0
+        for sp in spans {
+            var any = false
+            for i in sp.base..<(sp.base + sp.count) where p[i] != 0 { any = true; break }
+            if !any { deadDraws += 1; deadQuads += sp.count }
+        }
+        let tv = vis.reduce(0, +), ts = sub.reduce(0, +)
+        log(String(format: "quadvis: %d of %d draws have no visible quad (%d quads, %.1f%% of submitted)", deadDraws, spans.count, deadQuads, 100 * Double(deadQuads) / Double(max(ts, 1))))
+        var line = String(format: "quadvis: %d of %d opaque LOD quads own a pixel (%.1f%%);", tv, ts, 100 * Double(tv) / Double(max(ts, 1)))
+        for l in 0..<16 where sub[l] > 0 { line += String(format: " L%d %d/%d (%.0f%%)", l, vis[l], sub[l], 100 * Double(vis[l]) / Double(sub[l])) }
+        log(line)
+    }
+}
+nonisolated(unsafe) var lodVisSlot: [ObjectIdentifier: Int] = [:]
