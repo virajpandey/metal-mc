@@ -875,13 +875,20 @@ enum LodBuild {
                             let (x, z) = column(j)
                             let t0 = top[z * n + x]
                             if t0 < 0 { continue }
-                            for y in max(0, t0 - lodTileSkirt + 1)...t0 {
+                            // The skirt hangs from the column's top solid voxel: under a lake or the sea that's the
+                            // floor (a skirt at the water's surface skipped them, and the floor's steps between
+                            // levels showed through the water as specks of sky). Under water it's lit like the floor.
+                            var ts = t0
+                            while ts >= 0 && (kinds[Int(at(x, ts, z))] == airK || kinds[Int(at(x, ts, z))] == waterK) { ts -= 1 }
+                            if ts < 0 { continue }
+                            let wet = ts < t0 && kinds[Int(at(x, ts + 1, z))] == waterK
+                            for y in max(0, ts - lodTileSkirt + 1)...ts {
                                 let m = at(x, y, z), k = kinds[Int(m)]
                                 if k == airK || k == waterK { continue }
                                 // Toward open space the mesh already has a face.
                                 let nk = kinds[Int(at(x + sx, y, z + sz))]
                                 if nk == airK || nk == waterK { continue }
-                                edge[j * h + y] = UInt32(m)
+                                edge[j * h + y] = UInt32(m) | (wet ? UInt32(min(15, max(1, waterDepth(t0 - y)))) << 16 : 0)
                                 yLo = min(yLo, y); yHi = max(yHi, y)
                             }
                         }
@@ -904,8 +911,8 @@ enum LodBuild {
                                 let (x, z) = column(j)
                                 // X faces: w along y, h along z; Z faces: w along x, h along y.
                                 let (qw, qh) = e < 2 ? (ry, rj) : (rj, ry)
-                                buckets[b].append(UInt32(x) | UInt32(z) << 8 | UInt32(y) << 16 | UInt32(face) << 25)
-                                buckets[b].append(m | UInt32(qw - 1) << 8 | UInt32(qh - 1) << 16)
+                                buckets[b].append(UInt32(x) | UInt32(z) << 8 | UInt32(y) << 16 | UInt32(face) << 25 | (m >> 16) << 28)
+                                buckets[b].append((m & 255) | UInt32(qw - 1) << 8 | UInt32(qh - 1) << 16)
                                 aoBuckets[b].append(lodNoAOData)
                                 tileY[2 * t] = min(tileY[2 * t], y)
                                 tileY[2 * t + 1] = max(tileY[2 * t + 1], y + ry)
