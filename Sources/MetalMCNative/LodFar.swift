@@ -68,7 +68,8 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     case "snowy_plains", "ice_spikes": s.top = snow; s.frozen = true
     case "snowy_slopes", "frozen_peaks", "jagged_peaks": s.top = snow; s.under = stone; s.frozen = true; s.mountain = true
     case "stony_peaks": s.top = stone; s.under = stone; s.mountain = true
-    case "windswept_hills", "windswept_savanna", "meadow": s.mountain = true
+    case "windswept_hills", "windswept_savanna": s.mountain = true
+    case "meadow": s.mountain = true
     case "windswept_gravelly_hills": s.top = gravel; s.under = gravel; s.mountain = true
     case "stony_shore": s.top = stone; s.under = stone
     case "desert": s.top = sand; s.under = Mat.sandstone.rawValue
