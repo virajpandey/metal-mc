@@ -131,6 +131,14 @@ loom {
 			if (project.hasProperty("tileSplit")) {
 				environmentVariable "METALMC_TILESPLIT", project.findProperty("tileSplit").toString()
 			}
+			// Smart LOD (-PmetalExp=smartlod): -PlodErr=<pixels> splits tiles whose projected error is over it,
+			// -PlodBudget=<quads> caps the quads the view counts (LodSmart.swift).
+			if (project.hasProperty("lodErr")) {
+				environmentVariable "METALMC_LODERR", project.findProperty("lodErr").toString()
+			}
+			if (project.hasProperty("lodBudget")) {
+				environmentVariable "METALMC_LODBUDGET", project.findProperty("lodBudget").toString()
+			}
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
 				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"

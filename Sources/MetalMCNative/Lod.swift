@@ -948,6 +948,7 @@ public func mmc_lod_close() {
     r.world = nil
     r.worlds.removeAll()
     r.lock.unlock()
+    LodSmartState.shared.reset()
 }
 
 /// Tells the LOD where the player is, so the finest level follows them.
@@ -995,8 +996,13 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     // Zoom relative to vanilla's default 70-degree field of view (proj[1][1] = cot(35 degrees)), counted only when it's
     // clearly zoomed (the spyglass is about 10x; sprinting widens the view a little, which changes nothing).
     let fovZoom = Double(p[5]) / 1.4281
-    let chosen = LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: lodSplitFactor,
-                                    level0Radius: Double(lodLevel0Radius), zoom: fovZoom > 1.25 && !lodNoZoom ? fovZoom : 1)
+    let zoom = fovZoom > 1.25 && !lodNoZoom ? fovZoom : 1
+    // METALMC_EXP=smartlod: per tile by projected error within a quad budget (LodSmart.swift).
+    let chosen = lodSmart
+        ? LodRenderer.selectSmartFrame(w, meshes: snap.meshes, generation: snap.generation, cam: SIMD3(cx, cy, cz),
+                                       projView: lodMatrix(p, 0) * lodMatrix(p, 16), zoom: zoom)
+        : LodRenderer.select(snap.meshes, maxLevel: w.maxLevel, camX: cx, camZ: cz, splitFactor: lodSplitFactor,
+                             level0Radius: Double(lodLevel0Radius), zoom: zoom)
     guard !chosen.isEmpty else { return 0 }
     if let spec = lodDumpSpec, !lodDumpDone, cx >= spec[0] { lodDumpDone = true; lodDumpChosen(chosen, spec) }
     r.ensureIndexBuffer(quads: chosen.map { $0.0.quadCount }.max() ?? 1)

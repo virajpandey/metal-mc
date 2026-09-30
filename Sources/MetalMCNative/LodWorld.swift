@@ -124,6 +124,7 @@ final class LodMeshNode {
     // frame it was found visible.
     var tileTested = [UInt64](repeating: 0, count: 16)
     var tileVisible = [UInt64](repeating: 0, count: 16)
+    let tileError: [Float]      // smart LOD: per tile, RMS and max error of the parent over it (LodMesh.tileError)
     var size: Int { lodNodeVoxels << level }
 
     init?(node: LodNode) {
@@ -157,6 +158,7 @@ final class LodMeshNode {
             top = max(top, Int(w0 & 511) + Int((w0 >> 9) & 127), Int(w1 & 511))
         }
         columnsTop = top
+        tileError = m.tileError
     }
 }
 
@@ -617,6 +619,7 @@ final class LodWorld: @unchecked Sendable {
     func meshNode(_ g: LodGrid) -> LodMesh {
         var m = LodBuild.mesh(g, maxMerge: 64, skyCover: floating || lodSkyCover)
         if lodFarFieldLevel > 0 && g.level >= lodFarFieldLevel && !floating { m.columns = LodBuild.farColumns(g) }
+        if lodSmart && g.level >= 1 { m.tileError = lodTileErrors(g, rule: downsampleRule) }
         return m
     }
 

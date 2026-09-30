@@ -382,6 +382,7 @@ struct LodMesh {
     var aoOffsets: [UInt32]     // per quad: first rim value in `ao`, or lodNoAOData
     var ao: [UInt32]            // rim values, 16 per word
     var columns: [UInt32] = []  // far-field levels only: two words per column (LodBuild.farColumns)
+    var tileError: [Float] = [] // smart LOD (levels 1 and up): per tile, RMS and max error of the parent over it (lodTileErrors)
 }
 
 /// Chunk sections per tile side at `level` (levels 0 and 1 only: tiles of 64 and 128 blocks).
