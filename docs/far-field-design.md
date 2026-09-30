@@ -115,6 +115,22 @@ the quad run, which flatters the quads there.
 The near band against vanilla is unchanged (4.62-4.64). Past the rings' finest data a height field can't show
 overhangs or the gaps under canopies (a tree is a column down to the ground).
 
+**The horizon (commit c8847c0).** Column heights are stored in blocks, not voxels; generated columns get far-field words
+built from the generator's exact height, water and materials (LodGrid.farExact: a level-8 grid is one voxel tall, with
+no room for water); and with the far field on, the top level is generated out to the LOD distance instead of one node
+size. At LOD distance 262144 the fidelity tour's high views show terrain to the horizon line (116 generated nodes, 7.6 M
+columns, 82 s at 33 us per column per thread, cached after).
+
+Known artifacts (Viraj, 2026-09-30):
+- Spires where real terrain meets generated terrain: real columns at coarse levels come from voxels rounded up to 8-32
+  blocks, generated ones are exact. Fix: carry each column's true top through the downsampling.
+- Trees as pillars: one height per column can't hold a crown over air. Fix: a canopy layer (ground height plus canopy top
+  and bottom).
+- Thin tall things (a tower) become full-height pillars; each ring's cells are twice the previous ring's, so similar
+  objects change thickness across a ring edge. Better: pick detail by on-screen error, not distance alone.
+- Not the far field's: pale "curtains" under the sea along LOD node borders (the quad LOD's underwater skirts, drawn as
+  opaque floor stand-ins, seen through the translucent water); both renderers show them.
+
 Next: an absolute reference for that band (level 0 out to 2 km as the answer key), the horizon (rings past the LOD
 from the world generator, with heights in blocks instead of voxels so coarse rings keep full vertical precision),
 ambient occlusion at column feet, and the quad/march boundary moved inward (level 0's hidden quads).
