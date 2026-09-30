@@ -1227,9 +1227,23 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         ? lodHorizonTest(chosen, cx: cx, cy: cy, cz: cz, fadingIn: { id, t in (r.fadeIn[id]?.mask ?? 0) & (1 << UInt16(t)) != 0 },
                          inView: visible)
         : [:]
-    for (n, tileMask) in chosen { addTiles(n, tileMask, fadeOutStart: nil) }
+    // Far field: its levels are ray-marched instead of drawn as quads, once its rings are filled.
+    let farOn = lodFarFieldLevel > 0 && !w.floating
+        && FarField.shared.prepare(meshes: snap.meshes, generation: snap.generation, chosen: chosen, maxLevel: w.maxLevel, cx: cx, cz: cz)
+    var farNearest = Double.infinity   // horizontal distance to the nearest tile the far field draws
+    if farOn {
+        for (n, mask) in chosen where n.level >= lodFarFieldLevel {
+            let tb = Double(lodTileVoxels << n.level)
+            for t in 0..<16 where mask & (1 << UInt16(t)) != 0 {
+                let x0 = Double(n.x0) + Double(t % 4) * tb, z0 = Double(n.z0) + Double(t / 4) * tb
+                let dx = max(x0 - cx, 0, cx - (x0 + tb)), dz = max(z0 - cz, 0, cz - (z0 + tb))
+                farNearest = min(farNearest, (dx * dx + dz * dz).squareRoot())
+            }
+        }
+    }
+    for (n, tileMask) in chosen where !(farOn && n.level >= lodFarFieldLevel) { addTiles(n, tileMask, fadeOutStart: nil) }
     if lodRtShadows { RtShadows.shared.chosen = chosen }
-    for f in r.fadeOut { addTiles(f.node, f.mask, fadeOutStart: f.start) }
+    for f in r.fadeOut where !(farOn && f.node.level >= lodFarFieldLevel) { addTiles(f.node, f.mask, fadeOutStart: f.start) }
     if r.frame % 1000 == 0 {
         var perLevel = [Int](repeating: 0, count: 9), quadsPerLevel = [Int](repeating: 0, count: 9)
         for c in chosen { perLevel[min(8, c.0.level)] += 1 }
@@ -1239,7 +1253,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         r.coveredTiles = 0
     }
     let testBoxes = vis.map { !$0.slots.isEmpty } ?? false
-    guard !draws.isEmpty || testBoxes else { return 0 }
+    guard !draws.isEmpty || testBoxes || farOn else { return 0 }
 
     enc.setRenderPipelineState(pipe)
     enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: true))
@@ -1318,9 +1332,18 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             vis?.slots.removeAll(keepingCapacity: true)
         }
     }
+    var farDone = !farOn
+    func drawFar() {
+        farDone = true
+        if farNearest.isFinite, let colors = r.colorBuffer {
+            FarField.shared.draw(enc, u: u, colors: colors, lightmap: r.lightmap ?? r.dummyTexture!, lightSampler: r.lightSampler,
+                                 cy: cy, nearest: farNearest)
+        }
+    }
     var state = (seam: false, water: false, fade: false)
     for d in ordered {
         if d.water && !boxesDone {
+            if !farDone { drawFar() }
             runBoxes()
             bound = nil
             state = (seam: false, water: false, fade: false)
@@ -1371,6 +1394,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         lodVisSlot = slots
         lodMeasureVisibility(enc, ordered.filter { !$0.water && $0.fade == 0 }.map { ($0.node, $0.first, $0.count) }, ib)
     }
+    if !farDone { drawFar() }
     if !boxesDone { runBoxes() }
     // Minecraft's pipeline, depth, cull and bias state must be re-applied by the next setPipeline.
     ctx.pipe = nil

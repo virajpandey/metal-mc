@@ -105,6 +105,7 @@ final class LodMeshNode {
     let tileY: [Int]            // per tile: min and max voxel y (min > max if the tile is empty)
     let tileYCore: [Int]        // the same without the node's edge skirts
     let sectionMask: [UInt32]   // levels 0-1: the chunk sections each tile has quads in (LodMesh.sectionMask)
+    let columns: MTLBuffer?     // far-field levels: LodMesh.columns
     // Occlusion results, render thread only: the last frame each tile's box was tested, and the last
     // frame it was found visible.
     var tileTested = [UInt64](repeating: 0, count: 16)
@@ -132,6 +133,7 @@ final class LodMeshNode {
         tileY = m.tileY
         tileYCore = m.tileYCore
         sectionMask = m.sectionMask
+        columns = m.columns.isEmpty ? nil : ctx.device.makeBuffer(bytes: m.columns, length: m.columns.count * 4, options: [.storageModeShared])
     }
 }
 
@@ -585,7 +587,9 @@ final class LodWorld: @unchecked Sendable {
 
     /// Greedy mesh of a node grid, with sky light under cover (always in floating dimensions: their undersides need it).
     func meshNode(_ g: LodGrid) -> LodMesh {
-        LodBuild.mesh(g, maxMerge: 64, skyCover: floating || lodSkyCover)
+        var m = LodBuild.mesh(g, maxMerge: 64, skyCover: floating || lodSkyCover)
+        if lodFarFieldLevel > 0 && g.level >= lodFarFieldLevel && !floating { m.columns = LodBuild.farColumns(g) }
+        return m
     }
 
     // MARK: - Region cache

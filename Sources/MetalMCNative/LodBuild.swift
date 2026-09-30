@@ -348,6 +348,7 @@ struct LodMesh {
     var sectionMask: [UInt32]   // levels 0-1: per tile, the chunk sections holding its quads (skirts aside), lodTileSectionBits
     var aoOffsets: [UInt32]     // per quad: first rim value in `ao`, or lodNoAOData
     var ao: [UInt32]            // rim values, 16 per word
+    var columns: [UInt32] = []  // far-field levels only: one word per column (LodBuild.farColumns)
 }
 
 /// Chunk sections per tile side at `level` (levels 0 and 1 only: tiles of 64 and 128 blocks).
