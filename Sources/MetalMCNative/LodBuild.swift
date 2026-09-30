@@ -29,6 +29,12 @@ let lodSubtilesPerTile = (lodTileVoxels / lodSubtileVoxels) * (lodTileVoxels / l
 let lodTileSkirt = 2
 /// METALMC_EXP=notileskirts: no tile-edge skirts (A/B).
 let lodTileSkirts = !experiments.contains("notileskirts")
+/// METALMC_EXP=oldskirts: node-edge skirts under water stand in for the floor from the surface down, as before the fix
+/// for the curtains they drew through the sea (A/B; see LodBuild.mesh).
+let lodOldSkirts = experiments.contains("oldskirts")
+/// METALMC_EXP=oldledges: faces under a ledge in the sea are lit by the water between them and the ledge only, as before
+/// (A/B; see waterRun in LodBuild.mesh).
+let lodOldLedges = experiments.contains("oldledges")
 let lodWorldMinY = -64
 let lodWorldHeight = 384
 /// Unit-cube corners of each face, counter-clockwise from outside; must match kCorners in the LOD shader.
@@ -475,8 +481,8 @@ enum LodBuild {
     /// translucent like vanilla's, so lake and sea floors show through it); water only shows faces toward
     /// air. A face under water records how many blocks of water are above it (1-15), which darkens it like
     /// vanilla's skylight does. Outside the node counts as air on the sides (skirt walls that hide cracks
-    /// between levels) and as solid below the world. Merged quads are capped at `maxMerge` voxels per side
-    /// (tiles cap them at 64 anyway).
+    /// between levels; under water only below the floor) and as solid below the world. Merged quads are capped
+    /// at `maxMerge` voxels per side (tiles cap them at 64 anyway).
     static func mesh(_ grid: LodGrid, maxMerge: Int = 64, skyCover: Bool = false) -> LodMesh {
         let n = lodNodeVoxels, h = grid.height
         let kinds = lodKinds
@@ -644,6 +650,29 @@ enum LodBuild {
                 if x < 0 || z < 0 || x >= n || z >= n || y >= h { return 0 }
                 return g[(y * n + z) * n + x]
             }
+            // Water voxels from (x, y, z) up to the top of the water (only as many as depth 15 needs). A solid ledge
+            // with more water above it counts as water: under an overhang or in a ravine under the sea, sky light
+            // comes in from the side, through at least as much water as lies over the ledge. Counted only up to the
+            // ledge (METALMC_EXP=oldledges), the faces under it were lit as if a block or two deep and showed through
+            // the sea as pale streaks. Air over a ledge (a flooded cave under land) ends the count, as before. So does
+            // any ledge with the deep-water shortcut, which drops faces by this depth on the assumption that the water
+            // right over them is drawn opaque.
+            let crossLedges = !lodOldLedges && !deepWater
+            @inline(__always) func waterRun(_ x: Int, _ y: Int, _ z: Int) -> Int {
+                var d = 0, yy = y
+                while yy < h && waterDepth(d) < 15 {
+                    let k = kinds[Int(at(x, yy, z))]
+                    if k == waterK { d += 1; yy += 1; continue }
+                    if k == airK || !crossLedges || x < 0 || z < 0 || x >= n || z >= n { break }
+                    let colTop = top[z * n + x]
+                    var t = yy + 1
+                    while t <= colTop && kinds[Int(at(x, t, z))] != waterK && kinds[Int(at(x, t, z))] != airK { t += 1 }
+                    if t > colTop || kinds[Int(at(x, t, z))] != waterK { break }
+                    d += t - yy
+                    yy = t
+                }
+                return d
+            }
             // Face order +X -X +Y -Y +Z -Z. For each face: normal axis, and the (u, v) axes whose extents
             // the shader scales by (w, h): X faces u = y, v = z; Y faces u = x, v = z; Z faces u = x, v = y.
             for face in 0..<6 {
@@ -715,18 +744,24 @@ enum LodBuild {
                                 let outside = axis != 1 && (x + sx < 0 || z + sz < 0 || x + sx >= n || z + sz >= n)
                                 if k == waterK {
                                     if outside && kinds[Int(at(x, y + 1, z))] == waterK {
-                                        // Under the surface, the skirt toward the next node stands in for the floor
-                                        // beyond it: the column's floor, lit as that floor is. As water, the wall
-                                        // put a second layer of water in front of every node edge facing the camera
-                                        // (the far sea showed the node grid as bands), and rays under the surface
-                                        // that missed it found the sky under the sea.
-                                        var fy = y - 1
-                                        while fy >= 0 && kinds[Int(at(x, fy, z))] == waterK { fy -= 1 }
-                                        let fm = at(x, fy, z)
-                                        if kinds[Int(fm)] != airK {
-                                            var dw = 0, yy = fy + 1
-                                            while yy < h && waterDepth(dw) < 15 && kinds[Int(at(x, yy, z))] == waterK { dw += 1; yy += 1 }
-                                            f = UInt32(fm) | UInt32(min(15, max(1, waterDepth(dw)))) << 16
+                                        // Under the surface there's no skirt toward the next node. Where the two
+                                        // nodes' floors meet at different heights, the higher one's solid skirt
+                                        // (below) closes the step, so there's no crack to hide in the water above
+                                        // it, and any wall there is seen through the sea. As water, the wall put a
+                                        // second layer of water in front of every node edge facing the camera (the
+                                        // far sea showed the node grid as bands). As the column's floor, lit as
+                                        // that floor (METALMC_EXP=oldskirts), it was an opaque wall from the floor
+                                        // up to the surface between the camera and the sea floor beyond it, and
+                                        // from above the sea showed the node grid as curtains.
+                                        if lodOldSkirts {
+                                            var fy = y - 1
+                                            while fy >= 0 && kinds[Int(at(x, fy, z))] == waterK { fy -= 1 }
+                                            let fm = at(x, fy, z)
+                                            if kinds[Int(fm)] != airK {
+                                                var dw = 0, yy = fy + 1
+                                                while yy < h && waterDepth(dw) < 15 && kinds[Int(at(x, yy, z))] == waterK { dw += 1; yy += 1 }
+                                                f = UInt32(fm) | UInt32(min(15, max(1, waterDepth(dw)))) << 16
+                                            }
                                         }
                                     }
                                     // The top voxel's skirt stays water, and there's none at sea level, where every
@@ -749,8 +784,7 @@ enum LodBuild {
                                     var wy = y + 1
                                     if outside { while wy < h && kinds[Int(at(x, wy, z))] != waterK && kinds[Int(at(x, wy, z))] != airK { wy += 1 } }
                                     if outside && wy < h && kinds[Int(at(x, wy, z))] == waterK {
-                                        var wt = wy
-                                        while wt + 1 < h && kinds[Int(at(x, wt + 1, z))] == waterK { wt += 1 }
+                                        let wt = wy + waterRun(x, wy, z) - 1
                                         f = UInt32(m) | UInt32(min(15, max(1, waterDepth(wt - y + 1)))) << 16
                                     } else {
                                         f = UInt32(m) | coverDepth(fx, fy, fz) << 16 | blockLightAt(fx, fy, fz) << 20
@@ -758,9 +792,7 @@ enum LodBuild {
                                 }
                                 else if nk == waterK && !lodOpaqueWater {
                                     // Water voxels from the one in front of the face up.
-                                    var d = 0, yy = y + sy
-                                    while yy < h && waterDepth(d) < 15 && kinds[Int(at(x + sx, yy, z + sz))] == waterK { d += 1; yy += 1 }
-                                    let depth = min(15, max(1, waterDepth(d)))
+                                    let depth = min(15, max(1, waterDepth(waterRun(x + sx, y + sy, z + sz))))
                                     if !(deepWater && depth >= deepBlocks) { f = UInt32(m) | UInt32(depth) << 16 }
                                 }
                                 if f != 0 && axis != 1 {
@@ -1273,4 +1305,57 @@ public func mmc_debug_region_quad_materials2(_ path: UnsafePointer<CChar>, _ dee
         let m = LodBuild.mesh(g, maxMerge: 64)
         for i in 0..<(m.quads.count / 2) { out[Int(m.quads[2 * i + 1] & 255)] += 1 }
     }
+}
+
+/// Debug: one node of the active world as it's drawn: its quads (word0, word1 pairs, at most `cap` quads) and the
+/// starts of its (tile, bucket, sub-tile) ranges (lodBucketIndex order, plus the end: 16 * 16 * 16 + 1 entries).
+/// Returns the quad count, or -1 if the world has no such node. With mmc_debug_lod_select and mmc_debug_lod_colors,
+/// enough to render the LOD offline.
+@_cdecl("mmc_debug_lod_node_raw")
+public func mmc_debug_lod_node_raw(_ level: Int32, _ x: Int32, _ z: Int32, _ quads: UnsafeMutablePointer<UInt32>, _ cap: Int32,
+                                   _ starts: UnsafeMutablePointer<Int32>) -> Int32 {
+    let r = LodRenderer.shared
+    r.lock.lock(); let w = r.world; r.lock.unlock()
+    guard let w, let n = w.snapshot().meshes[LodNodeKey(level: Int(level), x: Int(x), z: Int(z))] else { return -1 }
+    let q = n.buffer.contents().bindMemory(to: UInt32.self, capacity: 2 * n.quadCount)
+    for i in 0..<(2 * min(n.quadCount, Int(cap))) { quads[i] = q[i] }
+    for (i, s) in n.start.enumerated() { starts[i] = Int32(s) }
+    return Int32(n.quadCount)
+}
+
+/// Debug: the LOD's material colors with the built-in biome tints (lodColorTable): 256 * 3 RGBA floats, material * 3 +
+/// face class (top, side, bottom).
+@_cdecl("mmc_debug_lod_colors")
+public func mmc_debug_lod_colors(_ out: UnsafeMutablePointer<Float>) {
+    for (i, c) in lodColorTable().enumerated() { out[4 * i] = c.x; out[4 * i + 1] = c.y; out[4 * i + 2] = c.z; out[4 * i + 3] = c.w }
+}
+
+/// Debug: one node built from a region file as LodWorld builds it (level 0: quarter (qx, qz); level 1: the region), for
+/// checking what its skirts cover against its neighbors. Writes its quads (word0, word1 pairs, at most `cap`) and per
+/// column (z * 256 + x) the top of its highest solid voxel (in the sea, the floor) and of its highest water voxel, in
+/// world blocks (Int16.min for none): columns[2 * i], columns[2 * i + 1]. With `voxels` non-nil, also the filled grid
+/// that was meshed (256 * 256 * height bytes, x fastest, then z, then y). Returns the quad count, -1 for no data.
+@_cdecl("mmc_debug_region_node_mesh")
+public func mmc_debug_region_node_mesh(_ path: UnsafePointer<CChar>, _ level: Int32, _ qx: Int32, _ qz: Int32,
+                                       _ quads: UnsafeMutablePointer<UInt32>, _ cap: Int32, _ columns: UnsafeMutablePointer<Int16>,
+                                       _ voxels: UnsafeMutablePointer<UInt8>?) -> Int32 {
+    let p = String(cString: path)
+    guard var g = level == 0 ? LodBuild.regionQuarterGrid(path: p, qx: Int(qx), qz: Int(qz)) : LodBuild.regionGrid(path: p) else { return -1 }
+    if level == 0 { g.fillUnreachable(deepRadius: 16, deepDepth: 8) } else { g.fillUnreachable() }
+    if let voxels { for (i, v) in g.v.enumerated() { voxels[i] = v } }
+    let m = LodBuild.mesh(g, maxMerge: 64, skyCover: lodSkyCover)
+    let n = lodNodeVoxels, s = 1 << g.level
+    let waterK = MaterialKind.water.rawValue, airK = MaterialKind.air.rawValue
+    for i in 0..<(n * n) {
+        var solidTop = Int(Int16.min), waterTop = Int(Int16.min)
+        for y in stride(from: g.height - 1, through: 0, by: -1) {
+            let k = lodKinds[Int(g.v[y * n * n + i])]
+            if k == waterK && waterTop == Int(Int16.min) { waterTop = (y + 1) * s + lodWorldMinY }
+            if k != waterK && k != airK { solidTop = (y + 1) * s + lodWorldMinY; break }
+        }
+        columns[2 * i] = Int16(solidTop); columns[2 * i + 1] = Int16(waterTop)
+    }
+    let count = min(m.quads.count / 2, Int(cap))
+    for i in 0..<(2 * count) { quads[i] = m.quads[i] }
+    return Int32(m.quads.count / 2)
 }
