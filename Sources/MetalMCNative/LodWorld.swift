@@ -160,6 +160,9 @@ final class LodWorld: @unchecked Sendable {
     let live: LodLiveStore
     let maxLevel: Int
     let fineRadius: Int
+    /// The LOD distance (blocks). With the far field on, the top level is generated out to it (the horizon) instead of
+    /// one node size: the far field draws those nodes from their columns, never as quads.
+    var distance = 0
 
     private let lock = NSLock()
     private var meshes: [LodNodeKey: LodMeshNode] = [:]
@@ -688,7 +691,8 @@ final class LodWorld: @unchecked Sendable {
             let size = lodNodeVoxels << level
             // A node is drawn when its parent splits (the parent's nearest point within the split factor x this
             // node's size) or, at the top level, anywhere within the LOD distance.
-            let reach = level == maxLevel ? Double(size) : lodSplitFactor * Double(size)
+            let reach = level == maxLevel ? (lodFarFieldOn ? Swift.max(Double(size), Double(distance)) : Double(size))
+                : lodSplitFactor * Double(size)
             let psize = size * 2
             let cx = Int((Double(c.x) / Double(size)).rounded(.down)), cz = Int((Double(c.z) / Double(size)).rounded(.down))
             let r = Int(reach) / size + 2

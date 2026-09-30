@@ -96,6 +96,11 @@ Results (Viraj's world, native 3456×2234, flying at y 150, TAA on, uncapped; `-
 | quads (ffpD) | 158.7 | 7.78 ms | 4.14 ms | 2.70 | 1.44 | 1.79 M |
 | far field from level 1 (ffpE) | 168.4 | 7.72 ms | 3.68 ms | 1.36 | 2.31 | 0.88 M |
 
+With 2048-cell rings and AO (commit 0e68840), under heavy background CPU (Microsoft Defender scanning at 30-90%):
+163.5 fps vs 159.9 with quads, main pass 3.86 vs 4.10 ms, p99 8.70 vs 8.14 ms; at 120 Hz with vsync both hold 119.8 fps
+and drop 14 vs 10 frames in the 60 s flight (the same flight dropped 11 a minute with quads on a quiet night earlier).
+The far field is faster on average but not yet a clear win; its payoffs are the horizon and level 0's hidden quads.
+
 Fidelity in the band past vanilla's 512 blocks (fog off, 4 km world). The answer key (`nL0`) is the quad LOD with
 level 0 (every block) out to 2 km (`-Plod0=2048`: 40 M quads, 158 s to build); past 2 km it's the same level-1 quads as
 the quad run, which flatters the quads there.

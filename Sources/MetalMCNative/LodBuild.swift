@@ -172,6 +172,10 @@ struct LodGrid {
     /// Levels 1 and up: light sources as voxel index << 4 | light level, the brightest in each voxel. Torches and
     /// lanterns are dropped from the voxels themselves (they'd be too small to see), so this keeps their light.
     var lights: [UInt32] = []
+    /// Far field: generated columns (LodFarStore.fill) as far-field column words (LodBuild.farColumns) from the
+    /// generator's exact heights, 0 for columns it didn't fill. Coarse voxels round heights to 8-256 blocks (a level-8
+    /// grid is one voxel tall, with no room for water); the far field uses these instead.
+    var farExact: [UInt32] = []
 
     init(level: Int) {
         self.level = level

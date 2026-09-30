@@ -276,6 +276,9 @@ final class LodFarStore: @unchecked Sendable {
         lock.unlock()
         let n = lodNodeVoxels, h = g.height, L = g.level
         var filled = 0
+        let exact = lodFarFieldOn
+        var exactOut = exact ? (g.farExact.isEmpty ? [UInt32](repeating: 0, count: n * n) : g.farExact) : []
+        defer { if exact { g.farExact = exactOut } }
         g.v.withUnsafeMutableBufferPointer { v in
             for z in 0..<n {
                 for x in 0..<n {
@@ -290,10 +293,31 @@ final class LodFarStore: @unchecked Sendable {
                         if nx < 0 || nz < 0 || nx >= n || nz >= n { continue }
                         slope = max(slope, abs(Int(cols.height[nz * n + nx]) - Int(cols.height[col])))
                     }
+                    let surface = table[cols.biome[col]] ?? Self.defaultSurface
                     Self.writeColumn(v, col: col, n: n, h: h, L: L, height: Int(cols.height[col]),
-                                     s: table[cols.biome[col]] ?? Self.defaultSurface, steep: slope * 2 > 3 << L,
+                                     s: surface, steep: slope * 2 > 3 << L,
                                      bx: key.x * (n << L) + (x << L), bz: key.z * (n << L) + (z << L),
                                      bottom: cols.bottom.map { Int($0[col]) })
+                    if exact && cols.bottom == nil {
+                        // The column as the far field sees it, from the exact height (blocks above the world bottom):
+                        // under the sea level, water to its voxel top (128, as the LOD draws it) over the bed, or ice;
+                        // else the top voxel's material (surface, snow, badlands band, or canopy over the ground).
+                        let ground = Int(cols.height[col]) - lodWorldMinY
+                        let surfaceMat = surface.mountain && slope * 2 > 3 << L ? Mat.stone.rawValue : surface.top
+                        let vegetation = surfaceMat == Mat.grass.rawValue || surfaceMat == Mat.snow.rawValue
+                            || (surfaceMat >= lodGrassBase && surfaceMat < lodGrassBase + 32)
+                        if Int(cols.height[col]) < lodSeaLevel {
+                            let bed = UInt32(vegetation ? surface.under : surfaceMat)
+                            exactOut[col] = surface.frozen ? 128 | UInt32(Mat.ice.rawValue) << 16 | bed << 24
+                                : UInt32(max(1, ground)) | UInt32(min(127, 128 - ground)) << 9 | bed << 16 | UInt32(surface.water) << 24
+                        } else {
+                            var topVoxel = h - 1
+                            while topVoxel > 0 && v[topVoxel * n * n + col] == 0 { topVoxel -= 1 }
+                            let top = v[topVoxel * n * n + col], trees = lodTreeMaterial[Int(top)]
+                            exactOut[col] = UInt32(min(lodWorldHeight, ground + (trees ? surface.canopy : 0))) | UInt32(top) << 16
+                                | UInt32(trees ? surfaceMat : surface.under) << 24
+                        }
+                    }
                     filled += 1
                 }
             }

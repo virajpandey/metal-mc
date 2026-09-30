@@ -23,6 +23,7 @@ import simd
 
 /// The finest LOD level drawn by the far field (METALMC_FARFIELD); 0: off.
 let lodFarFieldLevel = max(0, Int(ProcessInfo.processInfo.environment["METALMC_FARFIELD"] ?? "") ?? 0)
+let lodFarFieldOn = lodFarFieldLevel > 0
 /// Debug (METALMC_EXP=ffsteps): color hits by the number of march steps (green few, red many), misses dark blue.
 let farFieldSteps = experiments.contains("ffsteps")
 /// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
@@ -33,13 +34,15 @@ let farFieldCoverCells = 256    // coverage bitmap side, 64-block cells (16 km)
 
 extension LodBuild {
     /// One word per column of a node's grid for the far field: bits 0-8 the height of the top solid voxel's top
-    /// (voxels above the world bottom, 0 for none), 9-15 voxels of water above it, 16-23 the top voxel's material,
-    /// 24-31 the water's material if there's water, else the material under the top voxel.
+    /// (blocks above the world bottom, 0 for none), 9-15 blocks of water above it (to its voxel top), 16-23 the top
+    /// voxel's material, 24-31 the water's material if there's water, else the material under the top voxel. Heights
+    /// are in blocks, not voxels, so coarse levels keep the generator's exact heights (LodGrid.farExact).
     static func farColumns(_ g: LodGrid) -> [UInt32] {
         let n = lodNodeVoxels, layer = n * n
         var out = [UInt32](repeating: 0, count: layer)
         g.v.withUnsafeBufferPointer { v in
             for i in 0..<layer {
+                if !g.farExact.isEmpty && g.farExact[i] != 0 { out[i] = g.farExact[i]; continue }
                 var y = g.height - 1
                 while y >= 0 && v[y * layer + i] == 0 { y -= 1 }
                 if y < 0 { continue }
@@ -53,8 +56,9 @@ extension LodBuild {
                 let top: UInt8 = y >= 0 ? v[y * layer + i] : 0
                 var sub = top
                 if y > 0, v[(y - 1) * layer + i] != 0, !lodIsWater(v[(y - 1) * layer + i]) { sub = v[(y - 1) * layer + i] }
-                let depth = waterTop >= 0 ? min(127, waterTop - y) : 0
-                out[i] = UInt32(y + 1) | UInt32(depth) << 9 | UInt32(top) << 16 | UInt32(waterTop >= 0 ? waterMat : sub) << 24
+                let s = 1 << g.level
+                out[i] = UInt32((y + 1) * s) | UInt32(waterTop >= 0 ? min(127, (waterTop - y) * s) : 0) << 9
+                    | UInt32(top) << 16 | UInt32(waterTop >= 0 ? waterMat : sub) << 24
             }
         }
         return out
@@ -122,7 +126,7 @@ kernel void ff_fill(uint2 gid [[thread_position_in_grid]], constant FillParams& 
     if (local.x < 0 || local.y < 0 || local.x >= W || local.y >= W) return;
     uint c = cols[gid.y * 256u + gid.x];
     data.write(uint4(c), uint2(local), p.ring);
-    uint top = ((c & 511u) + ((c >> 9) & 127u)) << p.level;
+    uint top = (c & 511u) + ((c >> 9) & 127u);
     heights.write(ushort4(ushort(c == 0u ? 0u : top)), uint2(local), p.ring);
 }
 
@@ -160,7 +164,7 @@ constant float kShade[6] = { 0.6, 0.6, 1.0, 0.5, 0.8, 0.8 };
 constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
 
 static float solidAt(texture2d_array<uint, access::read> data, int2 c, uint r, float s) {
-    return float(data.read(uint2(clamp(c, int2(0), int2(W - 1))), r).r & 511u) * s;
+    return float(data.read(uint2(clamp(c, int2(0), int2(W - 1))), r).r & 511u);
 }
 // Ambient occlusion like the LOD's (vanilla's smooth lighting per voxel corner, bilinear inside the face). A top face's
 // corners count taller neighbors (both sides: 3); a side face darkens toward its foot, where the ground in front of it
@@ -277,7 +281,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
                 }
                 col = data.read(uint2(cell), r).r;
                 // Water surfaces sit 10/9 block below the voxel's top, as the LOD draws them (kWaterSurfaceDrop).
-                float top = float((col & 511u) + ((col >> 9) & 127u)) * s - (((col >> 9) & 127u) != 0u ? 10.0 / 9.0 : 0.0);
+                float top = float((col & 511u) + ((col >> 9) & 127u)) - (((col >> 9) & 127u) != 0u ? 10.0 / 9.0 : 0.0);
                 if (yA <= top) {
                     tHit = tc;
                     face = lastAxis == 0 ? (d.x > 0.0 ? 1 : 0) : (d.z > 0.0 ? 5 : 4);
@@ -302,8 +306,8 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     }
     float3 rel = dir * tHit;
     float y = f.cam.x + rel.y;
-    uint solid = col & 511u, depthVox = (col >> 9) & 127u;
-    float solidTop = float(solid) * s;
+    uint solid = col & 511u, depthVox = (col >> 9) & 127u;   // blocks
+    float solidTop = float(solid);
     uint topMat = (col >> 16) & 255u, lowMat = col >> 24;
     float sky = float(u.seamInfo.z);
     float3 light = lodLight(u, lightmap, ls, sky);
@@ -314,7 +318,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     float3 color;
     if (depthVox > 0u && face == 2) {
         // Water over its floor, like the LOD's translucent water over its meshed floor (lit for the water above it).
-        float depthBlocks = min(15.0, float(depthVox) * s - 1.0);
+        float depthBlocks = min(15.0, float(depthVox) - 1.0);
         float3 floorColor = colors[topMat * 3u].rgb * detail(u, sprites, atlas, atlasSampler, topMat, 2, rel, mip)
                           * lodLight(u, lightmap, ls, max(0.0, sky - depthBlocks));
         float a = f.cam.y;
@@ -323,13 +327,13 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         // The side of a water column. Rays that pass under the quads' water reach the first far-field column from the
         // side, below its surface: that's terrain seen through the water (the quads' water surface is drawn over it),
         // so it's the floor (or the solid side), lit for the water above it, not another water surface.
-        float waterTop = float(solid + depthVox) * s - 10.0 / 9.0;
+        float waterTop = float(solid + depthVox) - 10.0 / 9.0;
         bool side = y < solidTop;
         float depthBlocks = min(15.0, waterTop - (side ? y : solidTop));
         color = colors[topMat * 3u + (side ? 1u : 0u)].rgb * (side ? kShade[face] : 1.0)
               * detail(u, sprites, atlas, atlasSampler, topMat, side ? face : 2, rel, mip) * lodLight(u, lightmap, ls, max(0.0, sky - depthBlocks));
     } else {
-        uint mat = (face == 2 || y >= solidTop - s) ? topMat : lowMat;
+        uint mat = (face == 2 || y >= solidTop - min(s, 8.0)) ? topMat : lowMat;
         color = colors[mat * 3u + (face == 2 ? 0u : 1u)].rgb * kShade[face] * light
               * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip)
               * columnAO(data, hitCell, hitRing, s, face, solidTop, hitFrac, y);

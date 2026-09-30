@@ -903,6 +903,7 @@ private func lodOpen(regionDir: URL?, storeDir: URL?, cacheDir: URL? = nil, dime
     let w = LodWorld(id: id, dimension: dimension, floating: dimension == "minecraft:the_end",
                      hasSkyLight: dimension != "minecraft:the_nether", regionDir: regionDir, storeDir: storeDir, cacheDir: cacheDir,
                      maxLevel: maxLevel, fineRadius: fine, centerX: centerX, centerZ: centerZ)
+    w.distance = far
     r.worlds[dimension]?.stop()
     r.world?.setPaused(true)
     r.worlds[dimension] = w
