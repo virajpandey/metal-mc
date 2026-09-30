@@ -9,13 +9,15 @@ import simd
 //
 // Data: every LOD node at those levels also keeps one word per column (LodBuild.farColumns). Per level there's a
 // ring: a W x W window of that level's columns around the camera (one slice of a 2D array texture), and a max
-// pyramid of column tops over it. A ring is rewritten on the GPU when the camera moves 64 of its cells or a node in
-// its window changes. A bitmap of the area drawn by quads (levels below the far field's, 64-block cells) is rebuilt every frame and
+// pyramid of column tops over it. A ring is rewritten on the GPU when the camera moves 64 of its cells or the columns of
+// a node in its window change (nodes are rebuilt whenever their region is saved, mostly with the same columns), at most
+// one ring per frame; until then it's drawn with the window it was filled for. A bitmap of the area drawn by quads (levels below the far field's, 64-block cells) is rebuilt every frame and
 // tested where a ray reaches a column: columns in it count as empty, so rays only find terrain the quads don't draw.
 //
 // Drawing: right after the LOD's opaque quads, a shell around the camera at the horizontal distance of the nearest tile
-// the far field draws (a 64-sided prism from the world bottom up, and its floor). Every hit lies beyond it, so rays
-// start there and the early depth test skips pixels with anything drawn nearer than the shell. Each pixel marches ring 0 until its ray leaves ring 0's
+// the far field draws (a 64-sided prism from the world bottom up to the highest terrain in the rings or the camera,
+// and its floor). Every hit lies beyond it, so rays start there, the early depth test skips pixels with anything drawn
+// nearer than the shell, and rays that leave through its top (over all the terrain) never start. Each pixel marches ring 0 until its ray leaves ring 0's
 // window, then ring 1, and so on (each ring's cells are about 3.5 px wide where its window ends). A hit writes the
 // column's color (top or side face, vanilla's lightmap, water over its floor, fog) and its depth.
 
@@ -23,8 +25,10 @@ import simd
 let lodFarFieldLevel = max(0, Int(ProcessInfo.processInfo.environment["METALMC_FARFIELD"] ?? "") ?? 0)
 /// Debug (METALMC_EXP=ffsteps): color hits by the number of march steps (green few, red many), misses dark blue.
 let farFieldSteps = experiments.contains("ffsteps")
-let farFieldWidth = 1024        // cells per ring side
-let farFieldMips = 11           // max pyramid levels: 1024 ... 1
+/// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
+/// camera, about as far as the quads use that level.
+let farFieldWidth = Int(ProcessInfo.processInfo.environment["METALMC_FFWIDTH"] ?? "") ?? 2048
+let farFieldMips = farFieldWidth.trailingZeroBitCount + 1   // max pyramid levels: W ... 1
 let farFieldCoverCells = 256    // coverage bitmap side, 64-block cells (16 km)
 
 extension LodBuild {
@@ -60,7 +64,7 @@ extension LodBuild {
 /// Uniforms of the march (must match FarUniforms in the shader).
 struct FarUniforms {
     var invViewProj: simd_float4x4          // inverse of the jittered projection * view rotation (camera-relative)
-    var viewport: SIMD4<Float>               // width, height, depth of the full-screen triangle, rings
+    var viewport: SIMD4<Float>               // width, height, highest terrain in the rings (blocks above the bottom), rings
     var cam: SIMD4<Float>                    // x: camera height above the world bottom (blocks); y: water alpha;
                                              // z: shell radius (blocks); w: shell top relative to the camera
     var ring: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
@@ -152,6 +156,30 @@ vertex float4 ff_vs(uint vid [[vertex_id]], constant LodUniforms& u [[buffer(19)
 }
 
 constant float kShade[6] = { 0.6, 0.6, 1.0, 0.5, 0.8, 0.8 };
+// The LOD's ambient occlusion steps for 0-3 occluders at levels 1 and up (kAO in the LOD shader).
+constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
+
+static float solidAt(texture2d_array<uint, access::read> data, int2 c, uint r, float s) {
+    return float(data.read(uint2(clamp(c, int2(0), int2(W - 1))), r).r & 511u) * s;
+}
+// Ambient occlusion like the LOD's (vanilla's smooth lighting per voxel corner, bilinear inside the face). A top face's
+// corners count taller neighbors (both sides: 3); a side face darkens toward its foot, where the ground in front of it
+// occludes its lowest voxel's bottom corners.
+static float columnAO(texture2d_array<uint, access::read> data, int2 c, uint r, float s, int face, float top, float2 f, float y) {
+    if (face == 2) {
+        float o[4];
+        for (int k = 0; k < 4; k++) {
+            int2 dd = int2((k & 1) ? 1 : -1, (k & 2) ? 1 : -1);
+            bool a = solidAt(data, c + int2(dd.x, 0), r, s) > top, b = solidAt(data, c + int2(0, dd.y), r, s) > top;
+            bool g = solidAt(data, c + dd, r, s) > top;
+            o[k] = kAO[(a && b) ? 3 : int(a) + int(b) + int(g)];
+        }
+        return mix(mix(o[0], o[1], f.x), mix(o[2], o[3], f.x), f.y);
+    }
+    int2 front = face == 0 ? int2(1, 0) : (face == 1 ? int2(-1, 0) : (face == 4 ? int2(0, 1) : int2(0, -1)));
+    float v = (y - solidAt(data, c + front, r, s)) / s;
+    return v < 1.0 ? mix(kAO[1], 1.0, saturate(v)) : 1.0;
+}
 
 static float3 lodLight(constant LodUniforms& u, texture2d<float> lightmap, sampler s, float skyLevel) {
     if (u.lightmapOn > 0.5) return lightmap.sample(s, float2(0.5 / 16.0, (skyLevel + 0.5) / 16.0), level(0)).rgb;
@@ -196,12 +224,17 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     float3 dir = normalize(hp.xyz / hp.w);
     uint rings = uint(f.viewport.w);
     float t = f.cam.z / max(length(dir.xz), 1e-6) * 0.999;   // nothing to find inside the shell
+    // Nothing to find once a rising ray is over the highest terrain.
+    float tMax = dir.y > 0.0 ? (f.viewport.z - f.cam.x) / dir.y : INFINITY;
     int steps = 0;
     bool hit = false;
     float tHit = 0.0;
     int face = 2;
     uint col = 0;
     float s = 1.0;
+    int2 hitCell = int2(0);
+    uint hitRing = 0;
+    float2 hitFrac = float2(0.0);
     for (uint r = 0; r < rings && !hit; r++) {
         float4 rc = f.ring[r];
         s = rc.z;
@@ -211,7 +244,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         float2 ta = (0.0 - o.xz) * inv, tb = (float(W) - o.xz) * inv;
         float2 tmn = min(ta, tb), tmx = max(ta, tb);
         float tEnter = max(max(tmn.x, tmn.y), t);
-        float tLeave = min(tmx.x, tmx.y);
+        float tLeave = min(min(tmx.x, tmx.y), tMax);
         if (!(tEnter < tLeave)) continue;
         int lastAxis = tmn.x > tmn.y ? 0 : 1;
         int l = TOP;   // rays over everything in the ring (the sky) leave it in one step
@@ -252,6 +285,9 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
                     tHit = (top - o.y) / d.y;
                     face = 2;
                 }
+                hitCell = int2(cell);
+                hitRing = r;
+                hitFrac = saturate(o.xz + d.xz * tHit - cell);
                 hit = true;
                 break;
             }
@@ -295,7 +331,8 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     } else {
         uint mat = (face == 2 || y >= solidTop - s) ? topMat : lowMat;
         color = colors[mat * 3u + (face == 2 ? 0u : 1u)].rgb * kShade[face] * light
-              * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip);
+              * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip)
+              * columnAO(data, hitCell, hitRing, s, face, solidTop, hitFrac, y);
     }
     if (\(farFieldSteps ? "true" : "false")) color = mix(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), saturate(float(steps) / 128.0));
     float horiz = length(rel.xz);
@@ -330,13 +367,16 @@ final class FarField: @unchecked Sendable {
     private var heights: MTLTexture?       // R16Uint with mips, W x W x rings: column tops in blocks above the world bottom
     private var mipViews: [MTLTexture] = []
     private var rings = 0
-    private var origins: [SIMD2<Int>] = []  // per ring: world cell (of its level) at texel 0
+    private var origins: [SIMD2<Int>] = []  // per ring: world cell (of its level) at texel 0 for the current camera
+    private var filledOrigins: [SIMD2<Int>] = []   // per ring: the same for the window it holds
+    private var lastFill: [Int] = []
     private var coverOrigin = SIMD2<Int>(0, 0)
     private var cover = [UInt8](repeating: 0, count: farFieldCoverCells * farFieldCoverCells)
     private var ringKeys: [[Int]] = []     // per ring: its window and the nodes it was filled from
     private var coverBuffer: MTLBuffer?    // the bitmap the current frame draws with (a new one whenever it changes)
     private var lastCover: [UInt8] = []
     private(set) var ready = false
+    private var maxTop = Double(lodWorldHeight)   // highest terrain in the rings' nodes (blocks above the world bottom)
     var fills = 0
 
     /// Compiles the shaders in the background; nil until they're ready.
@@ -404,7 +444,10 @@ final class FarField: @unchecked Sendable {
         data = dt
         heights = ht
         rings = n
-        ringKeys = []
+        ringKeys = [[Int]](repeating: [], count: n)
+        filledOrigins = [SIMD2<Int>](repeating: .zero, count: n)
+        lastFill = [Int](repeating: 0, count: n)
+        ready = false
         return mipViews.count == farFieldMips
     }
 
@@ -443,7 +486,7 @@ final class FarField: @unchecked Sendable {
             coverBuffer = b
             lastCover = cover
         }
-        // Each ring's nodes (a rebuilt node is a new object), and the rings whose window or nodes changed.
+        // Each ring's nodes, and the rings whose window or nodes' columns changed.
         var perRing = [[(LodMeshNode, SIMD2<Int>)]](repeating: [], count: rings)
         var keys = origins.map { [$0.x, $0.y] }
         for (key, node) in meshes {
@@ -453,16 +496,24 @@ final class FarField: @unchecked Sendable {
             let o = origins[r]
             if cell.x + 256 <= o.x || cell.y + 256 <= o.y || cell.x >= o.x + farFieldWidth || cell.y >= o.y + farFieldWidth { continue }
             perRing[r].append((node, cell))
-            keys[r].append(ObjectIdentifier(node).hashValue)
+            keys[r].append(node.columnsHash &+ cell.x &* 0x9E37_79B9 &+ cell.y &* 0x85EB_CA6B)
         }
         for r in 0..<rings { keys[r] = Array(keys[r][..<2]) + keys[r][2...].sorted() }
-        let stale = (0..<rings).filter { ringKeys.count != rings || ringKeys[$0] != keys[$0] }
+        var top = 0
+        for ring in perRing {
+            for (node, _) in ring {
+                for t in 0..<16 where node.tileY[2 * t] <= node.tileY[2 * t + 1] { top = max(top, (node.tileY[2 * t + 1] + 1) << node.level) }
+            }
+        }
+        maxTop = Double(min(top, lodWorldHeight))
+        let stale = (0..<rings).filter { ringKeys[$0] != keys[$0] }
         if stale.isEmpty { return ready }
+        let r = stale.min { lastFill[$0] < lastFill[$1] }!   // the one waiting longest
         guard let data, let clearPipe, let fillPipe, let mipPipe,
               let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return false }
         cb.label = "MetalMC far field fill"
         var nodes = 0
-        for r in stale {
+        do {
             var slice = UInt32(r)
             enc.setComputePipelineState(clearPipe)
             enc.setBytes(&slice, length: 4, index: 0)
@@ -492,11 +543,13 @@ final class FarField: @unchecked Sendable {
         // Committed now, ahead of the frame's own command buffer (committed at the end of the frame), so this frame's
         // draw reads the new rings.
         cb.commit()
-        ringKeys = keys
         fills += 1
-        if fills % 20 == 1 { log("far field: fill \(fills): rings \(stale) of \(rings) from level \(k), \(nodes) nodes") }
-        ready = true
-        return true
+        ringKeys[r] = keys[r]
+        filledOrigins[r] = origins[r]
+        lastFill[r] = fills
+        if fills % 20 == 1 { log("far field: fill \(fills): ring \(r) of \(rings) from level \(k), \(nodes) nodes, \(stale.count) stale") }
+        ready = ready || ringKeys.allSatisfy { !$0.isEmpty }
+        return ready
     }
 
     /// Draws the march inside the LOD's pass (after its opaque quads). `u` is the LOD's uniforms for this frame.
@@ -506,23 +559,23 @@ final class FarField: @unchecked Sendable {
         let k = lodFarFieldLevel
         let vp = u.proj * u.view
         var f = FarUniforms(invViewProj: vp.inverse,
-                            viewport: SIMD4(Float(ctx.passWidth), Float(ctx.passHeight), 0, Float(rings)),
+                            viewport: SIMD4(Float(ctx.passWidth), Float(ctx.passHeight), Float(maxTop), Float(rings)),
                             cam: SIMD4(Float(cy - Double(lodWorldMinY)), lodWaterAlpha, Float(nearest),
-                                       Float(max(Double(lodWorldHeight) - (cy - Double(lodWorldMinY)), 0) + 1)),
+                                       Float(max(maxTop - (cy - Double(lodWorldMinY)), 0) + 1)),
                             ring: (.zero, .zero, .zero, .zero, .zero, .zero, .zero, .zero),
                             ringCover: (.zero, .zero, .zero, .zero, .zero, .zero, .zero, .zero))
         withUnsafeMutableBytes(of: &f.ring) { raw in
             let rp = raw.bindMemory(to: SIMD4<Float>.self)
             for r in 0..<rings {
                 let s = Double(1 << (k + r))
-                rp[r] = SIMD4(Float(camX / s - Double(origins[r].x)), Float(camZ / s - Double(origins[r].y)), Float(s), 0)
+                rp[r] = SIMD4(Float(camX / s - Double(filledOrigins[r].x)), Float(camZ / s - Double(filledOrigins[r].y)), Float(s), 0)
             }
         }
         withUnsafeMutableBytes(of: &f.ringCover) { raw in
             let rp = raw.bindMemory(to: SIMD4<Float>.self)
             for r in 0..<rings {
                 let s = 1 << (k + r)
-                rp[r] = SIMD4(Float(origins[r].x * s - coverOrigin.x * 64), Float(origins[r].y * s - coverOrigin.y * 64), 0, 0)
+                rp[r] = SIMD4(Float(filledOrigins[r].x * s - coverOrigin.x * 64), Float(filledOrigins[r].y * s - coverOrigin.y * 64), 0, 0)
             }
         }
         var uu = u

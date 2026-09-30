@@ -106,6 +106,7 @@ final class LodMeshNode {
     let tileYCore: [Int]        // the same without the node's edge skirts
     let sectionMask: [UInt32]   // levels 0-1: the chunk sections each tile has quads in (LodMesh.sectionMask)
     let columns: MTLBuffer?     // far-field levels: LodMesh.columns
+    let columnsHash: Int        // of the columns' contents: a node rebuilt with the same columns needs no ring refill
     // Occlusion results, render thread only: the last frame each tile's box was tested, and the last
     // frame it was found visible.
     var tileTested = [UInt64](repeating: 0, count: 16)
@@ -134,6 +135,9 @@ final class LodMeshNode {
         tileYCore = m.tileYCore
         sectionMask = m.sectionMask
         columns = m.columns.isEmpty ? nil : ctx.device.makeBuffer(bytes: m.columns, length: m.columns.count * 4, options: [.storageModeShared])
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for c in m.columns { h = (h ^ UInt64(c)) &* 0x100_0000_01b3 }
+        columnsHash = Int(truncatingIfNeeded: h)
     }
 }
 

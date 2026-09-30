@@ -1,4 +1,4 @@
-# Far field: a height-field ray march past the voxel LOD (design, not built yet)
+# Far field: a height-field ray march past the voxel LOD (prototype working, off by default)
 
 ## Why
 
@@ -53,3 +53,63 @@ blocks, and overhangs, caves and tree trunks under canopies are invisible.
 3. Shading parity (texture detail, lightmap, water, fog, AO from neighbor heights), then more rings, then rings past the
    LOD from seed sampling.
 4. Turn off level 1+ quads where the march covers them; measure the frame; then the horizon.
+
+## Prototype (2026-09-30, `METALMC_FARFIELD=<level>`, `-PfarField`, `Sources/MetalMCNative/FarField.swift`)
+
+Steps 1-2 and most of 3's shading, for LOD levels from `<level>` up (1 in the measurements below).
+
+- **Columns.** Every node at those levels keeps one 32-bit word per column (LodBuild.farColumns): the top solid voxel's
+  height, voxels of water above it, the top material, and the water's material (or the material under the top). That's
+  256 KB per node, filled on the GPU from the node's buffer.
+- **Rings.** Per level, a 2048 x 2048 window of that level's columns around the camera (one slice of a 2D array
+  texture; `METALMC_FFWIDTH`) with a max pyramid of column tops in blocks. Each level's ring reaches 1024 of its cells
+  from the camera, about as far as the quads use that level; 1024-cell rings switched to the next level at half that
+  distance, and against the answer key below scored 5.87 instead of 4.87. A ring is refilled (clear, one dispatch per
+  node, mip passes) when the camera moves 64 of its cells or the columns of a node in its window change, at most one
+  ring per frame, from a separate command buffer committed ahead of the frame's. Nodes are rebuilt whenever their
+  region is saved (every few seconds while flying over fresh chunks), nearly always with the same columns, so rings
+  are keyed on a hash of each node's columns rather than the node object (which refilled a ring about once a second).
+- **The quads' area.** Rays must not find terrain the quads draw (levels below the far field's): a 64-block bitmap of
+  the chosen quad tiles is rebuilt every frame (cheap on the CPU) and tested where a ray reaches a column; covered
+  columns count as empty. Baking it into the rings instead forced a full refill whenever a tile near the player changed
+  (every frame or two in flight: p99 15 ms).
+- **The shell.** The march is drawn as a 64-sided prism around the camera at the horizontal distance of the nearest
+  far-field tile, from the world bottom to the highest terrain in the rings (or the camera), plus its floor. Every hit
+  lies outside it, so rays start there, the early depth test skips every pixel with anything drawn nearer (the
+  fragment writes depth with `[[depth(less)]]`), and rays that leave through its top pass over all the terrain and never
+  start. A full-screen triangle at the depth of the nearest possible hit instead ran the march on every pixel with LOD
+  terrain beyond that plane: 120 fps instead of 168.
+- **The march.** Per ring, from the pyramid's top (rays over everything leave a ring in one step), the standard
+  max-mipmap traversal: skip a cell if the ray stays above its maximum, else descend; at a column, a side hit where the
+  ray enters it below its top, else a top hit. Then the next ring from where the ray leaves this one's window.
+- **Shading like the LOD's:** face shade, vanilla's lightmap, texture detail from a mip picked for the pixel's
+  footprint (no smooth derivatives at column edges), water over its depth-lit floor at the LOD's water alpha, the
+  water surface 10/9 block below the voxel top, fog, and ambient occlusion like the LOD's per-voxel-corner steps: a top
+  face's corners count taller neighbors, a side face darkens toward its foot (answer key 4.87 -> 4.47). A side hit below a water column's surface is terrain seen through
+  water (rays that pass under the quads' water reach the first far-field column that way), not another water surface:
+  shading it as water drew a bright strip where the quads end (far band error 4.92 -> 4.65).
+
+Results (Viraj's world, native 3456×2234, flying at y 150, TAA on, uncapped; `-PmetalExp=ffsteps` colors hits by steps):
+
+| | fps | p99 | main pass | vertex | fragment | LOD quads/frame |
+|---|---|---|---|---|---|---|
+| quads (ffpD) | 158.7 | 7.78 ms | 4.14 ms | 2.70 | 1.44 | 1.79 M |
+| far field from level 1 (ffpE) | 168.4 | 7.72 ms | 3.68 ms | 1.36 | 2.31 | 0.88 M |
+
+Fidelity in the band past vanilla's 512 blocks (fog off, 4 km world). The answer key (`nL0`) is the quad LOD with
+level 0 (every block) out to 2 km (`-Plod0=2048`: 40 M quads, 158 s to build); past 2 km it's the same level-1 quads as
+the quad run, which flatters the quads there.
+
+| | vs answer key | vs quads |
+|---|---|---|
+| quads (nC35) | 3.12 | – |
+| far field, 1024-cell rings (ff1d) | 5.87 | 4.55 |
+| 2048-cell rings (ff1e) | 4.87 | 2.97 |
+| + ambient occlusion (ff1f) | 4.47 | 2.46 |
+
+The near band against vanilla is unchanged (4.62-4.64). Past the rings' finest data a height field can't show
+overhangs or the gaps under canopies (a tree is a column down to the ground).
+
+Next: an absolute reference for that band (level 0 out to 2 km as the answer key), the horizon (rings past the LOD
+from the world generator, with heights in blocks instead of voxels so coarse rings keep full vertical precision),
+ambient occlusion at column feet, and the quad/march boundary moved inward (level 0's hidden quads).
