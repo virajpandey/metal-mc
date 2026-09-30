@@ -249,14 +249,14 @@ final class LodFarStore: @unchecked Sendable {
                 if s.frozen { v[vyWater * n * n + col] = Mat.ice.rawValue }
             }
         } else if s.canopy > 0 {
-            // Forest canopy isn't a flat sheet: tree height varies by 8-block patch (-2 to +2 blocks), and up close
-            // (voxels under 8 blocks) one 4-block cell in six is a clearing. Sparse woods keep trees on only
-            // `coverage` of their tree-sized cells, at every level (a solid canopy there reads as a carpet).
+            // Forest canopy isn't a flat sheet: tree height varies by 4-block cell, a tree's crown (-2 to +2 blocks), and
+            // up close (voxels under 8 blocks) one cell in six is a clearing. Sparse woods keep trees on only `coverage` of
+            // their tree-sized cells, at every level (a solid canopy there reads as a carpet).
             if s.coverage > 0 {
                 if lodHash(bx >> max(2, L), bz >> max(2, L), 1) >= s.coverage { return }
             } else if L < 3 && lodHash(bx >> 2, bz >> 2, 1) < 1.0 / 6.0 { return }
             let leaves = s.leafMix.isEmpty ? s.leaves : s.leafMix[min(s.leafMix.count - 1, Int(lodHash(bx >> 2, bz >> 2, 3) * Double(s.leafMix.count)))]
-            let canopy = s.canopy + Int(lodHash(bx >> 3, bz >> 3, 2) * 5) - 2
+            let canopy = s.canopy + Int(lodHash(bx >> 2, bz >> 2, 2) * 5) - 2
             let vyCanopy = min(h - 1, (top + canopy + 64) >> L)
             if vyCanopy > vyTop { for y in (vyTop + 1)...vyCanopy { v[y * n * n + col] = leaves } }
             else { v[vyTop * n * n + col] = leaves }
