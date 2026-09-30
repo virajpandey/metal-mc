@@ -178,10 +178,11 @@ struct LodGrid {
     /// Levels 1 and up: light sources as voxel index << 4 | light level, the brightest in each voxel. Torches and
     /// lanterns are dropped from the voxels themselves (they'd be too small to see), so this keeps their light.
     var lights: [UInt32] = []
-    /// Far field: generated columns (LodFarStore.fill) as far-field column words (LodBuild.farColumns) from the
-    /// generator's exact heights, 0 for columns it didn't fill. Coarse voxels round heights to 8-256 blocks (a level-8
-    /// grid is one voxel tall, with no room for water); the far field uses these instead.
-    var farExact: [UInt32] = []
+    /// Far field: each column at block precision (LodFarCell; empty when the far field is off): real columns from the
+    /// region's blocks, merged at every downsampling, and generated ones from the generator's heights (LodFarStore.fill).
+    /// Coarse voxels round heights to 8-256 blocks (a level-8 grid is one voxel tall, with no room for water); the far
+    /// field uses these instead. A cell with no area has none (the far field falls back to the voxels).
+    var far: [LodFarCell] = []
 
     init(level: Int) {
         self.level = level
@@ -190,6 +191,13 @@ struct LodGrid {
     }
 
     @inline(__always) func index(_ x: Int, _ y: Int, _ z: Int) -> Int { (y * lodNodeVoxels + z) * lodNodeVoxels + x }
+
+    /// Drops the far-field cells of `size` x `size` columns from (x0, z0) whose voxels were replaced (live chunks):
+    /// their cells come from the new voxels instead.
+    mutating func clearFar(x0: Int, z0: Int, size: Int) {
+        if far.isEmpty { return }
+        for z in z0..<min(lodNodeVoxels, z0 + size) { for x in x0..<min(lodNodeVoxels, x0 + size) { far[z * lodNodeVoxels + x] = LodFarCell() } }
+    }
 
     /// Fills air (and water) that can't be seen from LOD distances with stone, in two steps:
     ///
@@ -327,6 +335,21 @@ struct LodGrid {
                 }
             }
         }
+        // Far-field cells: each 2 x 2 merged (LodFarCell.merge); a column with voxels but no cell gets one from its voxels.
+        if !far.isEmpty {
+            if parent.far.isEmpty { parent.far = [LodFarCell](repeating: LodFarCell(), count: n * n) }
+            parent.far.withUnsafeMutableBufferPointer { out in
+                for pz in 0..<half {
+                    for px in 0..<half {
+                        @inline(__always) func child(_ dx: Int, _ dz: Int) -> LodFarCell {
+                            let i = (pz * 2 + dz) * n + px * 2 + dx
+                            return far[i].area != 0 ? far[i] : LodFarCell.voxels(self, column: i)
+                        }
+                        out[(qz * half + pz) * n + qx * half + px] = LodFarCell.merge(child(0, 0), child(1, 0), child(0, 1), child(1, 1))
+                    }
+                }
+            }
+        }
         // The brightest light of each 2 x 2 x 2 group, keeping only lights that can still show at the parent's level
         // (the mesher starts a light at its level minus half a voxel: nothing survives past level 4).
         let minLevel = UInt32((1 << parent.level) / 2)
@@ -358,7 +381,7 @@ struct LodMesh {
     var sectionMask: [UInt32]   // levels 0-1: per tile, the chunk sections holding its quads (skirts aside), lodTileSectionBits
     var aoOffsets: [UInt32]     // per quad: first rim value in `ao`, or lodNoAOData
     var ao: [UInt32]            // rim values, 16 per word
-    var columns: [UInt32] = []  // far-field levels only: one word per column (LodBuild.farColumns)
+    var columns: [UInt32] = []  // far-field levels only: two words per column (LodBuild.farColumns)
 }
 
 /// Chunk sections per tile side at `level` (levels 0 and 1 only: tiles of 64 and 128 blocks).
@@ -390,6 +413,8 @@ enum LodBuild {
         var lights: [UInt32] = []
         var tint = [UInt8](repeating: 0, count: 16)
         let n = lodNodeVoxels, cv = lodChunkVoxels
+        // Far-field cells at block precision (LodFarCell.block, each level-1 column merging its 2 x 2 blocks).
+        var far = lodFarCells && !floating ? [LodFarCell](repeating: LodFarCell(), count: n * n) : []
         r.withUnsafeBufferPointer { rb in
         grid.v.withUnsafeMutableBufferPointer { g in
             for i in 0..<1024 {
@@ -400,8 +425,23 @@ enum LodBuild {
                 // Biome tint class per 4 x 4-block cell (index z * 4 + x).
                 for k in 0..<16 { tint[k] = chunk.surfaceBiomes.count == 16 ? lodTintIndex(chunk.surfaceBiomes[k]) : 0 }
                 for k in 0..<blocks.count { blocks[k] = 0 }
+                var topSection = -1
                 for (sy, b) in chunk.sections where sy >= 0 && sy < lodWorldHeight / 16 {
                     for k in 0..<4096 { blocks[sy * 4096 + k] = b[k] }
+                    topSection = max(topSection, sy)
+                }
+                if !far.isEmpty {
+                    blocks.withUnsafeBufferPointer { bp in
+                        let b = bp.baseAddress!, top = topSection * 16 + 15
+                        for vz in 0..<cv {
+                            for vx in 0..<cv {
+                                let t = tint[(vz >> 1) * 4 + (vx >> 1)], x = 2 * vx, z = 2 * vz
+                                far[(lz0 + vz) * n + lx0 + vx] = LodFarCell.merge(
+                                    LodFarCell.block(b, x: x, z: z, top: top, tint: t), LodFarCell.block(b, x: x + 1, z: z, top: top, tint: t),
+                                    LodFarCell.block(b, x: x, z: z + 1, top: top, tint: t), LodFarCell.block(b, x: x + 1, z: z + 1, top: top, tint: t))
+                            }
+                        }
+                    }
                 }
                 blocks.withUnsafeBufferPointer { bp in
                     tint.withUnsafeBufferPointer { tp in
@@ -427,6 +467,7 @@ enum LodBuild {
         }
         }
         grid.lights = lights
+        grid.far = far
         return any ? grid : nil
     }
 

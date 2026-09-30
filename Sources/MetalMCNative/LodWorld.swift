@@ -30,16 +30,24 @@ struct LodQuadrant {
     var offsets: [UInt32]
     var runs: [UInt8]
     var lights: [UInt32] = []   // LodGrid.lights of the quadrant, as if it sat in the low corner of a level-2 grid
+    var far: [UInt8] = []       // its far-field cells (LodGrid.far), LodFarCell.encode'd; empty if it has none
 
-    init(offsets: [UInt32], runs: [UInt8], lights: [UInt32] = []) {
+    init(offsets: [UInt32], runs: [UInt8], lights: [UInt32] = [], far: [UInt8] = []) {
         self.offsets = offsets
         self.runs = runs
         self.lights = lights
+        self.far = far
     }
 
     init(grid g: LodGrid) {
         lights = g.lights
         let q = lodQuadrantVoxels, h = g.height
+        if !g.far.isEmpty {
+            var cells: [LodFarCell] = []
+            cells.reserveCapacity(q * q)
+            for z in 0..<q { cells += g.far[(z * lodNodeVoxels)..<(z * lodNodeVoxels + q)] }
+            far = LodFarCell.encode(cells[...])
+        }
         offsets = [UInt32](repeating: 0, count: q * q + 1)
         runs = []
         runs.reserveCapacity(q * q * 8)
@@ -69,6 +77,10 @@ struct LodQuadrant {
             let i = Int(l >> 4)
             g.lights.append(UInt32(i + (qz * q) * n + qx * q) << 4 | (l & 15))
         }
+        if lodFarCells, let cells = LodFarCell.decode(far, count: q * q) {
+            if g.far.isEmpty { g.far = [LodFarCell](repeating: LodFarCell(), count: n * n) }
+            for z in 0..<q { g.far.replaceSubrange(((qz * q + z) * n + qx * q)..<((qz * q + z) * n + qx * q + q), with: cells[(z * q)..<(z * q + q)]) }
+        }
         g.v.withUnsafeMutableBufferPointer { dst in
             runs.withUnsafeBufferPointer { r in
                 for z in 0..<q {
@@ -89,7 +101,7 @@ struct LodQuadrant {
         }
     }
 
-    var bytes: Int { offsets.count * 4 + runs.count + lights.count * 4 }
+    var bytes: Int { offsets.count * 4 + runs.count + lights.count * 4 + far.count }
 }
 
 /// A meshed node on the GPU.
@@ -107,6 +119,7 @@ final class LodMeshNode {
     let sectionMask: [UInt32]   // levels 0-1: the chunk sections each tile has quads in (LodMesh.sectionMask)
     let columns: MTLBuffer?     // far-field levels: LodMesh.columns
     let columnsHash: Int        // of the columns' contents: a node rebuilt with the same columns needs no ring refill
+    let columnsTop: Int         // the highest column top, water surface or canopy (blocks above the world bottom)
     // Occlusion results, render thread only: the last frame each tile's box was tested, and the last
     // frame it was found visible.
     var tileTested = [UInt64](repeating: 0, count: 16)
@@ -138,6 +151,12 @@ final class LodMeshNode {
         var h: UInt64 = 0xcbf2_9ce4_8422_2325
         for c in m.columns { h = (h ^ UInt64(c)) &* 0x100_0000_01b3 }
         columnsHash = Int(truncatingIfNeeded: h)
+        var top = 0
+        for i in stride(from: 0, to: m.columns.count - 1, by: 2) {
+            let w0 = m.columns[i], w1 = m.columns[i + 1]
+            top = max(top, Int(w0 & 511) + Int((w0 >> 9) & 127), Int(w1 & 511))
+        }
+        columnsTop = top
     }
 }
 
@@ -555,6 +574,8 @@ final class LodWorld: @unchecked Sendable {
                 }
                 let fromFile = self.regionDir.flatMap { LodBuild.regionGrid(path: $0.appendingPathComponent("r.\(x).\(z).mca").path, floating: self.floating) }
                 var g = fromFile ?? LodGrid(level: 1)
+                // Live chunks only (a server): far-field cells from their voxels, merged up like the file's.
+                if lodFarCells && !self.floating && g.far.isEmpty { g.far = [LodFarCell](repeating: LodFarCell(), count: lodNodeVoxels * lodNodeVoxels) }
                 let hasLive = self.live.overlay(regionX: x, regionZ: z, into: &g)
                 guard fromFile != nil || hasLive else {
                     outp[i] = RegionResult(key: LodBuild.key(x, z), quadrant: LodQuadrant(grid: LodGrid(level: 2)), node: nil, hasData: false, full: false)
@@ -603,8 +624,9 @@ final class LodWorld: @unchecked Sendable {
 
     /// Bump when what a quadrant holds changes (materials, downsampling), so older cache files are rebuilt.
     /// 2: 26.3's poplar leaves got their own materials. 3: huge mushrooms, prismarine. 4: light sources, magma.
-    /// 5: only light sources whose light can get out.
-    static let cacheVersion: UInt8 = 5
+    /// 5: only light sources whose light can get out. 6: the far field's cells (a light count before the lights, the
+    /// cells after them).
+    static let cacheVersion: UInt8 = 6
 
     private func cacheURL(_ x: Int, _ z: Int) -> URL? { cacheDir?.appendingPathComponent("r.\(x).\(z).lq") }
 
@@ -615,8 +637,9 @@ final class LodWorld: @unchecked Sendable {
     }
 
     /// A fully generated region's quadrant from an earlier session, if its region file hasn't changed since.
-    /// File: "MMCQ", version, region file stamp (ms, bytes), body length, then LZFSE of the offsets (UInt32), the runs
-    /// and the lights (UInt32 each).
+    /// File: "MMCQ", version, region file stamp (ms, bytes), body length, then LZFSE of the offsets (UInt32), the runs,
+    /// the light count and the lights (UInt32 each), and the far-field cells (LodQuadrant.far, to the end; none when
+    /// the far field was off). With the far field on, a quadrant cached without cells is read again from its region.
     func cachedQuadrant(x: Int, z: Int) -> LodQuadrant? {
         guard let url = cacheURL(x, z), let st = stamp(x, z), let d = try? Data(contentsOf: url), d.count > 29 else { return nil }
         let raw = [UInt8](d)
@@ -633,14 +656,15 @@ final class LodWorld: @unchecked Sendable {
             offsets[k] = UInt32(body[4 * k]) | UInt32(body[4 * k + 1]) << 8 | UInt32(body[4 * k + 2]) << 16 | UInt32(body[4 * k + 3]) << 24
         }
         let runStart = offsets.count * 4, runEnd = runStart + Int(offsets[q * q])
-        guard runEnd <= body.count, (body.count - runEnd) % 4 == 0 else { return nil }
+        guard runEnd + 4 <= body.count else { return nil }
+        @inline(__always) func u32(_ o: Int) -> UInt32 { UInt32(body[o]) | UInt32(body[o + 1]) << 8 | UInt32(body[o + 2]) << 16 | UInt32(body[o + 3]) << 24 }
         let runs = Array(body[runStart..<runEnd])
-        var lights = [UInt32](repeating: 0, count: (body.count - runEnd) / 4)
-        for k in 0..<lights.count {
-            let o = runEnd + 4 * k
-            lights[k] = UInt32(body[o]) | UInt32(body[o + 1]) << 8 | UInt32(body[o + 2]) << 16 | UInt32(body[o + 3]) << 24
-        }
-        return LodQuadrant(offsets: offsets, runs: runs, lights: lights)
+        let lightCount = Int(u32(runEnd)), farStart = runEnd + 4 + 4 * lightCount
+        guard farStart <= body.count else { return nil }
+        let lights = (0..<lightCount).map { u32(runEnd + 4 + 4 * $0) }
+        let far = lodFarCells ? Array(body[farStart...]) : []
+        if lodFarCells && far.isEmpty { return nil }
+        return LodQuadrant(offsets: offsets, runs: runs, lights: lights, far: far)
     }
 
     func saveQuadrant(x: Int, z: Int, _ quadrant: LodQuadrant) {
@@ -649,7 +673,8 @@ final class LodWorld: @unchecked Sendable {
         body.reserveCapacity(quadrant.offsets.count * 4 + quadrant.runs.count)
         for o in quadrant.offsets { body += [UInt8(o & 255), UInt8((o >> 8) & 255), UInt8((o >> 16) & 255), UInt8(o >> 24)] }
         body += quadrant.runs
-        for l in quadrant.lights { body += [UInt8(l & 255), UInt8((l >> 8) & 255), UInt8((l >> 16) & 255), UInt8(l >> 24)] }
+        for l in [UInt32(quadrant.lights.count)] + quadrant.lights { body += [UInt8(l & 255), UInt8((l >> 8) & 255), UInt8((l >> 16) & 255), UInt8(l >> 24)] }
+        body += quadrant.far
         var packed = [UInt8](repeating: 0, count: body.count + 1024)
         let n = body.withUnsafeBufferPointer { compression_encode_buffer(&packed, packed.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
         guard n > 0 else { return }

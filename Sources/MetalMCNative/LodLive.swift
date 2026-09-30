@@ -54,6 +54,7 @@ struct LodChunkColumns {
             let i = Int(l >> 4), x = i % n, z = (i / n) % n, y = i / (n * n)
             g.lights.append(UInt32((y * lodNodeVoxels + z0 + z) * lodNodeVoxels + x0 + x) << 4 | (l & 15))
         }
+        g.clearFar(x0: x0, z0: z0, size: n)   // the region file's far-field cells describe the chunk as it was
         data.withUnsafeBufferPointer { d in
             g.v.withUnsafeMutableBufferPointer { dst in
                 for c in 0..<(n * n) {

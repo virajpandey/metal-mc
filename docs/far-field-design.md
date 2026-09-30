@@ -116,20 +116,104 @@ The near band against vanilla is unchanged (4.62-4.64). Past the rings' finest d
 overhangs or the gaps under canopies (a tree is a column down to the ground).
 
 **The horizon (commit c8847c0).** Column heights are stored in blocks, not voxels; generated columns get far-field words
-built from the generator's exact height, water and materials (LodGrid.farExact: a level-8 grid is one voxel tall, with
-no room for water); and with the far field on, the top level is generated out to the LOD distance instead of one node
+built from the generator's exact height, water and materials (LodGrid.farExact, now LodGrid.far's cells: a level-8 grid
+is one voxel tall, with no room for water); and with the far field on, the top level is generated out to the LOD distance instead of one node
 size. At LOD distance 262144 the fidelity tour's high views show terrain to the horizon line (116 generated nodes, 7.6 M
 columns, 82 s at 33 us per column per thread, cached after).
 
 Known artifacts (Viraj, 2026-09-30):
 - Spires where real terrain meets generated terrain: real columns at coarse levels come from voxels rounded up to 8-32
-  blocks, generated ones are exact. Fix: carry each column's true top through the downsampling.
-- Trees as pillars: one height per column can't hold a crown over air. Fix: a canopy layer (ground height plus canopy top
-  and bottom).
+  blocks, generated ones are exact. Fixed offline by columns v2 (below); needs an in-game look.
+- Trees as pillars: one height per column can't hold a crown over air. Fixed offline by the canopy layer (below).
 - Thin tall things (a tower) become full-height pillars; each ring's cells are twice the previous ring's, so similar
-  objects change thickness across a ring edge. Better: pick detail by on-screen error, not distance alone.
+  objects change thickness across a ring edge. Better: pick detail by on-screen error, not distance alone. (Mean
+  heights shrink a lone tower to its share of the cell instead.)
 - Not the far field's: pale "curtains" under the sea along LOD node borders (the quad LOD's underwater skirts, drawn as
   opaque floor stand-ins, seen through the translucent water); both renderers show them.
+
+## Columns v2: true heights and a canopy layer (2026-09-30, offline; in-game checks pending)
+
+Two words per column instead of one (LodBuild.farColumns, LodFarCell.words; the rings are RG32Uint):
+
+- **Word 0, the ground**, as before: top in blocks above the world bottom, water depth, top material, water or side
+  material. **Word 1, the canopy:** a slab of leaves from its underside to its top (blocks above the world bottom) and
+  its material; 0 for none. The pyramid holds the higher of the ground (or water) and the canopy.
+- **The march** tests a column as the ground box plus the slab: a ray enters through a side (below the ground's top, or
+  into the slab), meets the slab's top or the ground's top on its way down, or the slab's underside on its way up; between
+  the ground and the slab it passes under the trees to the next column. Ground under a canopy gets 3 sky-light levels
+  less (vanilla's leaves dim sky light a level a block); the slab's underside is lit the same way, its sides darken
+  toward the underside, its top gets corner occlusion from taller crowns around it.
+
+**True heights (spires).** Every column carries a LodFarCell at block precision from the region file up: the dry
+ground's top, the water surface and the bed under it, the canopy's top and underside (the lowest leaves: a trunk under
+them is too thin to see; snow on leaves belongs to the tree), the shares of the cell with data, under water and under
+trees, and the materials. regionGrid builds one per 2 x 2 blocks from the chunk's blocks; LodGrid.downsample merges 2 x 2
+at every level; the region's level-2 quadrant keeps them (LZFSE, about 50 KB a region; quadrant cache version 6); live
+chunks drop the file's cells for their columns, which then come from the voxels. Generated columns build theirs from the
+generator's heights (LodFarStore.generatedCell), canopy included (a crown depth per biome: 3-10 blocks of leaves).
+
+Which statistic: each height is the mean over the part of the cell it describes, which composes exactly from level to
+level. Measured offline (`tools/fartest.py stats`, 100 regions of claudeworld-merged): per level, 16 cameras at world y
+150 and 260 around the regions, each at the distance the far field draws that level (1024 x 2^(L-1) to 1024 x 2^L
+blocks), every pixel-wide azimuth (70 degree field of view on 2234 px) sampled per block against level-1 truth:
+
+| level | voxel tops: silhouette px (signed) / >5% depth-off px / top - truth | cells, mean, canopy dithered | cells, mean, canopy wherever any | cells, max, canopy wherever any |
+|---|---|---|---|---|
+| 2 | 1.20 (+1.08) / 3.7% / +1.46 | 0.50 (-0.32) / 1.5% / -0.28 | 0.43 (-0.08) / 1.3% / +0.37 | 0.72 (+0.72) / 2.1% / +1.29 |
+| 3 | 1.49 (+1.36) / 6.4% / +3.51 | 0.70 (-0.56) / 2.9% / -0.26 | 0.56 (-0.20) / 2.3% / +0.93 | 0.79 (+0.79) / 3.2% / +2.80 |
+| 4 | 1.80 (+1.68) / 8.2% / +7.45 | 0.75 (-0.67) / 3.6% / -0.22 | 0.55 (-0.26) / 2.8% / +1.64 | 0.79 (+0.79) / 3.5% / +4.96 |
+| 5 | 1.99 (+1.96) / 7.7% / +15.50 | 0.65 (-0.60) / 2.9% / -0.15 | 0.47 (-0.29) / 2.2% / +2.57 | 0.70 (+0.70) / 3.1% / +8.21 |
+| 6 | 2.10 (+2.08) / 5.5% / +33.31 | 0.55 (-0.53) / 1.6% / +0.13 | 0.41 (-0.30) / 1.0% / +3.92 | 0.55 (+0.55) / 1.5% / +13.18 |
+
+The maximum keeps peaks on the silhouette but stands everything up (+1 to +13 blocks: it's what made the voxel tops
+spires). A canopy wherever a cell has any trees gives the best silhouettes but paints the land as forest: 27% of the
+cells at level 2, 63% at level 6, against 16% under trees in fact. So the default is the mean, and a partial canopy
+(cover below 100%) is drawn in a share of cells equal to its cover, picked by a hash: 16.1-16.5% at every level, heights
+unbiased (within 0.3 blocks), silhouettes 0.5-0.75 px (a third of the voxel tops'), a half to a third of their pixels
+more than 5% off in depth. It's also what the generator does for sparse woods, so real and generated forests match.
+
+Against the generator (`tools/fartest.py seam`, the cached generated nodes of claudeworld at the same places as real
+columns, and the real/generated boundary cells):
+
+| level | real - generated top, before: voxel tops (mean, p95) | after: cells (mean, p95) | boundary step: before / after / the generated terrain's own |
+|---|---|---|---|
+| 3 | +3.65, 15 | -0.75, 9 | 4.82 / 2.53 / 1.80 |
+| 4 | +8.29, 25 | -0.51, 9 | 8.89 / 3.19 / 2.84 |
+| 5 | +17.22, 42 | -0.59, 10 | 16.63 / 4.45 / 4.24 |
+| 6 | +37.56, 71 | +1.85, 15 | 35.16 / 7.74 / 6.46 |
+
+The seam now steps about as much as the terrain does anywhere else. The generated heights themselves read low at coarse
+levels: FarTerrain stops its search for the ground within a quarter voxel (2-64 blocks at levels 3-8) and returns the
+bottom of that interval (the real ground was 0.8, 1.7, 3.1 and 6.7 blocks above them at levels 3-6), so generated cells
+take the interval's middle (after: +0.33, +0.23, -0.24, +0.40).
+
+**A stepping bug (pre-existing).** The march recomputed its cell from the ray a small step past each boundary. For rays
+nearly along x or z crossing a boundary toward -x or -z, that step was under a float's precision, so floor() put the ray
+back in the cell it had just left; it spent its 192 steps there and skipped the rest of its ring, and a wedge of the next
+ring's terrain (cliff sides, brown and black) was drawn near the camera whenever the view looked close to -x or -z. Now
+the ray's position is carried separately and put half a cell past each boundary it crosses
+(`bench_out/results/far-field-v2/ (local, not in git) steps-l3-epsstep-0.png` before, `steps-l3-fixed-0.png` after). It may be some of the brown walls
+seen on the horizon.
+
+Offline renders (`tools/fartest.py render`: the world built by LodWorld from the fixture and the cached generated nodes,
+the march drawn by FarField into a PNG, every column by the march, no texture detail or fog), in `bench_out/results/far-field-v2/ (local, not in git) `:
+`seam-l5-{old,new}-{0,1}` (far field from level 5, the real terrain's east and south edges from 1 km out: the old
+voxel tops stand as 32-block plateaus with cliff sides above the generated terrain; the cells meet it) and
+`forest-l1-{old,new}-0` (level 1 over a spruce forest: the ground and water show under and between crowns). Mean march
+steps per hit pixel in forest views: 30.4 and 34.9 with the canopy, 29.2 and 33.8 without, 27.9 and 33.1 before these
+changes. The first pass over the fixture's 100 regions took as long with cells as without (run to run noise), and the
+in-memory quadrant cache grew from 36 to 41 MB.
+
+Switches (METALMC_EXP, `-PmetalExp`): `ffvoxeltops` (real columns' heights from the voxels as before), `ffpillars`
+(canopy drawn as columns down to the ground as before), `ffepsstep` (the old stepping). All three together are the first
+far field, but for generated columns' crown variation and search-interval middle.
+
+Costs: the rings take twice the memory (RG32: 32 MB per 2048-cell ring, 256 MB for 8 rings), node column buffers 512 KB
+instead of 256 KB, and every region's quadrant is rebuilt once (cache version 6).
+
+In-game checks still to run: the fidelity tour and the flight bench, new against all three switches; a look at the
+horizon from high up toward the real terrain's edges (spires gone, forests as crowns) and along -x and -z (no wedge);
+that rays passing under forest canopies at grazing angles don't run out of steps (holes); memory with 8 rings.
 
 Next: an absolute reference for that band (level 0 out to 2 km as the answer key), the horizon (rings past the LOD
 from the world generator, with heights in blocks instead of voxels so coarse rings keep full vertical precision),

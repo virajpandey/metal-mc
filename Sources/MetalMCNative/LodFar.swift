@@ -41,6 +41,7 @@ struct LodFarSurface {
     var water: UInt8 = lodTinted(Mat.water.rawValue, 0)   // tinted water
     var coverage: Double = 0 // share of the ground under trees in sparse woods (cherry groves); 0 for a closed forest
     var leafMix: [UInt8] = []   // canopy materials picked per tree-sized cell instead of `leaves` (dappled forests)
+    var crown = 0            // far field: blocks of leaves from the canopy's top down (0: half the canopy, plus one)
 }
 
 /// Surface rules approximated per biome name (vanilla's surface rules and tree density, simplified).
@@ -53,18 +54,20 @@ func lodFarSurface(_ name: String) -> LodFarSurface {
     var s = LodFarSurface(top: grass, under: dirt, canopy: 0, leaves: leaves, frozen: false, mountain: false,
                           water: lodTinted(Mat.water.rawValue, t))
     switch n {
-    case "forest", "flower_forest", "birch_forest", "old_growth_birch_forest", "windswept_forest": s.canopy = 6
-    case "dark_forest", "pale_garden": s.canopy = 7
-    case "taiga": s.canopy = 8
-    case "old_growth_pine_taiga", "old_growth_spruce_taiga": s.canopy = 11
-    case "jungle", "bamboo_jungle": s.canopy = 13
-    case "cherry_grove": s.canopy = 5; s.leaves = Mat.cherryLeaves.rawValue; s.coverage = 0.35   // scattered trees on grass
+    // Crowns (the far field's canopy slab): oaks and birches about 4 blocks of leaves, spruces leafy nearly to the
+    // ground, jungles dense with bushes under their crowns.
+    case "forest", "flower_forest", "birch_forest", "old_growth_birch_forest", "windswept_forest": s.canopy = 6; s.crown = 4
+    case "dark_forest", "pale_garden": s.canopy = 7; s.crown = 4
+    case "taiga": s.canopy = 8; s.crown = 6
+    case "old_growth_pine_taiga", "old_growth_spruce_taiga": s.canopy = 11; s.crown = 8
+    case "jungle", "bamboo_jungle": s.canopy = 13; s.crown = 10
+    case "cherry_grove": s.canopy = 5; s.crown = 3; s.leaves = Mat.cherryLeaves.rawValue; s.coverage = 0.35   // scattered trees on grass
     case "dappled_forest":
         // Poplars in three autumn colors (orange the most common, then red, then yellow).
-        s.canopy = 8; s.leaves = Mat.orangePoplarLeaves.rawValue; s.coverage = 0.45   // grass shows between them
+        s.canopy = 8; s.crown = 6; s.leaves = Mat.orangePoplarLeaves.rawValue; s.coverage = 0.45   // grass shows between them
         s.leafMix = [Mat.orangePoplarLeaves, .orangePoplarLeaves, .orangePoplarLeaves, .redPoplarLeaves, .redPoplarLeaves, .yellowPoplarLeaves].map(\.rawValue)
-    case "mangrove_swamp": s.canopy = 6; s.top = Mat.mud.rawValue; s.under = Mat.mud.rawValue
-    case "snowy_taiga", "grove": s.canopy = 7; s.top = snow; s.coverage = 0.55   // snow shows between the spruces
+    case "mangrove_swamp": s.canopy = 6; s.crown = 4; s.top = Mat.mud.rawValue; s.under = Mat.mud.rawValue
+    case "snowy_taiga", "grove": s.canopy = 7; s.crown = 5; s.top = snow; s.coverage = 0.55   // snow shows between the spruces
     case "snowy_plains", "ice_spikes": s.top = snow; s.frozen = true
     case "snowy_slopes", "frozen_peaks", "jagged_peaks": s.top = snow; s.under = stone; s.frozen = true; s.mountain = true
     case "stony_peaks": s.top = stone; s.under = stone; s.mountain = true
@@ -249,19 +252,64 @@ final class LodFarStore: @unchecked Sendable {
                 for y in (vyTop + 1)...vyWater { v[y * n * n + col] = s.water }
                 if s.frozen { v[vyWater * n * n + col] = Mat.ice.rawValue }
             }
-        } else if s.canopy > 0 {
-            // Forest canopy isn't a flat sheet: tree height varies by 4-block cell, a tree's crown (-2 to +2 blocks), and
-            // up close (voxels under 8 blocks) one cell in six is a clearing. Sparse woods keep trees on only `coverage` of
-            // their tree-sized cells, at every level (a solid canopy there reads as a carpet).
-            if s.coverage > 0 {
-                if lodHash(bx >> max(2, L), bz >> max(2, L), 1) >= s.coverage { return }
-            } else if L < 3 && lodHash(bx >> 2, bz >> 2, 1) < 1.0 / 6.0 { return }
-            let leaves = s.leafMix.isEmpty ? s.leaves : s.leafMix[min(s.leafMix.count - 1, Int(lodHash(bx >> 2, bz >> 2, 3) * Double(s.leafMix.count)))]
-            let canopy = s.canopy + Int(lodHash(bx >> 2, bz >> 2, 2) * 5) - 2
+        } else if let (canopy, leaves) = trees(s, bx: bx, bz: bz, L: L) {
             let vyCanopy = min(h - 1, (top + canopy + 64) >> L)
             if vyCanopy > vyTop { for y in (vyTop + 1)...vyCanopy { v[y * n * n + col] = leaves } }
             else { v[vyTop * n * n + col] = leaves }
         }
+    }
+
+    /// The trees writeColumn puts on the column at block (bx, bz) of a level-`L` grid: the canopy's top in blocks above
+    /// the ground and its leaves, or nil. Forest canopy isn't a flat sheet: tree height varies by 4-block cell, a tree's
+    /// crown (-2 to +2 blocks), and up close (voxels under 8 blocks) one cell in six is a clearing. Sparse woods keep trees
+    /// on only `coverage` of their tree-sized cells, at every level (a solid canopy there reads as a carpet).
+    static func trees(_ s: LodFarSurface, bx: Int, bz: Int, L: Int) -> (Int, UInt8)? {
+        guard s.canopy > 0 else { return nil }
+        if s.coverage > 0 {
+            if lodHash(bx >> max(2, L), bz >> max(2, L), 1) >= s.coverage { return nil }
+        } else if L < 3 && lodHash(bx >> 2, bz >> 2, 1) < 1.0 / 6.0 { return nil }
+        let leaves = s.leafMix.isEmpty ? s.leaves : s.leafMix[min(s.leafMix.count - 1, Int(lodHash(bx >> 2, bz >> 2, 3) * Double(s.leafMix.count)))]
+        return (s.canopy + Int(lodHash(bx >> 2, bz >> 2, 2) * 5) - 2, leaves)
+    }
+
+    /// A generated column as a far-field cell, from the generator's height (`height`: the first block above the ground)
+    /// rather than voxels: under the sea level the biome's water over its bed (or ice), else its surface under the canopy
+    /// writeColumn gives it, the crown hanging from the canopy's top (LodFarSurface.crown) over the ground. `sampled` is
+    /// the level of the node the height was generated for: FarTerrain stops its search for the ground within a quarter
+    /// of that level's voxel (1-64 blocks) and returns the bottom of that interval, so the cell takes its middle (against
+    /// real terrain the heights read 0.8, 1.7, 3.1 and 6.7 blocks low at levels 3-6 without it).
+    static func generatedCell(height: Int, sampled: Int, s: LodFarSurface, steep: Bool, bx: Int, bz: Int, L: Int) -> LodFarCell {
+        let u = LodFarCell.unit
+        var c = LodFarCell()
+        c.area = 255
+        let sea = (lodSeaLevel - lodWorldMinY) * u                          // the sea's top water block's top
+        let slack = max(1, (1 << sampled) / 4) - 1
+        let ground = min(lodWorldHeight * u, max(u, (height - lodWorldMinY) * u + slack * u / 2))
+        let surfaceMat = s.mountain && steep ? Mat.stone.rawValue : s.top
+        let vegetation = surfaceMat == Mat.grass.rawValue || surfaceMat == Mat.snow.rawValue
+            || (surfaceMat >= lodGrassBase && surfaceMat < lodGrassBase + 32)
+        if height < lodSeaLevel {
+            // Grass and snow give way to what's under them in lake and river beds, as in writeColumn.
+            let bed = vegetation ? s.under : surfaceMat
+            if s.frozen {
+                c.ground = UInt16(sea); c.groundMat = Mat.ice.rawValue; c.underMat = bed
+            } else {
+                c.wet = 255; c.water = UInt16(sea); c.waterMat = s.water
+                c.bed = UInt16(min(ground, sea - u)); c.bedMat = bed
+            }
+            return c
+        }
+        c.ground = UInt16(ground)
+        c.groundMat = s.bands ? lodBadlandsBands[((height - 1) % 192 + 192) % 192] : surfaceMat
+        c.underMat = s.under
+        if !s.bands, let (h, leaves) = trees(s, bx: bx, bz: bz, L: L) {
+            let top = min(lodWorldHeight * u, ground + h * u), crown = s.crown > 0 ? s.crown : (s.canopy + 1) / 2 + 1
+            c.canopyTop = UInt16(top)
+            c.canopyBottom = UInt16(max(ground, top - crown * u))
+            c.canopyMat = leaves
+            c.cover = 255
+        }
+        return c
     }
 
     static let defaultSurface = LodFarSurface(top: Mat.grass.rawValue, under: Mat.dirt.rawValue, canopy: 0, leaves: Mat.leaves.rawValue,
@@ -276,9 +324,11 @@ final class LodFarStore: @unchecked Sendable {
         lock.unlock()
         let n = lodNodeVoxels, h = g.height, L = g.level
         var filled = 0
-        let exact = lodFarFieldOn
-        var exactOut = exact ? (g.farExact.isEmpty ? [UInt32](repeating: 0, count: n * n) : g.farExact) : []
-        defer { if exact { g.farExact = exactOut } }
+        // The far field's cells for the filled columns, from the generator's heights (a level-8 grid is one voxel tall).
+        let cells = lodFarFieldOn
+        var farOut = cells ? (g.far.isEmpty ? [LodFarCell](repeating: LodFarCell(), count: n * n) : g.far) : []
+        if cells { g.far = [] }   // farOut holds them meanwhile (no copy when it writes)
+        defer { if cells { g.far = farOut } }
         g.v.withUnsafeMutableBufferPointer { v in
             for z in 0..<n {
                 for x in 0..<n {
@@ -298,25 +348,9 @@ final class LodFarStore: @unchecked Sendable {
                                      s: surface, steep: slope * 2 > 3 << L,
                                      bx: key.x * (n << L) + (x << L), bz: key.z * (n << L) + (z << L),
                                      bottom: cols.bottom.map { Int($0[col]) })
-                    if exact && cols.bottom == nil {
-                        // The column as the far field sees it, from the exact height (blocks above the world bottom):
-                        // under the sea level, water to its voxel top (128, as the LOD draws it) over the bed, or ice;
-                        // else the top voxel's material (surface, snow, badlands band, or canopy over the ground).
-                        let ground = Int(cols.height[col]) - lodWorldMinY
-                        let surfaceMat = surface.mountain && slope * 2 > 3 << L ? Mat.stone.rawValue : surface.top
-                        let vegetation = surfaceMat == Mat.grass.rawValue || surfaceMat == Mat.snow.rawValue
-                            || (surfaceMat >= lodGrassBase && surfaceMat < lodGrassBase + 32)
-                        if Int(cols.height[col]) < lodSeaLevel {
-                            let bed = UInt32(vegetation ? surface.under : surfaceMat)
-                            exactOut[col] = surface.frozen ? 128 | UInt32(Mat.ice.rawValue) << 16 | bed << 24
-                                : UInt32(max(1, ground)) | UInt32(min(127, 128 - ground)) << 9 | bed << 16 | UInt32(surface.water) << 24
-                        } else {
-                            var topVoxel = h - 1
-                            while topVoxel > 0 && v[topVoxel * n * n + col] == 0 { topVoxel -= 1 }
-                            let top = v[topVoxel * n * n + col], trees = lodTreeMaterial[Int(top)]
-                            exactOut[col] = UInt32(min(lodWorldHeight, ground + (trees ? surface.canopy : 0))) | UInt32(top) << 16
-                                | UInt32(trees ? surfaceMat : surface.under) << 24
-                        }
+                    if cells && cols.bottom == nil {
+                        farOut[col] = Self.generatedCell(height: Int(cols.height[col]), sampled: L, s: surface, steep: slope * 2 > 3 << L,
+                                                         bx: key.x * (n << L) + (x << L), bz: key.z * (n << L) + (z << L), L: L)
                     }
                     filled += 1
                 }
@@ -339,6 +373,11 @@ final class LodFarStore: @unchecked Sendable {
         var filled = 0
         var lastKey: LodNodeKey?
         var last: LodFarColumns?
+        // Far-field cells for the filled columns (levels 1-2 carry them up to the far field's levels).
+        let cells = lodFarCells && L >= 1
+        var farOut = cells ? (g.far.isEmpty ? [LodFarCell](repeating: LodFarCell(), count: n * n) : g.far) : []
+        if cells { g.far = [] }   // farOut holds them meanwhile (no copy when it writes)
+        defer { if cells { g.far = farOut } }
         g.v.withUnsafeMutableBufferPointer { v in
             for z in 0..<n {
                 for x in 0..<n {
@@ -380,9 +419,13 @@ final class LodFarStore: @unchecked Sendable {
                         bottom = Int((low / wsum).rounded())
                     }
                     let slope = max(abs(h10 - h00), abs(h01 - h00), abs(h11 - h10), abs(h11 - h01)) / s
+                    let surface = table[c.biome[nearest]] ?? Self.defaultSurface
                     Self.writeColumn(v, col: col, n: n, h: h, L: L, height: height,
-                                     s: table[c.biome[nearest]] ?? Self.defaultSurface, steep: slope > 1.5,
+                                     s: surface, steep: slope > 1.5,
                                      bx: x0 + x * voxel, bz: z0 + z * voxel, bottom: bottom)
+                    if cells && bottom == nil {
+                        farOut[col] = Self.generatedCell(height: height, sampled: k.level, s: surface, steep: slope > 1.5, bx: x0 + x * voxel, bz: z0 + z * voxel, L: L)
+                    }
                     filled += 1
                 }
             }

@@ -1,3 +1,4 @@
+import Compression
 import Foundation
 import Metal
 import MetalMCCore
@@ -7,10 +8,10 @@ import simd
 // ray march instead of quads (docs/far-field-design.md). The quads' cost is vertex invocations, and at those levels
 // 95% of them draw nothing (terrain seen at grazing angles); a ray march costs per pixel and has exact visibility.
 //
-// Data: every LOD node at those levels also keeps one word per column (LodBuild.farColumns). Per level there's a
-// ring: a W x W window of that level's columns around the camera (one slice of a 2D array texture), and a max
-// pyramid of column tops over it. A ring is rewritten on the GPU when the camera moves 64 of its cells or the columns of
-// a node in its window change (nodes are rebuilt whenever their region is saved, mostly with the same columns), at most
+// Data: every LOD node at those levels also keeps two words per column (LodBuild.farColumns): the ground (or water) at
+// block precision, and a tree canopy over it as a slab rays can pass under. Per level there's a ring: a W x W window of
+// that level's columns around the camera (one slice of a 2D array texture), and a max pyramid of column tops over it.
+// A ring is rewritten on the GPU when the camera moves 64 of its cells or the columns of a node in its window change (nodes are rebuilt whenever their region is saved, mostly with the same columns), at most
 // one ring per frame; until then it's drawn with the window it was filled for. A bitmap of the area drawn by quads (levels below the far field's, 64-block cells) is rebuilt every frame and
 // tested where a ray reaches a column: columns in it count as empty, so rays only find terrain the quads don't draw.
 //
@@ -24,6 +25,13 @@ import simd
 /// The finest LOD level drawn by the far field (METALMC_FARFIELD); 0: off.
 let lodFarFieldLevel = max(0, Int(ProcessInfo.processInfo.environment["METALMC_FARFIELD"] ?? "") ?? 0)
 let lodFarFieldOn = lodFarFieldLevel > 0
+/// Real columns' heights at block precision (LodFarCell), carried from the region files through every level. With
+/// METALMC_EXP=ffvoxeltops they come from the voxels as before: tops rounded to 2-256 blocks, which stood real terrain
+/// up to a voxel above the generated terrain next to it (spires along their seam).
+let lodFarCells = lodFarFieldOn && !experiments.contains("ffvoxeltops")
+/// Tree canopies as slabs over the ground (a second word per column). METALMC_EXP=ffpillars draws them as columns down
+/// to the ground as before.
+let lodFarCanopy = !experiments.contains("ffpillars")
 /// Debug (METALMC_EXP=ffsteps): color hits by the number of march steps (green few, red many), misses dark blue.
 let farFieldSteps = experiments.contains("ffsteps")
 /// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
@@ -32,36 +40,310 @@ let farFieldWidth = Int(ProcessInfo.processInfo.environment["METALMC_FFWIDTH"] ?
 let farFieldMips = farFieldWidth.trailingZeroBitCount + 1   // max pyramid levels: W ... 1
 let farFieldCoverCells = 256    // coverage bitmap side, 64-block cells (16 km)
 
-extension LodBuild {
-    /// One word per column of a node's grid for the far field: bits 0-8 the height of the top solid voxel's top
-    /// (blocks above the world bottom, 0 for none), 9-15 blocks of water above it (to its voxel top), 16-23 the top
-    /// voxel's material, 24-31 the water's material if there's water, else the material under the top voxel. Heights
-    /// are in blocks, not voxels, so coarse levels keep the generator's exact heights (LodGrid.farExact).
-    static func farColumns(_ g: LodGrid) -> [UInt32] {
-        let n = lodNodeVoxels, layer = n * n
-        var out = [UInt32](repeating: 0, count: layer)
-        g.v.withUnsafeBufferPointer { v in
-            for i in 0..<layer {
-                if !g.farExact.isEmpty && g.farExact[i] != 0 { out[i] = g.farExact[i]; continue }
-                var y = g.height - 1
-                while y >= 0 && v[y * layer + i] == 0 { y -= 1 }
-                if y < 0 { continue }
-                var waterTop = -1
-                var waterMat: UInt8 = 0
-                if lodIsWater(v[y * layer + i]) {
-                    waterTop = y
-                    waterMat = v[y * layer + i]
-                    while y >= 0 && (lodIsWater(v[y * layer + i]) || v[y * layer + i] == 0) { y -= 1 }
-                }
-                let top: UInt8 = y >= 0 ? v[y * layer + i] : 0
-                var sub = top
-                if y > 0, v[(y - 1) * layer + i] != 0, !lodIsWater(v[(y - 1) * layer + i]) { sub = v[(y - 1) * layer + i] }
-                let s = 1 << g.level
-                out[i] = UInt32((y + 1) * s) | UInt32(waterTop >= 0 ? min(127, (waterTop - y) * s) : 0) << 9
-                    | UInt32(top) << 16 | UInt32(waterTop >= 0 ? waterMat : sub) << 24
+/// Tree materials that are trunks (logs, stems): a crown's underside is its lowest leaves, not the trunk under them.
+let lodTrunkMaterial: [Bool] = {
+    var t = [Bool](repeating: false, count: 256)
+    for m in [Mat.log, .cherryWood, .mushroomStem] { t[Int(m.rawValue)] = true }
+    return t
+}()
+
+/// How a partial canopy is drawn (the offline evaluation's switch, mmc_debug_far_eval): 0 keeps it in a share of cells
+/// equal to its cover (picked by a hash of the cell), 1 in cells at least half covered, 2 in every cell with any.
+var lodFarCanopyMode = 0
+/// Debug (mmc_debug_far_eval): merge heights by their maximum instead of their mean (bit 0 ground, bit 1 canopy).
+var lodFarMergeMax = 0
+
+/// Far field: a column as the far field sees it, at block precision, at any level (columns v2, docs/far-field-design.md).
+/// Real columns get theirs from the blocks when a region is read (LodBuild.regionGrid: one per 2 x 2 blocks), and every
+/// downsampling merges 2 x 2 of them (LodGrid.downsample, the region's cached level-2 quadrant included), so a level's
+/// heights don't depend on its voxels, whose tops round to 2-256 blocks. Generated columns get theirs from the generator's
+/// heights (LodFarStore.fill). Each height is a mean over the part of the cell it describes: the dry ground over the dry
+/// part, the water and the bed under it over the wet part, the canopy over the part under trees. Means compose exactly
+/// from level to level, and a lone tree or tower doesn't stand up as a whole cell as it would with the maximum.
+struct LodFarCell: Equatable {
+    /// Height units per block.
+    static let unit = 16
+    var ground: UInt16 = 0          // top of the dry ground, in 1/16 blocks above the world bottom
+    var bed: UInt16 = 0             // top of the ground under the water
+    var water: UInt16 = 0           // top of the top water block
+    var canopyTop: UInt16 = 0       // top of the tree canopy
+    var canopyBottom: UInt16 = 0    // its underside (the lowest leaves)
+    var area: UInt8 = 0             // share of the cell with data, 0-255 (0: none; the voxels decide)
+    var wet: UInt8 = 0              // share of that under water
+    var cover: UInt8 = 0            // share of that under canopy
+    var groundMat: UInt8 = 0        // the dry ground's top block
+    var underMat: UInt8 = 0         // what its sides show a few blocks down
+    var bedMat: UInt8 = 0
+    var waterMat: UInt8 = 0
+    var canopyMat: UInt8 = 0
+
+    /// 2 x 2 cells to their parent: shares add up, heights are means weighted by the share they describe, and each
+    /// material is the one most of that share has (ties: the later cell).
+    static func merge(_ a: LodFarCell, _ b: LodFarCell, _ c: LodFarCell, _ d: LodFarCell) -> LodFarCell {
+        @inline(__always) func at(_ i: Int) -> LodFarCell { i == 0 ? a : (i == 1 ? b : (i == 2 ? c : d)) }
+        var areaSum = 0, dryW = 0, wetW = 0, covW = 0
+        var g = 0, bd = 0, wt = 0, ct = 0, cb = 0, gMax = 0, ctMax = 0
+        var dw = (0, 0, 0, 0), ww = (0, 0, 0, 0), cw = (0, 0, 0, 0)
+        for i in 0..<4 {
+            let x = at(i), ar = Int(x.area)
+            if ar == 0 { continue }
+            let dwi = ar * (255 - Int(x.wet)), wwi = ar * Int(x.wet), cwi = ar * Int(x.cover)
+            switch i {
+            case 0: dw.0 = dwi; ww.0 = wwi; cw.0 = cwi
+            case 1: dw.1 = dwi; ww.1 = wwi; cw.1 = cwi
+            case 2: dw.2 = dwi; ww.2 = wwi; cw.2 = cwi
+            default: dw.3 = dwi; ww.3 = wwi; cw.3 = cwi
             }
+            areaSum += ar
+            dryW += dwi; wetW += wwi; covW += cwi
+            g += dwi * Int(x.ground); bd += wwi * Int(x.bed); wt += wwi * Int(x.water)
+            ct += cwi * Int(x.canopyTop); cb += cwi * Int(x.canopyBottom)
+            if dwi > 0 { gMax = max(gMax, Int(x.ground)) }
+            if cwi > 0 { ctMax = max(ctMax, Int(x.canopyTop)) }
+        }
+        var p = LodFarCell()
+        if areaSum == 0 { return p }
+        p.area = UInt8((areaSum + 3) / 4)
+        p.wet = UInt8((wetW + areaSum / 2) / areaSum)
+        p.cover = UInt8((covW + areaSum / 2) / areaSum)
+        if dryW > 0 { p.ground = UInt16(lodFarMergeMax & 1 != 0 ? gMax : (g + dryW / 2) / dryW) }
+        if wetW > 0 { p.bed = UInt16((bd + wetW / 2) / wetW); p.water = UInt16((wt + wetW / 2) / wetW) }
+        if covW > 0 {
+            p.canopyTop = UInt16(lodFarMergeMax & 2 != 0 ? ctMax : (ct + covW / 2) / covW)
+            p.canopyBottom = UInt16((cb + covW / 2) / covW)
+        }
+        @inline(__always) func weight(_ w: (Int, Int, Int, Int), _ i: Int) -> Int { i == 0 ? w.0 : (i == 1 ? w.1 : (i == 2 ? w.2 : w.3)) }
+        @inline(__always) func vote(_ w: (Int, Int, Int, Int), _ mat: (LodFarCell) -> UInt8) -> UInt8 {
+            var best: UInt8 = 0, bestW = 0
+            for i in 0..<4 where weight(w, i) > 0 {
+                let m = mat(at(i))
+                var sum = 0
+                for j in 0..<4 where weight(w, j) > 0 && mat(at(j)) == m { sum += weight(w, j) }
+                if sum >= bestW { best = m; bestW = sum }
+            }
+            return best
+        }
+        p.groundMat = vote(dw) { $0.groundMat }
+        p.underMat = vote(dw) { $0.underMat }
+        p.bedMat = vote(ww) { $0.bedMat }
+        p.waterMat = vote(ww) { $0.waterMat }
+        p.canopyMat = vote(cw) { $0.canopyMat }
+        return p
+    }
+
+    /// One block column of a chunk (`b`: 16 x 16 x 384 material ids laid out y, z, x from the world bottom, `top` the
+    /// highest block that can be set) as a cell, `tint` its biome tint. Tree blocks at its top (snow on them too) are its
+    /// canopy, down to the lowest leaves (a trunk under them is too thin to see from the far field's distances), over the
+    /// water or the ground under them.
+    static func block(_ b: UnsafePointer<UInt8>, x: Int, z: Int, top: Int, tint: UInt8) -> LodFarCell {
+        let col = z * 16 + x
+        let airK = MaterialKind.air.rawValue, waterK = MaterialKind.water.rawValue, u = unit
+        let snow = Mat.snow.rawValue
+        @inline(__always) func m(_ y: Int) -> UInt8 { lodReduceInput[Int(b[y * 256 + col])] }
+        @inline(__always) func kind(_ y: Int) -> UInt8 { lodKinds[Int(m(y))] }
+        // Snow resting on leaves belongs to the tree (snowy spruces carry it on every tier).
+        @inline(__always) func tree(_ y: Int) -> Bool { lodTreeMaterial[Int(m(y))] || (m(y) == snow && y > 0 && lodTreeMaterial[Int(m(y - 1))]) }
+        var c = LodFarCell()
+        var y = top
+        while y >= 0 && kind(y) == airK { y -= 1 }
+        if y < 0 { return c }   // no blocks: no data
+        c.area = 255
+        if tree(y) {
+            c.canopyTop = UInt16((y + 1) * u)
+            c.canopyMat = lodTinted(m(y), tint)
+            c.cover = 255
+            var leaf = -1, low = y
+            while y >= 0 {
+                if tree(y) {
+                    low = y
+                    if !lodTrunkMaterial[Int(m(y))] { leaf = y }
+                } else if kind(y) != airK {
+                    break
+                }
+                y -= 1
+            }
+            c.canopyBottom = UInt16((leaf >= 0 ? leaf : low) * u)
+            if y < 0 { return c }
+        }
+        if kind(y) == waterK {
+            c.wet = 255
+            c.water = UInt16((y + 1) * u)
+            c.waterMat = lodTinted(m(y), tint)
+            while y >= 0 && (kind(y) == waterK || kind(y) == airK) { y -= 1 }
+            c.bed = UInt16((y + 1) * u)
+            c.bedMat = y >= 0 ? lodTinted(m(y), tint) : 0
+        } else {
+            c.ground = UInt16((y + 1) * u)
+            c.groundMat = lodTinted(m(y), tint)
+            // The sides: the block 3 under the top (dirt under grass, also under a snow layer), else the first solid
+            // block under that (the bed under ice).
+            var k = max(0, y - 3)
+            while k > 0 && (kind(k) == airK || kind(k) == waterK) { k -= 1 }
+            c.underMat = kind(k) == airK || kind(k) == waterK ? c.groundMat : lodTinted(m(k), tint)
+        }
+        return c
+    }
+
+    /// Column `i` of `g`'s voxels as a cell, for columns without one (live chunks, servers): the top of the top voxel,
+    /// the materials, and a canopy where tree voxels lie over air.
+    static func voxels(_ g: LodGrid, column i: Int) -> LodFarCell {
+        var c = LodFarCell()
+        let layer = lodNodeVoxels * lodNodeVoxels, s = (1 << g.level) * LodFarCell.unit
+        let airK = MaterialKind.air.rawValue
+        var y = g.height - 1
+        while y >= 0 && lodKinds[Int(g.v[y * layer + i])] == airK { y -= 1 }
+        if y < 0 { return c }
+        c.area = 255
+        if lodTreeMaterial[Int(g.v[y * layer + i])] {
+            c.canopyTop = UInt16((y + 1) * s)
+            c.canopyMat = g.v[y * layer + i]
+            c.cover = 255
+            var leaf = -1, low = y
+            while y >= 0 {
+                let t = g.v[y * layer + i]
+                if lodTreeMaterial[Int(t)] {
+                    low = y
+                    if !lodTrunkMaterial[Int(t)] { leaf = y }
+                } else if lodKinds[Int(t)] != airK {
+                    break
+                }
+                y -= 1
+            }
+            c.canopyBottom = UInt16((leaf >= 0 ? leaf : low) * s)
+            if y < 0 { return c }
+        }
+        let top = g.v[y * layer + i]
+        if lodIsWater(top) {
+            c.wet = 255
+            // The water's top block ends a block under the voxel's top: the far field draws water to one block over
+            // its top block (words), which puts it at the voxel top like the quads.
+            c.water = UInt16((y + 1) * s - LodFarCell.unit)
+            c.waterMat = top
+            while y >= 0 && (lodIsWater(g.v[y * layer + i]) || lodKinds[Int(g.v[y * layer + i])] == airK) { y -= 1 }
+            c.bed = UInt16((y + 1) * s)
+            c.bedMat = y >= 0 ? g.v[y * layer + i] : 0
+        } else {
+            c.ground = UInt16((y + 1) * s)
+            c.groundMat = top
+            c.underMat = top
+            if y > 0, g.v[(y - 1) * layer + i] != 0, !lodIsWater(g.v[(y - 1) * layer + i]) { c.underMat = g.v[(y - 1) * layer + i] }
+        }
+        return c
+    }
+
+    /// Whether the cell's canopy is drawn (it covers `cover` of the cell): column (x, z) of a level-`level` node. By
+    /// default a partial canopy stays in about `cover` of such cells, which keeps the share of trees (and their color)
+    /// at every level, as the generator's sparse woods do; the hash mixes in the cell's heights so neighboring nodes
+    /// don't repeat one pattern.
+    @inline(__always) func keepsCanopy(x: Int, z: Int, level: Int, mode: Int = lodFarCanopyMode) -> Bool {
+        switch mode {
+        case 1: return cover >= 128
+        case 2: return cover > 0
+        default:
+            return cover == 255 || Double(cover) / 255 > lodHash(x &+ Int(ground) &* 7919, z &+ Int(canopyTop) &* 104_729, 0xCA40 &+ UInt64(level))
+        }
+    }
+
+    /// The far field's two words for the cell (one RG32 texel of a ring per column). Word 0: bits 0-8 the ground's top
+    /// (blocks above the world bottom; 0: no column), 9-15 blocks of water over it (to one block over the top water
+    /// block's top, which the shader drops 10/9 block to vanilla's surface, as the LOD's quads do from their voxel tops),
+    /// 16-23 the top material (the bed's under water), 24-31 the water's material if there's water, else what the
+    /// sides show under the top. Word 1, the canopy (0: none): bits 0-8 its top and 9-17 its underside (blocks above the
+    /// world bottom), 18-25 its material. (x, z): the column in its node, which picks the cells that keep a partial canopy.
+    func words(x: Int, z: Int, level: Int, mode: Int = lodFarCanopyMode) -> (UInt32, UInt32) {
+        guard area > 0 else { return (0, 0) }
+        let u = LodFarCell.unit
+        @inline(__always) func blocks(_ h: UInt16) -> Int { (Int(h) + u / 2) / u }
+        var w0: UInt32, top: Int
+        let dryMat: UInt8
+        if wet >= 128 {
+            let surface = max(2, blocks(water) + 1), floor = min(surface - 1, max(1, blocks(bed), surface - 127))
+            w0 = UInt32(floor) | UInt32(surface - floor) << 9 | UInt32(bedMat) << 16 | UInt32(waterMat) << 24
+            top = surface
+            dryMat = bedMat
+        } else {
+            top = min(511, max(1, blocks(ground)))
+            w0 = UInt32(top) | UInt32(groundMat) << 16 | UInt32(underMat) << 24
+            dryMat = groundMat
+        }
+        let ct = min(511, blocks(canopyTop))
+        guard cover > 0, ct > top, keepsCanopy(x: x, z: z, level: level, mode: mode) else { return (w0, 0) }
+        if !lodFarCanopy { return (UInt32(ct) | UInt32(canopyMat) << 16 | UInt32(dryMat) << 24, 0) }
+        let cb = min(ct - 1, blocks(canopyBottom))
+        return (w0, UInt32(ct) | UInt32(cb) << 9 | UInt32(canopyMat) << 18)
+    }
+
+    /// Cells as bytes (18 per cell, little-endian, in field order), LZFSE-compressed: a region's cached quadrant.
+    static func encode(_ cells: ArraySlice<LodFarCell>) -> [UInt8] {
+        var raw = [UInt8]()
+        raw.reserveCapacity(cells.count * 18)
+        for c in cells {
+            for h in [c.ground, c.bed, c.water, c.canopyTop, c.canopyBottom] { raw.append(UInt8(h & 255)); raw.append(UInt8(h >> 8)) }
+            raw += [c.area, c.wet, c.cover, c.groundMat, c.underMat, c.bedMat, c.waterMat, c.canopyMat]
+        }
+        var packed = [UInt8](repeating: 0, count: raw.count + 1024)
+        let n = raw.withUnsafeBufferPointer { compression_encode_buffer(&packed, packed.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
+        return n > 0 ? Array(packed[0..<n]) : []
+    }
+
+    static func decode(_ bytes: [UInt8], count: Int) -> [LodFarCell]? {
+        guard !bytes.isEmpty else { return nil }
+        var raw = [UInt8](repeating: 0, count: count * 18)
+        let got = bytes.withUnsafeBufferPointer { compression_decode_buffer(&raw, raw.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
+        guard got == raw.count else { return nil }
+        var out = [LodFarCell](repeating: LodFarCell(), count: count)
+        for i in 0..<count {
+            let o = i * 18
+            @inline(__always) func h(_ k: Int) -> UInt16 { UInt16(raw[o + 2 * k]) | UInt16(raw[o + 2 * k + 1]) << 8 }
+            out[i] = LodFarCell(ground: h(0), bed: h(1), water: h(2), canopyTop: h(3), canopyBottom: h(4),
+                                area: raw[o + 10], wet: raw[o + 11], cover: raw[o + 12], groundMat: raw[o + 13],
+                                underMat: raw[o + 14], bedMat: raw[o + 15], waterMat: raw[o + 16], canopyMat: raw[o + 17])
         }
         return out
+    }
+}
+
+extension LodBuild {
+    /// Two words per column of a node's grid for the far field (LodFarCell.words), from the grid's cells where it has
+    /// them (real columns at block precision, generated ones from the generator's heights), else from its voxels.
+    static func farColumns(_ g: LodGrid) -> [UInt32] {
+        let n = lodNodeVoxels, layer = n * n
+        var out = [UInt32](repeating: 0, count: 2 * layer)
+        for i in 0..<layer {
+            let (w0, w1): (UInt32, UInt32)
+            if !g.far.isEmpty && g.far[i].area != 0 {
+                (w0, w1) = g.far[i].words(x: i % n, z: i / n, level: g.level)
+            } else if !lodFarCanopy {
+                (w0, w1) = (voxelWord(g, i), 0)
+            } else {
+                (w0, w1) = LodFarCell.voxels(g, column: i).words(x: i % n, z: i / n, level: g.level)
+            }
+            out[2 * i] = w0
+            out[2 * i + 1] = w1
+        }
+        return out
+    }
+
+    /// The column word from the voxels as the first far field made it (METALMC_EXP=ffpillars): the top voxel's top,
+    /// trees included, and the voxel under it for the sides.
+    static func voxelWord(_ g: LodGrid, _ i: Int) -> UInt32 {
+        let layer = lodNodeVoxels * lodNodeVoxels
+        var y = g.height - 1
+        while y >= 0 && g.v[y * layer + i] == 0 { y -= 1 }
+        if y < 0 { return 0 }
+        var waterTop = -1
+        var waterMat: UInt8 = 0
+        if lodIsWater(g.v[y * layer + i]) {
+            waterTop = y
+            waterMat = g.v[y * layer + i]
+            while y >= 0 && (lodIsWater(g.v[y * layer + i]) || g.v[y * layer + i] == 0) { y -= 1 }
+        }
+        let top: UInt8 = y >= 0 ? g.v[y * layer + i] : 0
+        var sub = top
+        if y > 0, g.v[(y - 1) * layer + i] != 0, !lodIsWater(g.v[(y - 1) * layer + i]) { sub = g.v[(y - 1) * layer + i] }
+        let s = 1 << g.level
+        return UInt32((y + 1) * s) | UInt32(waterTop >= 0 ? min(127, (waterTop - y) * s) : 0) << 9
+            | UInt32(top) << 16 | UInt32(waterTop >= 0 ? waterMat : sub) << 24
     }
 }
 
@@ -115,19 +397,20 @@ kernel void ff_clear(uint2 gid [[thread_position_in_grid]], constant uint& slice
     heights.write(ushort4(0), gid, slice);
 }
 
-// One node's columns into its level's ring.
+// One node's columns (two words each: LodFarCell.words) into its level's ring. The pyramid holds the top of the ground or
+// water, or of the canopy over it.
 kernel void ff_fill(uint2 gid [[thread_position_in_grid]], constant FillParams& p [[buffer(0)]],
-                    const device uint* cols [[buffer(1)]],
+                    const device uint2* cols [[buffer(1)]],
                     texture2d_array<uint, access::write> data [[texture(0)]],
                     texture2d_array<ushort, access::write> heights [[texture(1)]]) {
     if (gid.x >= 256u || gid.y >= 256u) return;
     int2 cell = p.nodeCell + int2(gid);
     int2 local = cell - p.ringOrigin;
     if (local.x < 0 || local.y < 0 || local.x >= W || local.y >= W) return;
-    uint c = cols[gid.y * 256u + gid.x];
-    data.write(uint4(c), uint2(local), p.ring);
-    uint top = (c & 511u) + ((c >> 9) & 127u);
-    heights.write(ushort4(ushort(c == 0u ? 0u : top)), uint2(local), p.ring);
+    uint2 c = cols[gid.y * 256u + gid.x];
+    data.write(uint4(c, 0u, 0u), uint2(local), p.ring);
+    uint top = max((c.x & 511u) + ((c.x >> 9) & 127u), c.y & 511u);
+    heights.write(ushort4(ushort(c.x == 0u ? 0u : top)), uint2(local), p.ring);
 }
 
 kernel void ff_mip(uint2 gid [[thread_position_in_grid]], constant uint& slice [[buffer(0)]],
@@ -163,25 +446,31 @@ constant float kShade[6] = { 0.6, 0.6, 1.0, 0.5, 0.8, 0.8 };
 // The LOD's ambient occlusion steps for 0-3 occluders at levels 1 and up (kAO in the LOD shader).
 constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
 
-static float solidAt(texture2d_array<uint, access::read> data, int2 c, uint r, float s) {
-    return float(data.read(uint2(clamp(c, int2(0), int2(W - 1))), r).r & 511u);
+// Sky light levels the ground under a canopy loses (vanilla's leaves dim sky light a level per block).
+constant float kUnderCanopy = 3.0;
+
+// A neighbor's height for ambient occlusion: its ground's top, or with `canopy` the top of its canopy if that's higher.
+static float solidAt(texture2d_array<uint, access::read> data, int2 c, uint r, bool canopy) {
+    uint2 w = data.read(uint2(clamp(c, int2(0), int2(W - 1))), r).rg;
+    return canopy ? float(max(w.x & 511u, w.y & 511u)) : float(w.x & 511u);
 }
 // Ambient occlusion like the LOD's (vanilla's smooth lighting per voxel corner, bilinear inside the face). A top face's
 // corners count taller neighbors (both sides: 3); a side face darkens toward its foot, where the ground in front of it
-// occludes its lowest voxel's bottom corners.
-static float columnAO(texture2d_array<uint, access::read> data, int2 c, uint r, float s, int face, float top, float2 f, float y) {
+// occludes its lowest voxel's bottom corners. A canopy's top counts its neighbors' canopies too (crowns shade each other).
+static float columnAO(texture2d_array<uint, access::read> data, int2 c, uint r, float s, int face, float top, float2 f, float y,
+                      bool canopy) {
     if (face == 2) {
         float o[4];
         for (int k = 0; k < 4; k++) {
             int2 dd = int2((k & 1) ? 1 : -1, (k & 2) ? 1 : -1);
-            bool a = solidAt(data, c + int2(dd.x, 0), r, s) > top, b = solidAt(data, c + int2(0, dd.y), r, s) > top;
-            bool g = solidAt(data, c + dd, r, s) > top;
+            bool a = solidAt(data, c + int2(dd.x, 0), r, canopy) > top, b = solidAt(data, c + int2(0, dd.y), r, canopy) > top;
+            bool g = solidAt(data, c + dd, r, canopy) > top;
             o[k] = kAO[(a && b) ? 3 : int(a) + int(b) + int(g)];
         }
         return mix(mix(o[0], o[1], f.x), mix(o[2], o[3], f.x), f.y);
     }
     int2 front = face == 0 ? int2(1, 0) : (face == 1 ? int2(-1, 0) : (face == 4 ? int2(0, 1) : int2(0, -1)));
-    float v = (y - solidAt(data, c + front, r, s)) / s;
+    float v = (y - solidAt(data, c + front, r, false)) / s;
     return v < 1.0 ? mix(kAO[1], 1.0, saturate(v)) : 1.0;
 }
 
@@ -234,7 +523,8 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     bool hit = false;
     float tHit = 0.0;
     int face = 2;
-    uint col = 0;
+    uint2 col = uint2(0);
+    bool onCanopy = false;
     float s = 1.0;
     int2 hitCell = int2(0);
     uint hitRing = 0;
@@ -253,47 +543,74 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         int lastAxis = tmn.x > tmn.y ? 0 : 1;
         int l = TOP;   // rays over everything in the ring (the sky) leave it in one step
         float tc = tEnter;
+        // Where the ray is (ring cells), kept inside its cell: each crossing puts it half a cell past the boundary it
+        // crossed. Recomputed from the ray a small step past the boundary, rounding put rays nearly along x or z back into
+        // the cell they had just left toward -x or -z, and they spent their steps there: a wedge of the next ring's
+        // terrain (cliff sides) drawn near the camera. METALMC_EXP=ffepsstep steps as before.
+        float2 q = o.xz + d.xz * tc;
         for (int i = 0; i < 192; i++) {
             steps++;
-            float3 p = o + d * tc;
             float cs = float(1 << l);
-            float2 cell = clamp(floor(p.xz / cs), 0.0, float(W >> l) - 1.0);
+            float2 cell = clamp(floor(q / cs), 0.0, float(W >> l) - 1.0);
             float hmax = float(heights.read(uint2(cell), r, l).r);
             float2 nb = (cell + select(float2(0.0), float2(1.0), d.xz > 0.0)) * cs;
             float2 tt = (nb - o.xz) * inv;
             float tExit = min(min(tt.x, tt.y), tLeave);
             float yA = o.y + d.y * tc, yB = o.y + d.y * tExit;
+            bool next = false, column = false;   // on to the next cell at this level; a column to test
             if (hmax <= 0.0 || min(yA, yB) > hmax) {
-                if (tExit >= tLeave) break;
-                lastAxis = tt.x < tt.y ? 0 : 1;
-                tc = tExit + max(tExit * 1e-5, 1e-3);
+                next = true;
                 l = min(l + 1, TOP);
             } else if (l > 0) {
                 l--;
             } else {
                 // A column in the quads' area: they draw it, so it's empty here.
                 float2 cb = floor((f.ringCover[r].xy + cell * s) / 64.0);
-                if (all(cb >= 0.0) && all(cb < float(COVER)) && cover[int(cb.y) * COVER + int(cb.x)] != 0) {
-                    if (tExit >= tLeave) break;
-                    lastAxis = tt.x < tt.y ? 0 : 1;
-                    tc = tExit + max(tExit * 1e-5, 1e-3);
-                    continue;
-                }
-                col = data.read(uint2(cell), r).r;
+                next = all(cb >= 0.0) && all(cb < float(COVER)) && cover[int(cb.y) * COVER + int(cb.x)] != 0;
+                column = !next;
+            }
+            if (column) {
+                uint2 cw = data.read(uint2(cell), r).rg;
                 // Water surfaces sit 10/9 block below the voxel's top, as the LOD draws them (kWaterSurfaceDrop).
-                float top = float((col & 511u) + ((col >> 9) & 127u)) - (((col >> 9) & 127u) != 0u ? 10.0 / 9.0 : 0.0);
-                if (yA <= top) {
-                    tHit = tc;
-                    face = lastAxis == 0 ? (d.x > 0.0 ? 1 : 0) : (d.z > 0.0 ? 5 : 4);
-                } else {
-                    tHit = (top - o.y) / d.y;
-                    face = 2;
+                float top = float((cw.x & 511u) + ((cw.x >> 9) & 127u)) - (((cw.x >> 9) & 127u) != 0u ? 10.0 / 9.0 : 0.0);
+                // The canopy, a slab from its underside to its top over the ground (LodFarCell.words).
+                bool slab = cw.y != 0u;
+                float cTop = float(cw.y & 511u), cBot = float((cw.y >> 9) & 511u);
+                int sideFace = lastAxis == 0 ? (d.x > 0.0 ? 1 : 0) : (d.z > 0.0 ? 5 : 4);
+                // The ray enters the column through a side (below the ground's top, or into the slab), else meets a top on
+                // its way down (the slab's from over it, the ground's from under it) or the slab's underside on its way
+                // up. Between the ground and the slab it passes under the trees to the next column.
+                int kind = 0;   // 1: the ground (or water), 2: the canopy
+                if (yA <= top) { kind = 1; tHit = tc; face = sideFace; }
+                else if (slab && yA >= cBot && yA <= cTop) { kind = 2; tHit = tc; face = sideFace; }
+                else if (d.y < 0.0) {
+                    if (slab && yA > cTop) {
+                        if (yB <= cTop) { kind = 2; tHit = (cTop - o.y) / d.y; face = 2; }
+                    } else if (yB <= top) { kind = 1; tHit = (top - o.y) / d.y; face = 2; }
+                } else if (slab && yA < cBot && yB >= cBot) { kind = 2; tHit = (cBot - o.y) / d.y; face = 3; }
+                if (kind != 0) {
+                    tHit = clamp(tHit, tc, tExit);
+                    col = cw;
+                    onCanopy = kind == 2;
+                    hitCell = int2(cell);
+                    hitRing = r;
+                    hitFrac = saturate(o.xz + d.xz * tHit - cell);
+                    hit = true;
+                    break;
                 }
-                hitCell = int2(cell);
-                hitRing = r;
-                hitFrac = saturate(o.xz + d.xz * tHit - cell);
-                hit = true;
-                break;
+                next = true;
+            }
+            if (next) {
+                if (tExit >= tLeave) break;
+                lastAxis = tt.x < tt.y ? 0 : 1;
+                if (\(experiments.contains("ffepsstep") ? "true" : "false")) {
+                    tc = tExit + max(tExit * 1e-5, 1e-3);
+                    q = o.xz + d.xz * tc;
+                } else {
+                    tc = tExit;
+                    q = o.xz + d.xz * tExit;
+                    if (lastAxis == 0) q.x = nb.x + (d.x > 0.0 ? 0.5 : -0.5); else q.y = nb.y + (d.z > 0.0 ? 0.5 : -0.5);
+                }
             }
         }
         t = tLeave;
@@ -306,17 +623,28 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     }
     float3 rel = dir * tHit;
     float y = f.cam.x + rel.y;
-    uint solid = col & 511u, depthVox = (col >> 9) & 127u;   // blocks
+    uint solid = col.x & 511u, depthVox = (col.x >> 9) & 127u;   // blocks
     float solidTop = float(solid);
-    uint topMat = (col >> 16) & 255u, lowMat = col >> 24;
-    float sky = float(u.seamInfo.z);
+    uint topMat = (col.x >> 16) & 255u, lowMat = col.x >> 24;
+    // Under a canopy the ground gets less of the sky.
+    float sky = max(0.0, float(u.seamInfo.z) - (col.y != 0u && !onCanopy ? kUnderCanopy : 0.0));
     float3 light = lodLight(u, lightmap, ls, sky);
     // About one texel per pixel: the pixel's footprint on the face, in blocks, times 16 texels per block.
-    float3 n = face == 2 ? float3(0.0, 1.0, 0.0) : (face < 2 ? float3(1.0, 0.0, 0.0) : float3(0.0, 0.0, 1.0));
+    float3 n = face == 2 || face == 3 ? float3(0.0, 1.0, 0.0) : (face < 2 ? float3(1.0, 0.0, 0.0) : float3(0.0, 0.0, 1.0));
     float footprint = tHit * 2.0 / (f.viewport.y * u.proj[1][1]) / max(abs(dot(dir, n)), 0.05);
     float mip = max(0.0, log2(footprint * 16.0));
     float3 color;
-    if (depthVox > 0u && face == 2) {
+    if (onCanopy) {
+        // The canopy: its top with the corner occlusion of taller crowns around it, its sides darker toward the underside
+        // (the crown shades itself), its underside lit by what gets under the trees.
+        uint cm = (col.y >> 18) & 255u;
+        float cTop = float(col.y & 511u), cBot = float((col.y >> 9) & 511u);
+        float3 lit = face == 3 ? lodLight(u, lightmap, ls, max(0.0, sky - kUnderCanopy)) : light;
+        float ao = face == 2 ? columnAO(data, hitCell, hitRing, s, 2, cTop, hitFrac, y, true)
+                 : (face == 3 ? 1.0 : mix(kAO[1], 1.0, saturate((y - cBot) / max(1.0, cTop - cBot))));
+        color = colors[cm * 3u + (face == 2 ? 0u : (face == 3 ? 2u : 1u))].rgb * kShade[face] * lit
+              * detail(u, sprites, atlas, atlasSampler, cm, face, rel, mip) * ao;
+    } else if (depthVox > 0u && face == 2) {
         // Water over its floor, like the LOD's translucent water over its meshed floor (lit for the water above it).
         float depthBlocks = min(15.0, float(depthVox) - 1.0);
         float3 floorColor = colors[topMat * 3u].rgb * detail(u, sprites, atlas, atlasSampler, topMat, 2, rel, mip)
@@ -336,7 +664,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         uint mat = (face == 2 || y >= solidTop - min(s, 8.0)) ? topMat : lowMat;
         color = colors[mat * 3u + (face == 2 ? 0u : 1u)].rgb * kShade[face] * light
               * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip)
-              * columnAO(data, hitCell, hitRing, s, face, solidTop, hitFrac, y);
+              * columnAO(data, hitCell, hitRing, s, face, solidTop, hitFrac, y, false);
     }
     if (\(farFieldSteps ? "true" : "false")) color = mix(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), saturate(float(steps) / 128.0));
     float horiz = length(rel.xz);
@@ -367,7 +695,7 @@ final class FarField: @unchecked Sendable {
     private var compiling = false
     private let lock = NSLock()
 
-    private var data: MTLTexture?          // R32Uint, W x W x rings: packed columns (LodBuild.farColumns)
+    private var data: MTLTexture?          // RG32Uint, W x W x rings: packed columns (LodBuild.farColumns)
     private var heights: MTLTexture?       // R16Uint with mips, W x W x rings: column tops in blocks above the world bottom
     private var mipViews: [MTLTexture] = []
     private var rings = 0
@@ -435,7 +763,7 @@ final class FarField: @unchecked Sendable {
         d.width = farFieldWidth
         d.height = farFieldWidth
         d.arrayLength = n
-        d.pixelFormat = .r32Uint
+        d.pixelFormat = .rg32Uint
         d.usage = [.shaderRead, .shaderWrite]
         d.storageMode = .private
         guard let dt = ctx.device.makeTexture(descriptor: d) else { return false }
@@ -504,11 +832,7 @@ final class FarField: @unchecked Sendable {
         }
         for r in 0..<rings { keys[r] = Array(keys[r][..<2]) + keys[r][2...].sorted() }
         var top = 0
-        for ring in perRing {
-            for (node, _) in ring {
-                for t in 0..<16 where node.tileY[2 * t] <= node.tileY[2 * t + 1] { top = max(top, (node.tileY[2 * t + 1] + 1) << node.level) }
-            }
-        }
+        for ring in perRing { for (node, _) in ring { top = max(top, node.columnsTop) } }
         maxTop = Double(min(top, lodWorldHeight))
         let stale = (0..<rings).filter { ringKeys[$0] != keys[$0] }
         if stale.isEmpty { return ready }
