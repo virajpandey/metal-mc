@@ -35,6 +35,10 @@
 		{
 			"config": "metalmc_lod.client.mixins.json",
 			"environment": "client"
+		},
+		{
+			"config": "metalmc_sky.client.mixins.json",
+			"environment": "client"
 		}
 	],
 	"depends": {

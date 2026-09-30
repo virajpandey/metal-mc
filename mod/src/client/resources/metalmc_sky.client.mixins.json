@@ -1,0 +1,18 @@
+{
+	"required": true,
+	"package": "metalmc.sky.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"MainTargetMixin",
+		"RenderTargetMixin",
+		"ScreenshotMixin",
+		"SkyGameRendererMixin",
+		"SkyRendererMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

@@ -60,6 +60,12 @@ abstract class GameRendererLodMixin {
             metalmc.backend.MetalShadows.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, strength, Lod.CLOUD_HEIGHT, TemporalAA.ENABLED);
         }
+        // Sky hook (METALMC_EXP=sky, metalmc.sky.Sky): the level through the air (aerial perspective, the render distance's
+        // fade into the sky, the tone curve), after the shadows; with anti-aliasing, as it loads the color.
+        if (metalmc.sky.Sky.frameActive) {
+            metalmc.backend.MetalSky.aerial(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
+                cameraState.viewRotationMatrix, TemporalAA.ENABLED);
+        }
         if (!TemporalAA.ENABLED) return;
         metalmc.backend.MetalTaa.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), TemporalAA.UNJITTERED,
             cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, TemporalAA.jitterX, TemporalAA.jitterY, false);

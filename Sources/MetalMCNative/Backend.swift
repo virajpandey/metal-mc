@@ -378,7 +378,7 @@ final class PipelineBox {
     let name: String
     /// Built with supportIndirectCommandBuffers (pipelines with per-instance vertex data: chunk terrain).
     let icbCapable: Bool
-    private var variants: [UInt: MTLRenderPipelineState] = [:]
+    private var variants: [UInt64: MTLRenderPipelineState] = [:]
     private let lock = NSLock()
 
     init(base: MTLRenderPipelineDescriptor, depthState: MTLDepthStencilState, cull: MTLCullMode, fill: MTLTriangleFillMode,
@@ -398,18 +398,35 @@ final class PipelineBox {
     }
 
     /// The pipeline state for a render pass with the given depth attachment format (.invalid = none).
-    func state(depthFormat: MTLPixelFormat) -> MTLRenderPipelineState? {
+    func state(depthFormat: MTLPixelFormat) -> MTLRenderPipelineState? { state(depthFormat: depthFormat, colorFormats: nil) }
+
+    /// HDR hook (Hdr.swift, METALMC_EXP=hdr): with `colorFormats` (the pass's), a color attachment whose format differs
+    /// from the pipeline's own gets the pass's format in a variant of its own. Vanilla's pipelines declare RGBA8 color
+    /// targets, but with HDR the main target is RGBA16Float. Without HDR, callers pass nil and nothing changes.
+    func state(depthFormat: MTLPixelFormat, colorFormats: [MTLPixelFormat]?) -> MTLRenderPipelineState? {
+        var key = UInt64(depthFormat.rawValue & 0x3ff)
+        var substitute: [(Int, MTLPixelFormat)] = []
+        if let colorFormats {
+            for (i, f) in colorFormats.enumerated() where i < 5 && f != .invalid {
+                let own = base.colorAttachments[i].pixelFormat
+                if own != .invalid && own != f {
+                    substitute.append((i, f))
+                    key |= UInt64(f.rawValue & 0x3ff) << UInt64(10 + 10 * i)
+                }
+            }
+        }
         lock.lock(); defer { lock.unlock() }
-        if let s = variants[depthFormat.rawValue] { return s }
+        if let s = variants[key] { return s }
         let d = base.copy() as! MTLRenderPipelineDescriptor
         d.depthAttachmentPixelFormat = depthFormat
         if depthFormat == .depth32Float_stencil8 { d.stencilAttachmentPixelFormat = depthFormat }
+        for (i, f) in substitute { d.colorAttachments[i].pixelFormat = f }
         do {
             let s = try ctx.device.makeRenderPipelineState(descriptor: d)
-            variants[depthFormat.rawValue] = s
+            variants[key] = s
             return s
         } catch {
-            log("pipeline \(name) (depth \(depthFormat.rawValue)) failed: \(error)")
+            log("pipeline \(name) (depth \(depthFormat.rawValue)\(substitute.isEmpty ? "" : ", colors \(substitute.map { $0.1.rawValue })")) failed: \(error)")
             return nil
         }
     }
@@ -539,6 +556,11 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
             }
             if !hasDepth { _ = box.state(depthFormat: .invalid) }
             if precreate != 0, let pf = MTLPixelFormat(rawValue: UInt(precreate)), pf != .depth32Float { _ = box.state(depthFormat: pf) }
+            // HDR hook (Hdr.swift): the variant for the float main target too, so the render thread doesn't compile it.
+            if hdrOutput && colorCount > 0 && d.colorAttachments[0].pixelFormat == .rgba8Unorm {
+                _ = box.state(depthFormat: .depth32Float, colorFormats: [.rgba16Float])
+                if !hasDepth { _ = box.state(depthFormat: .invalid, colorFormats: [.rgba16Float]) }
+            }
             return makeHandle(box)
         } catch {
             writeError("\(error)", err, errLen)
@@ -662,7 +684,9 @@ public func mmc_rp_set_pipeline(_ h: Int64) -> Int32 {
     guard let enc = ctx.pass else { return 0 }
     let p: PipelineBox = from(h)
     if ctx.pipe === p { return 1 }
-    guard let st = p.state(depthFormat: ctx.passDepthFormat) else {
+    // HDR hook (Hdr.swift): matched to the pass's color formats (the main target is RGBA16Float).
+    guard let st = hdrOutput ? p.state(depthFormat: ctx.passDepthFormat, colorFormats: ctx.passColorFormats)
+                             : p.state(depthFormat: ctx.passDepthFormat) else {
         ctx.pipe = nil
         return 0
     }
@@ -1241,7 +1265,8 @@ public func mmc_surface2_create(_ layerAddress: Int64) -> Int64 {
     guard let raw = UnsafeMutableRawPointer(bitPattern: Int(layerAddress)) else { return 0 }
     let layer = Unmanaged<CAMetalLayer>.fromOpaque(raw).takeUnretainedValue()
     layer.device = ctx.device
-    layer.pixelFormat = .bgra8Unorm
+    // HDR hook (Hdr.swift, METALMC_EXP=hdr): a float EDR layer in extended linear light instead of 8-bit SDR.
+    if hdrOutput { Hdr.shared.configure(layer) } else { layer.pixelFormat = .bgra8Unorm }
     layer.framebufferOnly = true
     layer.maximumDrawableCount = 3
     layer.allowsNextDrawableTimeout = true
@@ -1297,11 +1322,14 @@ public func mmc_surface2_blit(_ h: Int64, _ srcTex: Int64) {
         d.colorAttachments[0].storeAction = .store
         profAttach(d, "present blit \(drawable.texture.width)x\(drawable.texture.height)")
         guard let enc = ctx.ensureCB().makeRenderCommandEncoder(descriptor: d) else { return }
+        // HDR hook (Hdr.swift): follow the display's headroom; the EDR layer takes linear light, so the present decodes.
+        if hdrOutput { Hdr.shared.poll() }
         ctx.utilLock.lock()
         if ctx.blitPipeline == nil {
             let pd = MTLRenderPipelineDescriptor()
             pd.vertexFunction = utilFunction("blit_vs")
-            pd.fragmentFunction = utilFunction(experiments.contains("noflip") ? "blit_noflip_fs" : "blit_fs")
+            pd.fragmentFunction = hdrOutput ? Hdr.shared.presentFunction()
+                                            : utilFunction(experiments.contains("noflip") ? "blit_noflip_fs" : "blit_fs")
             pd.colorAttachments[0].pixelFormat = s.layer.pixelFormat
             ctx.blitPipeline = try! ctx.device.makeRenderPipelineState(descriptor: pd)
         }

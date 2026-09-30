@@ -110,6 +110,24 @@ loom {
 			if (project.hasProperty("shadowScale")) {
 				environmentVariable "METALMC_SHADOWSCALE", project.findProperty("shadowScale").toString()
 			}
+			// Sky and HDR (-PmetalExp=sky and/or hdr): -PskyExposure=<sun illuminance, default 12>, -PskyHaze=<distance
+			// scale for aerial perspective, default 1>, -PsunSize=<disk radius in degrees, default 0.6>,
+			// -PhdrSpace=srgb|p3 (default srgb, today's primaries), -PhdrPeak=<most headroom the tone curve uses>.
+			if (project.hasProperty("skyExposure")) {
+				environmentVariable "METALMC_SKYEXPOSURE", project.findProperty("skyExposure").toString()
+			}
+			if (project.hasProperty("skyHaze")) {
+				environmentVariable "METALMC_SKYHAZE", project.findProperty("skyHaze").toString()
+			}
+			if (project.hasProperty("sunSize")) {
+				environmentVariable "METALMC_SUNSIZE", project.findProperty("sunSize").toString()
+			}
+			if (project.hasProperty("hdrSpace")) {
+				environmentVariable "METALMC_HDRSPACE", project.findProperty("hdrSpace").toString()
+			}
+			if (project.hasProperty("hdrPeak")) {
+				environmentVariable "METALMC_HDRPEAK", project.findProperty("hdrPeak").toString()
+			}
 			if (project.hasProperty("visBias")) {
 				environmentVariable "METALMC_VISBIAS", project.findProperty("visBias").toString()
 			}

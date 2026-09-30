@@ -44,3 +44,188 @@ designed for the XDR panel's HDR, and ray-traced sun shadows. This file covers w
   off by default until the frame has more room (see the LOD vertex cost in lod-design.md).
 - **Not yet:** entities and particles don't cast shadows (they're not in the acceleration structures); water surfaces
   don't show shadows' effect on what's under them; no moonlight.
+
+## Sky and atmosphere (prototype, `METALMC_EXP=sky`, 2026-09-30)
+
+`Sources/MetalMCNative/Sky.swift`, with `metalmc.sky.Sky` and the mixins in `metalmc.sky.mixin` on the Java side. Off by
+default; everything below applies only with the experiment on.
+
+- **Model.** Hillaire's (EGSR 2020): Rayleigh and Mie scattering and ozone absorption over an Earth-sized planet (his
+  coefficients; ground at sea level, atmosphere 100 km thick), precomputed on the GPU into four tables:
+  - transmittance, 256 × 64 (Bruneton's parameterization);
+  - multiple scattering, 32 × 32, one 64-thread threadgroup per texel summing 64 directions (his f_ms series);
+  - sky view, 192 × 108, from the zenith down to the planet's horizon, rows squeezed toward the horizon;
+  - aerial perspective, 32 × 64 × 32: columns the angle from the sun around the vertical, rows the sine of the
+    elevation squeezed toward the horizontal (terrain a few km away and beyond is all within a degree or two of it),
+    slices the distance, quadratic out to 400 km. RGB in-scatter and RGB transmittance, in two textures.
+- **Flat world, round planet.** A camera-relative position p (blocks, which are metres) is the point (0, R + altitude, 0)
+  + p / 1000 km from the planet's center, the altitude being the camera's height above sea level. Terrain at the horizon
+  and the sky just above it are the same rays through the same air, so far terrain fades into exactly the sky behind it.
+  Rays toward terrain below sea level carry on through air at the ground's density.
+- **Below the planet's horizon** (0.3° down from 87 m up) the sky is the horizon's color, like vanilla's fog color there.
+  The physical sky, air down to a black planet, showed as a dark band wherever terrain ended short of the horizon.
+- **Sun.** Vanilla's direction, (−sin a, cos a, 0) for its sun angle a. The disk is 0.6° in radius (the ray-traced
+  shadows' penumbra; `METALMC_SUNSIZE` in degrees; the real sun's is 0.27°, vanilla's square about 17°), seen through the
+  transmittance, limb-darkened (Hestroffer and Magnan's power law at 680, 550 and 440 nm) and normalized so its mean is
+  the sun's illuminance. The terminator is soft over the disk's size.
+- **Units and exposure.** Scene-linear light where vanilla's white is 1 (vanilla's colors decoded from sRGB). The sun's
+  illuminance is 12 in those units (`METALMC_SKYEXPOSURE`), which puts the afternoon zenith at about sRGB (71, 102, 151),
+  a deeper blue than vanilla's, with a near-white horizon. Eye adaptation from the sun's height (no histogram): up to 3.5
+  stops as the sun goes from about 15° up to 9° under, so dusk and dawn keep their colors; vanilla's lightmap dims the
+  terrain over the same span. `METALMC_SKYHAZE` scales the distances aerial perspective sees (2: twice as hazy).
+- **Night.** The moon and stars stay vanilla's (drawn over our sky in the same pass). A faint blue-gray glow stands in
+  for the moon's scattering and fades in as the sun goes down (full at 12° under); at night it also replaces the haze on
+  far terrain.
+- **Rain** (vanilla's rain brightness): 40 times the Mie haze at full rain (visibility from about 200 km to 10), a flatter
+  Mie phase (g 0.8 → 0.3), 80% less sunlight, the sky and the haze 75% toward gray, no sun disk. Quantized to 1/32, so a
+  rain transition rebuilds the two atmosphere tables 32 times, not every frame.
+- **Per frame.**
+  1. At the start of `GameRenderer.renderLevel` (`SkyGameRendererMixin`): whether the sky replaces vanilla's this frame
+     (the overworld's sky, the camera in air, no blinding effect, no boss fog; anything else keeps vanilla's sky and
+     fog). Then the sky view and aerial perspective tables are rebuilt if the sun moved 0.01°, the altitude changed 0.5%,
+     or the rain or exposure changed; the other two when the rain did. Vanilla's distance fog, and the LOD's and the far
+     field's, which read the same fog data, is pushed out of reach; its render-distance start and end are kept for the
+     fade.
+  2. At the start of `SkyRenderer.render`, before its pass opens: the sky at a quarter of the resolution on each axis,
+     tone mapped and encoded (the sky has no edges, so filtering it up looks the same).
+  3. In the sky pass, in place of the sky disc (`SkyRendererMixin`): that sky filtered up, with the sun's disk worked
+     out per pixel near the sun, dithered on 8-bit targets. Vanilla's sunrise fan and sun aren't drawn.
+  4. After the level (`GameRendererLodMixin`, after the ray-traced shadows): every pixel that isn't sky, from the depth
+     buffer, gets aerial perspective (color × transmittance + in-scatter, in linear light), the render distance's edge
+     fades into the sky's own color (cylindrical distance, like vanilla's fog), and the tone curve makes it display light.
+     With anti-aliasing on, this happens in its resolve as it loads each pixel, after the shadows' shade (a second
+     variant of the resolve, chosen by a function constant, so the default one is unchanged); without, in a pass of its
+     own that first applies any shadows left for the anti-aliasing. The anti-aliasing's write back into an 8-bit frame is
+     then dithered: its 10-bit history averages the sky's own dither away, and smooth gradients banded.
+- **Shared with other passes.** `skyShaderHeader` (Sky.swift) has the frame parameters (`SkyFrame`) and the functions:
+  `skyAerialPerspective(rel, …)` gives the in-scatter and transmittance for a camera-relative position,
+  `skyApplyAerial(linearColor, rel, …)` applies them, `skyLevelColor` does the whole per-pixel job, `skyLuminance` is the
+  sky in a direction, and `skyToneMap`, `skyEncode` and `skyDecode` are the output side.
+
+### Integration call sites (not edited here)
+
+The full-screen application already covers every terrain source, so these are optimizations and fidelity steps, not
+needed for it to work:
+
+- **The LOD** (`Lod.swift`, `lodShade`, where it returns `mix(color, u.fogColor.rgb, fog * u.fogColor.a)`): prepend
+  `skyShaderHeader` to the LOD's shader source, bind this frame's `SkyFrame` (`Sky.shared.frame` with the draw's matrix
+  and size) and `Sky.shared.apScatter`/`apTrans` at free slots (fragment buffer 16 and textures 25 and 26 are unused by
+  the LOD today), and return `skyEncode(skyApplyAerial(skyDecode(color), in.rel, f, apScatter, apTrans))` instead. The
+  LOD's fog is already off while the sky is on.
+- **The far field** (`FarField.swift`, the fragment that ends `out.color = float4(mix(color, u.fogColor.rgb, …), 1.0)`):
+  the same with its `rel` (buffer 16 and textures 25 and 26 are free there too).
+- **Vanilla's chunks** would need their core shaders (translated GLSL) to call the same function, or keep the
+  full-screen application.
+- If either applies it in its own shader, the full-screen application must skip its pixels (a stencil bit, or a flag
+  in the G-buffer once there is one), or they get it twice. The payoff is small with anti-aliasing on (the work rides in
+  its resolve) and larger without.
+- The deferred-lighting rewrite (rewrite-plan.md, swing 2) is the natural single place: apply it once per pixel there.
+
+## HDR/EDR output (prototype, `METALMC_EXP=hdr`, 2026-09-30)
+
+`Sources/MetalMCNative/Hdr.swift`, hooks marked "HDR hook" in Backend.swift and Taa.swift, and `MainTargetMixin`,
+`RenderTargetMixin` and `ScreenshotMixin`. Useful with the sky on; on its own it changes nothing visible (vanilla's colors
+stay at most SDR white) and only costs the float target.
+
+- **The level in float.** The main target's color is RGBA16Float instead of RGBA8 (`MainTargetMixin`, and
+  `RenderTargetMixin` for window resizes). Its values stay sRGB-encoded like vanilla's, so blending and every shader
+  behave as before; the sky writes values above 1 where it's brighter than SDR white. Vanilla's pipelines declare RGBA8
+  color targets, so the backend builds each a variant with the pass's format (`PipelineBox.state`, keyed by the
+  substituted formats), warmed when the pipeline is created.
+- **The tone curve** (`skyToneMap`): scene-linear light to display-linear light, where 1 is the display's SDR white and
+  H its current EDR headroom. The identity up to a knee (1 when H ≥ 1.25, 0.9 at H = 1), so vanilla's colors and the GUI
+  are untouched, then an exponential shoulder with a matching slope that approaches H. It acts on the largest channel
+  (keeps the hue) and moves toward the same curve per channel the further past H the light is, by (m − k)/(m + 8H), so
+  the sun's disk (thousands of times over) comes out white and brighter than its glow while a sunset glow keeps its
+  orange. At H = 1 it is the SDR curve, which is what runs without `hdr` (the SDR fallback, into the 8-bit target).
+- **Where it runs.** Where the level becomes display light: in the sky pass for sky pixels, and in the aerial
+  perspective step (the anti-aliasing's resolve or its own pass) for everything else. That is after the level and before
+  the hand, the screen effects and the GUI, which then draw over display light: the GUI's white is SDR white, not
+  boosted, and a translucent panel over the sun dims it like anything else.
+- **The layer.** RGBA16Float drawables, `wantsExtendedDynamicRangeContent`, extended linear sRGB (`METALMC_HDRSPACE=p3`
+  for extended linear Display P3), no EDR metadata and `toneMapMode = .never` (macOS 15+), so values up to the headroom
+  are shown as they are. The present decodes sRGB to linear light. Setting a CAMetalLayer's pixel format tags it with a
+  matching color space (checked on macOS 26: BGRA8 gets sRGB, RGBA16Float extended linear sRGB), so today's SDR layer
+  is color-matched as sRGB and extended linear sRGB keeps the same colors.
+- **Headroom.** `NSScreen.maximumExtendedDynamicRangeColorComponentValue` of the window's screen, read every 30 frames on
+  the main thread (Minecraft's render thread on macOS), followed over about a quarter second, capped by
+  `METALMC_HDRPEAK`. It reads 1 until something on the screen asks for EDR, then rises as macOS turns EDR on. Offline on
+  this machine, with nothing asking for EDR: current 1.0, potential 16.0, reference 0 (the default preset has no
+  reference mode).
+- **Anti-aliasing.** With a float frame the history is RGBA16Float and nothing is clamped to 1 (RGB10A2 would clip the
+  highlights). CAS leaves values past 2 unsharpened.
+- **Screenshots.** Vanilla reads the main target as 8-bit RGBA; `ScreenshotMixin` hands it an 8-bit copy rolled into
+  SDR (the tone curve at H = 1). That covers F2, the world icon and the benchmark's screenshots.
+- **What the level-versus-GUI split still lacks.** Post effects (the spectator shaders, the menu blur) run through
+  vanilla's 8-bit intermediate targets, so they clip what they process. Translucent vanilla things blended over the sky
+  (a cloud's edge over a bright sky) get the tone curve a second time in the aerial perspective step, which compresses
+  those highlights a little more. The cleanest split, once the deferred rewrite is in: the level in its own float target,
+  tone mapped into the main target just before the hand, which also takes vanilla's 8-bit post chains out of the float
+  path.
+
+## Verified offline (2026-09-30, no game)
+
+- `swift build -c release`: clean, no new warnings. Every kernel compiles with the runtime compiler (`mslcheck` on
+  the sky, HDR and anti-aliasing shaders expanded from the Swift strings). The Java compiles; every mixin target was
+  checked against the 26.3 client jar with `javap` (method names, descriptors, and the `createTexture` calls' ordinals).
+- **Sky pictures** (`tools/skytest.swift`, which renders through the library's `mmc_debug_sky_render`: an
+  equirectangular view over a flat plain at sea level with rock ridges 2, 8, 30, 100 and 250 km away, from 87 m up, with
+  the game's aerial perspective and SDR tone curve), at noon, afternoon (35°), golden hour (8°), sunset (1°), twilight
+  (−4°), blue hour (−9°), night (−30°) and rain:
+  - noon and afternoon: blue zenith (afternoon sRGB 71, 102, 151), near-white horizon, a white glow around the sun; the
+    ridges go from gray at 2 km to pale blue at 30 km, barely there at 100 km, gone at 250 km;
+  - golden hour: a white disk brighter than its warm glow, peach horizon; sunset: lavender-blue upper sky, pink over the
+    sun, an orange band on the horizon (sRGB 255, 181, 81 at the sun), ridges dark against it; twilight: a purple sky
+    over a red-orange band; night: near-black with the faint glow; rain: an even gray overcast, the plain fading into
+    haze within a few km;
+  - no NaN or infinity in any view (scene-linear output checked), and no lookup-table rows show: the largest second
+    difference of the sky's encoded luminance up a clear column is under 0.62 of an 8-bit step at every time of day.
+- **The game's call sequence** (`tools/skyflow.swift`, through the C entry points with the experiments set, no window):
+  the tables, the quarter-resolution sky, the sky pass, a vanilla-style pipeline that declares RGBA8 drawing terrain into
+  the RGBA16Float target (accepted: the variant works), aerial perspective as its own pass and inside the
+  anti-aliasing, the HDR screenshot copy, and a present into an offscreen EDR layer. Near terrain keeps its exact color
+  (0.400, 0.520, 0.301 in and out); far terrain takes the sunlit haze. The two paths agree to within 0.04 at edges (the
+  anti-aliasing's sharpening); the quarter-resolution sky matches the per-pixel one to 0.12 of an 8-bit step on average.
+  Also run with `sky` alone (the RGBA8 target, the SDR curve, the anti-aliasing's dither, the 8-bit layer tagged sRGB as
+  before).
+- **Tone curve** (`mmc_debug_hdr_curve`): at H = 1, 1.5, 3, 8 and 16 it is monotonic, never past H, and the identity up
+  to the knee; at H = 8, for example: 2 → 1.93, 5 → 4.05, 10 → 6.07, 100 → 8.0.
+- **GPU time on this M3 Pro** (`mmc_debug_sky_time`, encoded as the game encodes them, medians of 30 after 10 warm-up
+  rounds, two runs agreeing within 0.01 ms; other builds were running on the machine):
+  - tables on their own: transmittance 0.02-0.04 ms, multiple scattering 0.09-0.22 (only when the rain changes), sky
+    view 0.07-0.15, aerial perspective 0.05-0.12; the per-frame pair together 0.067;
+  - at 3456 × 2234: the sky pass working out every pixel 0.48 ms, and 0.185 filtering up the quarter-resolution sky
+    (making it included); the same pass drawing a constant costs about 0.1-0.14, so the sky itself is about 0.05-0.09;
+  - the aerial perspective adds 0.28 ms to the anti-aliasing's resolve (1.05 → 1.33), or costs 0.38 as its own pass;
+  - so with anti-aliasing on, about 0.4-0.45 ms a frame over vanilla's sky pass.
+
+## Still to check in game
+
+- The frame with it on (native, TAA on, the real-terrain flight), against off, and with HDR:
+  - `BENCH_FIXTURE=claudeworld-merged bash tools/bench/bench_lod.sh skyoff 32768 -PbenchY=150 -PbenchFly=20 -PbenchExtraWait=600 -PbenchHitches=1 -Ptaa=true`
+  - the same with the label `skyon` and `-PmetalExp=sky`, `skyhdr` and `-PmetalExp=sky,hdr`, `hdronly` and
+    `-PmetalExp=hdr` (`BENCH_NOBUILD=1` after the first);
+  - `-PbenchTrace=1` on one of each for per-pass times, and `BENCH_VSYNC=true` for dropped frames at a real 120 Hz.
+  Expected: about 0.4-0.45 ms more with the sky (the tables, the sky pass and the resolve), and more with HDR: the float
+  history (about 0.3 ms, per the note in Taa.swift), the float target's bandwidth in every pass and the float present
+  (not measured offline).
+- The look, on the fidelity tour's views at several times of day with the LOD reaching the horizon:
+  - `bash tools/bench/fidelity.sh skyNoon 12 262144 -PmetalExp=sky -PfidelityTime=6000`
+  - the same with `-PfidelityTime=12000` (sunset), `13000` (dusk), `18000` (midnight) and `23500` (dawn), and with
+    `-PfarField=1`.
+  Things to look for: far terrain fading into the sky with no line at the horizon; the render distance's edge (try
+  `-Plod=0`, vanilla's chunks only) fading into the horizon's color, not a band; clouds (they get the haze from their
+  depth, but their own fade at the cloud range still goes to vanilla's fog color); water; the moon and stars over the
+  sky; the sun's disk and glow; banding in the sky with and without `-Ptaa=true`.
+- By hand: `/weather rain` and back (the sky and haze gray out and return, no flashes as the tables rebuild); under
+  water, in lava, in powder snow and with blindness, vanilla's sky and fog must come back; the Nether and the End keep
+  vanilla's; sunrise and sunset in motion (`/time add`); below sea level in a cave, vanilla's dark disc still covers the
+  lower sky.
+- HDR by hand (`-PmetalExp=sky,hdr`): the log's "hdr: EDR headroom" line should rise above 1 within a second; the sun and
+  the sky around it brighter than a white block; the GUI (hotbar, chat, menus) exactly as bright as without HDR; F2 and
+  the benchmark's screenshots look right (8-bit, SDR); resizing the window keeps HDR, with no "pipeline … failed" lines;
+  on an SDR external display the curve falls back to SDR; colors the same as without HDR (`-PhdrSpace=p3` for the more
+  saturated alternative).
+- Mixins: no errors applying `metalmc_sky.client.mixins.json`; with no experiment set, the frame and the fidelity scores
+  are unchanged (on the default path only the anti-aliasing's clamp is now written as `clamp(0, 1)`, and its resolve
+  has an unused sky variant).

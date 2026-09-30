@@ -13,7 +13,8 @@ import simd
 // than with the background behind them.
 //
 // The history is RGB10A2: at a 10% blend an 8-bit history stops converging up to 5 levels from its target, and a
-// 16-bit float one costs 0.3 ms more per frame at the panel's resolution. Each 16 x 16 threadgroup loads its pixels
+// 16-bit float one costs 0.3 ms more per frame at the panel's resolution. (With HDR's float frame, METALMC_EXP=hdr, it
+// is RGBA16Float, since the frame holds values above 1.) Each 16 x 16 threadgroup loads its pixels
 // and a 1-pixel border once into threadgroup memory. A draw then writes the new history back into the frame (the frame
 // isn't writable from shaders, and the resolve reads each pixel's neighbors), sharpened a little: averaging jittered
 // frames is a box filter over each pixel, which softens texture detail.
@@ -23,9 +24,13 @@ import simd
 //
 // An earlier version used MetalFX's temporal scaler at 1:1. It cost 9 ms per frame at the panel's resolution.
 
-private let taaShaderSource = """
-#include <metal_stdlib>
-using namespace metal;
+// Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
+private let taaShaderSource = skyShaderHeader + """
+
+// With the sky on (METALMC_EXP=sky), a second variant of the resolve applies the aerial perspective, the render
+// distance's fade into the sky and the tone curve to each pixel as it loads it (skyLevelColor), after the shadows'
+// shade, so that costs no full-screen pass of its own. The default variant has none of it.
+constant bool taaSky [[function_constant(0)]];
 
 struct TaaParams {
     float4x4 invCur;     // inverse of this frame's projection * view rotation (unjittered)
@@ -35,6 +40,7 @@ struct TaaParams {
     float reset;         // 1: the history is unusable (first frame, a jump, a gap)
     float blend;         // weight of the current frame when the view is still
     float4 shadow;       // ray-traced shadows (RtShadows) folded in: x strength (0: none), y-z fade distance range
+    float4 range;        // x: the largest value the frame holds (1; more for a float frame with HDR, Hdr.swift)
 };
 
 // Ray-traced shadows (RtShadows) store, per p.shadow.y x p.shadow.y pixels, the factor to multiply the color by (strength
@@ -91,6 +97,10 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         texture2d<float, access::write> nextHistory [[texture(3)]],
                         texture2d<half, access::read> lit [[texture(4)]],
                         constant TaaParams& p [[buffer(0)]],
+                        constant SkyFrame& sky [[buffer(1), function_constant(taaSky)]],
+                        texture3d<float> apScatter [[texture(5), function_constant(taaSky)]],
+                        texture3d<float> apTrans [[texture(6), function_constant(taaSky)]],
+                        texture2d<float> skyView [[texture(7), function_constant(taaSky)]],
                         uint2 gid [[thread_position_in_grid]],
                         uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
@@ -104,6 +114,10 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         float4 c = color.read(q);
         float d = depth.read(q);
         c.rgb *= float(shadowShade(lit, q, p));
+        if (taaSky) {
+            float haze;
+            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);
+        }
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
         dtile[i] = d;
     }
@@ -151,7 +165,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
             result = mix(h, cur, half(mix(p.blend, 0.3, saturate(length(motion) / 16.0))));
         }
     }
-    nextHistory.write(float4(saturate(fromYCoCg(float3(result))), 1.0), gid);
+    nextHistory.write(float4(clamp(fromYCoCg(float3(result)), 0.0, p.range.x), 1.0), gid);
 }
 
 struct CopyVOut {
@@ -166,13 +180,23 @@ vertex CopyVOut taa_copy_vs(uint vid [[vertex_id]]) {
 }
 
 // The new history into the frame, with contrast-adaptive sharpening (after AMD's CAS): each pixel is pushed away from
-// its 4 neighbors, less where they already differ a lot, so edges don't ring.
+// its 4 neighbors, less where they already differ a lot, so edges don't ring. sc: x sharpening, y the frame's largest
+// value (above 1 only for HDR's float frame, whose highlights past 2 CAS leaves unsharpened), z dither, w the frame.
+// The dither (the sky's, Sky.swift, on an 8-bit frame; 0 otherwise) keeps the sky's smooth gradients from banding as
+// the 10-bit history is written back to 8 bits: the sky's own dither is averaged away in the history.
+static float3 taaDither(float3 c, int2 g, float4 sc) {
+    if (sc.z <= 0.0) return c;
+    float2 p = float2(g) + 5.588238 * sc.w;
+    return c + (fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))) - 0.5) * sc.z;
+}
+
 fragment float4 taa_copy_fs(CopyVOut in [[stage_in]], texture2d<float, access::read> h [[texture(0)]],
-                            constant float& sharpen [[buffer(0)]]) {
+                            constant float4& sc [[buffer(0)]]) {
     int2 size = int2(h.get_width(), h.get_height());
     int2 g = int2(in.pos.xy);
     float3 c = h.read(uint2(g)).rgb;
-    if (sharpen <= 0.0) return float4(c, 1.0);
+    float sharpen = sc.x;
+    if (sharpen <= 0.0) return float4(taaDither(c, g, sc), 1.0);
     float3 n = h.read(uint2(clamp(g + int2(0, -1), int2(0), size - 1))).rgb;
     float3 s = h.read(uint2(clamp(g + int2(0, 1), int2(0), size - 1))).rgb;
     float3 w = h.read(uint2(clamp(g + int2(-1, 0), int2(0), size - 1))).rgb;
@@ -180,7 +204,7 @@ fragment float4 taa_copy_fs(CopyVOut in [[stage_in]], texture2d<float, access::r
     float3 mn = min(c, min(min(n, s), min(w, e))), mx = max(c, max(max(n, s), max(w, e)));
     float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));
     float3 wt = -amp * (0.2 * sharpen);
-    return float4(saturate((c + (n + s + w + e) * wt) / (1.0 + 4.0 * wt)), 1.0);
+    return float4(taaDither(clamp((c + (n + s + w + e) * wt) / (1.0 + 4.0 * wt), 0.0, sc.y), g, sc), 1.0);
 }
 """
 
@@ -192,6 +216,7 @@ private struct TaaParams {
     var reset: Float
     var blend: Float
     var shadow: SIMD4<Float> = .zero
+    var range = SIMD4<Float>(1, 0, 0, 0)
 }
 
 /// METALMC_TAABLEND: the current frame's weight when the view is still (default 0.1).
@@ -207,6 +232,9 @@ final class Taa: @unchecked Sendable {
     var key = ""
     var library: MTLLibrary?
     var pipe: MTLComputePipelineState?
+    var skyPipe: MTLComputePipelineState?   // the resolve with the sky's aerial perspective (Sky.swift), built on first use
+    var skyFailed = false
+    var frames = 0                   // frames anti-aliased, for the sky's dither
     var copyPipes: [UInt: MTLRenderPipelineState] = [:]   // by the frame's pixel format
     var valid = false                // the current history holds a frame
     var prevViewProj = matrix_identity_float4x4
@@ -221,7 +249,7 @@ final class Taa: @unchecked Sendable {
         do {
             if library == nil {
                 let lib = try ctx.device.makeLibrary(source: taaShaderSource, options: nil)
-                pipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "taa_resolve")!)
+                pipe = try ctx.device.makeComputePipelineState(function: resolveFunction(lib, sky: false))
                 library = lib
             }
             if copyPipes[color.pixelFormat.rawValue] == nil, let lib = library {
@@ -243,13 +271,37 @@ final class Taa: @unchecked Sendable {
             d.storageMode = .private
             return ctx.device.makeTexture(descriptor: d)
         }
-        guard let h0 = texture(.rgb10a2Unorm, [.shaderRead, .shaderWrite]),
-              let h1 = texture(.rgb10a2Unorm, [.shaderRead, .shaderWrite]) else { return false }
+        // HDR hook (Hdr.swift): a float frame holds values above 1 (the sky's highlights), which RGB10A2 would clip.
+        let historyFormat: MTLPixelFormat = color.pixelFormat == .rgba16Float ? .rgba16Float : .rgb10a2Unorm
+        guard let h0 = texture(historyFormat, [.shaderRead, .shaderWrite]),
+              let h1 = texture(historyFormat, [.shaderRead, .shaderWrite]) else { return false }
         history = [h0, h1]
         valid = false
         self.key = key
         log("TAA: resolve at \(key)")
         return true
+    }
+
+    /// The resolve, with or without the sky's aerial perspective in its load (the taaSky function constant).
+    func resolveFunction(_ lib: MTLLibrary, sky: Bool) throws -> MTLFunction {
+        let values = MTLFunctionConstantValues()
+        var on = sky
+        values.setConstantValue(&on, type: .bool, index: 0)
+        return try lib.makeFunction(name: "taa_resolve", constantValues: values)
+    }
+
+    /// Sky hook (Sky.swift): the resolve variant that applies the aerial perspective as it loads (nil if it failed to
+    /// build: the plain resolve runs, without the sky's haze).
+    func skyResolve() -> MTLComputePipelineState? {
+        if let skyPipe { return skyPipe }
+        guard let library, !skyFailed else { return nil }
+        do {
+            skyPipe = try ctx.device.makeComputePipelineState(function: resolveFunction(library, sky: true))
+        } catch {
+            log("TAA: sky resolve failed: \(error)")
+            skyFailed = true
+        }
+        return skyPipe
     }
 }
 
@@ -284,7 +336,23 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     // Ray-traced shadows traced this frame are applied here, as the color is loaded (RtShadows defers to the TAA).
     let shadows = RtShadows.shared.takeDeferred(width: color.width, height: color.height)
     if let sh = shadows { params.shadow = sh.params }
-    enc.setComputePipelineState(pipe)
+    // HDR hook (Hdr.swift): a float frame's values aren't clamped to 1.
+    let frameMax: Float = color.pixelFormat == .rgba16Float ? 65504 : 1
+    params.range.x = frameMax
+    // Sky hook (Sky.swift): the level through the air (aerial perspective, the render distance's fade, the tone curve),
+    // applied as the color is loaded, after the shadows' shade; on an 8-bit frame, dithered as it's written back.
+    var skyDither: Float = 0
+    if let sky = Sky.shared.takeDeferredAerial(width: color.width, height: color.height), let skyPipe = t.skyResolve() {
+        var frame = sky.frame
+        enc.setComputePipelineState(skyPipe)
+        enc.setBytes(&frame, length: MemoryLayout<SkyFrameGPU>.stride, index: 1)
+        enc.setTexture(sky.apScatter, index: 5)
+        enc.setTexture(sky.apTrans, index: 6)
+        enc.setTexture(sky.skyView, index: 7)
+        skyDither = color.pixelFormat == .rgba16Float ? 0 : 1.0 / 255
+    } else {
+        enc.setComputePipelineState(pipe)
+    }
     enc.setTexture(color, index: 0)
     enc.setTexture(depth, index: 1)
     enc.setTexture(t.history[t.current], index: 2)
@@ -302,11 +370,12 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     guard let copy = cb.makeRenderCommandEncoder(descriptor: d) else { return 0 }
     copy.setRenderPipelineState(copyPipe)
     copy.setFragmentTexture(t.history[1 - t.current], index: 0)
-    var sharpen = taaSharpen
-    copy.setFragmentBytes(&sharpen, length: 4, index: 0)
+    var sharpen = SIMD4<Float>(taaSharpen, frameMax, skyDither, Float(t.frames % 64))
+    copy.setFragmentBytes(&sharpen, length: 16, index: 0)
     copy.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
     copy.endEncoding()
     t.current = 1 - t.current
+    t.frames += 1
     t.valid = true
     t.prevViewProj = viewProj
     t.prevCam = camera

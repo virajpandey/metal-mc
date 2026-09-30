@@ -94,6 +94,13 @@ final class Mtl {
     private static final MethodHandle LOD_SET_TINTS = h("mmc_lod_set_tints", false, null, JAVA_LONG, JAVA_INT);
     private static final MethodHandle TAA_APPLY = h("mmc_taa_apply", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_FLOAT, JAVA_FLOAT, JAVA_INT);
     private static final MethodHandle SHADOWS_APPLY = h("mmc_shadows_apply", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_FLOAT, JAVA_FLOAT, JAVA_FLOAT, JAVA_INT);
+    private static final MethodHandle SKY_ENABLED = h("mmc_sky_enabled", false, JAVA_INT);
+    private static final MethodHandle SKY_PREPARE = h("mmc_sky_prepare", false, JAVA_INT, JAVA_LONG);
+    private static final MethodHandle SKY_VIEW = h("mmc_sky_view", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle SKY_DRAW = h("mmc_sky_draw", false, JAVA_INT, JAVA_LONG);
+    private static final MethodHandle SKY_AERIAL = h("mmc_sky_aerial", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
+    private static final MethodHandle HDR_ENABLED = h("mmc_hdr_enabled", false, JAVA_INT);
+    private static final MethodHandle HDR_SNAPSHOT = h("mmc_hdr_snapshot", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle LOD_OPEN3 = h("mmc_lod_open3", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
     private static final MethodHandle OCC_HIDDEN = h("mmc_occ_hidden", true, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle OCC_TEST = h("mmc_occ_test", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
@@ -351,6 +358,34 @@ final class Mtl {
 
     static int taaApply(long color, long depth, long params, long cam, float jitterX, float jitterY, int reset) {
         try { return (int) TAA_APPLY.invokeExact(color, depth, params, cam, jitterX, jitterY, reset); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int skyEnabled() {
+        try { return (int) SKY_ENABLED.invokeExact(); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int skyPrepare(long params) {
+        try { return (int) SKY_PREPARE.invokeExact(params); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int skyView(long color, long params) {
+        try { return (int) SKY_VIEW.invokeExact(color, params); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int skyDraw(long params) {
+        try { return (int) SKY_DRAW.invokeExact(params); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int skyAerial(long color, long depth, long params, int taa) {
+        try { return (int) SKY_AERIAL.invokeExact(color, depth, params, taa); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int hdrEnabled() {
+        try { return (int) HDR_ENABLED.invokeExact(); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int hdrSnapshot(long src, long dst) {
+        try { return (int) HDR_SNAPSHOT.invokeExact(src, dst); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static long lodOpen3(long worldDir, long storeDir, long cacheDir, long dimension, int far, int centerX, int centerZ) {
