@@ -18,6 +18,13 @@ let lodTilesPerSide = lodNodeVoxels / lodTileVoxels   // 4 x 4 tiles per node
 /// which draw afterwards with blending, then the tile-edge skirts of the -X, +X, -Z and +Z edges (levels 1 and
 /// up), drawn only next to a tile of the node that a finer level draws instead.
 let lodBucketsPerTile = 16
+/// Sub-tiles per tile (4 x 4 of 16 x 16 voxels). Each bucket's quads are sorted by the sub-tile their origin is in, so a
+/// tile can be drawn in part: the horizon occlusion test (Lod.swift) culls sub-tiles hidden behind nearer terrain.
+let lodSubtileVoxels = 16
+let lodSubtilesPerTile = (lodTileVoxels / lodSubtileVoxels) * (lodTileVoxels / lodSubtileVoxels)
+/// Index of (tile, bucket, sub-tile) in LodMesh.counts / LodMeshNode.start: bucket-major within a tile, so a fully
+/// drawn tile's buckets are still contiguous and merge into one draw.
+@inline(__always) func lodBucketIndex(_ t: Int, _ k: Int, _ st: Int) -> Int { (t * lodBucketsPerTile + k) * lodSubtilesPerTile + st }
 /// Voxels of a tile-edge skirt, down from the top of the column.
 let lodTileSkirt = 2
 /// METALMC_EXP=notileskirts: no tile-edge skirts (A/B).
@@ -332,7 +339,10 @@ struct LodGrid {
 /// in (u, v) from (0, 0)) packed into `ao`, starting at `aoOffsets[quad]` (in 2-bit units).
 struct LodMesh {
     var quads: [UInt32]         // pairs: word0 = x | z<<8 | y<<16 (9 bits) | face<<25 | water depth or cover<<28, word1 = mat | (w-1)<<8 | (h-1)<<16 | block light<<24
-    var counts: [Int]           // quads per (tile, bucket), tile-major: tile = tz * 4 + tx, buckets as lodBucketsPerTile
+    var counts: [Int]           // quads per (tile, bucket, sub-tile), see lodBucketIndex; tile = tz * 4 + tx
+    var subtiles: [Int32]       // per (tile, sub-tile), 8 values: quad bounds x0, x1, y0, y1, z0, z1 (voxels, end-exclusive;
+                                // x0 > x1 if empty), solid core top (the highest voxel every column is solid up to
+                                // from the bottom, -1 if none), unused
     var tileY: [Int]            // per tile: min and max voxel y of its quads (min > max if empty)
     var tileYCore: [Int]        // the same without the skirt walls on the node's outer edges
     var sectionMask: [UInt32]   // levels 0-1: per tile, the chunk sections holding its quads (skirts aside), lodTileSectionBits
@@ -488,6 +498,8 @@ enum LodBuild {
         let maskWords = grid.level <= 1 ? lodTileSectionWords(grid.level) : 0
         var sectionMask = [UInt32](repeating: 0, count: tiles * maskWords)
         var mask = [UInt32](repeating: 0, count: n * max(n, h))   // material | water depth or cover << 16 | block light << 20
+        // Per sub-tile: the top voxel of its solid core (every column solid from the bottom up to it), -1 if none.
+        var cores = [Int32](repeating: -1, count: tiles * lodSubtilesPerTile)
 
         grid.v.withUnsafeBufferPointer { g in
             // Highest non-air voxel per column, -1 for a column with no data (a missing chunk). Side faces
@@ -922,18 +934,101 @@ enum LodBuild {
                     }
                 }
             }
+            // Solid cores: the occluders of the horizon test. A column counts up to the top of its highest solid run
+            // (no air or water) that's at least 8 blocks deep, found from the surface down: leaves over air, overhangs,
+            // houses and water are skipped, and enclosed caves further down don't matter (a ray that deep underground
+            // already went through the surface). Level 0 keeps a block of margin for slabs and other partial blocks,
+            // which are solid voxels here but not full blocks in vanilla.
+            let stSide = lodTileVoxels / lodSubtileVoxels
+            let run = max(1, 8 >> grid.level)
+            var columnCore = [Int](repeating: -1, count: n * n)
+            for i in 0..<(n * n) where top[i] >= 0 {
+                var y = top[i], solid = 0, runTop = -1
+                while y >= 0 {
+                    let k = kinds[Int(g[y * n * n + i])]
+                    if k == airK || k == waterK { solid = 0 } else {
+                        if solid == 0 { runTop = y }
+                        solid += 1
+                        if solid >= run { break }
+                    }
+                    y -= 1
+                }
+                columnCore[i] = solid >= run || y < 0 && solid > 0 ? runTop : -1
+            }
+            for t in 0..<tiles {
+                let tx = t % lodTilesPerSide, tz = t / lodTilesPerSide
+                for st in 0..<lodSubtilesPerTile {
+                    let x0 = tx * lodTileVoxels + (st % stSide) * lodSubtileVoxels, z0 = tz * lodTileVoxels + (st / stSide) * lodSubtileVoxels
+                    var core = Int.max
+                    scan: for z in z0..<(z0 + lodSubtileVoxels) {
+                        for x in x0..<(x0 + lodSubtileVoxels) {
+                            let c = columnCore[z * n + x]
+                            if c < 0 { core = -1; break scan }
+                            core = min(core, c)
+                        }
+                    }
+                    if grid.level == 0 && core >= 0 { core -= 1 }
+                    cores[t * lodSubtilesPerTile + st] = Int32(max(-1, core))
+                }
+            }
         }
         var out: [UInt32] = []
         out.reserveCapacity(buckets.reduce(0) { $0 + $1.count })
+        // Quads sorted by sub-tile within each bucket (a counting sort), with each sub-tile's bounds.
+        let sts = lodSubtilesPerTile, stSide = lodTileVoxels / lodSubtileVoxels
+        var subtiles = [Int32](repeating: 0, count: tiles * sts * 8)
+        for i in 0..<(tiles * sts) {
+            subtiles[8 * i] = Int32.max; subtiles[8 * i + 1] = Int32.min
+            subtiles[8 * i + 2] = Int32.max; subtiles[8 * i + 3] = Int32.min
+            subtiles[8 * i + 4] = Int32.max; subtiles[8 * i + 5] = Int32.min
+            subtiles[8 * i + 6] = cores[i]
+        }
         var offsets: [UInt32] = []
         offsets.reserveCapacity(out.capacity / 2)
-        var counts = [Int](repeating: 0, count: tiles * lodBucketsPerTile)
+        var counts = [Int](repeating: 0, count: tiles * lodBucketsPerTile * sts)
+        var order: [Int] = []
         for (i, b) in buckets.enumerated() {
-            out.append(contentsOf: b)
-            offsets.append(contentsOf: aoBuckets[i])
-            counts[i] = b.count / 2
+            let t = i / lodBucketsPerTile, k = i % lodBucketsPerTile
+            let nq = b.count / 2
+            if nq == 0 { continue }
+            var stOf = [Int](repeating: 0, count: nq)
+            var perSt = [Int](repeating: 0, count: sts)
+            for q in 0..<nq {
+                let w0 = b[2 * q], w1 = b[2 * q + 1]
+                let x = Int(w0 & 255), z = Int((w0 >> 8) & 255), y = Int((w0 >> 16) & 511), face = Int((w0 >> 25) & 7)
+                let st = ((z % lodTileVoxels) / lodSubtileVoxels) * stSide + (x % lodTileVoxels) / lodSubtileVoxels
+                stOf[q] = st
+                perSt[st] += 1
+                // The quad's extent in voxels (a face lies on its voxel's far side for + faces).
+                let qw = Int((w1 >> 8) & 255) + 1, qh = Int((w1 >> 16) & 255) + 1
+                var x0 = x, x1 = x + 1, y0 = y, y1 = y + 1, z0 = z, z1 = z + 1
+                switch face / 2 {
+                case 0: y1 = y + qw; z1 = z + qh
+                case 1: x1 = x + qw; z1 = z + qh
+                default: x1 = x + qw; y1 = y + qh
+                }
+                if face == 0 { x0 += 1; x1 = x0 } else if face == 1 { x1 = x0 }
+                if face == 2 { y0 += 1; y1 = y0 } else if face == 3 { y1 = y0 }
+                if face == 4 { z0 += 1; z1 = z0 } else if face == 5 { z1 = z0 }
+                let si = 8 * (t * sts + st)
+                subtiles[si] = min(subtiles[si], Int32(x0)); subtiles[si + 1] = max(subtiles[si + 1], Int32(x1))
+                subtiles[si + 2] = min(subtiles[si + 2], Int32(y0)); subtiles[si + 3] = max(subtiles[si + 3], Int32(y1))
+                subtiles[si + 4] = min(subtiles[si + 4], Int32(z0)); subtiles[si + 5] = max(subtiles[si + 5], Int32(z1))
+            }
+            var next = [Int](repeating: 0, count: sts)
+            var acc = 0
+            for st in 0..<sts { next[st] = acc; acc += perSt[st]; counts[lodBucketIndex(t, k, st)] = perSt[st] }
+            if order.count < nq { order = [Int](repeating: 0, count: nq) }
+            for q in 0..<nq { order[next[stOf[q]]] = q; next[stOf[q]] += 1 }
+            let a = aoBuckets[i]
+            for r in 0..<nq {
+                let q = order[r]
+                out.append(b[2 * q]); out.append(b[2 * q + 1])
+                offsets.append(a[q])
+            }
         }
-        return LodMesh(quads: out, counts: counts, tileY: tileY, tileYCore: tileYCore, sectionMask: sectionMask, aoOffsets: offsets, ao: ao)
+        return LodMesh(quads: out, counts: counts, subtiles: subtiles, tileY: tileY, tileYCore: tileYCore, sectionMask: sectionMask,
+                       aoOffsets: offsets, ao: ao)
     }
 
     /// Builds every level from the save's overworld region files. Level-1 nodes are only meshed within

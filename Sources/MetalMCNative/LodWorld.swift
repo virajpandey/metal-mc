@@ -100,7 +100,8 @@ final class LodMeshNode {
     let aoOffsets: MTLBuffer    // UInt32 per quad (LodMesh.aoOffsets)
     let ao: MTLBuffer           // packed rim ambient occlusion (at least one word)
     let quadCount: Int
-    let start: [Int]            // prefix offsets of the (tile, face) buckets, 16 * 6 + 1 entries
+    let start: [Int]            // prefix offsets of the (tile, bucket, sub-tile) ranges (lodBucketIndex), plus the end
+    let subtiles: [Int32]       // per (tile, sub-tile): quad bounds and solid core (LodMesh.subtiles)
     let tileY: [Int]            // per tile: min and max voxel y (min > max if the tile is empty)
     let tileYCore: [Int]        // the same without the node's edge skirts
     let sectionMask: [UInt32]   // levels 0-1: the chunk sections each tile has quads in (LodMesh.sectionMask)
@@ -127,6 +128,7 @@ final class LodMeshNode {
         var starts = [0]
         for c in m.counts { starts.append(starts.last! + c) }
         start = starts
+        subtiles = m.subtiles
         tileY = m.tileY
         tileYCore = m.tileYCore
         sectionMask = m.sectionMask

@@ -137,7 +137,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     // agree, and collapse the quad to a point (no fragment discard, which would disable hidden-surface removal).
     float3 center = xs.xyz + (local + 0.5 * (kCorners[face][0] + kCorners[face][2]) * ext) * xs.w;
     VOut o;
-    if (length(center.xz) < u.discardRadius) {
+    if (length(center.xz) < u.discardRadius || (u.seamInfo.w != 0 && ((vid >> 2) & 3) != 0)) {
         o.pos = float4(0.0, 0.0, 0.0, 1.0);
         o.color = 0;
         o.rel = float3(0.0);
@@ -239,7 +239,7 @@ using LodMeshOut = metal::mesh<VOut, LodPrim, 4 * MESH_QUADS, 2 * MESH_QUADS, me
         rels[c] = rel;
         clips[c] = clip;
     }
-    bool culled = dot(kNormal[face], rels[0]) >= 0.0 || outL == 4 || outR == 4 || outB == 4 || outT == 4;
+    bool culled = dot(kNormal[face], rels[0]) >= 0.0 || outL == 4 || outR == 4 || outB == 4 || outT == 4 || (u.seamInfo.w != 0 && (qi & 3) != 0);
     LodPrim p;
     p.culled = culled;
     out.set_primitive(tid * 2, p);
@@ -471,6 +471,14 @@ let lodFadeFrames = Int(ProcessInfo.processInfo.environment["METALMC_FADE"] ?? "
 
 /// METALMC_EXP=meshshader draws the LOD with a mesh shader (one thread per quad) instead of indexed vertices.
 let lodMeshShaders = experiments.contains("meshshader")
+/// Horizon occlusion of LOD sub-tiles (lodHorizonTest), METALMC_EXP=horizon. Off: on real terrain it hid about a quarter
+/// of the sub-tiles in view but only 11% of the quads (4.22 -> 3.99 ms main pass) for 3.5 ms of CPU per frame, because
+/// most hidden LOD quads are hidden at a much finer grain (foreshortened steps and faces behind their neighbors).
+let lodHorizon = experiments.contains("horizon")
+/// Sub-tiles outside the view frustum aren't drawn (METALMC_EXP=nostfrustum draws whole tiles).
+let lodSubtileFrustum = !experiments.contains("nostfrustum")
+/// Debug (METALMC_EXP=cullfrac): drop 3 of every 4 LOD quads before rasterization, to measure what culling saves.
+let lodCullFrac = experiments.contains("cullfrac")
 /// METALMC_EXP=quadvis: every 240 frames, count the drawn opaque LOD quads that own at least one final pixel (per level).
 let lodQuadVis = experiments.contains("quadvis")
 nonisolated(unsafe) var lodVisPipe: MTLRenderPipelineState?
@@ -543,6 +551,7 @@ final class LodRenderer: @unchecked Sendable {
     // Occlusion culling (render thread, except LodVisSet.done).
     let visLock = NSLock()
     var visSets: [LodVisSet] = []
+    var horizonCulledTiles = 0      // tiles the horizon test hid entirely (debug counter)
     var frame: UInt64 = 0
     var latestResult: UInt64 = 0       // newest frame whose occlusion results have been read
     var lastCamera = SIMD3<Double>(repeating: .nan)
@@ -1015,7 +1024,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let csx = Int((cx / 16).rounded(.down)), csy = Int((cy / 16).rounded(.down)), csz = Int((cz / 16).rounded(.down))
     let bottomSection = lodWorldMinY >> 4
     u.camInSection = SIMD4(Float(cx - Double(csx * 16)), Float(cy - Double(csy * 16)), Float(cz - Double(csz * 16)), Float(H))
-    u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), w.hasSkyLight ? 15 : 0, 0)
+    u.seamInfo = SIMD4(Int32(csy - bottomSection), Int32(W), w.hasSkyLight ? 15 : 0, lodCullFrac ? 1 : 0)
     var seamBuffer: MTLBuffer?
     if !r.vanillaSections.isEmpty {
         while r.seamBuffers.count < 3, let b = ctx.device.makeBuffer(length: lodSeamWords * 4, options: [.storageModeShared]) {
@@ -1160,30 +1169,64 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                 slots[id] = slot
                 xforms.append(SIMD4(nodeLo.x, nodeLo.y, nodeLo.z, voxel))
             }
-            for water in [false, true] {
-                let base = t * lodBucketsPerTile + (water ? 6 : 0)
-                var f = 0
-                while f < 6 {
-                    if !faceVisible[f] || n.start[base + f + 1] == n.start[base + f] { f += 1; continue }
-                    var e = f + 1
-                    while e < 6 && (faceVisible[e] || n.start[base + e + 1] == n.start[base + e]) { e += 1 }
-                    draws.append(Draw(node: n, slot: slot, first: n.start[base + f], count: n.start[base + e] - n.start[base + f],
-                                      seam: seam, water: water, fade: fade, fadeOut: fadeOutStart != nil))
-                    f = e
+            // Sub-tiles the horizon test left visible (all of them for fading-out tiles, or with the test off).
+            var stMask: UInt16 = fadeOutStart == nil ? (horizonVis[id]?[t] ?? 0xFFFF) : 0xFFFF
+            if lodSubtileFrustum {
+                // Sub-tiles whose quads lie entirely outside the view (tiles at the screen's edges).
+                for st in 0..<lodSubtilesPerTile where stMask & (1 << UInt16(st)) != 0 {
+                    let si = 8 * (t * lodSubtilesPerTile + st)
+                    if n.subtiles[si] > n.subtiles[si + 1] { continue }
+                    let slo = nodeLo + SIMD3(Float(n.subtiles[si]), Float(n.subtiles[si + 2]), Float(n.subtiles[si + 4])) * voxel
+                    let shi = nodeLo + SIMD3(Float(n.subtiles[si + 1]), Float(n.subtiles[si + 3]), Float(n.subtiles[si + 5])) * voxel
+                    if !visible(slo, shi) { stMask &= ~(UInt16(1) << UInt16(st)) }
                 }
             }
+            if stMask == 0 { r.horizonCulledTiles += 1; continue }
+            var lastEnd = -1, lastWater = false
+            func emit(_ first: Int, _ end: Int, _ water: Bool) {
+                if first == end { return }
+                if first == lastEnd && water == lastWater, var d = draws.popLast() {
+                    d.count += end - first
+                    draws.append(d)
+                } else {
+                    draws.append(Draw(node: n, slot: slot, first: first, count: end - first, seam: seam, water: water, fade: fade,
+                                      fadeOut: fadeOutStart != nil))
+                }
+                lastEnd = end
+                lastWater = water
+            }
+            // Runs of visible sub-tiles of bucket k (empty ones bridge runs). Contiguous runs merge, also across
+            // buckets, so a fully visible tile's facing buckets are one draw as before.
+            func bucket(_ k: Int, _ water: Bool) {
+                var st = 0
+                while st < lodSubtilesPerTile {
+                    let b = lodBucketIndex(t, k, st)
+                    if stMask & (1 << UInt16(st)) == 0 || n.start[b + 1] == n.start[b] { st += 1; continue }
+                    var e = st + 1
+                    while e < lodSubtilesPerTile {
+                        let be = lodBucketIndex(t, k, e)
+                        if stMask & (1 << UInt16(e)) == 0 && n.start[be + 1] != n.start[be] { break }
+                        e += 1
+                    }
+                    emit(n.start[b], n.start[lodBucketIndex(t, k, e - 1) + 1], water)
+                    st = e
+                }
+            }
+            for f in 0..<6 where faceVisible[f] { bucket(f, false) }
             // Tile-edge skirts toward neighbor tiles of this node that it doesn't draw (a finer level does).
             for (e, (dx, dz, face)) in [(-1, 0, 1), (1, 0, 0), (0, -1, 5), (0, 1, 4)].enumerated() {
                 let ntx = tx + dx, ntz = tz + dz
                 if ntx < 0 || ntz < 0 || ntx >= lodTilesPerSide || ntz >= lodTilesPerSide || !faceVisible[face] { continue }
                 if tileMask & (1 << UInt16(ntz * lodTilesPerSide + ntx)) != 0 { continue }
-                let b = t * lodBucketsPerTile + 12 + e
-                if n.start[b + 1] == n.start[b] { continue }
-                draws.append(Draw(node: n, slot: slot, first: n.start[b], count: n.start[b + 1] - n.start[b],
-                                  seam: seam, water: false, fade: fade, fadeOut: fadeOutStart != nil))
+                bucket(12 + e, false)
             }
+            for f in 0..<6 where faceVisible[f] { bucket(6 + f, true) }
         }
     }
+    let horizonVis: [ObjectIdentifier: [UInt16]] = lodHorizon
+        ? lodHorizonTest(chosen, cx: cx, cy: cy, cz: cz, fadingIn: { id, t in (r.fadeIn[id]?.mask ?? 0) & (1 << UInt16(t)) != 0 },
+                         inView: visible)
+        : [:]
     for (n, tileMask) in chosen { addTiles(n, tileMask, fadeOutStart: nil) }
     for f in r.fadeOut { addTiles(f.node, f.mask, fadeOutStart: f.start) }
     if r.frame % 1000 == 0 {
@@ -1481,7 +1524,7 @@ public func mmc_debug_lod_select2(_ camX: Double, _ camZ: Double, _ splitFactor:
         out[5 * i] = Int64(n.level); out[5 * i + 1] = Int64(n.x0 >> (8 + n.level)); out[5 * i + 2] = Int64(n.z0 >> (8 + n.level))
         out[5 * i + 3] = Int64(mask)
         var quads = 0
-        for t in 0..<16 where mask & (1 << UInt16(t)) != 0 { quads += n.start[(t + 1) * lodBucketsPerTile] - n.start[t * lodBucketsPerTile] }
+        for t in 0..<16 where mask & (1 << UInt16(t)) != 0 { quads += n.start[lodBucketIndex(t + 1, 0, 0)] - n.start[lodBucketIndex(t, 0, 0)] }
         out[5 * i + 4] = Int64(quads)
         i += 1
     }
@@ -1671,3 +1714,124 @@ func lodMeasureVisibility(_ enc: MTLRenderCommandEncoder, _ draws: [(LodMeshNode
     }
 }
 nonisolated(unsafe) var lodVisSlot: [ObjectIdentifier: Int] = [:]
+
+/// Horizon occlusion for LOD sub-tiles (16 x 16 voxels). Terrain is a height field seen from one point, so whether a
+/// sub-tile is behind nearer terrain is a question of elevation angles: looking along an azimuth, a point is hidden if
+/// some nearer column that's solid from the world's bottom rises above the line to it. Occluders are each sub-tile's
+/// solid core (every column solid from the bottom up to it: never caves, overhangs, water, glass or houses), so the
+/// test only ever hides what's really hidden, with no latency and no GPU readback. Sub-tiles are processed nearest
+/// first; the horizon keeps, per azimuth bin, the highest core slope (height / distance) of the cores entirely nearer
+/// than the sub-tile being tested, over the bins each core fully covers. A sub-tile is hidden if its highest point's
+/// slope is below the horizon over every bin it touches. Returns, per node, a visible-sub-tile mask per tile.
+func lodHorizonTest(_ chosen: [(LodMeshNode, UInt16)], cx: Double, cy: Double, cz: Double,
+                    fadingIn: (ObjectIdentifier, Int) -> Bool,
+                    inView: (SIMD3<Float>, SIMD3<Float>) -> Bool) -> [ObjectIdentifier: [UInt16]] {
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    struct Occluder { var far: Float; var a0: Float; var a1: Float; var slope: Float }
+    struct Target { var near: Float; var far: Float; var a0: Float; var a1: Float; var top: Float; var node: Int32; var tile: Int16; var st: Int16 }
+    var occluders: [Occluder] = [], targets: [Target] = []
+    occluders.reserveCapacity(chosen.count * 256)
+    targets.reserveCapacity(chosen.count * 256)
+    // A pseudo-angle in [0, 4), monotonic in the azimuth (the "diamond angle"): no trigonometry.
+    @inline(__always) func pseudo(_ x: Float, _ z: Float) -> Float {
+        if z >= 0 { return x >= 0 ? z / max(x + z, 1e-30) : 1 - x / (z - x) }
+        return x < 0 ? 2 - z / (-x - z) : 3 + x / (x - z)
+    }
+    // Azimuth interval of a rectangle not containing the camera (a1 may exceed 4: it wraps through 0).
+    @inline(__always) func angles(_ x0: Float, _ x1: Float, _ z0: Float, _ z1: Float) -> (Float, Float)? {
+        if x0 <= 0 && x1 >= 0 && z0 <= 0 && z1 >= 0 { return nil }
+        let p0 = pseudo(x0, z0), p1 = pseudo(x1, z0), p2 = pseudo(x0, z1), p3 = pseudo(x1, z1)
+        let lo = min(min(p0, p1), min(p2, p3)), hi = max(max(p0, p1), max(p2, p3))
+        return hi - lo > 2 ? (hi, lo + 4) : (lo, hi)
+    }
+    @inline(__always) func distances(_ x0: Float, _ x1: Float, _ z0: Float, _ z1: Float) -> (Float, Float) {
+        let dx = max(max(x0, -x1), 0), dz = max(max(z0, -z1), 0)
+        let fx = max(abs(x0), abs(x1)), fz = max(abs(z0), abs(z1))
+        return ((dx * dx + dz * dz).squareRoot(), (fx * fx + fz * fz).squareRoot())
+    }
+    let side = lodTileVoxels / lodSubtileVoxels
+    for (ni, (n, mask)) in chosen.enumerated() {
+        let s = Float(1 << n.level)
+        let ox = Float(Double(n.x0) - cx), oz = Float(Double(n.z0) - cz), oy = Float(Double(lodWorldMinY) - cy)
+        let id = ObjectIdentifier(n)
+        let tileSize = Float(lodTileVoxels) * s
+        for t in 0..<(lodTilesPerSide * lodTilesPerSide) where mask & (1 << UInt16(t)) != 0 {
+            let tx = t % lodTilesPerSide, tz = t / lodTilesPerSide
+            // Only tiles in view: a tile entirely outside the frustum can't hide anything inside it either (rays
+            // through the frustum never reach it).
+            let lo = SIMD3(ox + Float(tx) * tileSize, oy, oz + Float(tz) * tileSize)
+            if !inView(lo, lo + SIMD3(tileSize, Float(lodWorldHeight), tileSize)) { continue }
+            let fading = fadingIn(id, t)
+            for st in 0..<lodSubtilesPerTile {
+                let si = 8 * (t * lodSubtilesPerTile + st)
+                let core = n.subtiles[si + 6]
+                if core >= 0 && !fading {
+                    // A tile fading in is only partly drawn: not an occluder until it's opaque.
+                    let x0 = ox + Float(tx * lodTileVoxels + (st % side) * lodSubtileVoxels) * s
+                    let z0 = oz + Float(tz * lodTileVoxels + (st / side) * lodSubtileVoxels) * s
+                    let x1 = x0 + Float(lodSubtileVoxels) * s, z1 = z0 + Float(lodSubtileVoxels) * s
+                    if let (a0, a1) = angles(x0, x1, z0, z1) {
+                        let (near, far) = distances(x0, x1, z0, z1)
+                        if near >= 8 {
+                            // The lowest slope anywhere on the core's top: at its farthest point if it's above the camera,
+                            // its nearest if below.
+                            let h = oy + Float(core + 1) * s
+                            occluders.append(Occluder(far: far, a0: a0, a1: a1, slope: h >= 0 ? h / far : h / near))
+                        }
+                    }
+                }
+                if n.subtiles[si] <= n.subtiles[si + 1] {
+                    let x0 = ox + Float(n.subtiles[si]) * s, x1 = ox + Float(n.subtiles[si + 1]) * s
+                    let z0 = oz + Float(n.subtiles[si + 4]) * s, z1 = oz + Float(n.subtiles[si + 5]) * s
+                    if let (a0, a1) = angles(x0, x1, z0, z1) {
+                        let (near, far) = distances(x0, x1, z0, z1)
+                        targets.append(Target(near: near, far: far, a0: a0, a1: a1, top: oy + Float(n.subtiles[si + 3]) * s,
+                                              node: Int32(ni), tile: Int16(t), st: Int16(st)))
+                    }
+                }
+            }
+        }
+    }
+    occluders.sort { $0.far < $1.far }
+    targets.sort { $0.near < $1.near }
+    let bins = 4096, perUnit = Float(bins) / 4
+    var horizon = [Float](repeating: -.infinity, count: bins)
+    var vis = [[UInt16]](repeating: [UInt16](repeating: 0xFFFF, count: lodTilesPerSide * lodTilesPerSide), count: chosen.count)
+    var oi = 0
+    for tg in targets {
+        // Every core entirely nearer than this sub-tile joins the horizon, over the bins it fully covers.
+        while oi < occluders.count && occluders[oi].far <= tg.near {
+            let o = occluders[oi]
+            oi += 1
+            var b = Int((o.a0 * perUnit).rounded(.up))
+            let end = Int((o.a1 * perUnit).rounded(.down))
+            while b < end {
+                let k = b & (bins - 1)
+                if horizon[k] < o.slope { horizon[k] = o.slope }
+                b += 1
+            }
+        }
+        // The highest slope of any point of the sub-tile's top: nearest point if above the camera, farthest if below.
+        let slope = tg.top >= 0 ? tg.top / max(tg.near, 1e-3) : tg.top / tg.far
+        let margin = 1e-4 + abs(slope) * 1e-4
+        var b = Int((tg.a0 * perUnit).rounded(.down))
+        let end = Int((tg.a1 * perUnit).rounded(.down))
+        var hidden = true
+        while b <= end {
+            if horizon[b & (bins - 1)] <= slope + margin { hidden = false; break }
+            b += 1
+        }
+        if hidden { vis[Int(tg.node)][Int(tg.tile)] &= ~(UInt16(1) << UInt16(tg.st)) }
+    }
+    var out: [ObjectIdentifier: [UInt16]] = [:]
+    for (ni, (n, _)) in chosen.enumerated() { out[ObjectIdentifier(n)] = vis[ni] }
+    lodHorizonCalls += 1
+    if lodHorizonCalls % 240 == 0 {
+        var hidden = 0
+        for v in vis { for m in v { hidden += 16 - m.nonzeroBitCount } }
+        log(String(format: "horizon: %d occluders, %d sub-tiles tested, %d hidden, %.2f ms", occluders.count, targets.count, hidden,
+                   Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6))
+    }
+    return out
+}
+nonisolated(unsafe) var lodHorizonCalls = 0
