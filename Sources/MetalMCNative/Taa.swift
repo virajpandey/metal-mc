@@ -37,11 +37,11 @@ struct TaaParams {
     float4 shadow;       // ray-traced shadows (RtShadows) folded in: x strength (0: none), y-z fade distance range
 };
 
-// Ray-traced shadows (RtShadows) store, per 2 x 2 pixels, the factor to multiply the color by (strength and distance fade
-// included); p.shadow.x is 0 when there are none this frame.
+// Ray-traced shadows (RtShadows) store, per p.shadow.y x p.shadow.y pixels, the factor to multiply the color by (strength
+// and distance fade included); p.shadow.x is 0 when there are none this frame.
 static half shadowShade(texture2d<half, access::read> lit, uint2 q, constant TaaParams& p) {
     if (p.shadow.x <= 0.0) return 1.0h;
-    return lit.read(min(q / 2, uint2(lit.get_width() - 1, lit.get_height() - 1))).r;
+    return lit.read(min(q / uint(p.shadow.y), uint2(lit.get_width() - 1, lit.get_height() - 1))).r;
 }
 
 static float3 toYCoCg(float3 c) {

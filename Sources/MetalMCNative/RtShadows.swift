@@ -27,10 +27,11 @@ using namespace raytracing;
 struct ShadowParams {
     float4x4 invViewProj;   // inverse of the (jittered) projection * view rotation the level was drawn with
     float4 sun;             // xyz: direction to the sun, w: the cloud layer's bottom, camera-relative
-    float4 sizes;           // full width, full height, half width, half height
+    float4 sizes;           // full width, full height, traced width, traced height
     float4 disk;            // xy: this frame's offset across the sun's disk (tangent plane), z: max ray length, w: 1 = no rays (debug)
     float4 camOffset;       // xyz: the camera's position relative to the instance structure's origin
     float4 shade;           // x: strength, y-z: the distance range over which shadows fade out
+    uint4 sample;           // x: pixels per traced sample along each axis (2 or 4), y-z: this frame's pixel within the block
 };
 
 // What the kernel stores: the factor the pixel's color is multiplied by (1 lit, 1 - strength in full shadow, less far
@@ -53,7 +54,8 @@ kernel void rt_shadow(instance_acceleration_structure accel [[buffer(0)]],
                       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(p.sizes.z) || gid.y >= uint(p.sizes.w)) return;
     uint2 full = uint2(p.sizes.xy);
-    uint2 fp = min(gid * 2, full - 1);
+    // One ray per scale x scale block, from a different pixel of it each frame (the anti-aliasing accumulates them).
+    uint2 fp = min(gid * p.sample.x + p.sample.yz, full - 1);
     float d = depth.read(fp);
     if (d <= 0.0) { out.write(half4(1.0), gid); return; }   // sky: reverse-Z puts the far plane at 0
     float3 pos = relAt(p, fp, d);
@@ -100,8 +102,8 @@ vertex ApplyOut rt_shadow_vs(uint vid [[vertex_id]]) {
 
 // Multiplies the color target by the shade stored for the pixel's 2 x 2 block (without anti-aliasing; with it, the
 // anti-aliasing does this as it loads the color).
-fragment half4 rt_shadow_fs(ApplyOut in [[stage_in]], texture2d<half, access::read> lit [[texture(1)]]) {
-    uint2 hc = min(uint2(in.pos.xy) / 2, uint2(lit.get_width() - 1, lit.get_height() - 1));
+fragment half4 rt_shadow_fs(ApplyOut in [[stage_in]], constant uint& scale [[buffer(0)]], texture2d<half, access::read> lit [[texture(1)]]) {
+    uint2 hc = min(uint2(in.pos.xy) / scale, uint2(lit.get_width() - 1, lit.get_height() - 1));
     return half4(half3(lit.read(hc).r), 1.0h);
 }
 """
@@ -113,7 +115,13 @@ private struct ShadowParams {
     var disk: SIMD4<Float>
     var camOffset: SIMD4<Float> = .zero
     var shade: SIMD4<Float> = .zero
+    var sample: SIMD4<UInt32> = .zero
 }
+
+/// Pixels per traced shadow sample along each axis: 4 (quarter resolution, about 0.5 ms at the panel's resolution; the
+/// anti-aliasing accumulates the rotating samples, and on the real-terrain tours it looked the same as half resolution)
+/// or 2 (METALMC_SHADOWSCALE=2, about 1 ms).
+let rtShadowScale = Int(ProcessInfo.processInfo.environment["METALMC_SHADOWSCALE"] ?? "") == 2 ? 2 : 4
 
 private struct TileKey: Hashable { let node: ObjectIdentifier; let tile: Int }
 /// A tile's structure; a class so marking it used needs no dictionary write.
@@ -343,6 +351,8 @@ final class RtShadows: @unchecked Sendable {
                      deferToTaa: deferToTaa, instances: instances, accels: accels, cpuStart: t0)
     }
 
+    /// A 4 x 4 visiting order that spreads consecutive frames' samples apart (a Bayer order).
+    private static let pattern: [SIMD2<UInt32>] = [0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12].map { SIMD2(UInt32($0 % 4), UInt32($0 / 4)) }
     private var lastChosenKey: [Int] = []
     private var cachedInstances: (instances: [MTLAccelerationStructureInstanceDescriptor], accels: [MTLAccelerationStructure])?
     private var rebuilds = 0
@@ -379,7 +389,8 @@ final class RtShadows: @unchecked Sendable {
             td = d
         }
         guard let tlas = tlasBuffer?.accel else { return false }
-        let w = color.width, h = color.height, hw = (w + 1) / 2, hh = (h + 1) / 2
+        let sc = rtShadowScale
+        let w = color.width, h = color.height, hw = (w + sc - 1) / sc, hh = (h + sc - 1) / sc
         if litTexture == nil || litTexture!.width != hw || litTexture!.height != hh {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: hw, height: hh, mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
@@ -399,7 +410,9 @@ final class RtShadows: @unchecked Sendable {
                                   sizes: SIMD4(Float(w), Float(h), Float(hw), Float(hh)),
                                   disk: SIMD4(rad * cos(ang), rad * sin(ang), 4000, experiments.contains("shnoray") ? 1 : 0),
                                   camOffset: SIMD4(Float(cam.x - origin.x), Float(cam.y - origin.y), Float(cam.z - origin.z), 0),
-                                  shade: SIMD4(strength, 6000, 20000, 0))
+                                  shade: SIMD4(strength, 6000, 20000, 0),
+                                  sample: SIMD4(UInt32(sc), UInt32(Self.pattern[Int(frame % 16)].x % UInt32(sc)),
+                                                UInt32(Self.pattern[Int(frame % 16)].y % UInt32(sc)), 0))
         ctx.endBlit()
         let cb = ctx.ensureCB()
         if let td, let scratch {
@@ -424,7 +437,7 @@ final class RtShadows: @unchecked Sendable {
             rebuilds = 0
         }
         if deferToTaa {
-            deferred = (lit, SIMD4(1, 0, 0, 0), w, h)
+            deferred = (lit, SIMD4(1, Float(sc), 0, 0), w, h)
             return true
         }
         let d = MTLRenderPassDescriptor()
@@ -433,6 +446,8 @@ final class RtShadows: @unchecked Sendable {
         d.colorAttachments[0].storeAction = .store
         guard let renc = cb.makeRenderCommandEncoder(descriptor: d) else { return false }
         renc.setRenderPipelineState(applyPipe)
+        var scale = UInt32(sc)
+        renc.setFragmentBytes(&scale, length: 4, index: 0)
         renc.setFragmentTexture(lit, index: 1)
         renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         renc.endEncoding()
