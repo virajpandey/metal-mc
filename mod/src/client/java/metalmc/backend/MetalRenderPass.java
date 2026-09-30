@@ -35,6 +35,19 @@ final class MetalRenderPass implements RenderPassBackend {
         if (pipeline != null) Mtl.rpSetPipeline(pipeline.handle);
     }
 
+    /**
+     * Near chunks (MetalNearChunks): the value last set for the current pipeline's uniform {@code name} (a buffer slice or
+     * a texture and sampler), or null. Their draw reads vanilla's terrain uniforms.
+     */
+    @Nullable Object uniformValue(String name) {
+        MetalRenderPipeline p = pipeline;
+        if (p == null) return null;
+        for (int i = 0; i < p.uniforms.size(); i++) {
+            if (p.uniforms.get(i).name().equals(name)) return uniforms[i];
+        }
+        return null;
+    }
+
     @Override
     public void pushDebugGroup(Supplier<String> label) {
     }

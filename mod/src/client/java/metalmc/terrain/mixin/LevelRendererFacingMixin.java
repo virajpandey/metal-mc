@@ -3,6 +3,7 @@ package metalmc.terrain.mixin;
 import java.util.List;
 import metalmc.terrain.FacingData;
 import metalmc.terrain.FacingSorter;
+import metalmc.terrain.NearChunks;
 import metalmc.terrain.SectionOcclusion;
 import net.minecraft.client.renderer.DynamicGpuData;
 import net.minecraft.client.renderer.LevelRenderer;
@@ -36,11 +37,16 @@ abstract class LevelRendererFacingMixin {
     @Shadow
     private net.minecraft.client.renderer.ViewArea viewArea;
 
+    @Shadow
+    private boolean usingMultiDrawIndirectForTerrain;
+
     @Inject(method = "extractSectionDrawGroups", at = @At("HEAD"))
     private void metalmc$beginOcclusion(CallbackInfoReturnable<Integer> cir) {
         Vec3 cam = levelRenderState.cameraRenderState.pos;
         SectionOcclusion.beginFrame(cam.x, cam.y, cam.z);
         if (viewArea != null && metalmc.lod.Lod.active()) SectionOcclusion.recordCompiled(((ViewAreaAccessor) viewArea).metalmc$sections());
+        // Near chunks draw from their own per-section stream only on the multi-draw-indirect path.
+        if (NearChunks.ENABLED) NearChunks.beginFrame(usingMultiDrawIndirectForTerrain);
     }
 
     // The section and layer vanilla is working on, recorded by the hooks below as it walks the visible sections
@@ -79,14 +85,27 @@ abstract class LevelRendererFacingMixin {
         return layer;
     }
 
-    /** The section layer's draw (the third List.add in the method): split into the facing buckets that can face the camera. */
+    /**
+     * The section layer's draw (the third List.add in the method): split into the facing buckets that can face the camera.
+     * Near chunks (METALMC_EXP=nearchunks): a layer repacked into the near-chunk arena goes to NearChunks' list instead,
+     * split the same way.
+     */
     @Redirect(method = "extractSectionDrawGroups", at = @At(value = "INVOKE", target = "Ljava/util/List;add(Ljava/lang/Object;)Z", ordinal = 2))
     private boolean metalmc$splitByFacing(List<Object> list, Object element) {
-        if (!FacingSorter.ENABLED || !(element instanceof DynamicGpuData.IndexedDraw draw) || !(currentMesh instanceof FacingData data)) {
+        int near = 0;
+        if (NearChunks.ENABLED && element instanceof DynamicGpuData.IndexedDraw) {
+            near = NearChunks.divertedEntry(currentMesh, currentLayer);
+            // Vanilla's heap holds a placeholder for a slimmed layer: draw nothing rather than garbage.
+            if (near == 0 && NearChunks.slimmed(currentMesh, currentLayer)) return true;
+        }
+        int[] counts = FacingSorter.ENABLED && currentMesh instanceof FacingData data ? data.metalmc$facings(currentLayer) : null;
+        if (!(element instanceof DynamicGpuData.IndexedDraw draw) || (counts == null && near == 0)) {
             return list.add(element);
         }
-        int[] counts = data.metalmc$facings(currentLayer);
-        if (counts == null) return list.add(element);
+        if (counts == null) {
+            NearChunks.add(currentLayer, near, draw.firstIndex() / 6, draw.indexCount() / 6, draw.baseInstance());
+            return true;
+        }
         Vec3 cam = levelRenderState.cameraRenderState.pos;
         int mask = FacingSorter.visibleMask(cam.x, cam.y, cam.z, currentX, currentY, currentZ);
         int quad = 0;
@@ -96,17 +115,21 @@ abstract class LevelRendererFacingMixin {
             if (visible) {
                 if (runStart < 0) runStart = quad;
             } else if (runStart >= 0) {
-                emit(list, draw, runStart, quad);
+                emit(list, draw, runStart, quad, near);
                 runStart = -1;
             }
             quad += counts[b];
         }
-        if (runStart >= 0) emit(list, draw, runStart, quad);
+        if (runStart >= 0) emit(list, draw, runStart, quad, near);
         return true;
     }
 
-    private static void emit(List<Object> list, DynamicGpuData.IndexedDraw draw, int fromQuad, int toQuad) {
+    private static void emit(List<Object> list, DynamicGpuData.IndexedDraw draw, int fromQuad, int toQuad, int near) {
         if (toQuad <= fromQuad) return;
+        if (near != 0) {
+            NearChunks.add(currentLayer, near, draw.firstIndex() / 6 + fromQuad, toQuad - fromQuad, draw.baseInstance());
+            return;
+        }
         if (fromQuad == 0 && (toQuad - fromQuad) * 6 == draw.indexCount()) {
             list.add(draw);   // every bucket visible: keep vanilla's draw
             return;

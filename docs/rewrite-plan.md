@@ -24,6 +24,7 @@ The LOD's quads are the big lever: at levels 1 and up, 95% of their vertex work 
    - Its 28-byte vertices get repacked into a compact form (about 8-12 bytes) in one GPU arena.
    - One GPU-built draw list covers every section.
    - Near chunks become level "−1" of the same system: one seam fewer, and one format for the lighting to extend.
+   - First step built and checked offline (2026-09-30, `METALMC_EXP=nearchunks`, docs/near-chunks-design.md): solid and cutout layers repacked on the mesh workers into 32-byte quad records (3.46× smaller than vanilla's on real terrain), drawn from one arena with vanilla's own uniforms, pixel-identical to vanilla's shader in the offline render checks. The draw list is still built on the CPU; in-game checks pending.
 3. **Visibility buffer + deferred lighting in tile memory (swing 2).** This is the base the lighting is built on. Each pixel is shaded once, and the lighting buffers live in the GPU's on-chip tile memory instead of RAM.
 4. **Lighting milestone 1:**
    - sky and atmosphere;

@@ -4,9 +4,13 @@
 	"compatibilityLevel": "JAVA_25",
 	"client": [
 		"CompiledSectionMeshMixin",
+		"CompiledSectionMeshNearMixin",
+		"DrawIndirectNearMixin",
 		"LevelRendererFacingMixin",
+		"RenderSectionNearMixin",
 		"SectionCompilerMixin",
 		"SectionCompilerResultsMixin",
+		"SectionCompilerResultsNearMixin",
 		"ViewAreaAccessor"
 	],
 	"injectors": {

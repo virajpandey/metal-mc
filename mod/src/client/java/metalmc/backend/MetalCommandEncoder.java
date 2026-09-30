@@ -50,6 +50,11 @@ final class MetalCommandEncoder implements CommandEncoderBackend {
         return currentRenderPass;
     }
 
+    /** The submit being recorded (near chunks tag freed arena ranges with the last submit that drew them). */
+    long currentSubmit() {
+        return currentSubmitIndex;
+    }
+
     void queueForDestroy(Runnable r) {
         destroyQueues[destroyQueueIndex].add(r);
     }
