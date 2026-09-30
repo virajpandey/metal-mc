@@ -89,6 +89,18 @@ loom {
 			if (project.hasProperty("taaBlend")) {
 				environmentVariable "METALMC_TAABLEND", project.findProperty("taaBlend").toString()
 			}
+			if (project.hasProperty("waterGain")) {
+				environmentVariable "METALMC_WATERGAIN", project.findProperty("waterGain").toString()
+			}
+			if (project.hasProperty("grassGain")) {
+				environmentVariable "METALMC_GRASSGAIN", project.findProperty("grassGain").toString()
+			}
+			if (project.hasProperty("waterAlpha")) {
+				environmentVariable "METALMC_WATERALPHA", project.findProperty("waterAlpha").toString()
+			}
+			if (project.hasProperty("transparentShade")) {
+				environmentVariable "METALMC_TRANSPARENTSHADE", project.findProperty("transparentShade").toString()
+			}
 			if (project.hasProperty("ffWidth")) {
 				environmentVariable "METALMC_FFWIDTH", project.findProperty("ffWidth").toString()
 			}

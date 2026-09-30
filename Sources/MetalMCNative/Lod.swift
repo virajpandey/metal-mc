@@ -291,7 +291,7 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
         float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size, dfdy(bc) * size));
         float luma = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
         float mean = top ? sprites[mat].luma.x : sprites[mat].luma.y;
-        color *= clamp(mix(mat == MAT_WATER ? 1.0 : 0.75, luma / max(mean, 0.02), t.a), 0.0, 2.0);
+        color *= clamp(mix(mat == MAT_WATER ? 1.0 : TRANSPARENT_SHADE, luma / max(mean, 0.02), t.a), 0.0, 2.0);
         if ((in.matFace >> 23) & 1) {
             float4 orect = sprites[GRASS_SIDE_SPRITE].top;
             float2 osize = orect.zw - orect.xy;
@@ -489,7 +489,10 @@ let lodMeshQuads = Int(ProcessInfo.processInfo.environment["METALMC_MESHQUADS"] 
 let lodNoLightmap = experiments.contains("nolightmap")
 
 /// Mean alpha of vanilla's water texture (water_still), the LOD water's opacity.
-let lodWaterAlpha: Float = 0.706
+let lodWaterAlpha: Float = Float(ProcessInfo.processInfo.environment["METALMC_WATERALPHA"] ?? "") ?? 0.706
+/// Brightness of transparent texels in texture detail (leaves, ice): through vanilla's cutout leaves you see shaded leaves
+/// further in. METALMC_TRANSPARENTSHADE for calibration runs.
+let lodTransparentShade: Float = Float(ProcessInfo.processInfo.environment["METALMC_TRANSPARENTSHADE"] ?? "") ?? 0.75
 
 /// METALMC_EXP=lodflat turns off LOD texture detail (flat colors, for A/B comparisons).
 let lodFlat = experiments.contains("lodflat")
@@ -626,6 +629,7 @@ final class LodRenderer: @unchecked Sendable {
                     .replacingOccurrences(of: "MESH_QUADS", with: "\(lodMeshQuads)")
                     .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
                     .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")
+                    .replacingOccurrences(of: "TRANSPARENT_SHADE", with: "\(lodTransparentShade)f")
                 library = try ctx.device.makeLibrary(source: src, options: nil)
             }
             if mesh {
@@ -747,6 +751,17 @@ final class LodRenderer: @unchecked Sendable {
         if colorBuffer != nil { return }
         var c = lodColorTable(tints: tints)
         for i in 0..<c.count { c[i] = SIMD4(c[i].x * packRatio[i].x, c[i].y * packRatio[i].y, c[i].z * packRatio[i].z, c[i].w) }
+        // Calibration runs (METALMC_WATERGAIN, METALMC_GRASSGAIN, "r,g,b" or one value): scale the water and grass colors.
+        func gain(_ name: String) -> SIMD3<Float>? {
+            guard let v = ProcessInfo.processInfo.environment[name] else { return nil }
+            let f = v.split(separator: ",").compactMap { Float($0) }
+            return f.count == 3 ? SIMD3(f[0], f[1], f[2]) : (f.count == 1 ? SIMD3(repeating: f[0]) : nil)
+        }
+        func scale(_ mats: [Int], _ g: SIMD3<Float>) {
+            for m in mats { for k in 0..<3 where (m * 3 + k) < c.count { let v = c[m * 3 + k]; c[m * 3 + k] = SIMD4(v.x * g.x, v.y * g.y, v.z * g.z, v.w) } }
+        }
+        if let g = gain("METALMC_WATERGAIN") { scale([Int(Mat.water.rawValue)] + (0..<32).map { Int(lodWaterBase) + $0 }, g) }
+        if let g = gain("METALMC_GRASSGAIN") { scale([Int(Mat.grass.rawValue)] + (0..<32).map { Int(lodGrassBase) + $0 }, g) }
         colorBuffer = ctx.device.makeBuffer(bytes: c, length: c.count * 16, options: [.storageModeShared])
     }
 
