@@ -93,6 +93,7 @@ final class Mtl {
     private static final MethodHandle LOD_TINT_BIOME = h("mmc_lod_tint_biome", false, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT);
     private static final MethodHandle LOD_SET_TINTS = h("mmc_lod_set_tints", false, null, JAVA_LONG, JAVA_INT);
     private static final MethodHandle TAA_APPLY = h("mmc_taa_apply", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_FLOAT, JAVA_FLOAT, JAVA_INT);
+    private static final MethodHandle SHADOWS_APPLY = h("mmc_shadows_apply", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_FLOAT, JAVA_FLOAT, JAVA_FLOAT, JAVA_INT);
     private static final MethodHandle LOD_OPEN3 = h("mmc_lod_open3", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
     private static final MethodHandle OCC_HIDDEN = h("mmc_occ_hidden", true, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
     private static final MethodHandle OCC_TEST = h("mmc_occ_test", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
@@ -341,6 +342,10 @@ final class Mtl {
 
     static void lodSetTints(long colors, int count) {
         try { LOD_SET_TINTS.invokeExact(colors, count); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static int shadowsApply(long color, long depth, long params, long cam, float sunAngle, float strength, float cloudHeight, int taa) {
+        try { return (int) SHADOWS_APPLY.invokeExact(color, depth, params, cam, sunAngle, strength, cloudHeight, taa); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static int taaApply(long color, long depth, long params, long cam, float jitterX, float jitterY, int reset) {

@@ -53,7 +53,14 @@ abstract class GameRendererLodMixin {
     @Inject(method = "render3dHud", at = @At("HEAD"))
     private void metalmc$temporalAA(CameraRenderState cameraState, PlayerRenderState playerState, OptionsRenderState optionsState,
                                     boolean consistentDepthRequired, CallbackInfo ci) {
-        if (!TemporalAA.ENABLED || mainRenderTarget.getColorTexture() == null || mainRenderTarget.getDepthTexture() == null) return;
+        if (mainRenderTarget.getColorTexture() == null || mainRenderTarget.getDepthTexture() == null) return;
+        if (Lod.active() && Lod.SUN_SKY) {
+            // Full strength while the sun is more than about 6 degrees up, fading out as it sets; weaker in rain.
+            float strength = 0.42f * Math.clamp((float) Math.cos(Lod.SUN_ANGLE) * 10f, 0f, 1f) * Lod.SUN_CLEAR;
+            metalmc.backend.MetalShadows.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
+                cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, strength, Lod.CLOUD_HEIGHT, TemporalAA.ENABLED);
+        }
+        if (!TemporalAA.ENABLED) return;
         metalmc.backend.MetalTaa.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), TemporalAA.UNJITTERED,
             cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, TemporalAA.jitterX, TemporalAA.jitterY, false);
     }

@@ -1228,6 +1228,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                          inView: visible)
         : [:]
     for (n, tileMask) in chosen { addTiles(n, tileMask, fadeOutStart: nil) }
+    if lodRtShadows { RtShadows.shared.chosen = chosen }
     for f in r.fadeOut { addTiles(f.node, f.mask, fadeOutStart: f.start) }
     if r.frame % 1000 == 0 {
         var perLevel = [Int](repeating: 0, count: 9), quadsPerLevel = [Int](repeating: 0, count: 9)
@@ -1295,14 +1296,42 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         + draws.filter { !$0.water && $0.fade > 0 }
         + draws.filter { $0.water && !$0.seam && $0.fade == 0 } + draws.filter { $0.water && $0.seam && $0.fade == 0 }
         + draws.filter { $0.water && $0.fade > 0 }
+    // The occlusion test's boxes go after the opaque LOD and before the water, which (with ray-traced shadows on)
+    // writes depth: the test must not see water surfaces as occluders of the floors under them.
+    var boxesDone = false
+    func runBoxes() {
+        boxesDone = true
+        if let vis, testBoxes, let boxPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, box: true),
+           let cb = ctx.cb {
+            enc.setRenderPipelineState(boxPipe)
+            enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
+            enc.setCullMode(.back)   // front faces only: half the fragments of drawing every face
+            enc.setVertexBuffer(vis.boxes, offset: 0, index: 22)
+            enc.setFragmentBuffer(vis.marks, offset: 0, index: 23)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 36, instanceCount: vis.slots.count)
+            vis.frame = r.frame
+            vis.pending = true
+            cb.addCompletedHandler { _ in
+                r.visLock.lock(); vis.done = true; r.visLock.unlock()
+            }
+        } else {
+            vis?.slots.removeAll(keepingCapacity: true)
+        }
+    }
     var state = (seam: false, water: false, fade: false)
     for d in ordered {
+        if d.water && !boxesDone {
+            runBoxes()
+            bound = nil
+            state = (seam: false, water: false, fade: false)
+        }
         let fading = d.fade > 0
         if d.seam != state.seam || d.water != state.water || fading != state.fade {
             let p = fading ? (d.water ? fadeWaterPipe : fadePipe) : (d.water ? (d.seam ? seamWaterPipe : waterPipe) : (d.seam ? seamPipe : pipe))
             guard let p else { continue }   // a pipeline that failed to build: skip its draws, not everything after them
             if d.water && !state.water {
-                enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
+                // Water writes depth only for the ray-traced shadows (its surface, not the floor under it, receives them).
+                enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: lodRtShadows))
                 u.alpha = lodOpaqueWater ? 1 : lodWaterAlpha
                 enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
             }
@@ -1342,22 +1371,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         lodVisSlot = slots
         lodMeasureVisibility(enc, ordered.filter { !$0.water && $0.fade == 0 }.map { ($0.node, $0.first, $0.count) }, ib)
     }
-    if let vis, testBoxes, let boxPipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, box: true),
-       let cb = ctx.cb {
-        enc.setRenderPipelineState(boxPipe)
-        enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: false))
-        enc.setCullMode(.back)   // front faces only: half the fragments of drawing every face
-        enc.setVertexBuffer(vis.boxes, offset: 0, index: 22)
-        enc.setFragmentBuffer(vis.marks, offset: 0, index: 23)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 36, instanceCount: vis.slots.count)
-        vis.frame = r.frame
-        vis.pending = true
-        cb.addCompletedHandler { _ in
-            r.visLock.lock(); vis.done = true; r.visLock.unlock()
-        }
-    } else {
-        vis?.slots.removeAll(keepingCapacity: true)
-    }
+    if !boxesDone { runBoxes() }
     // Minecraft's pipeline, depth, cull and bias state must be re-applied by the next setPipeline.
     ctx.pipe = nil
     ctx.boundPipeState = nil

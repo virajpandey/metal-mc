@@ -34,7 +34,15 @@ struct TaaParams {
     float2 size;         // texture size in pixels
     float reset;         // 1: the history is unusable (first frame, a jump, a gap)
     float blend;         // weight of the current frame when the view is still
+    float4 shadow;       // ray-traced shadows (RtShadows) folded in: x strength (0: none), y-z fade distance range
 };
+
+// Ray-traced shadows (RtShadows) store, per 2 x 2 pixels, the factor to multiply the color by (strength and distance fade
+// included); p.shadow.x is 0 when there are none this frame.
+static half shadowShade(texture2d<half, access::read> lit, uint2 q, constant TaaParams& p) {
+    if (p.shadow.x <= 0.0) return 1.0h;
+    return lit.read(min(q / 2, uint2(lit.get_width() - 1, lit.get_height() - 1))).r;
+}
 
 static float3 toYCoCg(float3 c) {
     return float3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
@@ -81,6 +89,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         depth2d<float, access::read> depth [[texture(1)]],
                         texture2d<float, access::sample> history [[texture(2)]],
                         texture2d<float, access::write> nextHistory [[texture(3)]],
+                        texture2d<half, access::read> lit [[texture(4)]],
                         constant TaaParams& p [[buffer(0)]],
                         uint2 gid [[thread_position_in_grid]],
                         uint2 lid [[thread_position_in_threadgroup]],
@@ -93,8 +102,10 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
     for (uint i = lid.y * 16 + lid.x; i < 18 * 18; i += 256) {
         uint2 q = uint2(clamp(base + int2(i % 18, i / 18), int2(0), size - 1));
         float4 c = color.read(q);
+        float d = depth.read(q);
+        c.rgb *= float(shadowShade(lit, q, p));
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
-        dtile[i] = depth.read(q);
+        dtile[i] = d;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (int(gid.x) >= size.x || int(gid.y) >= size.y) return;
@@ -180,6 +191,7 @@ private struct TaaParams {
     var size: SIMD2<Float>
     var reset: Float
     var blend: Float
+    var shadow: SIMD4<Float> = .zero
 }
 
 /// METALMC_TAABLEND: the current frame's weight when the view is still (default 0.1).
@@ -269,11 +281,15 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     var params = TaaParams(invCur: viewProj.inverse, prev: t.prevViewProj,
                            camDelta: restart ? .zero : SIMD4(Float(delta.x), Float(delta.y), Float(delta.z), 0),
                            size: SIMD2(Float(color.width), Float(color.height)), reset: restart ? 1 : 0, blend: taaBlend)
+    // Ray-traced shadows traced this frame are applied here, as the color is loaded (RtShadows defers to the TAA).
+    let shadows = RtShadows.shared.takeDeferred(width: color.width, height: color.height)
+    if let sh = shadows { params.shadow = sh.params }
     enc.setComputePipelineState(pipe)
     enc.setTexture(color, index: 0)
     enc.setTexture(depth, index: 1)
     enc.setTexture(t.history[t.current], index: 2)
     enc.setTexture(t.history[1 - t.current], index: 3)
+    enc.setTexture(shadows?.lit ?? RtShadows.shared.dummyLit(), index: 4)
     enc.setBytes(&params, length: MemoryLayout<TaaParams>.stride, index: 0)
     // Whole threadgroups: every thread helps load the tile, including those past the edge.
     enc.dispatchThreadgroups(MTLSize(width: (color.width + 15) / 16, height: (color.height + 15) / 16, depth: 1),

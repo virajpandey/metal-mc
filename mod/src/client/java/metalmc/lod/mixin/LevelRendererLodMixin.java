@@ -32,6 +32,11 @@ abstract class LevelRendererLodMixin {
         shift = At.Shift.AFTER))
     private void metalmc$drawLod(ChunkSectionsToRender chunks, FeatureRenderDispatcher.PreparedFrame featureFrame, RenderPass renderPass, CallbackInfo ci) {
         CameraRenderState cam = levelRenderState.cameraRenderState;
+        var sky = levelRenderState.skyRenderState;
+        Lod.SUN_SKY = sky.skybox == net.minecraft.world.level.dimension.DimensionType.Skybox.OVERWORLD;
+        Lod.SUN_ANGLE = sky.sunAngle;
+        Lod.SUN_CLEAR = sky.rainBrightness;
+        Lod.CLOUD_HEIGHT = levelRenderState.cloudHeight;
         if (Lod.active()) drawLod(cam);
         metalmc.terrain.SectionOcclusion.test(Lod.LEVEL_PROJECTION, cam.viewRotationMatrix, cam.pos.x, cam.pos.y, cam.pos.z);
     }

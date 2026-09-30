@@ -44,6 +44,14 @@ public final class Lod implements ClientModInitializer {
     }
 
     /** True once the LOD of the player's dimension is built and should be drawn (and the far plane and fog extended). */
+    /** Vanilla's sun angle (radians) and whether this dimension has the overworld's sky, from the last level drawn. */
+    public static volatile float SUN_ANGLE;
+    public static volatile boolean SUN_SKY;
+    /** 1 in clear weather, lower in rain (vanilla's rain brightness). */
+    public static volatile float SUN_CLEAR = 1f;
+    /** The cloud layer's bottom (world y), from the last level drawn. */
+    public static volatile float CLOUD_HEIGHT = 192f;
+
     public static boolean active() {
         if (!ENABLED || !ready) return false;
         Minecraft mc = Minecraft.getInstance();

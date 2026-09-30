@@ -1258,3 +1258,14 @@ public func mmc_debug_region_emitter_materials(_ path: UnsafePointer<CChar>, _ o
         for e in g.emitters { out[Int(g.v[Int(e)])] += 1 }
     }
 }
+
+/// Debug: quads per material of a region's four level-0 nodes with a given deep-air fill (deepRadius -1: none).
+@_cdecl("mmc_debug_region_quad_materials2")
+public func mmc_debug_region_quad_materials2(_ path: UnsafePointer<CChar>, _ deepRadius: Int32, _ deepDepth: Int32, _ out: UnsafeMutablePointer<Int64>) {
+    for q in 0..<4 {
+        guard var g = LodBuild.regionQuarterGrid(path: String(cString: path), qx: q & 1, qz: q >> 1) else { continue }
+        g.fillUnreachable(deepRadius: Int(deepRadius), deepDepth: Int(deepDepth))
+        let m = LodBuild.mesh(g, maxMerge: 64)
+        for i in 0..<(m.quads.count / 2) { out[Int(m.quads[2 * i + 1] & 255)] += 1 }
+    }
+}
