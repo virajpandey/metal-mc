@@ -218,3 +218,50 @@ that rays passing under forest canopies at grazing angles don't run out of steps
 Next: an absolute reference for that band (level 0 out to 2 km as the answer key), the horizon (rings past the LOD
 from the world generator, with heights in blocks instead of voxels so coarse rings keep full vertical precision),
 ambient occlusion at column feet, and the quad/march boundary moved inward (level 0's hidden quads).
+
+## Night of 2026-10-01: in game at the panel's resolution, towers, rings updated in place
+
+**The answer key again.** The fidelity runs from 2026-09-30 evening on were partly at the wrong resolution: a crash during
+startup (HDR's, since fixed) makes Minecraft's next start windowed and drop its fullscreen mode, and without a mode the
+exclusive fullscreen takes the desktop's ("More Space" on this Mac: 4112 x 2658, scaled down by the system).
+bench_lod.sh now sets the mode (1728 x 1117 @ 120, 3456 x 2234 pixels) and startedCleanly before every run. The answer
+key was rendered again with the current build (`nL0c`, level 0 out to 2 km). Fidelity tour, far band, against it
+(lower is better):
+
+| | far band | near band (vs vanilla) |
+|---|---|---|
+| quads (`m3Q`) | 3.03 | 4.58 |
+| far field (`m3F`) | 4.26 | 4.60 |
+| smart LOD (`m3S`) | 3.15 | 4.58 |
+| near chunks (`m3N`) | 3.02 | 4.58 |
+
+The far field is brighter than the answer key by about 2.7 levels (RGB +2.8 +2.7 +2.2); by surface (`biasclass`): light
+gray +22, dark gray +14 (6.6% of the band, half the bias), dirt +3.6, leaves +1.6 (the quads: +3.2, +2.4, +2.0, +0.5).
+The worst views look north over the ice spikes: the answer key shows the spikes (light blue-gray, standing over the
+snow), the far field's level-1 cells average them into the snow under them (white).
+
+**Towers (columns v3, `LodFarCell.addTower`).** A cell's dry ground can be two heights: a base over the cell and a high
+part standing in a rectangle of it (a spire, a peak, an ice spike, the top of a cliff the cell straddles), instead of
+one mean over the whole cell. At every merge from the blocks up, the children's ground is taken as parts (each child's
+base over its quadrant, its high part in its rectangle); the parts split in two by height where that explains the most
+of their spread (Otsu's split), and the high side is the tower if it stands at least a quarter of the cell (and 2
+blocks) over the rest and its rectangle is at most three quarters of the cell. High parts far apart (a rectangle more
+than twice their share plus an eighth) would stand the whole cell up, so then only the most prominent one is the tower.
+The rectangle is kept in eighths of the cell; `ground` stays the mean, so everything else reads the cell as before. The
+level-2 quadrant cache keeps the towers (24 bytes a cell instead of 18; cache version 7). Word 1 with bit 31 set is a
+tower (its top, rectangle, top block) instead of a canopy (trees covering at least half the cell keep the canopy); the
+march tests it as a box from the bottom to its top beside the base that word 0 holds, and shades its sides with its own
+block where that differs from the base's (a stone peak on grass). `METALMC_EXP=ffnotowers` turns them off.
+
+Offline (`tools/fartest.py render`, the view over the spires at 2.3 km, which ring 1 draws at level 2): 1.1% of the
+pixels change, all on rough terrain (cliff faces near the camera, the ice spikes); zoomed in (`FARTEST_FOV=12`) the
+spires keep their shape and get narrower where they're narrower. The spires themselves are real: from 600 blocks
+closer, at level 1, the same gray columns stand there.
+
+**Rings updated in place.** A ring is now toroidal: cell (x, z) of its level is texel (x mod W, z mod W), and the march
+works in ring coordinates (the world's cells less a multiple of W, so they stay small). A window that moves 64 cells
+clears and writes the 64-cell strip it moved onto instead of all W x W cells, a node that changes writes its own cells,
+a node that goes clears its cells. Offline, along a five-view route: the first view matches a full fill but for 106 of
+1.9 M pixels (coarse pyramid cells at the window's edge now hold neighbors from across the torus: more steps, never a
+different hit), a view after a round trip and one reached from two directions are identical; a move writes 262 K cells
+instead of 8.4 M. `METALMC_EXP=fflog` logs every update with its time, to line them up with long frames.
