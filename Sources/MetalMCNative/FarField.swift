@@ -11,8 +11,10 @@ import simd
 // Data: every LOD node at those levels also keeps two words per column (LodBuild.farColumns): the ground (or water) at
 // block precision, and a tree canopy over it as a slab rays can pass under. Per level there's a ring: a W x W window of
 // that level's columns around the camera (one slice of a 2D array texture), and a max pyramid of column tops over it.
-// A ring is rewritten on the GPU when the camera moves 64 of its cells or the columns of a node in its window change (nodes are rebuilt whenever their region is saved, mostly with the same columns), at most
-// one ring per frame; until then it's drawn with the window it was filled for. A bitmap of the area drawn by quads (levels below the far field's, 64-block cells) is rebuilt every frame and
+// A ring is toroidal (cell (x, z) of its level at texel (x mod W, z mod W)) and updated on the GPU, at most one ring per
+// frame, when the camera moves 64 of its cells (the cells the window moved onto) or nodes in its window come, go or
+// change columns (those nodes' cells; nodes are rebuilt whenever their region is saved, mostly with the same columns);
+// until then it's drawn with the window it holds. A bitmap of the area drawn by quads (levels below the far field's, 64-block cells) is rebuilt every frame and
 // tested where a ray reaches a column: columns in it count as empty, so rays only find terrain the quads don't draw.
 //
 // Drawing: right after the LOD's opaque quads, a shell around the camera at the horizontal distance of the nearest tile
@@ -483,9 +485,10 @@ struct FarUniforms {
     var cam: SIMD4<Float>                    // x: camera height above the world bottom (blocks); y: water alpha;
                                              // z: shell radius (blocks); w: shell top relative to the camera
     var ring: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
-                                             // per ring: camera in ring-local cells (xy), cell size in blocks (z)
+                                             // per ring: camera in ring coordinates (cells, xy), cell size in blocks (z)
     var ringCover: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
-                                             // per ring: its texel 0 in blocks from the coverage bitmap's corner (xy)
+                                             // per ring: its coordinates' origin in blocks from the coverage bitmap's
+                                             // corner (xy), its window's first cell in its coordinates (zw)
 }
 
 let farFieldShaderSource = """
@@ -512,34 +515,37 @@ struct FarUniforms {
     float4 ring[8];
     float4 ringCover[8];
 };
-struct FillParams { int2 nodeCell; int2 ringOrigin; uint ring; uint level; };
+struct FillParams { int2 nodeCell; int2 base; int2 size; uint ring; uint level; };
+struct ClearParams { int2 base; int2 size; uint ring; uint pad; };
 
 constant int W = \(farFieldWidth);
 constant int TOP = \(farFieldMips - 1);
 constant int COVER = \(farFieldCoverCells);
 
-kernel void ff_clear(uint2 gid [[thread_position_in_grid]], constant uint& slice [[buffer(0)]],
+// A ring is toroidal: the cell (x, z) of its level is texel (x mod W, z mod W), so a window that moves only needs the
+// cells it moved onto written. Clears a rectangle of cells (base, size).
+kernel void ff_clear(uint2 gid [[thread_position_in_grid]], constant ClearParams& p [[buffer(0)]],
                      texture2d_array<uint, access::write> data [[texture(0)]],
                      texture2d_array<ushort, access::write> heights [[texture(1)]]) {
-    if (gid.x >= uint(W) || gid.y >= uint(W)) return;
-    data.write(uint4(0), gid, slice);
-    heights.write(ushort4(0), gid, slice);
+    if (gid.x >= uint(p.size.x) || gid.y >= uint(p.size.y)) return;
+    uint2 t = uint2((p.base + int2(gid)) & (W - 1));
+    data.write(uint4(0), t, p.ring);
+    heights.write(ushort4(0), t, p.ring);
 }
 
-// One node's columns (two words each: LodFarCell.words) into its level's ring. The pyramid holds the top of the ground or
-// water, or of the canopy over it.
+// A rectangle (base, size) of one node's columns (two words each: LodFarCell.words) into its level's ring. The pyramid
+// holds the top of the ground or water, or of the canopy (or tower) over it.
 kernel void ff_fill(uint2 gid [[thread_position_in_grid]], constant FillParams& p [[buffer(0)]],
                     const device uint2* cols [[buffer(1)]],
                     texture2d_array<uint, access::write> data [[texture(0)]],
                     texture2d_array<ushort, access::write> heights [[texture(1)]]) {
-    if (gid.x >= 256u || gid.y >= 256u) return;
-    int2 cell = p.nodeCell + int2(gid);
-    int2 local = cell - p.ringOrigin;
-    if (local.x < 0 || local.y < 0 || local.x >= W || local.y >= W) return;
-    uint2 c = cols[gid.y * 256u + gid.x];
-    data.write(uint4(c, 0u, 0u), uint2(local), p.ring);
+    if (gid.x >= uint(p.size.x) || gid.y >= uint(p.size.y)) return;
+    int2 cell = p.base + int2(gid), i = cell - p.nodeCell;
+    uint2 t = uint2(cell & (W - 1));
+    uint2 c = cols[i.y * 256 + i.x];
+    data.write(uint4(c, 0u, 0u), t, p.ring);
     uint top = max((c.x & 511u) + ((c.x >> 9) & 127u), c.y & 511u);
-    heights.write(ushort4(ushort(c.x == 0u ? 0u : top)), uint2(local), p.ring);
+    heights.write(ushort4(ushort(c.x == 0u ? 0u : top)), t, p.ring);
 }
 
 kernel void ff_mip(uint2 gid [[thread_position_in_grid]], constant uint& slice [[buffer(0)]],
@@ -580,7 +586,7 @@ constant float kUnderCanopy = 3.0;
 
 // A neighbor's height for ambient occlusion: its ground's top, or with `canopy` the top of its canopy if that's higher.
 static float solidAt(texture2d_array<uint, access::read> data, int2 c, uint r, bool canopy) {
-    uint2 w = data.read(uint2(clamp(c, int2(0), int2(W - 1))), r).rg;
+    uint2 w = data.read(uint2(c & (W - 1)), r).rg;
     return canopy ? float(max(w.x & 511u, w.y & 511u)) : float(w.x & 511u);
 }
 // Ambient occlusion like the LOD's (vanilla's smooth lighting per voxel corner, bilinear inside the face). A top face's
@@ -661,10 +667,13 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     for (uint r = 0; r < rings && !hit; r++) {
         float4 rc = f.ring[r];
         s = rc.z;
+        // Ring coordinates: cells of the ring's level, offset by a multiple of W from the world's, so the window is
+        // [win, win + W) and a cell's texel is the cell mod W (at pyramid level l, mod W >> l).
+        float2 win = f.ringCover[r].zw;
         float3 o = float3(rc.x, f.cam.x, rc.y);
         float3 d = float3(dir.x / s, dir.y, dir.z / s);
         float2 inv = 1.0 / d.xz;
-        float2 ta = (0.0 - o.xz) * inv, tb = (float(W) - o.xz) * inv;
+        float2 ta = (win - o.xz) * inv, tb = (win + float(W) - o.xz) * inv;
         float2 tmn = min(ta, tb), tmx = max(ta, tb);
         float tEnter = max(max(tmn.x, tmn.y), t);
         float tLeave = min(min(tmx.x, tmx.y), tMax);
@@ -680,8 +689,8 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         for (int i = 0; i < 192; i++) {
             steps++;
             float cs = float(1 << l);
-            float2 cell = clamp(floor(q / cs), 0.0, float(W >> l) - 1.0);
-            float hmax = float(heights.read(uint2(cell), r, l).r);
+            float2 cell = clamp(floor(q / cs), floor(win / cs), floor((win + float(W - 1)) / cs));
+            float hmax = float(heights.read(uint2(int2(cell) & ((W >> l) - 1)), r, l).r);
             float2 nb = (cell + select(float2(0.0), float2(1.0), d.xz > 0.0)) * cs;
             float2 tt = (nb - o.xz) * inv;
             float tExit = min(min(tt.x, tt.y), tLeave);
@@ -699,7 +708,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
                 column = !next;
             }
             if (column) {
-                uint2 cw = data.read(uint2(cell), r).rg;
+                uint2 cw = data.read(uint2(int2(cell) & (W - 1)), r).rg;
                 // Water surfaces sit 10/9 block below the voxel's top, as the LOD draws them (kWaterSurfaceDrop).
                 float top = float((cw.x & 511u) + ((cw.x >> 9) & 127u)) - (((cw.x >> 9) & 127u) != 0u ? 10.0 / 9.0 : 0.0);
                 // The canopy, a slab from its underside to its top over the ground (LodFarCell.words). Or a tower: the
@@ -834,12 +843,19 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
 }
 """
 
-/// Fill parameters (must match FillParams in the shader).
+/// Fill and clear parameters (must match FillParams and ClearParams in the shader).
 struct FarFillParams {
     var nodeCell: SIMD2<Int32>
-    var ringOrigin: SIMD2<Int32>
+    var base: SIMD2<Int32>
+    var size: SIMD2<Int32>
     var ring: UInt32
     var level: UInt32
+}
+struct FarClearParams {
+    var base: SIMD2<Int32>
+    var size: SIMD2<Int32>
+    var ring: UInt32
+    var pad: UInt32 = 0
 }
 
 final class FarField: @unchecked Sendable {
@@ -857,12 +873,13 @@ final class FarField: @unchecked Sendable {
     private var heights: MTLTexture?       // R16Uint with mips, W x W x rings: column tops in blocks above the world bottom
     private var mipViews: [MTLTexture] = []
     private var rings = 0
-    private var origins: [SIMD2<Int>] = []  // per ring: world cell (of its level) at texel 0 for the current camera
+    private var origins: [SIMD2<Int>] = []  // per ring: the window's first cell (of its level) for the current camera
     private var filledOrigins: [SIMD2<Int>] = []   // per ring: the same for the window it holds
+    private var filledNodes: [[SIMD2<Int>: Int]] = []   // per ring: the nodes written into it (first cell: columns hash)
+    private var filled: [Bool] = []
     private var lastFill: [Int] = []
     private var coverOrigin = SIMD2<Int>(0, 0)
     private var cover = [UInt8](repeating: 0, count: farFieldCoverCells * farFieldCoverCells)
-    private var ringKeys: [[Int]] = []     // per ring: its window and the nodes it was filled from
     private var coverBuffer: MTLBuffer?    // the bitmap the current frame draws with (a new one whenever it changes)
     private var lastCover: [UInt8] = []
     private(set) var ready = false
@@ -934,7 +951,8 @@ final class FarField: @unchecked Sendable {
         data = dt
         heights = ht
         rings = n
-        ringKeys = [[Int]](repeating: [], count: n)
+        filledNodes = [[SIMD2<Int>: Int]](repeating: [:], count: n)
+        filled = [Bool](repeating: false, count: n)
         filledOrigins = [SIMD2<Int>](repeating: .zero, count: n)
         lastFill = [Int](repeating: 0, count: n)
         ready = false
@@ -976,65 +994,106 @@ final class FarField: @unchecked Sendable {
             coverBuffer = b
             lastCover = cover
         }
-        // Each ring's nodes, and the rings whose window or nodes' columns changed.
-        var perRing = [[(LodMeshNode, SIMD2<Int>)]](repeating: [], count: rings)
-        var keys = origins.map { [$0.x, $0.y] }
+        // Each ring's nodes in its window, and the rings whose window moved or whose nodes came, went or changed columns.
+        let W = farFieldWidth
+        var perRing = [[SIMD2<Int>: LodMeshNode]](repeating: [:], count: rings)
         for (key, node) in meshes {
             let r = key.level - k
             guard r >= 0, r < rings, node.columns != nil else { continue }
             let cell = SIMD2(node.x0 >> key.level, node.z0 >> key.level)
             let o = origins[r]
-            if cell.x + 256 <= o.x || cell.y + 256 <= o.y || cell.x >= o.x + farFieldWidth || cell.y >= o.y + farFieldWidth { continue }
-            perRing[r].append((node, cell))
-            keys[r].append(node.columnsHash &+ cell.x &* 0x9E37_79B9 &+ cell.y &* 0x85EB_CA6B)
+            if cell.x + 256 <= o.x || cell.y + 256 <= o.y || cell.x >= o.x + W || cell.y >= o.y + W { continue }
+            perRing[r][cell] = node
         }
-        for r in 0..<rings { keys[r] = Array(keys[r][..<2]) + keys[r][2...].sorted() }
         var top = 0
-        for ring in perRing { for (node, _) in ring { top = max(top, node.columnsTop) } }
+        for ring in perRing { for (_, node) in ring { top = max(top, node.columnsTop) } }
         maxTop = Double(min(top, lodWorldHeight))
-        let stale = (0..<rings).filter { ringKeys[$0] != keys[$0] }
-        if stale.isEmpty { return ready }
-        let r = stale.min { lastFill[$0] < lastFill[$1] }!   // the one waiting longest
+        func stale(_ r: Int) -> Bool {
+            if !filled[r] || filledOrigins[r] != origins[r] || perRing[r].count != filledNodes[r].count { return true }
+            for (cell, node) in perRing[r] where filledNodes[r][cell] != node.columnsHash { return true }
+            return false
+        }
+        let staleRings = (0..<rings).filter(stale)
+        if staleRings.isEmpty { return ready }
+        let r = staleRings.min { lastFill[$0] < lastFill[$1] }!   // the one waiting longest
+        // What to write (rectangles of cells of the ring's level, low corner and size): the cells the window moved onto
+        // (all of it the first time or after a jump of a window or more) get cleared and every node's columns there;
+        // elsewhere only nodes that are new or changed get written, and the cells of nodes that went get cleared.
+        let o = origins[r], o1 = o &+ SIMD2(W, W), old = filledOrigins[r], old1 = old &+ SIMD2(W, W)
+        let fresh = !filled[r] || abs(o.x - old.x) >= W || abs(o.y - old.y) >= W
+        func clip(_ a0: SIMD2<Int>, _ a1: SIMD2<Int>, _ b0: SIMD2<Int>, _ b1: SIMD2<Int>) -> (SIMD2<Int>, SIMD2<Int>)? {
+            let lo = SIMD2(max(a0.x, b0.x), max(a0.y, b0.y)), hi = SIMD2(min(a1.x, b1.x), min(a1.y, b1.y))
+            return lo.x < hi.x && lo.y < hi.y ? (lo, hi &- lo) : nil
+        }
+        var exposed: [(SIMD2<Int>, SIMD2<Int>)] = []   // low and high corners
+        if fresh {
+            exposed = [(o, o1)]
+        } else {
+            if o.x < old.x { exposed.append((o, SIMD2(old.x, o1.y))) } else if o.x > old.x { exposed.append((SIMD2(old1.x, o.y), o1)) }
+            let sx0 = max(o.x, old.x), sx1 = min(o1.x, old1.x)
+            if o.y < old.y { exposed.append((SIMD2(sx0, o.y), SIMD2(sx1, old.y))) } else if o.y > old.y { exposed.append((SIMD2(sx0, old1.y), SIMD2(sx1, o1.y))) }
+        }
+        var clears: [(SIMD2<Int>, SIMD2<Int>)] = []
+        for (lo, hi) in exposed { if let c = clip(lo, hi, o, o1) { clears.append(c) } }
+        if !fresh {
+            let k0 = SIMD2(max(o.x, old.x), max(o.y, old.y)), k1 = SIMD2(min(o1.x, old1.x), min(o1.y, old1.y))   // held and still in view
+            for (cell, _) in filledNodes[r] where perRing[r][cell] == nil {
+                if let c = clip(cell, cell &+ SIMD2(256, 256), k0, k1) { clears.append(c) }
+            }
+        }
+        var writes: [(LodMeshNode, SIMD2<Int>, SIMD2<Int>, SIMD2<Int>)] = []   // node, its first cell, rectangle
+        for (cell, node) in perRing[r] {
+            let n1 = cell &+ SIMD2(256, 256)
+            if fresh || filledNodes[r][cell] != node.columnsHash {
+                if let (b, sz) = clip(cell, n1, o, o1) { writes.append((node, cell, b, sz)) }
+            } else {
+                for (lo, hi) in exposed { if let (b, sz) = clip(cell, n1, lo, hi) { writes.append((node, cell, b, sz)) } }
+            }
+        }
         guard let data, let clearPipe, let fillPipe, let mipPipe,
               let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return false }
         cb.label = "MetalMC far field fill"
-        var nodes = 0
-        do {
-            var slice = UInt32(r)
-            enc.setComputePipelineState(clearPipe)
-            enc.setBytes(&slice, length: 4, index: 0)
-            enc.setTexture(data, index: 0)
-            enc.setTexture(mipViews[0], index: 1)
-            enc.dispatchThreads(MTLSize(width: farFieldWidth, height: farFieldWidth, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
-            enc.setComputePipelineState(fillPipe)
-            let o = origins[r]
-            for (node, cell) in perRing[r] {
-                var p = FarFillParams(nodeCell: SIMD2(Int32(cell.x), Int32(cell.y)), ringOrigin: SIMD2(Int32(o.x), Int32(o.y)),
-                                      ring: UInt32(r), level: UInt32(k + r))
-                enc.setBytes(&p, length: MemoryLayout<FarFillParams>.stride, index: 0)
-                enc.setBuffer(node.columns, offset: 0, index: 1)
-                enc.dispatchThreads(MTLSize(width: 256, height: 256, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
-                nodes += 1
-            }
-            enc.setComputePipelineState(mipPipe)
-            enc.setBytes(&slice, length: 4, index: 0)
-            for m in 1..<farFieldMips {
-                enc.setTexture(mipViews[m - 1], index: 0)
-                enc.setTexture(mipViews[m], index: 1)
-                let w = max(1, farFieldWidth >> m)
-                enc.dispatchThreads(MTLSize(width: w, height: w, depth: 1), threadsPerThreadgroup: MTLSize(width: min(16, w), height: min(16, w), depth: 1))
-            }
+        var cells = 0
+        enc.setTexture(data, index: 0)
+        enc.setTexture(mipViews[0], index: 1)
+        enc.setComputePipelineState(clearPipe)
+        for (b, sz) in clears {
+            var p = FarClearParams(base: SIMD2(Int32(b.x), Int32(b.y)), size: SIMD2(Int32(sz.x), Int32(sz.y)), ring: UInt32(r))
+            enc.setBytes(&p, length: MemoryLayout<FarClearParams>.stride, index: 0)
+            enc.dispatchThreads(MTLSize(width: sz.x, height: sz.y, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            cells += sz.x * sz.y
+        }
+        enc.setComputePipelineState(fillPipe)
+        for (node, cell, b, sz) in writes {
+            var p = FarFillParams(nodeCell: SIMD2(Int32(cell.x), Int32(cell.y)), base: SIMD2(Int32(b.x), Int32(b.y)),
+                                  size: SIMD2(Int32(sz.x), Int32(sz.y)), ring: UInt32(r), level: UInt32(k + r))
+            enc.setBytes(&p, length: MemoryLayout<FarFillParams>.stride, index: 0)
+            enc.setBuffer(node.columns, offset: 0, index: 1)
+            enc.dispatchThreads(MTLSize(width: sz.x, height: sz.y, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            cells += sz.x * sz.y
+        }
+        var slice = UInt32(r)
+        enc.setComputePipelineState(mipPipe)
+        enc.setBytes(&slice, length: 4, index: 0)
+        for m in 1..<farFieldMips {
+            enc.setTexture(mipViews[m - 1], index: 0)
+            enc.setTexture(mipViews[m], index: 1)
+            let w = max(1, farFieldWidth >> m)
+            enc.dispatchThreads(MTLSize(width: w, height: w, depth: 1), threadsPerThreadgroup: MTLSize(width: min(16, w), height: min(16, w), depth: 1))
         }
         enc.endEncoding()
         // Committed now, ahead of the frame's own command buffer (committed at the end of the frame), so this frame's
         // draw reads the new rings.
         cb.commit()
-        fills += 1
-        ringKeys[r] = keys[r]
+        self.fills += 1
+        filled[r] = true
         filledOrigins[r] = origins[r]
-        lastFill[r] = fills
-        if fills % 20 == 1 || farFieldLogFills { log("far field: fill \(fills): ring \(r) of \(rings) from level \(k), \(nodes) nodes, \(stale.count) stale") }
-        ready = ready || ringKeys.allSatisfy { !$0.isEmpty }
+        filledNodes[r] = perRing[r].mapValues { $0.columnsHash }
+        lastFill[r] = self.fills
+        if self.fills % 20 == 1 || farFieldLogFills {
+            log("far field: fill \(self.fills): ring \(r) of \(rings) from level \(k), \(fresh ? "all" : "\(clears.count) cleared and \(writes.count) written rectangles,") \(cells) cells, \(staleRings.count) stale")
+        }
+        ready = ready || filled.allSatisfy { $0 }
         return ready
     }
 
@@ -1054,14 +1113,18 @@ final class FarField: @unchecked Sendable {
             let rp = raw.bindMemory(to: SIMD4<Float>.self)
             for r in 0..<rings {
                 let s = Double(1 << (k + r))
-                rp[r] = SIMD4(Float(camX / s - Double(filledOrigins[r].x)), Float(camZ / s - Double(filledOrigins[r].y)), Float(s), 0)
+                // Ring coordinates (the march's): the world's cells less a multiple of W, so the window starts at its
+                // first cell's texel.
+                let base = filledOrigins[r] &- (filledOrigins[r] & SIMD2(repeating: farFieldWidth - 1))
+                rp[r] = SIMD4(Float(camX / s - Double(base.x)), Float(camZ / s - Double(base.y)), Float(s), 0)
             }
         }
         withUnsafeMutableBytes(of: &f.ringCover) { raw in
             let rp = raw.bindMemory(to: SIMD4<Float>.self)
             for r in 0..<rings {
                 let s = 1 << (k + r)
-                rp[r] = SIMD4(Float(filledOrigins[r].x * s - coverOrigin.x * 64), Float(filledOrigins[r].y * s - coverOrigin.y * 64), 0, 0)
+                let win = filledOrigins[r] & SIMD2(repeating: farFieldWidth - 1), base = filledOrigins[r] &- win
+                rp[r] = SIMD4(Float(base.x * s - coverOrigin.x * 64), Float(base.y * s - coverOrigin.y * 64), Float(win.x), Float(win.y))
             }
         }
         var uu = u
