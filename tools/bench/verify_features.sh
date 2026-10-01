@@ -31,7 +31,7 @@ fly ${P}fh -PmetalExp=sky,hdr
 echo "== near band vs vanilla"
 for L in ${P}S ${P}N; do (cd "$SHOTS" && "$FS" . nA nB $L | tail -1); done
 echo "== far band vs the level-0 answer key"
-for L in ${P}S ${P}N; do (cd "$SHOTS" && "$FS" . nL0 nA $L | tail -1); done
+for L in ${P}S ${P}N; do (cd "$SHOTS" && "$FS" . nL0c nA $L | tail -1); done
 echo "== flights"
 for L in ${P}fs ${P}fn ${P}fk ${P}fh; do
   echo "$L: $(grep -h 'METALMC_BENCH label' bench_out/run_$L.log | grep -o 'fps_mean=[^ ]*\|ms_p99=[^ ]*\|frames_over_8ms=[^ ]*\|per_frame_lod_kquads=[^ ]*' | tr '\n' ' ')"

@@ -2,7 +2,7 @@
 # usage: verify_all.sh <prefix> [extra gradle args for every run...]
 # The full in-game check after a batch of changes, one game at a time:
 #   1. fidelity tour (4 km world, fog off) with quads and with the far field: near band vs vanilla (nA/nB), far band vs
-#      the level-0 answer key (nL0, level 0 out to 2 km);
+#      the level-0 answer key (nL0c, level 0 out to 2 km, rendered 2026-10-01 at the panel's resolution);
 #   2. the horizon tour (LOD 262144, generated terrain, far field on);
 #   3. flights on Viraj's world: uncapped (fps, p99, frames over 8.33 ms) and at 120 Hz with vsync (dropped frames),
 #      quads vs far field.
@@ -31,7 +31,7 @@ sed -i '' "s/^enableVsync:.*/enableVsync:false/" mod/run/options.txt
 echo "== near band vs vanilla (192-512 blocks)"
 for L in ${P}Q ${P}F; do (cd "$SHOTS" && "$FS" . nA nB $L | tail -1); done
 echo "== far band vs the level-0 answer key (512 blocks-2 km)"
-for L in ${P}Q ${P}F; do (cd "$SHOTS" && "$FS" . nL0 nA $L | tail -1); done
+for L in ${P}Q ${P}F; do (cd "$SHOTS" && "$FS" . nL0c nA $L | tail -1); done
 echo "== flights"
 for L in ${P}fq ${P}ff ${P}vq ${P}vf; do
   echo "$L: $(grep -h 'METALMC_BENCH label' bench_out/run_$L.log | grep -o 'fps_mean=[^ ]*\|ms_p99=[^ ]*\|frames_over_8ms=[^ ]*\|frames_over_16ms=[^ ]*\|per_frame_lod_kquads=[^ ]*' | tr '\n' ' ')"
