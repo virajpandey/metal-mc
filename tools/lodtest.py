@@ -1,10 +1,11 @@
 """Builds LOD for a world save through libMetalMCNative, outside the game, and prints the result.
 usage: python3 lodtest.py <world dir> [far] [centerX] [centerZ]"""
 import ctypes
+import os
 import sys
 import time
 
-lib = ctypes.CDLL("/Users/rachnap/Projects/metal-mc/.build/release/libMetalMCNative.dylib")
+lib = ctypes.CDLL(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".build/release/libMetalMCNative.dylib"))
 lib.mmc_lod_open.argtypes = [ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
 lib.mmc_lod_open.restype = ctypes.c_int32
 lib.mmc_lod_status.argtypes = [ctypes.POINTER(ctypes.c_int64)]

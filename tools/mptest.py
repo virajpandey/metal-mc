@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 
-lib = ctypes.CDLL("/Users/rachnap/Projects/metal-mc/.build/release/libMetalMCNative.dylib")
+lib = ctypes.CDLL(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".build/release/libMetalMCNative.dylib"))
 lib.mmc_lod_open.argtypes = [ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
 lib.mmc_lod_open.restype = ctypes.c_int32
 lib.mmc_lod_open2.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]

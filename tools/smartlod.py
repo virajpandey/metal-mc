@@ -34,7 +34,7 @@ lib.mmc_debug_lod_quads_in.restype = ctypes.c_int32
 lib.mmc_debug_lod_smart_graph_us.argtypes = [ctypes.c_int32]
 lib.mmc_debug_lod_smart_graph_us.restype = ctypes.c_double
 
-world = sys.argv[1] if len(sys.argv) > 1 else "/Users/rachnap/Projects/metal-mc/fixtures/claudeworld-merged"
+world = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures/claudeworld-merged")
 far = int(sys.argv[2]) if len(sys.argv) > 2 else 8192
 region_dir = f"{world}/dimensions/minecraft/overworld/region"
 SPLIT = 3.0

@@ -10,7 +10,7 @@ import time
 import uuid
 
 fixture = sys.argv[1]
-root = "/Users/rachnap/Projects/metal-mc"
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 run = os.path.join(root, "mod/run-server")
 os.makedirs(run, exist_ok=True)
 world = os.path.join(run, "world")

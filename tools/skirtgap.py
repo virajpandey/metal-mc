@@ -11,7 +11,7 @@ lib.mmc_debug_region_node_mesh.argtypes = [ctypes.c_char_p, ctypes.c_int32, ctyp
                                            ctypes.POINTER(ctypes.c_uint32), ctypes.c_int32, ctypes.POINTER(ctypes.c_int16), ctypes.c_void_p]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Fixtures aren't in git worktrees: fall back to the main checkout's.
-FIX = next(p for p in [os.path.join(ROOT, "fixtures"), "/Users/rachnap/Projects/metal-mc/fixtures"] if os.path.isdir(p))
+FIX = next(p for p in [os.path.join(ROOT, "fixtures"), os.path.expanduser("~/Projects/metal-mc/fixtures")] if os.path.isdir(p))
 REG = os.path.join(FIX, "claudeworld-merged/dimensions/minecraft/overworld/region/r.%d.%d.mca")
 CAP = 3_000_000
 VERBOSE = os.environ.get("VERBOSE") is not None
