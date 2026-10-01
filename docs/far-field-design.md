@@ -303,3 +303,13 @@ far band 3.28 and 3.32 against the older answer key `nL0` (3.03 and 3.34 against
 uncapped 109.8 fps (quads, 3.55 M quads a frame) against 153.1 (far field, 0.87 M; p99 8.39 ms, 115 frames over
 8.33 ms), and at 120 Hz 110.8 fps (the quads can't hold it) against 119.8 with 5 dropped frames in 60 s. The quads'
 earlier numbers (158 fps) came from drawing nothing past 2 km.
+
+**The march, cheaper (2026-10-01 morning).** Offline (`tools/fartest.py render` with `FARTEST_REPEAT=12`,
+`FARTEST_SHELL=512`, the panel's resolution, the flight's world) the march over the flight's view (y 150, 10° down)
+cost 4.0 ms of GPU time with no near geometry in front of it, 29.4 steps per hit pixel. Two changes:
+
+- Each ring's march starts at pyramid level 6 instead of the top (11): from the top every ray that meets terrain first
+  descends 11 levels, while a ray over the terrain climbs a level a step anyway. Flight view 4.02 → 3.51 ms, from 260
+  blocks up 6.04 → 5.50, near the ground 2.94 → 2.38 (level 4: 3.35, 5.39, 2.86); 6 of 7.7 M pixels differ (rays at the
+  step cap). `METALMC_FFSTART` sets it.
+- A top face's corner occlusion read 12 neighbors for 8 distinct ones; now each once (the image is identical).
