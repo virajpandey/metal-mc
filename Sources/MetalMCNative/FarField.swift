@@ -42,8 +42,10 @@ let lodFarTowers = lodFarCells && !experiments.contains("ffnotowers")
 /// Debug (METALMC_EXP=ffsteps): color hits by the number of march steps (green few, red many), misses dark blue.
 let farFieldSteps = experiments.contains("ffsteps")
 /// METALMC_FFGAIN: scales the light on land and trees (not water), standing in for the occlusion of detail finer than a
-/// cell (the quads' voxels keep steps the cells' mean heights smooth away, and with them corners that darken). Default 1.
-let farFieldGain = max(0, Float(ProcessInfo.processInfo.environment["METALMC_FFGAIN"] ?? "") ?? 1)
+/// cell (the quads' voxels keep steps the cells' mean heights smooth away, and with them corners that darken). Default
+/// 0.93, fitted against the level-0 answer key (far band 3.80 at 1, 3.43 at 0.96, 3.32 at 0.93, with the two-occluder
+/// side foot; the quads 3.05).
+let farFieldGain = max(0, Float(ProcessInfo.processInfo.environment["METALMC_FFGAIN"] ?? "") ?? 0.93)
 /// Debug (METALMC_EXP=fflog): log every ring refill (with its time), to line them up with long frames.
 let farFieldLogFills = experiments.contains("fflog")
 /// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
@@ -879,7 +881,13 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
               * columnAO(data, hitCell, hitRing, s, face, solidTop, hitFrac, y, false);
 #endif
     }
-    if (depthVox == 0u || onCanopy || onTower) color *= \(farFieldGain);   // land and trees: METALMC_FFGAIN
+    if (depthVox == 0u || onCanopy || onTower) {
+        // Land and trees (METALMC_FFGAIN): as occlusion, so lit mode's G-buffer predicts this color and relights it alike.
+        color *= \(farFieldGain);
+#if LIT_MODE
+        litAO *= \(farFieldGain);
+#endif
+    }
     if (\(farFieldSteps ? "true" : "false")) color = mix(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), saturate(float(steps) / 128.0));
     float horiz = length(rel.xz);
     float fog = max(linearFog(length(rel), u.envStart, u.envEnd), linearFog(max(horiz, abs(rel.y)), u.rdStart, u.rdEnd));
