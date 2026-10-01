@@ -296,3 +296,10 @@ measurable and gain a little in the far band, more where it doesn't reach (cliff
 - At a locked 120 Hz the two drop as many frames (4-6 in 60 s), the far field's CPU time is lower, and it's the only
   one of the two that reaches the horizon: so it's on by default. `METALMC_FARFIELD=0` (`-PfarField=0`) draws quads at
   every level as before; `tools/bench/verify_all.sh` asks for that explicitly for its quads runs.
+
+Verified with the new defaults (`verify_all.sh m9`, after the projection's far plane was pushed past the LOD, so the
+quads past 2 km are drawn instead of clipped): fidelity near band 4.58 (quads) and 4.60 (far field) against vanilla,
+far band 3.28 and 3.32 against the older answer key `nL0` (3.03 and 3.34 against `nL0c`); the real-terrain flight
+uncapped 109.8 fps (quads, 3.55 M quads a frame) against 153.1 (far field, 0.87 M; p99 8.39 ms, 115 frames over
+8.33 ms), and at 120 Hz 110.8 fps (the quads can't hold it) against 119.8 with 5 dropped frames in 60 s. The quads'
+earlier numbers (158 fps) came from drawing nothing past 2 km.
