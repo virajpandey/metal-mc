@@ -394,17 +394,27 @@ public func mmc_debug_far_render(_ camX: Double, _ camY: Double, _ camZ: Double,
     rp.depthAttachment.clearDepth = 0
     rp.depthAttachment.storeAction = .dontCare
     let sd = MTLSamplerDescriptor()
-    guard let sampler = ctx.device.makeSamplerState(descriptor: sd),
-          let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeRenderCommandEncoder(descriptor: rp) else { return -1 }
-    // Texture detail is off (camFrac.w 0), but its slots get something bound, as the LOD's pass does in the game.
-    enc.setFragmentBuffer(colors, offset: 0, index: 20)
-    enc.setFragmentTexture(lightmap, index: 30)
-    enc.setFragmentSamplerState(sampler, index: 15)
-    FarField.shared.draw(enc, u: u, colors: colors, lightmap: lightmap, lightSampler: sampler, cy: camY, nearest: Double(shell))
-    enc.endEncoding()
-    cb.commit()
-    cb.waitUntilCompleted()
-    if cb.status != .completed { return -1 }
+    guard let sampler = ctx.device.makeSamplerState(descriptor: sd) else { return -1 }
+    // FARTEST_REPEAT=n: draw the march n times and log the median GPU time of a draw (the first is a warm-up).
+    let repeats = max(1, Int(ProcessInfo.processInfo.environment["FARTEST_REPEAT"] ?? "") ?? 1)
+    var times: [Double] = []
+    for _ in 0..<repeats {
+        guard let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeRenderCommandEncoder(descriptor: rp) else { return -1 }
+        // Texture detail is off (camFrac.w 0), but its slots get something bound, as the LOD's pass does in the game.
+        enc.setFragmentBuffer(colors, offset: 0, index: 20)
+        enc.setFragmentTexture(lightmap, index: 30)
+        enc.setFragmentSamplerState(sampler, index: 15)
+        FarField.shared.draw(enc, u: u, colors: colors, lightmap: lightmap, lightSampler: sampler, cy: camY, nearest: Double(shell))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        if cb.status != .completed { return -1 }
+        times.append((cb.gpuEndTime - cb.gpuStartTime) * 1000)
+    }
+    if repeats > 1 {
+        let t = times.dropFirst().sorted()
+        log(String(format: "far field render: march %.3f ms GPU (median of %d, min %.3f)", t[t.count / 2], t.count, t.first ?? 0))
+    }
     // Rows come out bottom-up (the march's shell flips y like the game's GL-style targets).
     var px = [UInt8](repeating: 0, count: W * H * 4)
     color.getBytes(&px, bytesPerRow: W * 4, from: MTLRegionMake2D(0, 0, W, H), mipmapLevel: 0)

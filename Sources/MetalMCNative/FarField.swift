@@ -46,6 +46,12 @@ let farFieldSteps = experiments.contains("ffsteps")
 /// 0.93, fitted against the level-0 answer key (far band 3.80 at 1, 3.43 at 0.96, 3.32 at 0.93, with the two-occluder
 /// side foot; the quads 3.05).
 let farFieldGain = max(0, Float(ProcessInfo.processInfo.environment["METALMC_FFGAIN"] ?? "") ?? 0.93)
+/// METALMC_FFSTART: the pyramid level each ring's march starts at. From the top (11 with 2048-cell rings) rays over
+/// everything leave a ring in one step, but every ray that meets terrain first descends 11 levels; a ray over the terrain
+/// climbs a level a step anyway. Default 6, measured offline at the panel's resolution (the march's GPU time, top → 6):
+/// the flight's view 4.02 → 3.51 ms, from 260 blocks up 6.04 → 5.50, near the ground 2.94 → 2.38; 6 of 7.7 M pixels
+/// differ (rays at the step cap).
+let farFieldStartLevel = Int(ProcessInfo.processInfo.environment["METALMC_FFSTART"] ?? "") ?? 6
 /// Debug (METALMC_EXP=fflog): log every ring refill (with its time), to line them up with long frames.
 let farFieldLogFills = experiments.contains("fflog")
 /// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
@@ -608,10 +614,13 @@ static float solidAt(texture2d_array<uint, access::read> data, int2 c, uint r, b
 static float columnAO(texture2d_array<uint, access::read> data, int2 c, uint r, float s, int face, float top, float2 f, float y,
                       bool canopy) {
     if (face == 2) {
+        // The 8 neighbors once each (the 4 corners share them): -x, +x, -z, +z, then the diagonals in corner order.
+        bool ex0 = solidAt(data, c + int2(-1, 0), r, canopy) > top, ex1 = solidAt(data, c + int2(1, 0), r, canopy) > top;
+        bool ez0 = solidAt(data, c + int2(0, -1), r, canopy) > top, ez1 = solidAt(data, c + int2(0, 1), r, canopy) > top;
         float o[4];
         for (int k = 0; k < 4; k++) {
             int2 dd = int2((k & 1) ? 1 : -1, (k & 2) ? 1 : -1);
-            bool a = solidAt(data, c + int2(dd.x, 0), r, canopy) > top, b = solidAt(data, c + int2(0, dd.y), r, canopy) > top;
+            bool a = (k & 1) ? ex1 : ex0, b = (k & 2) ? ez1 : ez0;
             bool g = solidAt(data, c + dd, r, canopy) > top;
             o[k] = kAO[(a && b) ? 3 : int(a) + int(b) + int(g)];
         }
@@ -696,7 +705,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         float tLeave = min(min(tmx.x, tmx.y), tMax);
         if (!(tEnter < tLeave)) continue;
         int lastAxis = tmn.x > tmn.y ? 0 : 1;
-        int l = TOP;   // rays over everything in the ring (the sky) leave it in one step
+        int l = min(TOP, \(farFieldStartLevel));   // a ray over the terrain climbs a level a step (METALMC_FFSTART)
         float tc = tEnter;
         // Where the ray is (ring cells), kept inside its cell: each crossing puts it half a cell past the boundary it
         // crossed. Recomputed from the ray a small step past the boundary, rounding put rays nearly along x or z back into

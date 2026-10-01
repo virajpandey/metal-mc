@@ -6,7 +6,8 @@ usage: python3 fartest.py <lib dir> shader <out.metal>            the march's sh
        python3 fartest.py <lib dir> render <world dir> <far cache dir> <out prefix> <far> <x> <y> <z> <yaw> <pitch> [...]
 The far field must be on (METALMC_FARFIELD=<level>, set here to 1 unless given); METALMC_EXP picks the A/B switches.
 render: FARTEST_CACHE=<dir> keeps the regions' quadrant cache there; FARTEST_PROBE=level,cx0,cz0,w,h prints cells' words;
-FARTEST_FOV (vertical, degrees, default 70) and FARTEST_SIZE (WxH, default 1728x1117) set the camera.
+FARTEST_FOV (vertical, degrees, default 70) and FARTEST_SIZE (WxH, default 1728x1117) set the camera; FARTEST_SHELL
+(blocks, default 32) where rays start; FARTEST_REPEAT=n logs the march's median GPU time over n draws.
 <far cache dir>: <game dir>/metalmc/lod/far/<world>-<seed hash> (read only)."""
 import ctypes
 import os
@@ -100,10 +101,11 @@ elif cmd == "render":
                                             f"|{words[2 * (j * w + i) + 1] & 511}-{(words[2 * (j * w + i) + 1] >> 9) & 511}" for i in range(w)))
     fov = float(os.environ.get("FARTEST_FOV", "70"))   # vertical field of view, degrees (a narrow one zooms in)
     size = tuple(int(v) for v in os.environ.get("FARTEST_SIZE", "1728x1117").split("x"))
+    shell = float(os.environ.get("FARTEST_SHELL", "32"))   # where rays start (blocks): the game's is its nearest far tile
     for k, (x, y, z, yaw, pitch) in enumerate(views):
         path = f"{prefix}{k}.png"
         for _ in range(100):
-            r = lib.mmc_debug_far_render(x, y, z, yaw, pitch, fov, size[0], size[1], 32.0, path.encode())
+            r = lib.mmc_debug_far_render(x, y, z, yaw, pitch, fov, size[0], size[1], shell, path.encode())
             if r != 0:
                 break
             time.sleep(0.1)
