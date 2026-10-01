@@ -201,9 +201,12 @@ vertex CopyVOut taa_copy_vs(uint vid [[vertex_id]]) {
 // band too; 0 on RGBA16Float) keeps the sky's smooth gradients from banding as the history is written back: the sky's
 // own dither is averaged away in the history.
 static float3 taaDither(float3 c, int2 g, float4 sc) {
-    if (sc.z <= 0.0) return c;
+    if (sc.z == 0.0) return c;
     float2 p = float2(g) + 5.588238 * sc.w;
-    return c + (fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))) - 0.5) * sc.z;
+    float n = fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))) - 0.5;
+    // sc.z < 0: the packed RG11B10Float frame, whose steps are relative to the value (see skyDither).
+    if (sc.z < 0.0) return c * (1.0 + n * float3(1.0 / 64.0, 1.0 / 64.0, 1.0 / 32.0));
+    return c + n * sc.z;
 }
 
 fragment float4 taa_copy_fs(CopyVOut in [[stage_in]], texture2d<float, access::read> h [[texture(0)]],
@@ -389,7 +392,7 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setTexture(sky.apScatter, index: 5)
         enc.setTexture(sky.apTrans, index: 6)
         enc.setTexture(sky.skyView, index: 7)
-        skyDither = color.pixelFormat == .rgba16Float ? 0 : (color.pixelFormat == .rg11b10Float ? 1.0 / 128 : 1.0 / 255)
+        skyDither = color.pixelFormat == .rgba16Float ? 0 : (color.pixelFormat == .rg11b10Float ? -1 : 1.0 / 255)
     } else {
         enc.setComputePipelineState(relight ? (t.litResolve(sky: false) ?? pipe) : pipe)
     }

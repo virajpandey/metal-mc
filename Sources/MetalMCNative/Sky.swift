@@ -333,12 +333,14 @@ static float3 skyToneMap(float3 x, float4 tone) {
     return mix(hue, chan, saturate((m - k) / (m + 8.0 * H)));
 }
 
-// Dither for 8-bit targets (tone.z: its amplitude, 0 for float ones), interleaved gradient noise moving every frame
-// (aerial.w: the frame, mod 64) so the anti-aliasing averages it away: smooth sky gradients don't band.
+// Dither for 8-bit targets (tone.z: its amplitude, 0 for RGBA16Float), interleaved gradient noise moving every frame
+// (aerial.w: the frame, mod 64) so the anti-aliasing averages it away: smooth sky gradients don't band. tone.z < 0:
+// HDR's packed RG11B10Float, whose steps are relative (6-bit mantissas, 5 in blue): a dither relative to the value.
 static float3 skyDither(float3 enc, uint2 q, constant SkyFrame& f) {
-    if (f.tone.z <= 0.0) return enc;
+    if (f.tone.z == 0.0) return enc;
     float2 p = float2(q) + 5.588238 * f.aerial.w;
     float n = fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715))));
+    if (f.tone.z < 0.0) return enc * (1.0 + (n - 0.5) * float3(1.0 / 64.0, 1.0 / 64.0, 1.0 / 32.0));
     return enc + (n - 0.5) * f.tone.z;
 }
 
@@ -932,7 +934,7 @@ final class Sky: @unchecked Sendable {
         let h: Float = isFloat ? max(headroom, 1) : 1
         f.tone.x = h
         f.tone.y = skyKnee(h)
-        f.tone.z = isFloat ? 0 : 1.0 / 255
+        f.tone.z = isFloat ? (target == .rg11b10Float ? -1 : 0) : 1.0 / 255
         enc.setRenderPipelineState(pipe)
         enc.setDepthStencilState(ctx.depthState(compare: .always, write: false))
         enc.setCullMode(.none)
@@ -1018,7 +1020,7 @@ final class Sky: @unchecked Sendable {
         let h: Float = isFloat ? max(headroom, 1) : 1
         f.tone.x = h
         f.tone.y = skyKnee(h)
-        f.tone.z = isFloat ? 0 : 1.0 / 255
+        f.tone.z = isFloat ? (color.pixelFormat == .rg11b10Float ? -1 : 0) : 1.0 / 255
         return f
     }
 
