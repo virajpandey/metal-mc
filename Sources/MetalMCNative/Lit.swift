@@ -33,6 +33,12 @@ import simd
 // pass); PipelineBox gives vanilla's pipelines a variant with the extra target and no writes; the LOD, far field and
 // near chunk shaders are compiled with LIT_MODE 1 and write it; RtShadows stores the raw visibility; mmc_lit_relight
 // runs the pass. Without METALMC_EXP=lit none of it is compiled in or attached.
+//
+// With the GI cache (METALMC_EXP=lit,gi, Gi.swift): RtShadows runs the cache after its shadow rays and leaves its
+// half-resolution light, and where the cache has data for a pixel (giUpsample) it replaces the sky term (the open sky's
+// light on the face times the sky light level's curve): the sky as the real openings let it in, plus bounced light,
+// times AO. Everything else is as above. Without gi the shaders are the same text as before (the GI parts are spliced in
+// only with litGi).
 
 /// METALMC_EXP=lit: deferred relighting of terrain.
 let litEnabled = experiments.contains("lit")
@@ -75,9 +81,26 @@ static uint2 litPack(float3 albedo, float ao, uint face, float depth, float sky,
 #endif
 """
 
+/// With the GI cache (litGi only; empty otherwise, so the relight's text is unchanged without it): litRelightPixel's
+/// extra arguments, and the sky term taken from the cache.
+private let litGiRelightArgsDoc = litGi ? "\n// giIrr, giCode: the GI cache's half-resolution light and code words (gi_resolve; 1 x 1 stand-ins when it didn't run)." : ""
+private let litGiRelightArgs = litGi ? ", texture2d<float> giIrr, texture2d<uint> giCode" : ""
+private let litGiSkyTerm = litGi ? """
+
+        // The GI cache (Gi.swift) where it has data for the pixel's face and plane: the sky's light as the real openings
+        // let it in, plus bounced light, in place of the sky light level's curve. In env's units (the cache's light is
+        // made from it), so the daylight curve's scale and the exposure apply as before. Faces that aren't axis-aligned
+        // (plants) take the top face's beside them. Debug view 8: green where it applied, red where it didn't, blue for
+        // light sources.
+        if (giIrr.get_width() > 1u) {
+            float4 gi = giUpsample(giIrr, giCode, q, fi < 6u ? fi : 2u, rel);
+            if (gi.w > 0.0) { skyAmb = gi.rgb * ao; giUsed = true; }
+        }
+""" : ""
+
 /// The relight's per-pixel work (litRelightPixel), shared by its own pass and by the anti-aliasing's resolve (Taa.swift),
 /// which applies it as it loads each pixel when anti-aliasing is on. Needs skyShaderHeader, then LIT_MODE 1 and
-/// litShaderHeader, before it.
+/// litShaderHeader (and with litGi, giUpsampleHeader), before it.
 let litRelightHeader = """
 
 struct LitFrame {
@@ -121,9 +144,9 @@ static float litFogValue(float d, float s, float e) {
 
 // The relight of pixel q, whose color is dst (as the target holds it), depth d and G-buffer texel g: the color it gets.
 // Pixels that aren't lit terrain keep theirs. env: the sun's light (0), the sky's on each face direction (1-6, the LOD's
-// face order) and on faces that aren't axis-aligned (7), linear, per unit of albedo.
+// face order) and on faces that aren't axis-aligned (7), linear, per unit of albedo.\(litGiRelightArgsDoc)
 static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<half, access::read> vis, texture2d<float> lightmap,
-                              constant LitFrame& f, constant float4* env) {
+                              constant LitFrame& f, constant float4* env\(litGiRelightArgs)) {
     uint code = g.x >> 29;
     uint view = uint(f.misc.z);
     if (code == 0u) return view != 0u ? float3(0.0) : dst;
@@ -161,7 +184,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
 
     // The new light, linear, per unit of albedo.
     float3 E;
-    float vSunOut = 0.0;
+    float vSunOut = 0.0;\(litGi ? "\n    bool giUsed = false;" : "")
     if (block >= 15.0) {
         // Light sources (vanilla gives emissive faces full block light): full bright, like vanilla.
         E = float3(1.0);
@@ -189,7 +212,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         float ndlSun = fi < 6u ? max(dot(n, f.sunDir.xyz), 0.0) : 0.25 + 0.5 * saturate(f.sunDir.y);
         float ndlMoon = fi < 6u ? max(dot(n, f.moonDir.xyz), 0.0) : 0.25 + 0.5 * saturate(f.moonDir.y);
         float3 sun = env[0].rgb * ndlSun * vSun;
-        float3 skyAmb = env[1u + fi].rgb * skyFall * ao;
+        float3 skyAmb = env[1u + fi].rgb * skyFall * ao;\(litGiSkyTerm)
         // The moon, calibrated to vanilla's night: a top face under a high moon gets vanilla's night sky light, 60% of it
         // from the moon itself, 40% from the glow of the night sky.
         float moonLum = litLuma(vanillaSky) * f.moonDir.w;
@@ -212,7 +235,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         else if (view == 4u) c = float3(ao);
         else if (view == 5u) c = skyEncode(skyDecode(float3(0.5)) * E);
         else if (view == 6u) c = float3(vSunOut);
-        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));
+        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));\(litGi ? "\n        else if (view == 8u) c = giUsed ? float3(0.0, 0.8, 0.0) : (block >= 15.0 ? float3(0.0, 0.0, 0.9) : float3(0.9, 0.0, 0.0));" : "")
         return saturate(c);
     }
     return o;
@@ -222,7 +245,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
 private let litShaderSource = skyShaderHeader + """
 
 #define LIT_MODE 1
-\(litShaderHeader)
+\(litShaderHeader)\(litGi ? giUpsampleHeader : "")
 \(litRelightHeader)
 
 struct LitVOut { float4 pos [[position]]; };
@@ -240,13 +263,13 @@ fragment float4 lit_relight_fs(LitVOut in [[stage_in]], float4 dst [[color(0)]],
                                depth2d<float, access::read> depth [[texture(0)]],
                                texture2d<uint, access::read> gbuf [[texture(1)]],
                                texture2d<half, access::read> vis [[texture(2)]],
-                               texture2d<float> lightmap [[texture(3)]],
+                               texture2d<float> lightmap [[texture(3)]],\(litGi ? "\n                               texture2d<float> giIrr [[texture(4)]],\n                               texture2d<uint> giCode [[texture(5)]]," : "")
                                constant LitFrame& f [[buffer(0)]],
                                constant float4* env [[buffer(1)]]) {
     uint2 q = uint2(in.pos.xy);
     uint2 g = gbuf.read(q).rg;
     if ((g.x >> 29) == 0u && f.misc.z == 0.0) return dst;
-    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env), dst.a);
+    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giIrr, giCode" : "")), dst.a);
 }
 
 // The sun's light and the sky's on each face direction, from the atmosphere's tables (with our sky on), scaled by p.x so
@@ -289,7 +312,7 @@ kernel void lit_env(device float4* out [[buffer(0)]], constant SkyFrame& f [[buf
     float3 ground = f.atmo.planet.w * (up + sun * max(f.sun.y, 0.0));
     float3 tz = skyTransmittanceToSpace(trans, f.atmo, r0, 1.0);
     float scale = 1.0 / max(p.x * dot(tz, float3(0.2126, 0.7152, 0.0722)), 1e-6);
-    out[0] = float4(sun * scale, 0.0);
+    out[0] = float4(sun * scale, \(litGi ? "scale" : "0.0"));
     out[1] = float4((px + 0.5 * ground) * scale, 0.0);
     out[2] = float4((nx + 0.5 * ground) * scale, 0.0);
     out[3] = float4(up * scale, 0.0);
@@ -355,12 +378,19 @@ final class Lit: @unchecked Sendable {
     private var envBuffer: MTLBuffer?
     private var dummyLightmap: MTLTexture?
     private var dummyVis: MTLTexture?
+    /// With the GI cache: 1 x 1 stand-ins for its light and code words when it didn't run this frame.
+    private var dummyGi: (irr: MTLTexture, code: MTLTexture)?
     private var failed = false
-    private var frames = 0, relit = 0, missed = 0
+    private var frames = 0, relit = 0, missed = 0, giFrames = 0
     /// Debug view (METALMC_LITVIEW, see lit_relight_fs; mmc_lit_set_view offline).
     var view: Float = Float(ProcessInfo.processInfo.environment["METALMC_LITVIEW"] ?? "") ?? 0
     /// Offline timing only: leave the G-buffer out of the main pass.
     var noAttach = false
+    /// With the GI cache: whether the relight takes its light (offline A/B, mmc_debug_lit_gi; the cache runs either way).
+    var useGi = true
+    /// Whether the last relight had the atmosphere's light (the GI cache, which runs before it in the frame, takes the
+    /// same kind of light: a frame late when the sky turns on or off).
+    private(set) var lastAtmosphere = false
 
     /// Adds the G-buffer to the level's main pass (mmc_pass_begin), cleared to "not lit terrain".
     func attach(_ d: MTLRenderPassDescriptor, color: MTLTexture) -> Bool {
@@ -383,26 +413,38 @@ final class Lit: @unchecked Sendable {
         return true
     }
 
-    private func ensure(format: MTLPixelFormat) -> Bool {
+    /// The library, the sun and sky kernel and the stand-in textures.
+    private func ensureLibrary() -> Bool {
         if failed { return false }
-        if library == nil {
-            do {
-                let lib = try ctx.device.makeLibrary(source: litShaderSource, options: nil)
-                envPipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "lit_env")!)
-                library = lib
-            } catch {
-                log("lit: shaders failed: \(error)")
-                failed = true
-                return false
-            }
-            envBuffer = ctx.device.makeBuffer(length: 8 * 16, options: .storageModePrivate)
-            let d1 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
-            d1.usage = .shaderRead
-            dummyLightmap = ctx.device.makeTexture(descriptor: d1)
-            let d2 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: 1, height: 1, mipmapped: false)
-            d2.usage = .shaderRead
-            dummyVis = ctx.device.makeTexture(descriptor: d2)
+        if library != nil { return true }
+        do {
+            let lib = try ctx.device.makeLibrary(source: litShaderSource, options: nil)
+            envPipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "lit_env")!)
+            library = lib
+        } catch {
+            log("lit: shaders failed: \(error)")
+            failed = true
+            return false
         }
+        envBuffer = ctx.device.makeBuffer(length: 8 * 16, options: .storageModePrivate)
+        let d1 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+        d1.usage = .shaderRead
+        dummyLightmap = ctx.device.makeTexture(descriptor: d1)
+        let d2 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: 1, height: 1, mipmapped: false)
+        d2.usage = .shaderRead
+        dummyVis = ctx.device.makeTexture(descriptor: d2)
+        if litGi {
+            let d3 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg11b10Float, width: 1, height: 1, mipmapped: false)
+            d3.usage = .shaderRead
+            let d4 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Uint, width: 1, height: 1, mipmapped: false)
+            d4.usage = .shaderRead
+            if let a = ctx.device.makeTexture(descriptor: d3), let b = ctx.device.makeTexture(descriptor: d4) { dummyGi = (a, b) }
+        }
+        return true
+    }
+
+    private func ensure(format: MTLPixelFormat) -> Bool {
+        if !ensureLibrary() { return false }
         if relightPipes[format.rawValue] == nil, let lib = library {
             let d = MTLRenderPipelineDescriptor()
             d.label = "MetalMC lit relight"
@@ -418,8 +460,27 @@ final class Lit: @unchecked Sendable {
         return relightPipes[format.rawValue] != nil && envPipe != nil && envBuffer != nil
     }
 
+    /// The GI cache's light (Gi.swift, encodeFrame with the atmosphere): this frame's sun and sky light from the sky's
+    /// tables, as the relight will compute them (lit_env), into `buffer` (9 float4: the 8 of env, the sky view table's
+    /// scale in the first one's w with litGi) in `enc`. False if the sky's tables or the kernel aren't there.
+    func encodeEnv(_ enc: MTLComputeCommandEncoder, into buffer: MTLBuffer) -> Bool {
+        let sky = Sky.shared
+        guard ensureLibrary(), let envPipe, sky.ready, let trans = sky.transmittance, let skyView = sky.skyView else { return false }
+        var frame = sky.frame
+        var scale = SIMD4<Float>(1.12 * skyExposure, 0, 0, 0)
+        enc.setComputePipelineState(envPipe)
+        enc.setBuffer(buffer, offset: 0, index: 0)
+        enc.setBytes(&frame, length: MemoryLayout<SkyFrameGPU>.stride, index: 1)
+        enc.setBytes(&scale, length: 16, index: 2)
+        enc.setTexture(trans, index: 0)
+        enc.setTexture(skyView, index: 1)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        return true
+    }
+
     /// Left for the anti-aliasing's resolve this frame (see bindDeferred).
-    private var deferred: (frame: LitFrameGPU, daylight: [SIMD4<Float>], vis: MTLTexture, lightmap: MTLTexture, width: Int, height: Int)?
+    private var deferred: (frame: LitFrameGPU, daylight: [SIMD4<Float>], vis: MTLTexture, lightmap: MTLTexture, gi: (irr: MTLTexture, code: MTLTexture)?,
+                           width: Int, height: Int)?
 
     /// True if this frame's relight was left for the anti-aliasing's resolve (Taa.swift), at this size.
     func hasDeferred(width: Int, height: Int) -> Bool {
@@ -428,7 +489,7 @@ final class Lit: @unchecked Sendable {
     }
 
     /// Binds the deferred relight's inputs to the anti-aliasing's resolve (its taaLit variant: buffers 2 and 3, textures
-    /// 8-10) and forgets it.
+    /// 8-10, and with the GI cache 11 and 12) and forgets it.
     func bindDeferred(_ enc: MTLComputeCommandEncoder) {
         guard var d = deferred, let gbuffer, let envBuffer else { return }
         deferred = nil
@@ -441,6 +502,18 @@ final class Lit: @unchecked Sendable {
         enc.setTexture(gbuffer, index: 8)
         enc.setTexture(d.vis, index: 9)
         enc.setTexture(d.lightmap, index: 10)
+        if let gi = d.gi {
+            enc.setTexture(gi.irr, index: 11)
+            enc.setTexture(gi.code, index: 12)
+        }
+    }
+
+    /// With the GI cache: this frame's light from it (RtShadows ran it), or the stand-ins.
+    private func giTextures(width: Int, height: Int) -> (irr: MTLTexture, code: MTLTexture)? {
+        guard litGi, let dummyGi else { return nil }
+        guard let g = RtShadows.shared.takeLitGi(width: width, height: height), useGi else { return dummyGi }
+        giFrames += 1
+        return (g.irr, g.code)
     }
 
     /// Relights the terrain of the level just drawn into `color` (see the top of this file). Needs no pass open.
@@ -486,6 +559,8 @@ final class Lit: @unchecked Sendable {
             f.size.z = Float(v.scale)
             f.sunDir.w = v.moon ? 1 : 0
         }
+        let gi = giTextures(width: color.width, height: color.height)
+        lastAtmosphere = atmosphere
         ctx.endBlit()
         let cb = ctx.ensureCB()
         var daylight: [SIMD4<Float>] = []
@@ -505,7 +580,7 @@ final class Lit: @unchecked Sendable {
             daylight = litDaylightEnv(sunAngle: sunAngle)
         }
         if deferToTaa {
-            deferred = (f, daylight, visTexture, lightmap ?? dummyLightmap!, color.width, color.height)
+            deferred = (f, daylight, visTexture, lightmap ?? dummyLightmap!, gi, color.width, color.height)
             countFrame(atmosphere: atmosphere, traced: f.size.z > 0)
             return true
         }
@@ -521,6 +596,10 @@ final class Lit: @unchecked Sendable {
         enc.setFragmentTexture(gbuffer, index: 1)
         enc.setFragmentTexture(visTexture, index: 2)
         enc.setFragmentTexture(lightmap ?? dummyLightmap, index: 3)
+        if let gi {
+            enc.setFragmentTexture(gi.irr, index: 4)
+            enc.setFragmentTexture(gi.code, index: 5)
+        }
         enc.setFragmentBytes(&f, length: MemoryLayout<LitFrameGPU>.stride, index: 0)
         if daylight.isEmpty {
             enc.setFragmentBuffer(envBuffer, offset: 0, index: 1)
@@ -537,8 +616,9 @@ final class Lit: @unchecked Sendable {
     private func countFrame(atmosphere: Bool, traced: Bool) {
         relit += 1
         if frames % 1200 == 0 {
-            log("lit: relit \(relit) of the last 1200 frames (\(atmosphere ? "atmosphere" : "vanilla daylight"), \(traced ? "traced visibility" : "no rays"))")
+            log("lit: relit \(relit) of the last 1200 frames (\(atmosphere ? "atmosphere" : "vanilla daylight"), \(traced ? "traced visibility" : "no rays")\(litGi ? ", GI cache in \(giFrames)" : ""))")
             relit = 0
+            giFrames = 0
         }
     }
 
@@ -625,6 +705,14 @@ public func mmc_lit_set_view(_ view: Int32) {
 @_cdecl("mmc_lit_set_no_attach")
 public func mmc_lit_set_no_attach(_ on: Int32) {
     Lit.shared.noAttach = on != 0
+}
+
+/// Offline A/B with the GI cache (METALMC_EXP=lit,gi): 0 relights with the sky term as without the cache, which keeps
+/// running; 1 (default) takes the cache's light. Returns 1 if the cache is wired (litGi).
+@_cdecl("mmc_debug_lit_gi")
+public func mmc_debug_lit_gi(_ on: Int32) -> Int32 {
+    Lit.shared.useGi = on != 0
+    return litGi ? 1 : 0
 }
 
 /// Offline: encodes a copy of the G-buffer (RG32Uint, 8 bytes a pixel, rows bottom-up like every target) into `buffer`

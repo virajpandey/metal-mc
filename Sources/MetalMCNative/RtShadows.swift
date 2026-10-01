@@ -13,6 +13,13 @@ import simd
 // Lit mode (METALMC_EXP=lit, Lit.swift): the kernel stores the raw visibility instead (1 lit, 0 shadowed, toward 1 with
 // distance where the haze takes over), toward the sun, or toward the moon while the sun is down, and nothing darkens the
 // color: the relight multiplies the sun's (or moon's) light by it, and the anti-aliasing doesn't apply it again.
+//
+// With the GI cache (METALMC_EXP=lit,gi, Gi.swift): each tile's structure has one geometry per quad range of its node's
+// buffer (the opaque faces, then the tile-edge skirts: giTileMesh; the same triangles), and the instance structure comes
+// with a table of each instance's node buffer address and ranges (GiTile), so a bounce ray reads what it hit from the
+// quad itself: no per-triangle data in the structures. After the shadow rays the cache runs its frame (GiCache
+// encodeFrame) on the same depth, projection, origin and instance structure, and leaves its half-resolution light for
+// the relight like the visibility.
 
 /// On with `shadows=true` in config/metalmc.properties (mmc_set_rt_shadows at startup) or METALMC_EXP=rtshadows.
 nonisolated(unsafe) var lodRtShadows = experiments.contains("rtshadows")
@@ -133,6 +140,8 @@ private final class BlasEntry {
     let node: LodMeshNode   // kept alive so its identifier can't be reused while the entry exists
     let accel: MTLAccelerationStructure
     var lastUsed: UInt64
+    /// With the GI cache: the structure's geometries' quad ranges in the node's buffer (giTileMesh).
+    var giRanges: [(first: Int, count: Int)] = []
     init(_ node: LodMeshNode, _ accel: MTLAccelerationStructure, _ lastUsed: UInt64) { self.node = node; self.accel = accel; self.lastUsed = lastUsed }
 }
 
@@ -160,6 +169,21 @@ final class RtShadows: @unchecked Sendable {
     private var origin = SIMD3<Double>(0, 0, 0)
     private var instanceKey: [ObjectIdentifier] = []
     private var tlasAccels: [MTLAccelerationStructure] = []   // the structures the current instance structure references
+    /// With the GI cache: the current instance structure's GiTile table and the node buffers it points into.
+    private var tlasGi: (table: MTLBuffer, buffers: [MTLBuffer])?
+    /// With the GI cache: its half-resolution light and code words this frame, for the relight (takeLitGi).
+    private var giIrr: MTLTexture?, giCode: MTLTexture?
+    private var litGiOut: (irr: MTLTexture, code: MTLTexture, width: Int, height: Int)?
+    private var giRuns = 0
+    /// Offline timing (mmc_debug_gi_frame): 0 skips the cache's frame.
+    var giOn = true
+
+    /// Lit mode with the GI cache: this frame's light from it (gi_resolve's output and code words, half the frame's size).
+    func takeLitGi(width: Int, height: Int) -> (irr: MTLTexture, code: MTLTexture)? {
+        defer { litGiOut = nil }
+        guard let g = litGiOut, g.width == width, g.height == height else { return nil }
+        return (g.irr, g.code)
+    }
 
     func takeDeferred(width: Int, height: Int) -> (lit: MTLTexture, params: SIMD4<Float>)? {
         defer { deferred = nil }
@@ -248,21 +272,28 @@ final class RtShadows: @unchecked Sendable {
             [SIMD3(0, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0), SIMD3(1, 0, 0)],
         ]
         var verts: [Float] = [], idx: [UInt32] = []
-        for k in 0..<lodBucketsPerTile where k < 6 || k >= 12 {
-            let a = n.start[lodBucketIndex(t, k, 0)], b = n.start[lodBucketIndex(t, k, lodSubtilesPerTile)]
-            for i in a..<b {
-                let w0 = q[2 * i], w1 = q[2 * i + 1]
-                let face = Int((w0 >> 25) & 7)
-                if face > 5 { continue }
-                let local = SIMD3(Float(w0 & 255), Float((w0 >> 16) & 511), Float((w0 >> 8) & 255))
-                let qw = Float(((w1 >> 8) & 255) + 1), qh = Float(((w1 >> 16) & 255) + 1)
-                let ext: SIMD3<Float> = face < 2 ? SIMD3(1, qw, qh) : (face < 4 ? SIMD3(qw, 1, qh) : SIMD3(qw, qh, 1))
-                let base = UInt32(verts.count / 3)
-                for c in corners[face] {
-                    let p = (local + c * ext) * scale
-                    verts += [p.x, p.y, p.z]
+        var giRanges: [(first: Int, count: Int)] = []
+        if litGi {
+            // The same quads, one geometry per quad range of the node's buffer: the GI cache's bounce rays find the quad
+            // they hit from the geometry and primitive index (zero copy).
+            (verts, idx, giRanges) = giTileMesh(quads: q, start: n.start, tile: t, level: n.level)
+        } else {
+            for k in 0..<lodBucketsPerTile where k < 6 || k >= 12 {
+                let a = n.start[lodBucketIndex(t, k, 0)], b = n.start[lodBucketIndex(t, k, lodSubtilesPerTile)]
+                for i in a..<b {
+                    let w0 = q[2 * i], w1 = q[2 * i + 1]
+                    let face = Int((w0 >> 25) & 7)
+                    if face > 5 { continue }
+                    let local = SIMD3(Float(w0 & 255), Float((w0 >> 16) & 511), Float((w0 >> 8) & 255))
+                    let qw = Float(((w1 >> 8) & 255) + 1), qh = Float(((w1 >> 16) & 255) + 1)
+                    let ext: SIMD3<Float> = face < 2 ? SIMD3(1, qw, qh) : (face < 4 ? SIMD3(qw, 1, qh) : SIMD3(qw, qh, 1))
+                    let base = UInt32(verts.count / 3)
+                    for c in corners[face] {
+                        let p = (local + c * ext) * scale
+                        verts += [p.x, p.y, p.z]
+                    }
+                    idx += [base, base + 1, base + 2, base, base + 2, base + 3]
                 }
-                idx += [base, base + 1, base + 2, base, base + 2, base + 3]
             }
         }
         let dev = ctx.device
@@ -281,7 +312,7 @@ final class RtShadows: @unchecked Sendable {
         g.triangleCount = idx.count / 3
         g.opaque = true
         let d = MTLPrimitiveAccelerationStructureDescriptor()
-        d.geometryDescriptors = [g]
+        d.geometryDescriptors = litGi ? giGeometries(vb: vb, ib: ib, triangles: idx.count / 3, ranges: giRanges) : [g]
         let sizes = dev.accelerationStructureSizes(descriptor: d)
         guard let accel = dev.makeAccelerationStructure(size: sizes.accelerationStructureSize),
               let scratch = dev.makeBuffer(length: max(sizes.buildScratchBufferSize, 16), options: .storageModePrivate),
@@ -293,6 +324,7 @@ final class RtShadows: @unchecked Sendable {
         enc.build(accelerationStructure: accel, descriptor: d, scratchBuffer: scratch, scratchBufferOffset: 0)
         enc.writeCompactedSize(accelerationStructure: accel, buffer: sizeBuf, offset: 0, sizeDataType: .ulong)
         enc.endEncoding()
+        let ranges = giRanges
         cb.addCompletedHandler { [self] _ in
             // Then a compacted copy (about half the memory, same speed), from the build queue's own thread.
             cpuQueue.async { [self] in
@@ -308,7 +340,9 @@ final class RtShadows: @unchecked Sendable {
                 }
                 lock.lock()
                 building.remove(key)
-                blas[key] = BlasEntry(n, final, frame)
+                let entry = BlasEntry(n, final, frame)
+                entry.giRanges = ranges
+                blas[key] = entry
                 lock.unlock()
             }
         }
@@ -334,17 +368,24 @@ final class RtShadows: @unchecked Sendable {
         if chosenKey == lastChosenKey, let cached = cachedInstances {
             lock.unlock()
             return trace(color: color, depth: depth, p: p, cam: cam, sunAngle: sunAngle, strength: strength, cloudHeight: cloudHeight,
-                         deferToTaa: deferToTaa, instances: cached.instances, accels: cached.accels, cpuStart: t0)
+                         deferToTaa: deferToTaa, instances: cached.instances, accels: cached.accels, gi: cached.gi, cpuStart: t0)
         }
         lastChosenKey = chosenKey
         var accels: [MTLAccelerationStructure] = []
         var instances: [MTLAccelerationStructureInstanceDescriptor] = []
+        // With the GI cache: each instance's GiTile (its node's buffer and quad ranges) and the node buffers.
+        var giTiles: [SIMD4<UInt32>] = [], giBuffers: [MTLBuffer] = []
         for (n, mask) in chosen {
             let id = ObjectIdentifier(n)
             let at = SIMD3(Float(Double(n.x0) - origin.x), Float(Double(lodWorldMinY) - origin.y), Float(Double(n.z0) - origin.z))
+            var nodeUsed = false
             for t in 0..<(lodTilesPerSide * lodTilesPerSide) where mask & (1 << UInt16(t)) != 0 {
                 guard let e = blas[TileKey(node: id, tile: t)] else { continue }
                 e.lastUsed = frame
+                if litGi {
+                    giTiles.append(giTileEntry(n.buffer, e.giRanges))
+                    if !nodeUsed { giBuffers.append(n.buffer); nodeUsed = true }
+                }
                 let ai = UInt32(accels.count)
                 accels.append(e.accel)
                 var inst = MTLAccelerationStructureInstanceDescriptor()
@@ -360,20 +401,21 @@ final class RtShadows: @unchecked Sendable {
         // Structures unused for 10 s are released.
         if frame % 600 == 0 { blas = blas.filter { frame - $0.value.lastUsed < 1200 } }
         lock.unlock()
-        cachedInstances = (instances, accels)
+        cachedInstances = (instances, accels, (giTiles, giBuffers))
         return trace(color: color, depth: depth, p: p, cam: cam, sunAngle: sunAngle, strength: strength, cloudHeight: cloudHeight,
-                     deferToTaa: deferToTaa, instances: instances, accels: accels, cpuStart: t0)
+                     deferToTaa: deferToTaa, instances: instances, accels: accels, gi: (giTiles, giBuffers), cpuStart: t0)
     }
 
     /// A 4 x 4 visiting order that spreads consecutive frames' samples apart (a Bayer order).
     private static let pattern: [SIMD2<UInt32>] = [0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12].map { SIMD2(UInt32($0 % 4), UInt32($0 / 4)) }
     private var lastChosenKey: [Int] = []
-    private var cachedInstances: (instances: [MTLAccelerationStructureInstanceDescriptor], accels: [MTLAccelerationStructure])?
+    private var cachedInstances: (instances: [MTLAccelerationStructureInstanceDescriptor], accels: [MTLAccelerationStructure],
+                                  gi: (tiles: [SIMD4<UInt32>], buffers: [MTLBuffer]))?
     private var rebuilds = 0
 
     private func trace(color: MTLTexture, depth: MTLTexture, p: UnsafePointer<Float>, cam: SIMD3<Double>, sunAngle: Float, strength: Float,
                        cloudHeight: Float, deferToTaa: Bool, instances: [MTLAccelerationStructureInstanceDescriptor],
-                       accels: [MTLAccelerationStructure], cpuStart: UInt64) -> Bool {
+                       accels: [MTLAccelerationStructure], gi: (tiles: [SIMD4<UInt32>], buffers: [MTLBuffer]), cpuStart: UInt64) -> Bool {
         guard let kernel, let applyPipe = applyPipes[color.pixelFormat.rawValue] else { return false }
         if instances.isEmpty { return false }
         // Rebuild only when the set of tile structures (or the origin) changed.
@@ -438,6 +480,10 @@ final class RtShadows: @unchecked Sendable {
             aenc.endEncoding()
             instanceKey = key
             tlasAccels = accels
+            if litGi {
+                tlasGi = gi.tiles.count == instances.count
+                    ? dev.makeBuffer(bytes: gi.tiles, length: gi.tiles.count * 16, options: .storageModeShared).map { ($0, gi.buffers) } : nil
+            }
         }
         guard let enc = cb.makeComputeCommandEncoder() else { return false }
         enc.setComputePipelineState(kernel)
@@ -448,6 +494,11 @@ final class RtShadows: @unchecked Sendable {
         enc.setTexture(lit, index: 1)
         enc.dispatchThreads(MTLSize(width: hw, height: hh, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
+        // Lit mode with the GI cache: its frame, on the same depth, projection, origin and instance structure.
+        if litGi && giOn {
+            encodeGi(cb: cb, depth: depth, invViewProj: params.invViewProj, cam: cam, sunAngle: sunAngle, cloudHeight: cloudHeight, tlas: tlas,
+                     width: w, height: h)
+        }
         if frame % 240 == 0 {
             log(String(format: "rt shadows: %d tiles, %d instance-structure rebuilds in the last 240 frames, %.3f ms CPU", instances.count, rebuilds,
                        Double(DispatchTime.now().uptimeNanoseconds - cpuStart) / 1e6))
@@ -478,6 +529,44 @@ final class RtShadows: @unchecked Sendable {
         }
         return true
     }
+
+    /// Lit mode with the GI cache (METALMC_EXP=lit,gi): its frame after the shadow rays (GiCache.encodeFrame), with the
+    /// light the relight had last frame (the atmosphere's or the daylight curve's), its output left for the relight.
+    private func encodeGi(cb: MTLCommandBuffer, depth: MTLTexture, invViewProj: simd_float4x4, cam: SIMD3<Double>, sunAngle: Float,
+                          cloudHeight: Float, tlas: MTLAccelerationStructure, width w: Int, height h: Int) {
+        guard let cache = GiCache.shared, let gi = tlasGi else { return }
+        let hw = (w + 1) / 2, hh = (h + 1) / 2
+        if giIrr == nil || giIrr!.width != hw || giIrr!.height != hh {
+            func tex(_ format: MTLPixelFormat) -> MTLTexture? {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: hw, height: hh, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]
+                d.storageMode = .private
+                return ctx.device.makeTexture(descriptor: d)
+            }
+            giIrr = tex(.rg11b10Float)
+            giCode = tex(.r32Uint)
+        }
+        guard let irr = giIrr, let code = giCode else { return }
+        cache.tiles = gi
+        let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
+        let daylight = litDaylightEnv(sunAngle: sunAngle)
+        let light: GiLightSource = Lit.shared.lastAtmosphere ? .atmosphere(fallback: daylight) : .daylight(daylight)
+        guard cache.encodeFrame(cb, depth: depth, out: irr, code: code, invViewProj: invViewProj, cam: cam, origin: origin, accel: tlas,
+                                accels: tlasAccels, sunDir: sun, sunUp: sun.y > -0.05 ? 1 : 0, cloudHeight: cloudHeight, light: light) else { return }
+        litGiOut = (irr, code, w, h)
+        giRuns += 1
+        if giRuns % 1200 == 0 {
+            let c = cache.counters.contents().bindMemory(to: UInt32.self, capacity: 20)
+            log("gi: \(giRuns) frames, \(gi.table.length / 16) tiles; last read: \(c[19]) visible cells seen, \(c[1]) updated, \(c[11]) rays so far")
+        }
+    }
+}
+
+/// Offline timing with the GI cache (METALMC_EXP=lit,gi): 0 skips its frame in RtShadows.trace (the relight then has no
+/// cache light: its sky term as without it), 1 (default) runs it.
+@_cdecl("mmc_debug_gi_frame")
+public func mmc_debug_gi_frame(_ on: Int32) {
+    RtShadows.shared.giOn = on != 0
 }
 
 /// Shadows for the level just drawn into `color` (see RtShadows). `p`: projection as drawn (jittered), then view

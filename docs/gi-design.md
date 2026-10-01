@@ -1,12 +1,13 @@
-# Bounce light: a world-space irradiance cache (design + prototype, `METALMC_EXP=gi`, not wired into the frame yet)
+# Bounce light: a world-space irradiance cache (design + prototype; in the frame with lit mode, `METALMC_EXP=lit,gi`)
 
 The goal is the part of SEUS PTGI that is hardest to fake: indirect light that is noise-free, stable while the camera
 moves, reaches the whole LOD, and fits a locked 120 Hz at the panel's native 3456 x 2234 (8.33 ms a frame). The budget
 set for it is 1.5 ms of GPU per frame, everything included.
 
-`Sources/MetalMCNative/Gi.swift` has the kernels and an offline test; `tools/gicache.py` drives the test. Nothing in the
-game calls it yet: the last section lists the hooks. Numbers marked *measured* come from the offline test on the M3 Pro;
-*estimate* means reasoned, not measured.
+`Sources/MetalMCNative/Gi.swift` has the kernels and an offline test; `tools/gicache.py` drives the test. In the game it
+runs with lit mode (`METALMC_EXP=lit,gi`): RtShadows runs its frame and the relight takes its light in place of its sky
+term (lighting-design.md, "Lit mode with the GI cache"); `gi` without `lit` changes nothing. Numbers marked *measured*
+come from the offline tests on the M3 Pro; *estimate* means reasoned, not measured.
 
 ## Why a cache on the world
 
@@ -160,9 +161,11 @@ Quality:
 
 Acceleration structures with the per-triangle data the bounce rays need (material, face, block light, sky cover: 4
 bytes): 41.9 -> 64.6 bytes per triangle compacted, +54% (*measured*, 3.45 M triangles, +75 MB). At the game's 26 M
-triangles that would be about +590 MB (*estimate*). The zero-copy alternative: one geometry per quad range in each tile's
-structure, and the hit's geometry and primitive index look up the quad in the node's own buffer (bound by GPU address in
-an argument buffer): no extra memory, one dependent read per bounce hit. That's the one to integrate.
+triangles that would be about +590 MB (*estimate*). The zero-copy alternative, integrated: one geometry per quad range in
+each tile's structure, and the hit's geometry and primitive index look up the quad in the node's own buffer (bound by
+GPU address in a per-instance table, `GiTile`): 41.8 bytes per triangle, the same as without the data (*measured*,
+3.41 M triangles, 136.0 MB either way), and the dependent read per bounce hit costs nothing measurable (update 0.41 ms
+against 0.46 with the data, back to back).
 
 ## Emissive light (torches, lava, glowstone)
 
@@ -208,57 +211,57 @@ steps per column over 2048^2 columns per ring, spread over the refill (which alr
 ## Prototype
 
 - `Sources/MetalMCNative/Gi.swift`: `GiCache` (table, pipelines, `encodeFrame` for the game and the stages separately),
-  the kernels `gi_request`, `gi_schedule`, `gi_args`, `gi_update`, `gi_resolve`, `gi_invalidate`, `gi_count`, the
-  lighting pass's `giUpsample` and the debug view `gi_debug_view` (lit, irradiance, cells, samples, without the cache,
-  bounce only), plus offline-test kernels and entry points (`mmc_debug_gi_scene`, `_run`, `_set_block`, `_reset`,
-  `_selftest`).
-- Switches: `METALMC_EXP=gi` (reserved for the game hook), `METALMC_GICAP` (log2 slots, 21), `METALMC_GIBUDGET` (cells a
-  frame, 16384), `METALMC_GISPP` (samples an update, 4), `METALMC_GIHISTORY` (updates averaged, 64), `METALMC_GIRANGE`
-  (level-0 range, 160), `METALMC_GISPATIAL` (0, off: biased), `METALMC_GIREPEAT` (offline timing only).
-- Offline test: `python3 tools/gicache.py selftest | synth <dir> | edit <dir> | region <r.X.Z.mca> <dir>`
-  (`METALMC_DYLIB` for another build). The synthetic scene is a LOD grid built in code (a house with a window and a door,
+  the kernels `gi_light`, `gi_request`, `gi_schedule`, `gi_args`, `gi_update`, `gi_resolve`, `gi_invalidate`,
+  `gi_count`, the lighting pass's `giUpsample` (`giUpsampleHeader`, shared with lit mode's relight) and the debug view
+  `gi_debug_view` (lit, irradiance, cells, samples, without the cache, bounce only, and lit mode's relight without and
+  with the cache), plus offline-test kernels and entry points (`mmc_debug_gi_scene`, `_run`, `_set_block`, `_reset`,
+  `_selftest`, `_lit_light`, and `mmc_debug_gi_frame`, `mmc_debug_lit_gi` for lit mode's A/B).
+- The light (`GiLight`, buffer 15): the sun, the sky (the atmosphere's sky view table or a gradient), the ground below the
+  horizon, the open sky on each face direction, and the scale the cells' light is read at. The offline test fills it with
+  the prototype's light (scale 1); lit mode makes it each frame (`gi_light`) from the relight's own light, per unit of
+  daylight (lighting-design.md, "Lit mode with the GI cache").
+- Switches: `METALMC_EXP=lit,gi` (in the frame with lit mode; `gi` alone does nothing in the game), `METALMC_GICAP`
+  (log2 slots, 21), `METALMC_GIBUDGET` (cells a frame, 16384), `METALMC_GISPP` (samples an update, 4),
+  `METALMC_GIHISTORY` (updates averaged, 64), `METALMC_GIRANGE` (level-0 range, 160), `METALMC_GISPATIAL` (0, off:
+  biased), `METALMC_GIREPEAT` (offline timing only); in the game `-PgiCap`, `-PgiBudget`, `-PgiSpp`, `-PgiHistory`,
+  `-PgiRange`.
+- Offline test: `python3 tools/gicache.py selftest | synth <dir> | litsynth <dir> | edit <dir> | region <r.X.Z.mca> <dir>`
+  (`METALMC_DYLIB` for another build; zero-copy structures as the game builds them, `GICACHE_PRIMDATA=1` for per-triangle
+  data). The synthetic scene is a LOD grid built in code (a house with a window and a door,
   a white floor and a red wall, a closed room lit by glowstone, a hill with a tunnel); the region test meshes a fixture
   region as the LOD does. `selftest` checks 1,500 key round trips (both signs, both sides of 2^23, the world's bottom and
   top, every face and level) and ray-winding cases.
 - Found on the way: the LOD's faces, counterclockwise seen from outside, are back faces to Metal's intersector with a
   counterclockwise front winding: `clockwise` is right (`gi_test_rays`).
 
-## Integration (not done; each step flag-gated by `METALMC_EXP=gi`)
+## Integration (with lit mode, `METALMC_EXP=lit,gi`; lighting-design.md, "Lit mode with the GI cache")
 
-1. **Triangle data.** RtShadows' tile structures need the material and face of what a ray hits: build them with one
-   geometry per quad range and look the quad up in the node's buffer (zero copy), or with `primitiveDataBuffer`
-   (`giTileGeometry` builds it, `giBuildBlas` uses it; +54% structure memory).
-2. **Per frame.** In `RtShadows.trace`, after the instance structure is built, with the same depth texture, the projection
-   as drawn and the same origin: `GiCache.encodeFrame(cb, depth:, out:, code:, invViewProj:, cam:, origin:, accel: tlas,
-   accels: tlasAccels, sunDir:, sunUp:)` (the out and code textures at half the frame's size). The structure must cover
-   every direction: `chosen` is the LOD's selection, not frustum-culled, so it does.
-3. **Shading.** The cache's term needs albedo, so it belongs in the deferred lighting pass of the rewrite (visibility
-   buffer, step 3 of rewrite-plan.md), through `giUpsample`. Until then the only honest use is the debug view (mode 1,
-   irradiance) drawn over the frame to look at it in the world.
+1. **Triangle data: done, zero copy.** RtShadows' tile structures have one geometry per quad range (`giTileMesh`), and a
+   per-instance table points into the node buffers (`GiTile`, `giHitQuad`). `primitiveDataBuffer` (`giTileGeometry`,
+   +54% structure memory) remains for offline comparisons.
+2. **Per frame: done.** In `RtShadows.trace`, after the shadow rays, on the same depth, jittered projection, origin and
+   instance structure: `GiCache.shared.encodeFrame`, into half-resolution light and code textures the relight takes.
+3. **Shading: done, in lit mode's relight** (its G-buffer has the albedo): `giUpsample` replaces the sky term where it
+   has data, times AO.
 4. **Edits.** Block changes near the player (a client-side block update hook) call `GiCache.invalidate`; a chunk the LOD
-   rebuilds could invalidate its changed columns in bulk.
-5. **Sky.** `giSky` is a placeholder gradient; the atmosphere model (Sky.swift, once it exists) should provide the sky
-   radiance and the sun's color.
+   rebuilds could invalidate its changed columns in bulk. Not done.
+5. **Sky: done.** With our sky, the sky view table and the relight's own sun and sky light; without, lit mode's daylight
+   curve.
 6. **Dimensions.** One cache per dimension (keys are world positions), cleared on a new world; the Nether has no sky.
-7. **Gradle.** `-P` passthroughs for the `METALMC_GI*` knobs in mod/build.gradle once it runs in the game.
+   Not done (lit mode runs in the overworld only; the one cache isn't cleared on a world change).
+7. **Gradle: done** (`-PgiCap`, `-PgiBudget`, `-PgiSpp`, `-PgiHistory`, `-PgiRange`).
 
-Checks to run in the game once it's wired (not before: until then `METALMC_EXP=gi` changes nothing in the game):
-
-- Frame cost, the real-terrain flight with traced passes, with and without it:
-  `BENCH_FIXTURE=claudeworld-merged BENCH_TIMEOUT=900 bash tools/bench/bench_lod.sh giA 32768 -PbenchY=150 -PbenchFly=20 -PbenchExtraWait=600 -PbenchTrace=1 -Ptaa=true -PmetalExp=rtshadows,gi`
-  and the same with label `giB` and `-PmetalExp=rtshadows`; then at 120 Hz with `BENCH_VSYNC=true` for dropped frames.
-- The look: `bash tools/bench/fidelity.sh giF 12 32768 -PmetalExp=rtshadows,gi` at noon, and with `-PfidelityTime=13000`
-  and `18000` (dusk, midnight), with the debug view drawn over the frame.
-- By hand: a walk into a cave and into a house (light follows openings, nothing leaks through 1-block walls), a block
-  broken in a wall while watching (the edit response), a fast 180-degree turn (no black flashes).
+The checks to run in the game are in lighting-design.md ("Lit mode with the GI cache", "Not done, and what to look at in
+game").
 
 ## Next
 
-- Split each cell's light by source (sky, sun, block; 3 x RGB halfs) and scale at read time: day, night and weather
-  changes then show at once instead of lagging by the history (64 updates, up to a few seconds for cells updated every
-  few frames).
+- Split each cell's light by source (sky, sun, block; 3 x RGB halfs) and scale at read time. Lit mode already reads the
+  cells per unit of the frame's daylight (sun plus sky), so a change of daylight shows at once and only the change of
+  the sun-to-sky ratio lags by the history; the split would make that exact too and carry bounced block light, which
+  lit mode leaves out (its scale doesn't follow the daylight). 16 bytes more per slot (104 MB at 2 M slots, from 72).
 - Guide bounce rays toward bright cells a cell has found (a direction reservoir per cell): the remaining noise is small
   bright sources seen through small openings.
-- The zero-copy triangle data (above) and the far-field column cache.
+- The far-field column cache.
 - Measure in the game: the frame cost with the LOD's real structures (26 M triangles), and how many cells a flight keeps
   alive.

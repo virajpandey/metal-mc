@@ -26,7 +26,7 @@ import simd
 
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
 // Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise.
-private let taaShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + litRelightHeader : "") + """
+private let taaShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "") + """
 
 // With the sky on (METALMC_EXP=sky), a second variant of the resolve applies the aerial perspective, the render
 // distance's fade into the sky and the tone curve to each pixel as it loads it (skyLevelColor), after the shadows'
@@ -111,7 +111,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
                         texture2d<uint, access::read> litGbuf [[texture(8), function_constant(taaLit)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
-                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],
+                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")
 #endif
                         uint2 gid [[thread_position_in_grid]],
                         uint2 lid [[thread_position_in_threadgroup]],
@@ -126,7 +126,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         float4 c = color.read(q);
         float d = depth.read(q);
 #if LIT_MODE
-        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv);
+        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : ""));
 #endif
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
