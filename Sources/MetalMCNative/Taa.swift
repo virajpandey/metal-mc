@@ -197,8 +197,9 @@ vertex CopyVOut taa_copy_vs(uint vid [[vertex_id]]) {
 // The new history into the frame, with contrast-adaptive sharpening (after AMD's CAS): each pixel is pushed away from
 // its 4 neighbors, less where they already differ a lot, so edges don't ring. sc: x sharpening, y the frame's largest
 // value (above 1 only for HDR's float frame, whose highlights past 2 CAS leaves unsharpened), z dither, w the frame.
-// The dither (the sky's, Sky.swift, on an 8-bit frame; 0 otherwise) keeps the sky's smooth gradients from banding as
-// the 10-bit history is written back to 8 bits: the sky's own dither is averaged away in the history.
+// The dither (the sky's, Sky.swift, on an 8-bit frame, and on HDR's packed RG11B10Float frame, whose 6-bit mantissas
+// band too; 0 on RGBA16Float) keeps the sky's smooth gradients from banding as the history is written back: the sky's
+// own dither is averaged away in the history.
 static float3 taaDither(float3 c, int2 g, float4 sc) {
     if (sc.z <= 0.0) return c;
     float2 p = float2(g) + 5.588238 * sc.w;
@@ -287,7 +288,7 @@ final class Taa: @unchecked Sendable {
             return ctx.device.makeTexture(descriptor: d)
         }
         // HDR hook (Hdr.swift): a float frame holds values above 1 (the sky's highlights), which RGB10A2 would clip.
-        let historyFormat: MTLPixelFormat = color.pixelFormat == .rgba16Float ? .rgba16Float : .rgb10a2Unorm
+        let historyFormat: MTLPixelFormat = isFloatFrame(color.pixelFormat) ? color.pixelFormat : .rgb10a2Unorm
         guard let h0 = texture(historyFormat, [.shaderRead, .shaderWrite]),
               let h1 = texture(historyFormat, [.shaderRead, .shaderWrite]) else { return false }
         history = [h0, h1]
@@ -373,7 +374,7 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     let shadows = RtShadows.shared.takeDeferred(width: color.width, height: color.height)
     if let sh = shadows { params.shadow = sh.params }
     // HDR hook (Hdr.swift): a float frame's values aren't clamped to 1.
-    let frameMax: Float = color.pixelFormat == .rgba16Float ? 65504 : 1
+    let frameMax: Float = isFloatFrame(color.pixelFormat) ? 65504 : 1
     params.range.x = frameMax
     // Lit hook (Lit.swift): the relight left for the resolve, applied as the color is loaded, before the sky's work.
     let relight = litEnabled && Lit.shared.hasDeferred(width: color.width, height: color.height)
@@ -388,7 +389,7 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setTexture(sky.apScatter, index: 5)
         enc.setTexture(sky.apTrans, index: 6)
         enc.setTexture(sky.skyView, index: 7)
-        skyDither = color.pixelFormat == .rgba16Float ? 0 : 1.0 / 255
+        skyDither = color.pixelFormat == .rgba16Float ? 0 : (color.pixelFormat == .rg11b10Float ? 1.0 / 128 : 1.0 / 255)
     } else {
         enc.setComputePipelineState(relight ? (t.litResolve(sky: false) ?? pipe) : pipe)
     }

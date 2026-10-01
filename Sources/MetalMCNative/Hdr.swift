@@ -32,6 +32,14 @@ import QuartzCore
 
 /// METALMC_EXP=hdr: float main target, EDR drawable, tone curve into the display's headroom.
 let hdrOutput = experiments.contains("hdr")
+/// METALMC_HDRFORMAT=rg11b10: the float main target (and the anti-aliasing's history) as RG11B10Float, 32 bits a pixel
+/// instead of RGBA16Float's 64: half the bandwidth in every pass that loads or stores it, for 6-bit mantissas (5 in
+/// blue) and no alpha, so the anti-aliasing dithers what it writes back. The drawable stays RGBA16Float.
+let hdrPacked = hdrOutput && ProcessInfo.processInfo.environment["METALMC_HDRFORMAT"] == "rg11b10"
+/// The main target's format with HDR.
+let hdrTargetFormat: MTLPixelFormat = hdrPacked ? .rg11b10Float : .rgba16Float
+/// Whether a color target holds HDR's float frame.
+@inline(__always) func isFloatFrame(_ f: MTLPixelFormat) -> Bool { f == .rgba16Float || f == .rg11b10Float }
 /// METALMC_HDRSPACE: the primaries the linear output is tagged with. "srgb" (default): extended linear sRGB, the same
 /// primaries as today's SDR layer (setting a CAMetalLayer's pixel format tags it with a matching color space: BGRA8 gets
 /// sRGB, checked on macOS 26), so turning HDR on changes brightness only. "p3": extended linear Display P3 (the game's
@@ -190,7 +198,7 @@ final class Hdr: @unchecked Sendable {
 
 /// 1 with METALMC_EXP=hdr (Java makes the main target RGBA16Float then).
 @_cdecl("mmc_hdr_enabled")
-public func mmc_hdr_enabled() -> Int32 { hdrOutput ? 1 : 0 }
+public func mmc_hdr_enabled() -> Int32 { hdrOutput ? (hdrPacked ? 2 : 1) : 0 }
 
 /// The headroom the tone curve uses this frame (1 without HDR).
 @_cdecl("mmc_hdr_headroom")

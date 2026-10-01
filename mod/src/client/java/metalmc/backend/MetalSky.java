@@ -29,13 +29,18 @@ public final class MetalSky {
         return enabled == 1;
     }
 
-    /** HDR output is on (METALMC_EXP=hdr) and the Metal backend runs: the main target is RGBA16Float. */
+    /** HDR output is on (METALMC_EXP=hdr) and the Metal backend runs: the main target is float (hdrFormat). */
     public static boolean hdr() {
         if (hdr < 0) {
             if (MetalDevice.current == null) return false;
             hdr = Mtl.hdrEnabled();
         }
-        return hdr == 1;
+        return hdr >= 1;
+    }
+
+    /** The main target's format with HDR: RGBA16Float, or RG11B10Float with METALMC_HDRFORMAT=rg11b10 (Hdr.swift). */
+    public static GpuFormat hdrFormat() {
+        return hdr() && hdr == 2 ? GpuFormat.RG11B10_FLOAT : GpuFormat.RGBA16_FLOAT;
     }
 
     /**
@@ -105,7 +110,7 @@ public final class MetalSky {
      * into SDR instead. Any other texture comes back as it is.
      */
     public static GpuTexture screenshotSource(GpuTexture source) {
-        if (!hdr() || !(source instanceof MetalTexture src) || source.getFormat() != GpuFormat.RGBA16_FLOAT) return source;
+        if (!hdr() || !(source instanceof MetalTexture src) || source.getFormat() != hdrFormat()) return source;
         int w = source.getWidth(0), h = source.getHeight(0);
         if (snapshot == null || snapshot.isClosed() || snapshot.getWidth(0) != w || snapshot.getHeight(0) != h) {
             if (snapshot != null) snapshot.close();

@@ -928,7 +928,7 @@ final class Sky: @unchecked Sendable {
         f.view.w = Float(ctx.passHeight)
         f.horizon.z = skyPixelAngle(invViewProj, width: f.view.z)
         // An SDR target holds at most 1, in 8 bits (dithered); a float one (METALMC_EXP=hdr) up to the display's headroom.
-        let isFloat = target == .rgba16Float
+        let isFloat = isFloatFrame(target)
         let h: Float = isFloat ? max(headroom, 1) : 1
         f.tone.x = h
         f.tone.y = skyKnee(h)
@@ -1014,7 +1014,7 @@ final class Sky: @unchecked Sendable {
         f.invViewProj = invViewProj
         f.view.z = Float(color.width)
         f.view.w = Float(color.height)
-        let isFloat = color.pixelFormat == .rgba16Float
+        let isFloat = isFloatFrame(color.pixelFormat)
         let h: Float = isFloat ? max(headroom, 1) : 1
         f.tone.x = h
         f.tone.y = skyKnee(h)

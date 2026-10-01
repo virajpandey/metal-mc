@@ -108,6 +108,9 @@ loom {
 			if (project.hasProperty("farField")) {
 				environmentVariable "METALMC_FARFIELD", project.findProperty("farField").toString()
 			}
+			if (project.hasProperty("hdrFormat")) {
+				environmentVariable "METALMC_HDRFORMAT", project.findProperty("hdrFormat").toString()
+			}
 			if (project.hasProperty("ffGain")) {
 				environmentVariable "METALMC_FFGAIN", project.findProperty("ffGain").toString()
 			}

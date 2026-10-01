@@ -19,6 +19,6 @@ abstract class RenderTargetMixin {
         target = "Lcom/mojang/renderpearl/api/device/GpuDevice;createTexture(Ljava/util/function/Supplier;ILcom/mojang/renderpearl/api/GpuFormat;IIII)Lcom/mojang/renderpearl/api/textures/GpuTexture;",
         ordinal = 1), index = 2)
     private GpuFormat metalmc$hdrFormat(GpuFormat format) {
-        return (Object) this instanceof MainTarget && MetalSky.hdr() ? GpuFormat.RGBA16_FLOAT : format;
+        return (Object) this instanceof MainTarget && MetalSky.hdr() ? MetalSky.hdrFormat() : format;
     }
 }

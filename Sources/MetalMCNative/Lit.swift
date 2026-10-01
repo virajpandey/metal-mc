@@ -472,7 +472,7 @@ final class Lit: @unchecked Sendable {
         let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
         var f = LitFrameGPU()
         f.invViewProj = (mat(0) * mat(16)).inverse
-        f.size = SIMD4(Float(color.width), Float(color.height), 0, color.pixelFormat == .rgba16Float ? 65504 : 1)
+        f.size = SIMD4(Float(color.width), Float(color.height), 0, isFloatFrame(color.pixelFormat) ? 65504 : 1)
         f.sunDir = SIMD4(sun, 0)
         f.moonDir = SIMD4(-sun, litSmoothstep(0.1, -0.15, sun.y))
         f.fogColor = SIMD4(p[33], p[34], p[35], p[36])
