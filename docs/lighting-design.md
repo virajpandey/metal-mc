@@ -420,3 +420,13 @@ measured). In-game per-pass times (`-PbenchTrace=1`) are the numbers to go by.
    cache's light is in the relight's units.
 3. In `litRelightPixel`: `giUpsample(irr, code, q, face, rel)` where it has data (`w == 1`) replaces the sky term
    (`env[1 + face] x sky light curve`), times AO; the G-buffer's face and the relight's `rel` are what it needs.
+
+## HDR's main target packed (2026-10-01)
+
+HDR's float main target cost about a millisecond over the sky alone, mostly bandwidth: every pass that loads or stores
+it moves 64 bits a pixel. It's now RG11B10Float by default (`METALMC_HDRFORMAT=rgba16f` for RGBA16Float), and so is the
+anti-aliasing's history; the drawable stays RGBA16Float for EDR. The real-terrain flight with sky and HDR (far field
+on): 124.7 → 136.3 fps, frames over 8.33 ms 2,166 → 964. Its 6-bit mantissas (5 in blue) banded the sky's glow around
+the sun in rings with an absolute dither (`m9Tp`); the sky pass and the anti-aliasing now dither relative to the value
+(1/64 of it, 1/32 in blue), and the sunset is as smooth as with RGBA16Float (`m10Tp`). No alpha: the render tour's
+GUI, inventory, pause blur, particles, the Nether and the End look as before.

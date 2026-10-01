@@ -32,10 +32,11 @@ import QuartzCore
 
 /// METALMC_EXP=hdr: float main target, EDR drawable, tone curve into the display's headroom.
 let hdrOutput = experiments.contains("hdr")
-/// METALMC_HDRFORMAT=rg11b10: the float main target (and the anti-aliasing's history) as RG11B10Float, 32 bits a pixel
-/// instead of RGBA16Float's 64: half the bandwidth in every pass that loads or stores it, for 6-bit mantissas (5 in
-/// blue) and no alpha, so the anti-aliasing dithers what it writes back. The drawable stays RGBA16Float.
-let hdrPacked = hdrOutput && ProcessInfo.processInfo.environment["METALMC_HDRFORMAT"] == "rg11b10"
+/// The float main target (and the anti-aliasing's history) as RG11B10Float by default, 32 bits a pixel instead of
+/// RGBA16Float's 64: half the bandwidth in every pass that loads or stores it (the real-terrain flight with sky and HDR:
+/// 124.7 → 136.3 fps), for 6-bit mantissas (5 in blue) and no alpha, so the sky and the anti-aliasing dither relative
+/// to the value. METALMC_HDRFORMAT=rgba16f: RGBA16Float as before. The drawable stays RGBA16Float.
+let hdrPacked = hdrOutput && ProcessInfo.processInfo.environment["METALMC_HDRFORMAT"] != "rgba16f"
 /// The main target's format with HDR.
 let hdrTargetFormat: MTLPixelFormat = hdrPacked ? .rg11b10Float : .rgba16Float
 /// Whether a color target holds HDR's float frame.
