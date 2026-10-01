@@ -36,6 +36,8 @@ let skyEnabled = experiments.contains("sky")
 /// METALMC_SKYEXPOSURE: the sun's illuminance in scene units (vanilla's white is 1). The default puts the noon zenith
 /// near vanilla's sky blue with a bright, hazy horizon.
 private let skyExposure = max(0, Float(ProcessInfo.processInfo.environment["METALMC_SKYEXPOSURE"] ?? "") ?? 12)
+/// Debug (METALMC_EXP=skyhazedebug): the level's pixels as their distance, haze and fade (skyLevelColor), the sky magenta.
+let skyDebugHaze = experiments.contains("skyhazedebug")
 /// METALMC_SKYHAZE: multiplies distances for aerial perspective (2: twice as hazy; 0.5: clearer). Default 1, physical.
 private let skyHaze = max(0, Float(ProcessInfo.processInfo.environment["METALMC_SKYHAZE"] ?? "") ?? 1)
 /// METALMC_SUNSIZE: the sun disk's angular radius in degrees. The default 0.6 matches the ray-traced shadows' penumbra
@@ -350,7 +352,7 @@ static float3 skyOutput(float3 x, constant SkyFrame& f) { return skyEncode(skyTo
 static float3 skyLevelColor(float3 c, uint2 q, float d, constant SkyFrame& f, texture3d<float> apScatter,
                             texture3d<float> apTrans, texture2d<float> skyView, thread float& haze) {
     haze = 0.0;
-    if (d <= 0.0) return c;
+    if (d <= 0.0) return \(skyDebugHaze ? "float3(1.0, 0.0, 1.0)" : "c");
     float2 ndc = (float2(q) + 0.5) / f.view.zw * 2.0 - 1.0;
     float4 h = f.invViewProj * float4(ndc, d, 1.0);
     float3 rel = h.xyz / h.w;
@@ -358,6 +360,8 @@ static float3 skyLevelColor(float3 c, uint2 q, float d, constant SkyFrame& f, te
     float fade = skyFadeAmount(rel, f);
     if (fade > 0.0) lin = mix(lin, skyLuminance(f, rel / length(rel), skyView), fade);
     haze = max(haze, fade);
+    // Debug (METALMC_EXP=skyhazedebug): red the distance (400 km full), green the haze, blue the fade; sky magenta.
+    if (\(skyDebugHaze ? "true" : "false")) return float3(saturate(length(rel) / 400000.0), haze, fade);
     return skyOutput(lin, f);
 }
 
