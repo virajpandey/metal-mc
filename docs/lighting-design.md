@@ -395,6 +395,21 @@ measured). In-game per-pass times (`-PbenchTrace=1`) are the numbers to go by.
   terrain), walk into a cave (no sun inside; torches light it like vanilla), night (moonlight close to vanilla's on
   tops, darker sides), the Nether and the End (not relit: vanilla's look, no G-buffer attached).
 
+### In game (2026-10-01, native 3456 x 2234, TAA on, the far field on)
+
+- **It runs.** The render tour with `-PmetalExp=lit,nearchunks,rtshadows,sky` (`m6Lt`), with `hdr` too (`m6Lh`), and the
+  LOD tour to the horizon (`m6LL`, LOD 262144): no errors, "relit 1200 of the last 1200 frames (atmosphere, traced
+  visibility)". The level-pass mixin applies (the G-buffer is attached).
+- **The look.** Noon: the same brightness as the forward frame on sunlit tops, slopes away from the sun and shaded faces
+  darker, the shadows placed (the ravine under the camera falls into shade). Night: vanilla's, a little bluer. Rain: the
+  streaks stay over relit terrain, the light flat. Dusk is much darker than vanilla's, with warm light on the faces that
+  catch the low sun: a tuning question (`-PlitExposure`).
+- **The overlay test** (`-PlitView=7`, `m6Lv`): terrain green; water, mobs, the hand and the sky not terrain; flowers
+  over grass flagged as overlays and kept as drawn.
+- **Cost** (the real-terrain flight, far field on): near chunks, ray-traced shadows and the sky without lit mode
+  132.8 fps (p99 9.89 ms, 1,174 frames over 8.33 ms); with it 115.4 fps (p99 10.79 ms, 4,565 over): about 1.1 ms, the
+  G-buffer's writes and the relight. With the shadows' 1 ms and the sky's 0.5 ms the whole look doesn't hold 120 Hz yet.
+
 ### Next: the GI cache as the sky term (gi-design.md, "Integration" steps 1-3, not wired)
 
 1. RtShadows' tile structures with the per-triangle material and face (`giTileGeometry` / `giBuildBlas`, or one
