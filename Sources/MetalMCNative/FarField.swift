@@ -586,7 +586,7 @@ constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
 
 // A side face's foot: vanilla's smooth lighting counts two occluders at a step's bottom corners (the ground in front
 // and the corner beside it), as the quads' voxels do; METALMC_EXP=ffsideao1 counts one as before (brighter by a tenth).
-constant float kSideFoot = \(experiments.contains("ffsideao1") ? "kAO[1]" : "kAO[2]");
+constant float kSideFoot = \(experiments.contains("ffsideao1") ? "0.88" : "0.76");   // kAO[1] or kAO[2]
 
 // Sky light levels the ground under a canopy loses (vanilla's leaves dim sky light a level per block).
 constant float kUnderCanopy = 3.0;
