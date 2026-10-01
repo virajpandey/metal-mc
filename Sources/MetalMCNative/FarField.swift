@@ -39,6 +39,8 @@ let lodFarCanopy = !experiments.contains("ffpillars")
 let lodFarTowers = lodFarCells && !experiments.contains("ffnotowers")
 /// Debug (METALMC_EXP=ffsteps): color hits by the number of march steps (green few, red many), misses dark blue.
 let farFieldSteps = experiments.contains("ffsteps")
+/// Debug (METALMC_EXP=fflog): log every ring refill (with its time), to line them up with long frames.
+let farFieldLogFills = experiments.contains("fflog")
 /// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
 /// camera, about as far as the quads use that level.
 let farFieldWidth = Int(ProcessInfo.processInfo.environment["METALMC_FFWIDTH"] ?? "") ?? 2048
@@ -1031,7 +1033,7 @@ final class FarField: @unchecked Sendable {
         ringKeys[r] = keys[r]
         filledOrigins[r] = origins[r]
         lastFill[r] = fills
-        if fills % 20 == 1 { log("far field: fill \(fills): ring \(r) of \(rings) from level \(k), \(nodes) nodes, \(stale.count) stale") }
+        if fills % 20 == 1 || farFieldLogFills { log("far field: fill \(fills): ring \(r) of \(rings) from level \(k), \(nodes) nodes, \(stale.count) stale") }
         ready = ready || ringKeys.allSatisfy { !$0.isEmpty }
         return ready
     }
