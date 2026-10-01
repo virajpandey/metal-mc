@@ -410,16 +410,9 @@ measured). In-game per-pass times (`-PbenchTrace=1`) are the numbers to go by.
   132.8 fps (p99 9.89 ms, 1,174 frames over 8.33 ms); with it 115.4 fps (p99 10.79 ms, 4,565 over): about 1.1 ms, the
   G-buffer's writes and the relight. With the shadows' 1 ms and the sky's 0.5 ms the whole look doesn't hold 120 Hz yet.
 
-### Next: the GI cache as the sky term (gi-design.md, "Integration" steps 1-3, not wired)
+### Next: the GI cache as the sky term (gi-design.md, "Integration" steps 1-3)
 
-1. RtShadows' tile structures with the per-triangle material and face (`giTileGeometry` / `giBuildBlas`, or one
-   geometry per quad range, zero copy) when `lit,gi` is on.
-2. In `RtShadows.trace`, after the instance structure is built: `GiCache.shared.encodeFrame(cb, depth:, out:, code:,
-   invViewProj:, cam:, origin:, accel: tlas, accels: tlasAccels, sunDir:, sunUp:)` into half-resolution irradiance and
-   code textures, kept for the relight like the visibility; `giSky` from the atmosphere (its sky view table) so the
-   cache's light is in the relight's units.
-3. In `litRelightPixel`: `giUpsample(irr, code, q, face, rel)` where it has data (`w == 1`) replaces the sky term
-   (`env[1 + face] x sky light curve`), times AO; the G-buffer's face and the relight's `rel` are what it needs.
+Done: see "Lit mode with the GI cache" below.
 
 ## HDR's main target packed (2026-10-01)
 
@@ -430,3 +423,136 @@ on): 124.7 → 136.3 fps, frames over 8.33 ms 2,166 → 964. Its 6-bit mantissas
 the sun in rings with an absolute dither (`m9Tp`); the sky pass and the anti-aliasing now dither relative to the value
 (1/64 of it, 1/32 in blue), and the sunset is as smooth as with RGBA16Float (`m10Tp`). No alpha: the render tour's
 GUI, inventory, pause blur, particles, the Nether and the End look as before.
+
+## Lit mode with the GI cache (prototype, `METALMC_EXP=lit,gi`, 2026-10-01)
+
+The world-space irradiance cache (gi-design.md, `Sources/MetalMCNative/Gi.swift`) wired into lit mode as its sky term:
+the sky's light as the real openings let it in, plus bounced light. Meant to run as
+`-PmetalExp=lit,nearchunks,rtshadows,sky,gi` (or without `sky`). With `gi` and no `lit`, or `lit` and no `gi`, nothing
+changes: the GI parts of the relight's and the anti-aliasing's shaders are spliced into their text only with both
+(`litGi`), RtShadows builds its structures as before, and nothing else runs.
+
+- **What a bounce ray needs from its hit, zero copy.** RtShadows builds each tile's structure with one geometry per
+  quad range of the node's own buffer: the opaque faces' buckets, then the tile-edge skirts' (`giTileMesh`: the same
+  triangles in the same order as without the cache). With the instance structure comes a table of each instance's node
+  buffer, by GPU address, and its ranges' first quads (`GiTile`, 16 bytes an instance, buffer 17); the encoder declares
+  the node buffers resident. A hit's instance, geometry and primitive index give its quad (`start[geometry] + primitive
+  / 2`), and the quad's two words give the material, face, block light and sky cover the primitive data held
+  (`giHitQuad`). Structure memory on the region test (3.41 M triangles): 41.8 bytes a triangle with zero copy, the
+  same as without the cache (136.0 MB; the second geometry costs nothing measurable after compaction), against 64.5
+  with per-triangle data (209.7 MB, +73.8 MB). The other route stays for comparisons (`GICACHE_PRIMDATA=1`); it wasn't
+  needed.
+- **Per frame.** In `RtShadows.trace`, after the shadow rays: `GiCache.shared.encodeFrame` on the same depth, jittered
+  projection, origin and instance structure, in one compute encoder, into half-resolution RG11B10Float light and R32Uint
+  code words that the relight takes like the visibility (`takeLitGi`). The cache (2 M cells, 72 MB) and its kernels are
+  made on the first `lit,gi` frame.
+- **Its light is the relight's.** Each frame `gi_light` makes the cache's light (`GiLight`) from lit mode's own sun and
+  sky light (the relight's `env`): with our sky, Lit's `lit_env` run on this frame's sky tables into the cache's buffer,
+  and bounce rays that leave the terrain read the sky view table (`skyLuminance`, scaled to the relight's units by
+  `lit_env`'s own scale, which it writes to `env[0].w` with `gi` only); without it, `litDaylightEnv`'s values and an even
+  sky whose light on a top face is the curve's sky (and its ground below the horizon). Which of the two follows the
+  relight's choice of the frame before (one frame late when our sky turns on or off). Block light isn't in the cells: the
+  relight's block light stays vanilla's flood fill, and bouncing it would need a cell channel of its own (below). No
+  cells for vanilla's clouds (they write depth), as `rt_shadow` skips them.
+- **Time of day.** The cells hold light per unit of the frame's daylight (the sun's irradiance plus the open sky's on a
+  top face, per channel, `env`'s units), and the resolve multiplies by this frame's: a change of brightness or color
+  (the time of day, rain, eye adaptation) shows in the first frame; what follows over the cells' history (64 updates)
+  is only the change in the pattern of light, as the sun moves and the sun-to-sky ratio changes. Measured (below): after
+  a jump from noon to dusk the shaded faces' mean luma is within 3% of where it settles from the first frame on, and
+  within 1.6% after 64 frames (half a second). Without the scale the cells would start from noon's light and take their
+  history to come down (*estimate*: 0.5 s for cells updated every frame, seconds for the rest, longer for bounced light,
+  which reads other cells' lagging light).
+- **Shading.** In `litRelightPixel`, where `giUpsample` finds a sample on the pixel's face and plane, the sky term
+  (`env[1 + face] x` the sky light level's curve `x AO`) becomes the cache's light `x AO`; it is in `env`'s units, so
+  the daylight curve's scale (without our sky) and the exposure apply as before. Everything else is unchanged: sun x
+  N.L x traced visibility, moon, block light, the overlay test. Faces that aren't axis-aligned (plants) take the top
+  face's sample around them. Where no sample matches (3.9% of the relit terrain in the test view: faces a pixel or two
+  wide, far hills) the sky term stays; the cells' own lookups (`giIrradiance`) aren't made there (they need the table
+  bound, 0.1-0.5 ms more offline). Debug view 8 (`-PlitView=8`): green where the cache's light applied, red where it
+  didn't, blue for light sources.
+
+### Verified offline (2026-10-01, no game)
+
+- `swift build -c release`: clean (the two warnings in `RtShadows.apply` were there before). The Java compiles
+  (`build.gradle` has `-PgiBudget`, `-PgiRange`, `-PgiCap`, `-PgiSpp`, `-PgiHistory` now). Every kernel compiles at run
+  time in both routes.
+- `python3 tools/gicache.py selftest`, both routes: 1,500 key round trips and the 4 ray cases right (with zero copy the
+  hit's face comes from its quad). The region's pictures (`region/`, zero copy) have the materials in their places.
+- **Without `gi` nothing changed.** `tools/litflow.swift` in `sdr` mode (lit mode without the cache) through the same
+  driver on the unmodified library and this one: every number it prints is the same (the G-buffer and overlay checks,
+  the luma tables, the anti-aliasing's match), and 16 of its 17 pictures are the same to the bit. The 17th, the first
+  capture after the warm-up (`sdr-lit-morning.png`), differs in 384 of 1.93 M pixels, by at most 7 levels, all near the
+  horizon (rows 297-324): a far tile's shadow structure finished building in the background a frame apart in the two
+  runs, by the look of it (they build asynchronously, nearest first); not proven.
+- **The synthetic house** (`python3 tools/gicache.py litsynth <dir>`, lit mode's daylight curve through `gi_light`, the
+  relight's formula without AO or lightmap; 1152 x 745, 128 frames): the room lit through its 4 x 3 window, mean 8-bit
+  luma at exposure 4: lit 26.3, lit+gi 45.9 at mid-morning (the LOD's sky cover leaves the room black but for the
+  floor by the window; the cache lights it from the sunlit patch on the floor, warm, the red wall's bounce on the
+  floor), 7.3 and 23.9 at dusk; outside 74.5 and 74.0 at exposure 1 (in the open the cache's sky matches the sky term's).
+  Frame-to-frame change of the cache's light: 1.17% in the room (1.14% at dusk), 0.03% outside.
+- **The game's call sequence** (`LITFLOW_GI=1 .build/litflow ... sky|sdr [time]`: claudeworld-merged, LOD to 2048,
+  camera at (8, 150, 8) looking west 22 degrees down over hills, a ravine and the sea, 1728 x 1117; the cache and the
+  relight as the game runs them, lit and lit+gi in the same frames through `mmc_debug_lit_gi`; 16-frame means), mean
+  8-bit luma of the relit terrain:
+
+  | Light | | Shaded faces (no direct sun) | Sunlit tops | All relit terrain |
+  |---|---|---|---|---|
+  | atmosphere (`sky`) | morning | 41.1 -> 35.1 | 77.8 -> 77.5 | 76.2 -> 74.5 |
+  | | noon | 47.6 -> 36.1 | 99.9 -> 99.4 | 81.1 -> 76.7 |
+  | | dusk (sun 8 degrees up) | 33.2 -> 30.9 | 31.9 -> 30.7 | 32.4 -> 30.8 |
+  | daylight curve (`sdr`) | morning | | 82.2 -> 80.8 | 77.2 -> 74.5 |
+  | | noon | | 98.6 -> 97.6 | 77.8 -> 72.2 |
+  | | dusk | 25.7 -> 19.1 (faces turned away) | 41.1 -> 37.0 | 35.5 -> 30.6 |
+
+  Sunlit tops barely change; shaded faces get darker where terrain hides part of the sky (terrace risers, the ravine,
+  inside the forest's canopy), and greener from the grass in front of them, where the sky term gave every face with sky
+  light 15 the same open sky and a gray ground. The cache's light covered 96.1% of the relit terrain (94.6% at dusk).
+  Frame-to-frame change of single frames on shaded faces: 0.16-0.23% without the cache (the sky's dither), 0.23-0.27%
+  with it (`sdr`, no dither: 0.00% and 0.05%). A jump from noon to dusk (`sky`): the shaded faces' mean luma 31.1 in the
+  first frame after it, 31.1, 31.1, 31.0 at frames 2, 8 and 16, 30.9 at 32, 30.7 at 63, settling at 30.2 (the sky term
+  without the cache: 33.2); `sdr`: 19.0 to 18.8 over 63 frames, settling at 18.5.
+- Pictures (`bench_out/results/gi-lit/`): `skygi-lit-<time>.png` and `skygi-lit-gi-<time>.png` (morning, noon, dusk),
+  `skygi-view-gi-coverage-<time>.png` (view 8), the same with `sdrgi-`; `synth/room-lit.png`, `room-lit-gi.png`,
+  `room-dusk-*`, `outside-*`; `region/region-*.png` (the cache's own views on real terrain, zero copy).
+
+### Costs (offline, M3 Pro, 3456 x 2234)
+
+Other agents' GPU work shared the machine during these runs; the numbers are medians, and A/B runs were made back to
+back.
+
+- The cache's stages on real terrain (`METALMC_GIREPEAT=4 python3 tools/gicache.py region <r.0.0.mca> <dir>`, 128 frames,
+  converged): zero copy request 0.17, schedule 0.03, update 0.41, resolve 0.46: 1.06 ms; with per-triangle data, just
+  before, 0.20, 0.03, 0.46, 0.47: 1.16 ms. The dependent read per bounce hit costs nothing measurable. (A first zero-copy
+  run while other work had the GPU: 1.69 ms.) The relight's upsample: 0.32-0.50 ms more (the region test's
+  lighting-pass share without lookups).
+- In the frame (`LITFLOW_GI=1 .build/litflow ... sky time`, whole frames with and without the cache's frame,
+  alternating, 60 each): with the relight in the anti-aliasing's resolve, median +1.11 ms (fastest +1.76); with it as a
+  pass of its own, fastest +1.21 ms (the medians were noise). About 1.1-1.8 ms, against the cache's 1.5 ms budget: with
+  the shadows' 1 ms, the sky's 0.5 and lit mode's 1.1, the whole look is further from 120 Hz.
+
+### Not done, and what to look at in game
+
+- Not run in game. Not run offline with `hdr`, or on the mesh-shader LOD path.
+- Block edits aren't sent to the cache (`GiCache.invalidate` has no caller yet): a broken block reaches it when the LOD
+  rebuilds the node (new tile structures), and the cells around it keep their old light for their history; a face that
+  vanished keeps its cell until it's unseen for 10 s.
+- The cache isn't cleared on a world change (lit mode only runs in the overworld; another world's cells at the same
+  coordinates fade out over their history, or are evicted after 10 s unseen).
+- No bounced block light (torchlight around corners stays vanilla's flood fill). The split by source in gi-design.md's
+  "Next" (separate sun, sky and block channels per cell, scaled at read time) would add it and make the time-of-day
+  scale exact for the sun-to-sky ratio too.
+- Water, entities and the hand get no cache light (they aren't lit terrain).
+- The first `lit,gi` frame creates the cache and compiles its kernels on the render thread: a one-time hitch.
+- In game, with timings (`BENCH_NOBUILD=1` after the first):
+  - `BENCH_FIXTURE=claudeworld-merged bash tools/bench/bench_lod.sh litgion 32768 -PbenchY=150 -PbenchFly=20 -PbenchExtraWait=600 -PbenchHitches=1 -PbenchTrace=1 -Ptaa=true -PmetalExp=lit,nearchunks,rtshadows,sky,gi`
+  - the same with label `litgioff` and `-PmetalExp=lit,nearchunks,rtshadows,sky`; `litginosky` with
+    `-PmetalExp=lit,nearchunks,rtshadows,gi`.
+- The look: `bash tools/bench/fidelity.sh litGiNoon 12 32768 -PmetalExp=lit,nearchunks,rtshadows,sky,gi -Ptaa=true`, with
+  `-PfidelityTime=13000` and `18000`, against the same without `gi`; and `-PlitView=8` (green nearly everywhere on
+  terrain; red only on thin faces and at the far edge).
+- By hand: the log's "gi: cache of 2097152 cells, 72 MB, hit quads from the LOD's buffers (zero copy)", "gi: ... frames"
+  and "lit: relit ... GI cache in ..." lines, no "gi: shaders failed"; a house with a window (dark inside but for the
+  sunlit patch's bounce; nothing leaks through 1-block walls); a cave mouth; `/time set 12000` from noon (the light drops
+  at once and settles within a second or two); `/weather rain` and back; a fast 180-degree turn (cells without samples
+  show the sky term for a few frames, no black); breaking a block in a wall; flying fast at the LOD's speed (cells are
+  per block face near the camera: watch for blotches where they're new).

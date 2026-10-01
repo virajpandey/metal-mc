@@ -3,8 +3,9 @@ import Metal
 import MetalMCCore
 import simd
 
-// Bounce light (global illumination) from a world-space irradiance cache (METALMC_EXP=gi, prototype: the kernels and
-// an offline test, not yet wired into the frame; docs/gi-design.md has the design, the measurements and the hooks).
+// Bounce light (global illumination) from a world-space irradiance cache (METALMC_EXP=gi, prototype; in the frame with
+// lit mode, METALMC_EXP=lit,gi: docs/gi-design.md has the design and the measurements, docs/lighting-design.md "Lit mode
+// with the GI cache" the wiring).
 //
 // Minecraft's world is axis-aligned block faces that rarely change, so indirect light is stored on the world instead
 // of the screen: one cache cell per block face near the player (keyed by the air block in front of the face and the
@@ -30,9 +31,18 @@ import simd
 //
 // Direct sunlight on screen stays the per-pixel shadow ray (RtShadows), and block light the flood fill vanilla and the
 // LOD already carry; the cache holds what those can't: sky light that follows the real openings, and bounced light.
+//
+// In lit mode (METALMC_EXP=lit,gi) RtShadows runs the frame after building its instance structure (encodeFrame), and
+// the relight takes the cache's light in place of its sky term (litRelightPixel, giUpsample). What a bounce ray needs
+// from its hit (material, face, block light, sky cover) comes from the quad it hit, read from the LOD node's own quad
+// buffer (GI_ZERO_COPY: each tile's structure has one geometry per quad range, and the hit's instance, geometry and
+// primitive index find the quad through giTiles); the structures carry no per-triangle data. The cells hold light per
+// unit of the frame's daylight (GiLight.scale), so the time of day, rain and lightning show at once.
 
-/// METALMC_EXP=gi: the world-space irradiance cache (prototype; not drawn yet).
+/// METALMC_EXP=gi: the world-space irradiance cache (with lit, wired into the frame: litGi).
 let lodGi = experiments.contains("gi")
+/// METALMC_EXP=lit,gi: the cache runs in the frame and lit mode's relight takes its light (nothing changes without both).
+let litGi = litEnabled && lodGi
 private func giEnv(_ key: String) -> String? { ProcessInfo.processInfo.environment[key] }
 /// METALMC_GICAP: log2 of the cache's slots (default 21: 2 M cells, 72 MB).
 let giCapacityLog2 = min(24, max(14, Int(giEnv("METALMC_GICAP") ?? "") ?? 21))
@@ -65,10 +75,61 @@ let giBucketSlots = 16
 /// Bytes per slot: fingerprint 4, key and first surface point 16, last seen 4, light 8, count and flags 4.
 let giBytesPerCell = 36
 
-private let giShaderSource = """
-#include <metal_stdlib>
+/// The way back from gi_resolve's half-resolution output to full resolution (giUpsample), shared by the cache's library
+/// and lit mode's relight (Lit.swift, Taa.swift, with METALMC_EXP=lit,gi only).
+let giUpsampleHeader = """
+
+// gi_resolve's code word per half-resolution sample: the surface's plane (its camera-relative coordinate along the face's
+// axis, as a half) | face << 16, and GI_CODE_DATA when the irradiance is there, GI_CODE_EMPTY when the surface's cells
+// have no samples yet; 0 for the sky or past the cached range.
+#define GI_CODE_DATA (1u << 19)
+#define GI_CODE_EMPTY (1u << 20)
+
+// gi_resolve's half-resolution irradiance at full-resolution pixel `gid`, whose surface is on `face` at camera-relative
+// `rel`: its own 2 x 2 block's sample when that is on the same face and plane (most pixels: two reads), else the nearest
+// of the 8 around it that is (an edge, or a face too small for a sample of its own, like the riser of a one-block step:
+// planes up to a block and a half apart count, the next step's light). The samples are bilinear across cells 10 or
+// more pixels wide, so nearest-sample steps of 2 pixels don't show; a bilinear upsample (4 taps, or a gather of the codes
+// and a filtered read) cost 0.5-0.9 ms at the panel's resolution, since so many pixels lie near a face's edge in this
+// world that the taps rarely all match. w: 1 with data; 0 when nothing matched (the caller may take the cells itself,
+// giIrradiance); -1 when the surface's cells have no samples yet (they'd find nothing: not worth the lookups, which just
+// after a turn cost 1 ms).
+static float4 giUpsample(texture2d<float> irr, texture2d<uint> code, uint2 gid, uint face, float3 rel) {
+    int2 hsize = int2(irr.get_width(), irr.get_height());
+    int2 c0 = min(int2(gid / 2u), hsize - 1);
+    float plane = rel[face >> 1];
+    float tol = max(0.25, 0.002 * length(rel));   // depth precision and the half's fall with distance
+    uint c = code.read(uint2(c0)).r;
+    uint cf = (c >> 16) & 7u;
+    float cd = abs(float(as_type<half>(ushort(c & 0xFFFFu))) - plane);
+    if (cf == face && (c & GI_CODE_DATA) != 0u && cd <= tol) return float4(irr.read(uint2(c0)).rgb, 1.0);
+    bool empty = cf == face && (c & GI_CODE_EMPTY) != 0u && cd <= tol;
+    // The 8 around, edge neighbors first, the nearest plane winning.
+    const int2 around[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };
+    int best = -1;
+    float bestD = tol + 1.5;
+    for (int k = 0; k < 8; k++) {
+        uint2 hc = uint2(clamp(c0 + around[k], int2(0), hsize - 1));
+        uint n = code.read(hc).r;
+        if (((n >> 16) & 7u) != face) continue;
+        float nd = abs(float(as_type<half>(ushort(n & 0xFFFFu))) - plane);
+        if ((n & GI_CODE_DATA) == 0u) { empty = empty || ((n & GI_CODE_EMPTY) != 0u && nd <= tol); continue; }
+        if (nd < bestD - 0.01) { bestD = nd; best = k; }
+    }
+    if (best >= 0) return float4(irr.read(uint2(clamp(c0 + around[best], int2(0), hsize - 1))).rgb, 1.0);
+    return float4(0.0, 0.0, 0.0, empty ? -1.0 : 0.0);
+}
+"""
+
+/// The cache's kernels. `zeroCopy`: a bounce hit finds its quad in the LOD node's buffer through giTiles (the game's
+/// route, structures without per-triangle data); otherwise it reads the structure's primitive data (giTileGeometry,
+/// +54% structure memory; offline comparisons only).
+private func giShaderSource(zeroCopy: Bool) -> String {
+    "#define GI_ZERO_COPY \(zeroCopy ? 1 : 0)\n" + skyShaderHeader + giUpsampleHeader + "\n" + giKernelSource
+}
+
+private let giKernelSource = """
 #include <metal_raytracing>
-using namespace metal;
 using namespace raytracing;
 
 struct GiParams {
@@ -77,10 +138,11 @@ struct GiParams {
     int4 camBlock;         // xyz: the camera's block (floor of its position); w: buckets - 1
     float4 camFrac;        // xyz: camera position minus camBlock; w: distance where level-0 cells end (blocks)
     float4 sun;            // xyz: direction to the sun; w: 1 with the sun up, 0 without
-    float4 sunColor;       // rgb: sun irradiance on a surface facing it (linear); w: sun disk radius (radians)
-    float4 skyZenith;      // rgb: sky radiance straight up; w: max sun ray length (blocks)
-    float4 skyHorizon;     // rgb: sky radiance at the horizon; w: updates a cell's average holds at most
-    float4 blockLight;     // rgb: irradiance at block light 15 (torch color); w: frames unseen before eviction
+    float4 rays;           // x: sun disk radius (radians), y: max sun ray length (blocks), z: updates a cell's average
+                           // holds at most, w: the cloud layer's bottom relative to the camera (the request skips the 4
+                           // blocks above it: vanilla's clouds write depth; a huge value without clouds)
+    float4 blockLight;     // rgb: irradiance at block light 15 (torch color; 0 in lit mode, whose block light stays
+                           // vanilla's); w: frames unseen before eviction
     float4 sizes;          // full width, full height, request width, request height
     float4 limits;         // x: farthest distance cached (blocks), y: ray offset from surfaces, z: debug view mode,
                            // w: max bounce ray length (blocks)
@@ -91,6 +153,45 @@ struct GiParams {
     uint4 sample;          // x: pixels per request sample, y-z: this frame's pixel in that block, w: samples per update
     uint4 sched;           // x: chance (of 2^32) that a visible cell with samples is listed this frame, y-w: unused
 };
+
+// The cache's light, in its own units: light per unit of the frame's daylight, so that a change of daylight (the time of
+// day, rain, a lightning flash) shows at once instead of after the cells' history (64 updates, up to seconds): the
+// resolve multiplies what the cells hold by `scale`. In lit mode gi_light makes it each frame from the relight's sun and
+// sky light (Lit.swift's env), so `scale` x the cells' light is in the relight's units; the offline test fills it with
+// the prototype's light (scale 1).
+struct GiLight {
+    float4 sun;            // rgb: the sun's irradiance on a surface facing it
+    float4 scale;          // rgb: what the cells' light is multiplied by where it's read (the frame's daylight)
+    float4 skyView;        // rgb: Sky's sky view table (skyLuminance) to these units; w: 1 to take the sky from it
+    float4 zenith;         // rgb: sky radiance straight up (without the table)
+    float4 horizon;        // rgb: sky radiance at the horizon (without the table)
+    float4 ground;         // rgb: radiance below the horizon, where rays leave past the LOD's edge
+    float4 open[6];        // rgb: irradiance from the open sky on each face direction (a bounce hit on a cell without
+                           // samples takes half of it)
+};
+
+#if GI_ZERO_COPY
+// Per instance of the instance structure (in its order): the LOD node's quad buffer, by its GPU address (the encoder
+// declares the buffers resident), and the first quad of each geometry of the tile's structure (its opaque faces, then
+// its tile-edge skirts; giTileMesh). A geometry has two triangles per quad in the buffer's order.
+struct GiTile {
+    const device uint* quads;
+    uint start[2];
+};
+// The hit's quad, as giTileGeometry packs a triangle's data: material | face << 8 | block light << 11 | water depth or
+// sky cover << 15. One dependent read per hit instead of 4 bytes per triangle in the structure (+54% memory).
+static uint giHitQuad(const device GiTile* tiles, uint instance, uint geometry, uint primitive) {
+    const device GiTile& t = tiles[instance];
+    uint q = t.start[min(geometry, 1u)] + primitive / 2u;
+    uint w0 = t.quads[2u * q], w1 = t.quads[2u * q + 1u];
+    return (w1 & 255u) | (((w0 >> 25) & 7u) << 8) | (((w1 >> 24) & 15u) << 11) | (((w0 >> 28) & 15u) << 15);
+}
+#define GI_HIT(h) giHitQuad(tiles, h.instance_id, h.geometry_id, h.primitive_id)
+#define GI_TILES_ARG , const device GiTile* tiles [[buffer(17)]]
+#else
+#define GI_HIT(h) giPrim(h.primitive_data)
+#define GI_TILES_ARG
+#endif
 
 #define GI_BUCKET 16u
 #define GI_MAX_LEVEL 12u
@@ -233,18 +334,20 @@ static void giEnqueueVisible(constant GiParams& p, device uint* list, device ato
     if (i < giVisiblePart(p)) list[i] = e;
 }
 
-static float3 giSky(constant GiParams& p, float3 d) {
-    // Below the horizon a ray has left the geometry (past the LOD's edge): dim ground.
-    if (d.y < 0.0) return p.skyHorizon.rgb * 0.3;
-    return mix(p.skyHorizon.rgb, p.skyZenith.rgb, sqrt(d.y));
+// The sky's radiance in direction d: the atmosphere's (Sky.swift's sky view table, as lit mode's relight integrates it)
+// or the prototype's gradient. Below the horizon a ray has left the geometry (past the LOD's edge): the ground.
+static float3 giSky(constant GiLight& L, constant SkyFrame& sf, texture2d<float> skyView, float3 d) {
+    if (d.y < 0.0) return L.ground.rgb;
+    if (L.skyView.w > 0.5) return skyLuminance(sf, d, skyView) * L.skyView.rgb;
+    return mix(L.horizon.rgb, L.zenith.rgb, sqrt(d.y));
 }
 // Irradiance from vanilla's block light level: its lightmap curve, f / (4 - 3f).
 static float3 giBlockLight(constant GiParams& p, uint level) {
     float f = float(level) / 15.0;
     return p.blockLight.rgb * (f / (4.0 - 3.0 * f));
 }
-static float3 giSunOn(constant GiParams& p, uint face) {
-    return p.sunColor.rgb * (p.sun.w * max(0.0, dot(kGiNormal[face], p.sun.xyz)));
+static float3 giSunOn(constant GiParams& p, constant GiLight& L, uint face) {
+    return L.sun.rgb * (p.sun.w * max(0.0, dot(kGiNormal[face], p.sun.xyz)));
 }
 
 struct GiSurface { float3 rel; uint face; };
@@ -324,7 +427,8 @@ kernel void gi_request(constant GiParams& p [[buffer(1)]],
     uint2 q = min(gid * p.sample.x + p.sample.yz, full - 1);
     GiSurface s;
     uint seen = 0u;
-    if (giSurfaceAt(p, depth, q, s) && length(s.rel) <= p.limits.x) {
+    // (Vanilla's clouds write depth: no cells for them.)
+    if (giSurfaceAt(p, depth, q, s) && length(s.rel) <= p.limits.x && !(s.rel.y > p.rays.w - 0.1 && s.rel.y < p.rays.w + 4.1)) {
         float lf = giLevelF(p, length(s.rel));
         uint level = min(uint(lf), GI_MAX_LEVEL);
         float3 f = p.camFrac.xyz + s.rel;
@@ -399,6 +503,10 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
                       const device uint* list [[buffer(7)]],
                       device atomic_uint* counters [[buffer(8)]],
                       constant float4* mats [[buffer(9)]],
+                      constant GiLight& L [[buffer(15)]],
+                      constant SkyFrame& sf [[buffer(16)]],
+                      texture2d<float> skyView [[texture(6)]]
+                      GI_TILES_ARG,
                       uint tid [[thread_position_in_grid]]) {
     if (tid >= atomic_load_explicit(&counters[1], memory_order_relaxed)) return;
     uint nv = atomic_load_explicit(&counters[17], memory_order_relaxed);
@@ -457,7 +565,7 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
             ray pr(st, -n, 0.001, float(s) + 0.01);
             auto ph = probe.intersect(pr, accel, 0xFF);
             rays++;
-            if (ph.type != intersection_type::none && ((giPrim(ph.primitive_data) >> 8) & 7u) == face) {
+            if (ph.type != intersection_type::none && ((GI_HIT(ph) >> 8) & 7u) == face) {
                 o = st - n * ph.distance;
             } else if (verify) {
                 continue;   // checking whether the surface is still there: no fallback
@@ -476,8 +584,8 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
         // How much of the sun's disk the face sees (a different point of the disk per sample).
         if (p.sun.w > 0.0 && dot(n, p.sun.xyz) > 0.0) {
             float2 dk = giR2(si, shiftC);
-            float r = p.sunColor.w * sqrt(dk.x), ang = 2.0 * kGiPi * dk.y;
-            ray sr(o, normalize(p.sun.xyz + sunT1 * (r * cos(ang)) + sunT2 * (r * sin(ang))), 0.0, p.skyZenith.w);
+            float r = p.rays.x * sqrt(dk.x), ang = 2.0 * kGiPi * dk.y;
+            ray sr(o, normalize(p.sun.xyz + sunT1 * (r * cos(ang)) + sunT2 * (r * sin(ang))), 0.0, p.rays.y);
             rays++;
             sunSamples++;
             if (shadow.intersect(sr, accel, 0xFF).type == intersection_type::none) sumSun += 1.0;
@@ -492,9 +600,9 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
         ray br(o, dir, 0.0, p.limits.w);
         rays++;
         auto bh = bounce.intersect(br, accel, 0xFF);
-        if (bh.type == intersection_type::none) { sumE += kGiPi * giSky(p, dir); continue; }
+        if (bh.type == intersection_type::none) { sumE += kGiPi * giSky(L, sf, skyView, dir); continue; }
         if (!bh.triangle_front_facing) continue;   // the back of a surface: the ray is inside terrain, no light
-        uint pd = giPrim(bh.primitive_data);
+        uint pd = GI_HIT(bh);
         uint hm = pd & 255u, hf = min((pd >> 8) & 7u, 5u), hbl = (pd >> 11) & 15u;
         float3 hp = o + dir * bh.distance;
         int3 hair = giAirBlock(p.origin.xyz, hp, hf);
@@ -518,7 +626,7 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
             he = giFindA(check, hb, hfp);
         }
         float3 eh;
-        float3 sunH = giSunOn(p, hf);
+        float3 sunH = giSunOn(p, L, hf);
         half4 hv = he >= 0 ? value[he] : half4(0.0h);
         if (giSampled(hv)) {
             eh = float3(hv.rgb) + (float(hv.a) - 1.0) * sunH;
@@ -528,11 +636,11 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
             // Nothing cached there yet: its direct sun from one more ray, and half the open sky.
             float vis = 0.0;
             if (sunH.x + sunH.y + sunH.z > 0.0) {
-                ray hs(hp + kGiNormal[hf] * offset, p.sun.xyz, 0.0, p.skyZenith.w);
+                ray hs(hp + kGiNormal[hf] * offset, p.sun.xyz, 0.0, p.rays.y);
                 rays++;
                 vis = shadow.intersect(hs, accel, 0xFF).type == intersection_type::none ? 1.0 : 0.0;
             }
-            eh = vis * sunH + 0.5 * kGiPi * mix(p.skyHorizon.rgb, p.skyZenith.rgb, 0.6);
+            eh = vis * sunH + 0.5 * L.open[hf].rgb;
             uncached++;
         }
         eh += giBlockLight(p, hbl);
@@ -580,7 +688,7 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
     }
     // A running mean until the average holds `history` updates, then an exponential one.
     half4 old = value[e];
-    uint cnt = giSampled(old) ? (m & 255u) : 0u, cap = uint(p.skyHorizon.w);
+    uint cnt = giSampled(old) ? (m & 255u) : 0u, cap = uint(p.rays.z);
     float alpha = 1.0 / float(min(cnt, cap) + 1u);
     float3 rgb = mix(float3(old.rgb), est, alpha);
     // The sun's share only changes when it was tested (a face turned away from it, or night, keeps the last one, or 0
@@ -635,20 +743,16 @@ static float4 giIrradiance(constant GiParams& p, const device uint* check, const
     return e;
 }
 
-// gi_resolve's code word per half-resolution sample: the surface's plane (its camera-relative coordinate along the face's
-// axis, as a half) | face << 16, and GI_CODE_DATA when the irradiance is there, GI_CODE_EMPTY when the surface's cells
-// have no samples yet; 0 for the sky or past the cached range.
-#define GI_CODE_DATA (1u << 19)
-#define GI_CODE_EMPTY (1u << 20)
-
 // Indirect irradiance (sky and bounced light) at half resolution: one sample per 2 x 2 pixels, at the block's nearest
-// surface, into an RG11B10 texture, with a code word per sample (above) so the lighting pass can upsample it by face and
-// plane without the depth buffer (giUpsample). At the panel's resolution a full-resolution resolve cost
-// 1.4-1.6 ms, mostly its lookups (4 per pixel) and its output's bandwidth; a cell spans 10 pixels or more, so a quarter
-// of the lookups loses nothing but the edges, which the upsample keeps.
+// surface, into an RG11B10 texture, with a code word per sample (GI_CODE_DATA, giUpsampleHeader) so the lighting pass can
+// upsample it by face and plane without the depth buffer (giUpsample). At the panel's resolution a full-resolution
+// resolve cost 1.4-1.6 ms, mostly its lookups (4 per pixel) and its output's bandwidth; a cell spans 10 pixels or more,
+// so a quarter of the lookups loses nothing but the edges, which the upsample keeps. The cells' light is per unit of
+// daylight: times this frame's (GiLight.scale).
 kernel void gi_resolve(constant GiParams& p [[buffer(1)]],
                        const device uint* check [[buffer(2)]],
                        const device half4* value [[buffer(5)]],
+                       constant GiLight& L [[buffer(15)]],
                        depth2d<float, access::read> depth [[texture(0)]],
                        texture2d<float, access::write> out [[texture(1)]],
                        texture2d<uint, access::write> code [[texture(5)]],
@@ -672,43 +776,8 @@ kernel void gi_resolve(constant GiParams& p [[buffer(1)]],
     float3 f = p.camFrac.xyz + s.rel;
     float4 e = giIrradiance(p, check, value, f, giAirBlock(p.camBlock.xyz, f, s.face), s.face, giLevelF(p, length(s.rel)));
     uint pc = uint(as_type<ushort>(half(s.rel[s.face >> 1]))) | (s.face << 16);
-    out.write(float4(e.w > 0.0 ? e.rgb : float3(0.0), 1.0), gid);
+    out.write(float4(e.w > 0.0 ? e.rgb * L.scale.rgb : float3(0.0), 1.0), gid);
     code.write(uint4(pc | (e.w > 0.0 ? GI_CODE_DATA : GI_CODE_EMPTY)), gid);
-}
-
-// gi_resolve's half-resolution irradiance at full-resolution pixel `gid`, whose surface is on `face` at camera-relative
-// `rel`: its own 2 x 2 block's sample when that is on the same face and plane (most pixels: two reads), else the nearest
-// of the 8 around it that is (an edge, or a face too small for a sample of its own, like the riser of a one-block step:
-// planes up to a block and a half apart count, the next step's light). The samples are bilinear across cells 10 or
-// more pixels wide, so nearest-sample steps of 2 pixels don't show; a bilinear upsample (4 taps, or a gather of the codes
-// and a filtered read) cost 0.5-0.9 ms at the panel's resolution, since so many pixels lie near a face's edge in this
-// world that the taps rarely all match. w: 1 with data; 0 when nothing matched (the caller may take the cells itself,
-// giIrradiance); -1 when the surface's cells have no samples yet (they'd find nothing: not worth the lookups, which just
-// after a turn cost 1 ms).
-static float4 giUpsample(texture2d<float> irr, texture2d<uint> code, uint2 gid, uint face, float3 rel) {
-    int2 hsize = int2(irr.get_width(), irr.get_height());
-    int2 c0 = min(int2(gid / 2u), hsize - 1);
-    float plane = rel[face >> 1];
-    float tol = max(0.25, 0.002 * length(rel));   // depth precision and the half's fall with distance
-    uint c = code.read(uint2(c0)).r;
-    uint cf = (c >> 16) & 7u;
-    float cd = abs(float(as_type<half>(ushort(c & 0xFFFFu))) - plane);
-    if (cf == face && (c & GI_CODE_DATA) != 0u && cd <= tol) return float4(irr.read(uint2(c0)).rgb, 1.0);
-    bool empty = cf == face && (c & GI_CODE_EMPTY) != 0u && cd <= tol;
-    // The 8 around, edge neighbors first, the nearest plane winning.
-    const int2 around[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };
-    int best = -1;
-    float bestD = tol + 1.5;
-    for (int k = 0; k < 8; k++) {
-        uint2 hc = uint2(clamp(c0 + around[k], int2(0), hsize - 1));
-        uint n = code.read(hc).r;
-        if (((n >> 16) & 7u) != face) continue;
-        float nd = abs(float(as_type<half>(ushort(n & 0xFFFFu))) - plane);
-        if ((n & GI_CODE_DATA) == 0u) { empty = empty || ((n & GI_CODE_EMPTY) != 0u && nd <= tol); continue; }
-        if (nd < bestD - 0.01) { bestD = nd; best = k; }
-    }
-    if (best >= 0) return float4(irr.read(uint2(clamp(c0 + around[best], int2(0), hsize - 1))).rgb, 1.0);
-    return float4(0.0, 0.0, 0.0, empty ? -1.0 : 0.0);
 }
 
 static float3 giTonemap(float3 c) {
@@ -719,14 +788,19 @@ static float3 giTonemap(float3 c) {
 // Debug view (limits.z): 0 lit (sun from the per-pixel shadow, sky and bounced light from the cache, block light),
 // 1 the cache's irradiance alone (magenta: none), 2 cells (a color per cell, dimmed where it has no samples), 3 samples
 // (red none, green converged, magenta: no cell), 4 without the cache (sun, vanilla's sky light as flat ambient, block
-// light), 5 bounced and sky light only (albedo times the cache). `irr` and `code` are gi_resolve's output; `prim` holds
-// each pixel's primitive data (material, face, block light, sky cover) and `sunVis` its sun visibility; in the game,
-// 1 x 1 stand-ins give white and full sun.
+// light), 5 bounced and sky light only (albedo times the cache); lit mode's relight (Lit.swift, without its AO and
+// lightmap: block light by vanilla's curve, sRGB-encoded and clipped like its SDR output) 6 with its sky term (the open
+// sky's light on the face times the sky light level's curve) and 7 with the cache's light in its place where the cache
+// has data. `irr` and `code` are gi_resolve's output; `prim` holds each pixel's primitive data (material, face, block
+// light, sky cover) and `sunVis` its sun visibility; in the game, 1 x 1 stand-ins give white and full sun.
 kernel void gi_debug_view(constant GiParams& p [[buffer(1)]],
                           const device uint* check [[buffer(2)]],
                           const device half4* value [[buffer(5)]],
                           const device uint* meta [[buffer(6)]],
                           constant float4* mats [[buffer(9)]],
+                          constant GiLight& L [[buffer(15)]],
+                          constant SkyFrame& sf [[buffer(16)]],
+                          texture2d<float> skyView [[texture(6)]],
                           depth2d<float, access::read> depth [[texture(0)]],
                           texture2d<float> irr [[texture(1)]],
                           texture2d<uint, access::read> prim [[texture(2)]],
@@ -739,7 +813,8 @@ kernel void gi_debug_view(constant GiParams& p [[buffer(1)]],
     GiSurface s;
     if (!giSurfaceAt(p, depth, gid, s)) {
         float3 d = normalize(giRelAt(p, gid, 1.0));
-        out.write(float4(giTonemap(giSky(p, d) * kGiPi * p.look.x), 1.0), gid);
+        float3 sky = giSky(L, sf, skyView, d) * kGiPi * L.scale.rgb;
+        out.write(float4(mode >= 6u ? skyEncode(saturate(sky * p.look.x / kGiPi)) : giTonemap(sky * p.look.x), 1.0), gid);
         return;
     }
     bool dummy = prim.get_width() == 1u;
@@ -748,17 +823,27 @@ kernel void gi_debug_view(constant GiParams& p [[buffer(1)]],
     float3 albedo = dummy ? float3(0.6) : mats[mat * 4u + giFaceClass(s.face)].rgb;
     float3 emit = dummy ? float3(0.0) : mats[mat * 4u + 3u].rgb * p.look.z;
     float vis = sunVis.get_width() == 1u ? 1.0 : float(sunVis.read(gid).r);
-    float3 sunI = giSunOn(p, s.face) * vis;
+    float3 sunI = giSunOn(p, L, s.face) * L.scale.rgb * vis;
     float4 up = giUpsample(irr, code, gid, s.face, s.rel);
     if (up.w == 0.0 && length(s.rel) <= p.limits.x) {
         // No half-resolution sample on this pixel's face and plane (a face a pixel or two wide): its own lookups, which
         // only these few pixels pay for.
         float3 f = p.camFrac.xyz + s.rel;
         up = giIrradiance(p, check, value, f, giAirBlock(p.camBlock.xyz, f, s.face), s.face, giLevelF(p, length(s.rel)));
+        up.rgb *= L.scale.rgb;
     }
     float3 ir = up.rgb;
     bool has = up.w > 0.0;
-    float3 ambient = kGiPi * mix(p.skyHorizon.rgb, p.skyZenith.rgb, 0.6) * (s.face == 2u ? 1.0 : (s.face == 3u ? 0.3 : 0.6));
+    float3 ambient = L.open[2].rgb * L.scale.rgb * (s.face == 2u ? 1.0 : (s.face == 3u ? 0.3 : 0.6));
+    if (mode >= 6u) {
+        // Lit mode's relight: sun, the sky term (or the cache's light), block light by vanilla's curve (no lightmap).
+        float sky = float(15u - min(cover, 15u)), b = float(bl) / 15.0;
+        float fall = skyDecode(float3((sky / 15.0) / (4.0 - 3.0 * (sky / 15.0)))).x;
+        float3 skyTerm = mode == 7u && has ? ir : L.open[s.face].rgb * L.scale.rgb * fall;
+        float3 lin = albedo * (sunI + skyTerm + float3(b / (4.0 - 3.0 * b) * (b / (4.0 - 3.0 * b))));
+        out.write(float4(skyEncode(saturate(lin * p.look.x)), 1.0), gid);
+        return;
+    }
     float3 c;
     if (mode == 1u) {
         c = has ? ir : float3(1.0, 0.0, 1.0);
@@ -773,7 +858,7 @@ kernel void gi_debug_view(constant GiParams& p [[buffer(1)]],
             uint h = giMix(k.x ^ giMix(k.y));
             c = float3(float(h & 255u), float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0 * (cnt > 0u ? 1.0 : 0.3);
         } else {
-            float r = float(cnt) / p.skyHorizon.w;
+            float r = float(cnt) / p.rays.z;
             c = e < 0 ? float3(1.0, 0.0, 1.0) : mix(float3(1.0, 0.0, 0.0), float3(0.0, 1.0, 0.0), saturate(r));
         }
         out.write(float4(c, 1.0), gid);
@@ -839,7 +924,7 @@ kernel void gi_count(constant GiParams& p [[buffer(1)]],
                      device atomic_uint* counters [[buffer(8)]],
                      uint tid [[thread_position_in_grid]]) {
     bool live = tid < (uint(p.camBlock.w) + 1u) * GI_BUCKET && check[tid] != 0u;
-    bool conv = live && float(meta[tid] & 255u) >= p.skyHorizon.w;
+    bool conv = live && float(meta[tid] & 255u) >= p.rays.z;
     uint nl = simd_sum(live ? 1u : 0u), nc = simd_sum(conv ? 1u : 0u);
     if (simd_is_first()) {
         if (nl > 0u) atomic_fetch_add_explicit(&counters[6], nl, memory_order_relaxed);
@@ -854,7 +939,8 @@ kernel void gi_test_primary(instance_acceleration_structure accel [[buffer(0)]],
                             constant float4x4& viewProj [[buffer(11)]],
                             device float* depthOut [[buffer(12)]],
                             texture2d<uint, access::write> prim [[texture(2)]],
-                            texture2d<half, access::write> sunVis [[texture(3)]],
+                            texture2d<half, access::write> sunVis [[texture(3)]]
+                            GI_TILES_ARG,
                             uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(p.sizes.x) || gid.y >= uint(p.sizes.y)) return;
     float3 dir = normalize(giRelAt(p, gid, 1.0));
@@ -872,7 +958,7 @@ kernel void gi_test_primary(instance_acceleration_structure accel [[buffer(0)]],
     float3 rel = dir * h.distance;
     float4 clip = viewProj * float4(rel, 1.0);
     depthOut[idx] = clip.z / clip.w;
-    uint pd = giPrim(h.primitive_data);
+    uint pd = GI_HIT(h);
     prim.write(uint4(pd), gid);
     uint face = min((pd >> 8) & 7u, 5u);
     float vis = 0.0;
@@ -880,7 +966,7 @@ kernel void gi_test_primary(instance_acceleration_structure accel [[buffer(0)]],
         intersector<instancing> sh;
         sh.accept_any_intersection(true);
         sh.assume_geometry_type(geometry_type::triangle);
-        ray sr(cam + rel + kGiNormal[face] * 0.02, p.sun.xyz, 0.0, p.skyZenith.w);
+        ray sr(cam + rel + kGiNormal[face] * 0.02, p.sun.xyz, 0.0, p.rays.y);
         vis = sh.intersect(sr, accel, 0xFF).type == intersection_type::none ? 1.0 : 0.0;
     }
     sunVis.write(half4(half(vis)), gid);
@@ -939,7 +1025,8 @@ kernel void gi_test_upsample(constant GiParams& p [[buffer(1)]],
 // culling. out per ray: hit, face, front facing, distance bits (no culling), then hit and face with back faces culled.
 kernel void gi_test_rays(instance_acceleration_structure accel [[buffer(0)]],
                          const device float4* rays [[buffer(13)]],
-                         device uint4* out [[buffer(14)]],
+                         device uint4* out [[buffer(14)]]
+                         GI_TILES_ARG,
                          uint tid [[thread_position_in_grid]]) {
     float4 o = rays[2 * tid], d = rays[2 * tid + 1];
     ray r(o.xyz, d.xyz, 0.0, o.w);
@@ -951,9 +1038,28 @@ kernel void gi_test_rays(instance_acceleration_structure accel [[buffer(0)]],
     b.set_triangle_cull_mode(triangle_cull_mode::back);
     auto hb = b.intersect(r, accel, 0xFF);
     bool hitA = ha.type != intersection_type::none, hitB = hb.type != intersection_type::none;
-    out[2 * tid] = uint4(hitA ? 1u : 0u, hitA ? (giPrim(ha.primitive_data) >> 8) & 7u : 9u, hitA && ha.triangle_front_facing ? 1u : 0u,
+    out[2 * tid] = uint4(hitA ? 1u : 0u, hitA ? (GI_HIT(ha) >> 8) & 7u : 9u, hitA && ha.triangle_front_facing ? 1u : 0u,
                          as_type<uint>(hitA ? ha.distance : -1.0));
-    out[2 * tid + 1] = uint4(hitB ? 1u : 0u, hitB ? (giPrim(hb.primitive_data) >> 8) & 7u : 9u, 0u, as_type<uint>(hitB ? hb.distance : -1.0));
+    out[2 * tid + 1] = uint4(hitB ? 1u : 0u, hitB ? (GI_HIT(hb) >> 8) & 7u : 9u, 0u, as_type<uint>(hitB ? hb.distance : -1.0));
+}
+
+// Lit mode (METALMC_EXP=lit,gi): the frame's GiLight from the relight's sun and sky light. env: lit_env's output (with the
+// atmosphere: env[0].w is its scale from the sky view table to these units) or litDaylightEnv's, in the relight's units
+// per unit of albedo: the sun's irradiance, then the sky's on +X -X +Y -Y +Z -Z and on faces that aren't axis-aligned.
+// opt.x: 1 to take the sky's radiance from the sky view table. The daylight the cells are measured in is the sun's
+// irradiance plus the open sky's on a top face; the sky without the table is even (its irradiance on a top is pi times
+// its radiance, as litDaylightEnv's sides are half sky and half ground).
+kernel void gi_light(constant float4* env [[buffer(16)]], constant float4& opt [[buffer(18)]], device GiLight& L [[buffer(15)]],
+                     uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    float3 d = max(env[0].rgb + env[3].rgb, float3(1e-4));
+    L.sun = float4(env[0].rgb / d, 0.0);
+    L.scale = float4(d, 0.0);
+    L.skyView = opt.x > 0.5 ? float4(float3(env[0].w) / d, 1.0) : float4(0.0);
+    L.zenith = float4(env[3].rgb / (kGiPi * d), 0.0);
+    L.horizon = L.zenith;
+    L.ground = float4(env[4].rgb / (kGiPi * d), 0.0);
+    for (uint f = 0; f < 6u; f++) L.open[f] = float4(env[1u + f].rgb / d, 0.0);
 }
 
 // Offline self-test: cell keys of blocks through giAirBlock, giCellOf, giKey and back through giUnkey.
@@ -969,16 +1075,14 @@ kernel void gi_test_keys(const device int4* blocks [[buffer(13)]], device int4* 
 }
 """
 
-/// Mirrors GiParams in the shader (288 bytes).
+/// Mirrors GiParams in the shader (256 bytes).
 struct GiParams {
     var invViewProj = matrix_identity_float4x4
     var origin = SIMD4<Int32>.zero
     var camBlock = SIMD4<Int32>.zero
     var camFrac = SIMD4<Float>.zero
     var sun = SIMD4<Float>.zero
-    var sunColor = SIMD4<Float>.zero
-    var skyZenith = SIMD4<Float>.zero
-    var skyHorizon = SIMD4<Float>.zero
+    var rays = SIMD4<Float>.zero
     var blockLight = SIMD4<Float>.zero
     var sizes = SIMD4<Float>.zero
     var limits = SIMD4<Float>.zero
@@ -997,6 +1101,22 @@ let giTorch = SIMD3<Float>(1.6, 1.15, 0.7)
 /// Emission of a light-15 block (glowstone, lava), pi times its radiance.
 let giEmission: Float = 4.0
 
+/// GiLight (the shader's: sun, scale, skyView, zenith, horizon, ground, open[6]) holding the prototype's light, for the
+/// offline test without lit mode: the cells' units are the light's own (scale 1).
+func giPrototypeLight(sunUp: Float) -> [SIMD4<Float>] {
+    let mid = (giSkyHorizon + (giSkyZenith - giSkyHorizon) * 0.6) * .pi
+    return [SIMD4(giSunIrradiance * sunUp, 0), SIMD4(1, 1, 1, 0), .zero, SIMD4(giSkyZenith, 0), SIMD4(giSkyHorizon, 0),
+            SIMD4(giSkyHorizon * 0.3, 0)] + [SIMD4<Float>](repeating: SIMD4(mid, 0), count: 6)
+}
+
+/// Lit mode's light for the cache this frame (encodeFrame): the relight's sun and sky light (Lit.swift's env), either
+/// the atmosphere's (lit_env from this frame's sky tables, the sky's radiance from its sky view table; litDaylightEnv's
+/// values if the tables aren't there) or litDaylightEnv's values.
+enum GiLightSource {
+    case atmosphere(fallback: [SIMD4<Float>])
+    case daylight([SIMD4<Float>])
+}
+
 /// Per material: top, side and bottom albedo (linear) and emission (pi times radiance), four float4 each.
 func giMaterialTable(_ colors: [SIMD4<Float>]) -> [SIMD4<Float>] {
     var t = [SIMD4<Float>](repeating: .zero, count: 256 * 4)
@@ -1012,13 +1132,29 @@ func giMaterialTable(_ colors: [SIMD4<Float>]) -> [SIMD4<Float>] {
 }
 
 /// The cache: its table, pipelines and per-frame state. One per dimension would be the in-game shape (cells are keyed
-/// by world position); the prototype has one.
+/// by world position); there is one, and lit mode only runs in the overworld.
 final class GiCache: @unchecked Sendable {
+    /// Lit mode's cache (METALMC_EXP=lit,gi), made on first use with the LOD's colors as it draws them (nil without lit,gi
+    /// or without ray tracing). Render thread.
+    static let shared: GiCache? = litGi ? GiCache(capacityLog2: giCapacityLog2, colors: LodRenderer.shared.giColors()) : nil
+
     let slots: Int
     let listCapacity: Int   // the most cells one frame can update
+    /// GI_ZERO_COPY: bounce hits read their quad from the LOD node's buffer (`tiles` must describe the instance structure).
+    let zeroCopy: Bool
     let check: MTLBuffer, keys: MTLBuffer, stamp: MTLBuffer, value: MTLBuffer, meta: MTLBuffer, list: MTLBuffer
     let counters: MTLBuffer   // shared: the statistics are read on the CPU
     let mats: MTLBuffer
+    /// GiLight: gi_light writes it each frame in lit mode, the offline test the prototype's light (giPrototypeLight).
+    let light: MTLBuffer
+    /// Lit mode with the atmosphere: lit_env's output for gi_light (8 float4 and its sky view scale).
+    private let envBuffer: MTLBuffer
+    private let dummySkyView: MTLTexture
+    /// The sky for this frame's bounce rays (lit mode with the atmosphere: Sky's frame and sky view table).
+    private var skyFrame = SkyFrameGPU()
+    private var skyView: MTLTexture?
+    /// Zero copy: the instance structure's GiTile per instance and the node buffers their addresses point into.
+    var tiles: (table: MTLBuffer, buffers: [MTLBuffer])?
     private var pipes: [String: MTLComputePipelineState] = [:]
     var frame: Int32 = 1
     private var sweepPos = 0, sweepLen = 0, sweeps = 0
@@ -1031,22 +1167,26 @@ final class GiCache: @unchecked Sendable {
     /// blocks what a bounce ray finds is low on the horizon and weighs little, and long rays cost the most).
     var maxDistance: Float = 8192, sunRayLength: Float = 4000, bounceRayLength: Float = 512
 
-    init?(capacityLog2: Int, colors: [SIMD4<Float>] = lodColorTable()) {
+    init?(capacityLog2: Int, colors: [SIMD4<Float>] = lodColorTable(), zeroCopy: Bool = true) {
         let dev = ctx.device
         guard dev.supportsRaytracing else { log("gi: no ray tracing on this device"); return nil }
-        guard MemoryLayout<GiParams>.stride == 288 else { log("gi: GiParams is \(MemoryLayout<GiParams>.stride) bytes, the shader's 288"); return nil }
+        guard MemoryLayout<GiParams>.stride == 256 else { log("gi: GiParams is \(MemoryLayout<GiParams>.stride) bytes, the shader's 256"); return nil }
         slots = 1 << capacityLog2
         listCapacity = giBudget
+        self.zeroCopy = zeroCopy
         func buf(_ bytes: Int, _ mode: MTLResourceOptions = .storageModePrivate) -> MTLBuffer? { dev.makeBuffer(length: max(bytes, 16), options: mode) }
         let table = giMaterialTable(colors)
+        let sv = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
+        sv.usage = .shaderRead
         guard let c = buf(slots * 4), let k = buf(slots * 16), let s = buf(slots * 4), let v = buf(slots * 8), let m = buf(slots * 4),
               let l = buf(listCapacity * 4), let n = buf(64 * 4, .storageModeShared),
-              let t = dev.makeBuffer(bytes: table, length: table.count * 16, options: .storageModeShared) else { return nil }
-        check = c; keys = k; stamp = s; value = v; meta = m; list = l; counters = n; mats = t
+              let t = dev.makeBuffer(bytes: table, length: table.count * 16, options: .storageModeShared),
+              let li = buf(12 * 16, .storageModeShared), let env = buf(9 * 16), let dsv = dev.makeTexture(descriptor: sv) else { return nil }
+        check = c; keys = k; stamp = s; value = v; meta = m; list = l; counters = n; mats = t; light = li; envBuffer = env; dummySkyView = dsv
         do {
-            let lib = try dev.makeLibrary(source: giShaderSource, options: nil)
+            let lib = try dev.makeLibrary(source: giShaderSource(zeroCopy: zeroCopy), options: nil)
             for name in ["gi_begin", "gi_request", "gi_schedule", "gi_args", "gi_update", "gi_resolve", "gi_debug_view", "gi_invalidate",
-                         "gi_count", "gi_test_primary", "gi_test_rays", "gi_test_keys", "gi_test_upsample"] {
+                         "gi_count", "gi_light", "gi_test_primary", "gi_test_rays", "gi_test_keys", "gi_test_upsample"] {
                 guard let f = lib.makeFunction(name: name) else { log("gi: no function \(name)"); return nil }
                 pipes[name] = try dev.makeComputePipelineState(function: f)
             }
@@ -1055,11 +1195,12 @@ final class GiCache: @unchecked Sendable {
             return nil
         }
         memset(counters.contents(), 0, counters.length)
+        setLight(giPrototypeLight(sunUp: 1))
         guard let cb = ctx.queue.makeCommandBuffer() else { return nil }
         clear(cb)
         cb.commit()
         cb.waitUntilCompleted()
-        log("gi: cache of \(slots) cells, \((slots * giBytesPerCell) >> 20) MB")
+        log("gi: cache of \(slots) cells, \((slots * giBytesPerCell) >> 20) MB, \(zeroCopy ? "hit quads from the LOD's buffers (zero copy)" : "per-triangle data")")
     }
 
     func pipe(_ name: String) -> MTLComputePipelineState { pipes[name]! }
@@ -1069,6 +1210,11 @@ final class GiCache: @unchecked Sendable {
         guard let b = cb.makeBlitCommandEncoder() else { return }
         for x in [check, keys, stamp, value, meta] { b.fill(buffer: x, range: 0..<x.length, value: 0) }
         b.endEncoding()
+    }
+
+    /// Sets the light from the CPU (GiLight's 12 float4; the offline test, with nothing in flight).
+    func setLight(_ l: [SIMD4<Float>]) {
+        l.withUnsafeBytes { light.contents().copyMemory(from: $0.baseAddress!, byteCount: min($0.count, light.length)) }
     }
 
     /// Queues an edited block (world coordinates): cells within `radius` blocks restart their averages next frame.
@@ -1091,9 +1237,7 @@ final class GiCache: @unchecked Sendable {
                            Int32(slots / giBucketSlots - 1))
         p.camFrac = SIMD4(Float(cam.x - camFloor.x), Float(cam.y - camFloor.y), Float(cam.z - camFloor.z), level0Range)
         p.sun = SIMD4(simd_normalize(sunDir), sunUp)
-        p.sunColor = SIMD4(giSunIrradiance * sunUp, 0.0105)
-        p.skyZenith = SIMD4(giSkyZenith, sunRayLength)
-        p.skyHorizon = SIMD4(giSkyHorizon, history)
+        p.rays = SIMD4(0.0105, sunRayLength, history, 1e9)
         p.blockLight = SIMD4(giTorch, evictFrames)
         p.sizes = SIMD4(Float(width), Float(height), Float((width + sc - 1) / sc), Float((height + sc - 1) / sc))
         p.limits = SIMD4(maxDistance, 0.02, 0, bounceRayLength)
@@ -1136,11 +1280,51 @@ final class GiCache: @unchecked Sendable {
         enc.setBuffer(list, offset: 0, index: 7)
         enc.setBuffer(counters, offset: 0, index: 8)
         enc.setBuffer(mats, offset: 0, index: 9)
+        enc.setBuffer(light, offset: 0, index: 15)
+    }
+
+    /// What the kernels that trace rays need beside the table: the hit quads' buffers (zero copy, buffer 17) and the sky
+    /// (buffer 16, texture 6).
+    func bindRays(_ enc: MTLComputeCommandEncoder) {
+        if zeroCopy, let tiles {
+            enc.setBuffer(tiles.table, offset: 0, index: 17)
+            enc.useResources(tiles.buffers, usage: .read)
+        }
+        var f = skyFrame
+        enc.setBytes(&f, length: MemoryLayout<SkyFrameGPU>.stride, index: 16)
+        enc.setTexture(skyView ?? dummySkyView, index: 6)
     }
 
     private func dispatch1D(_ enc: MTLComputeCommandEncoder, _ name: String, _ n: Int) {
         enc.setComputePipelineState(pipe(name))
         enc.dispatchThreads(MTLSize(width: max(n, 1), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    }
+
+    /// Lit mode: the frame's GiLight from the relight's light (gi_light), and the sky its bounce rays see.
+    private func encodeLight(_ enc: MTLComputeCommandEncoder, _ source: GiLightSource) {
+        var opt = SIMD4<Float>.zero
+        var daylight: [SIMD4<Float>]
+        switch source {
+        case .atmosphere(let fallback):
+            daylight = fallback
+            if let view = Sky.shared.skyView, Lit.shared.encodeEnv(enc, into: envBuffer) {
+                enc.setBuffer(envBuffer, offset: 0, index: 16)
+                skyFrame = Sky.shared.frame
+                skyView = view
+                opt.x = 1
+                daylight = []
+            }
+        case .daylight(let env):
+            daylight = env
+        }
+        if !daylight.isEmpty {
+            daylight.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 16) }
+            skyFrame = SkyFrameGPU()
+            skyView = nil
+        }
+        enc.setBytes(&opt, length: 16, index: 18)
+        enc.setBuffer(light, offset: 0, index: 15)
+        dispatch1D(enc, "gi_light", 1)
     }
 
     /// Stage 0: clear the frame's counters and apply queued edits.
@@ -1186,6 +1370,7 @@ final class GiCache: @unchecked Sendable {
     /// Stage 3: trace the listed cells' rays. `accels`: the structures `accel` references.
     func encodeUpdate(_ enc: MTLComputeCommandEncoder, accel: MTLAccelerationStructure, accels: [MTLAccelerationStructure], params p: inout GiParams) {
         bindTable(enc)
+        bindRays(enc)
         enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
         enc.setAccelerationStructure(accel, bufferIndex: 0)
         enc.useResources(accels, usage: .read)
@@ -1206,13 +1391,22 @@ final class GiCache: @unchecked Sendable {
                             threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     }
 
-    /// The whole frame in one encoder, for the game (not wired yet; docs/gi-design.md, "Integration"): request, schedule,
-    /// update and resolve, after the level is drawn and RtShadows has built its instance structure, into `out` and `code`.
+    /// Lit mode's frame (METALMC_EXP=lit,gi; RtShadows.trace, once its instance structure is built, after the level is
+    /// drawn): the light from the relight's, then request, schedule, update and resolve, in one encoder, into `out` and
+    /// `code` (half the depth buffer's size rounded up). The instance structure must cover every direction (RtShadows'
+    /// tiles are the LOD's selection, not frustum-culled) and, with zero copy, `tiles` must describe its instances.
+    /// `cloudHeight`: the cloud layer's bottom (world y). Block light isn't in the cells: the relight's stays vanilla's
+    /// flood fill, and it couldn't follow the daylight's scale.
     func encodeFrame(_ cb: MTLCommandBuffer, depth: MTLTexture, out: MTLTexture, code: MTLTexture, invViewProj: simd_float4x4, cam: SIMD3<Double>,
                      origin: SIMD3<Double>, accel: MTLAccelerationStructure, accels: [MTLAccelerationStructure], sunDir: SIMD3<Float>,
-                     sunUp: Float) -> Bool {
+                     sunUp: Float, cloudHeight: Float, light: GiLightSource) -> Bool {
+        if zeroCopy && tiles == nil { return false }
         var p = params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: depth.width, height: depth.height)
+        p.blockLight = SIMD4(0, 0, 0, evictFrames)
+        p.rays.w = cloudHeight - Float(cam.y)
         guard let enc = cb.makeComputeCommandEncoder() else { return false }
+        enc.label = "MetalMC GI cache"
+        encodeLight(enc, light)
         encodeBegin(enc, params: &p)
         encodeRequest(enc, depth: depth, params: &p)
         encodeSchedule(enc, params: &p)
@@ -1222,12 +1416,94 @@ final class GiCache: @unchecked Sendable {
         advance()
         return true
     }
+
+    /// Offline test: lit mode's light from litDaylightEnv at `sunAngle` (vanilla's, radians) into `light`, as encodeFrame
+    /// makes it without the atmosphere. Blocks until done.
+    func debugDaylightLight(sunAngle: Float) {
+        guard let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return }
+        encodeLight(enc, .daylight(litDaylightEnv(sunAngle: sunAngle)))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+}
+
+extension LodRenderer {
+    /// The LOD's colors as it draws them (the game's biome tints, the resource pack's ratios), for the cache's albedos.
+    func giColors() -> [SIMD4<Float>] {
+        var c = lodColorTable(tints: tints)
+        for i in 0..<min(c.count, packRatio.count) { c[i] = SIMD4(c[i].x * packRatio[i].x, c[i].y * packRatio[i].y, c[i].z * packRatio[i].z, c[i].w) }
+        return c
+    }
 }
 
 /// A 4 x 4 visiting order that spreads consecutive frames' request samples apart (a Bayer order, as RtShadows').
 let giRequestPattern: [SIMD2<UInt32>] = [0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12].map { SIMD2(UInt32($0 % 4), UInt32($0 / 4)) }
 
-// MARK: - Acceleration structures with per-triangle data
+// MARK: - Acceleration structures the bounce rays can read their hits from
+
+/// A tile's opaque quads and tile-edge skirts (the quads RtShadows takes, in its order) as triangles in node-local blocks,
+/// for a structure with one geometry per quad range (zero copy, giHitQuad: a hit's geometry and primitive index find its
+/// quad in the node's buffer). `ranges`: per geometry, its first quad in the node's buffer and its quad count (the opaque
+/// faces' buckets, then the skirts', empty ones left out). Two triangles per quad, in the buffer's order.
+func giTileMesh(quads: UnsafePointer<UInt32>, start: [Int], tile t: Int, level: Int) -> (verts: [Float], idx: [UInt32], ranges: [(first: Int, count: Int)]) {
+    let scale = Float(1 << level)
+    var verts: [Float] = [], idx: [UInt32] = [], ranges: [(first: Int, count: Int)] = []
+    for (k0, k1) in [(0, 6), (12, lodBucketsPerTile)] {
+        let a = start[lodBucketIndex(t, k0, 0)], b = start[lodBucketIndex(t, k1 - 1, lodSubtilesPerTile)]
+        if b <= a { continue }
+        ranges.append((a, b - a))
+        verts.reserveCapacity(verts.count + (b - a) * 12)
+        idx.reserveCapacity(idx.count + (b - a) * 6)
+        for i in a..<b {
+            let w0 = quads[2 * i], w1 = quads[2 * i + 1]
+            let face = Int((w0 >> 25) & 7)
+            let base = UInt32(verts.count / 3)
+            if face > 5 {
+                // Not a block face (the mesher makes none): a degenerate quad keeps the triangles in step with the quads.
+                verts += [Float](repeating: 0, count: 12)
+            } else {
+                let local = SIMD3(Float(w0 & 255), Float((w0 >> 16) & 511), Float((w0 >> 8) & 255))
+                let qw = Float(((w1 >> 8) & 255) + 1), qh = Float(((w1 >> 16) & 255) + 1)
+                let ext: SIMD3<Float> = face < 2 ? SIMD3(1, qw, qh) : (face < 4 ? SIMD3(qw, 1, qh) : SIMD3(qw, qh, 1))
+                for (cx, cy, cz) in lodFaceCorners[face] {
+                    let p = (local + SIMD3(Float(cx), Float(cy), Float(cz)) * ext) * scale
+                    verts += [p.x, p.y, p.z]
+                }
+            }
+            idx += [base, base + 1, base + 2, base, base + 2, base + 3]
+        }
+    }
+    return (verts, idx, ranges)
+}
+
+/// The geometry descriptors of a tile's structure: one per quad range (giTileMesh's, consecutive in `ib`), or one for all
+/// of `ib`'s `triangles` without ranges.
+func giGeometries(vb: MTLBuffer, ib: MTLBuffer, triangles: Int, ranges: [(first: Int, count: Int)]?) -> [MTLAccelerationStructureTriangleGeometryDescriptor] {
+    var out: [MTLAccelerationStructureTriangleGeometryDescriptor] = []
+    var first = 0
+    for count in ranges.map({ $0.map { 2 * $0.count } }) ?? [triangles] {
+        let g = MTLAccelerationStructureTriangleGeometryDescriptor()
+        g.vertexBuffer = vb
+        g.vertexStride = 12
+        g.vertexFormat = .float3
+        g.indexBuffer = ib
+        g.indexBufferOffset = first * 12
+        g.indexType = .uint32
+        g.triangleCount = count
+        g.opaque = true
+        out.append(g)
+        first += count
+    }
+    return out
+}
+
+/// GiTile (giHitQuad) for an instance whose structure giTileMesh built: the node's quad buffer and its ranges' first quads.
+func giTileEntry(_ buffer: MTLBuffer, _ ranges: [(first: Int, count: Int)]) -> SIMD4<UInt32> {
+    let a = buffer.gpuAddress
+    return SIMD4(UInt32(truncatingIfNeeded: a), UInt32(truncatingIfNeeded: a >> 32), UInt32(ranges.first?.first ?? 0),
+                 UInt32(ranges.count > 1 ? ranges[1].first : 0))
+}
 
 /// A tile's opaque quads (and tile-edge skirts, as RtShadows takes them) as triangles in node-local blocks, with 4 bytes
 /// per triangle for the cache's bounce rays: material | face << 8 | block light << 11 | water depth or sky cover << 15.
@@ -1257,28 +1533,23 @@ func giTileGeometry(quads: UnsafePointer<UInt32>, start: [Int], tile t: Int, lev
     return (verts, idx, prims)
 }
 
-/// Builds and compacts one primitive structure (with per-triangle data unless `prims` is nil). Blocks until done.
-func giBuildBlas(verts: [Float], idx: [UInt32], prims: [UInt32]?, queue: MTLCommandQueue) -> MTLAccelerationStructure? {
+/// Builds and compacts one primitive structure: with per-triangle data `prims` (one geometry), or one geometry per range
+/// of `ranges` (giTileMesh's), or one geometry without either. Blocks until done.
+func giBuildBlas(verts: [Float], idx: [UInt32], prims: [UInt32]?, ranges: [(first: Int, count: Int)]? = nil,
+                 queue: MTLCommandQueue) -> MTLAccelerationStructure? {
     let dev = ctx.device
     guard !idx.isEmpty,
           let vb = dev.makeBuffer(bytes: verts, length: verts.count * 4, options: .storageModeShared),
           let ib = dev.makeBuffer(bytes: idx, length: idx.count * 4, options: .storageModeShared) else { return nil }
-    let g = MTLAccelerationStructureTriangleGeometryDescriptor()
-    g.vertexBuffer = vb
-    g.vertexStride = 12
-    g.vertexFormat = .float3
-    g.indexBuffer = ib
-    g.indexType = .uint32
-    g.triangleCount = idx.count / 3
-    g.opaque = true
-    if let prims {
+    let geometries = giGeometries(vb: vb, ib: ib, triangles: idx.count / 3, ranges: prims == nil ? ranges : nil)
+    if let prims, let g = geometries.first {
         guard let pb = dev.makeBuffer(bytes: prims, length: prims.count * 4, options: .storageModeShared) else { return nil }
         g.primitiveDataBuffer = pb
         g.primitiveDataStride = 4
         g.primitiveDataElementSize = 4
     }
     let d = MTLPrimitiveAccelerationStructureDescriptor()
-    d.geometryDescriptors = [g]
+    d.geometryDescriptors = geometries
     let sizes = dev.accelerationStructureSizes(descriptor: d)
     guard let accel = dev.makeAccelerationStructure(size: sizes.accelerationStructureSize),
           let scratch = dev.makeBuffer(length: max(sizes.buildScratchBufferSize, 16), options: .storageModePrivate),
@@ -1320,7 +1591,14 @@ private final class GiTestScene {
     var cache: GiCache?
     var triangles = 0, blasBytes = 0
     var buildMs = 0.0
-    var withPrims = true
+    /// The structures' per-triangle route: zero copy (the game's: one geometry per quad range, the hit's quad read from
+    /// the node's buffer), primitive data (4 bytes per triangle in the structure), or none (what RtShadows builds without
+    /// the cache; no cache then).
+    enum Route { case zeroCopy, primitiveData, none }
+    var route = Route.zeroCopy
+    var nodeBuffers: [MTLBuffer] = []   // zero copy: each node's quads
+    var tiles: MTLBuffer?               // zero copy: GiTile per instance
+    var litLight = false                // lit mode's light (mmc_debug_gi_lit_light) instead of the prototype's
     var lastResolve: [Float] = []   // the last frame's resolved irradiance (half resolution, rgba)
 }
 nonisolated(unsafe) private var giTest: GiTestScene?
@@ -1376,14 +1654,33 @@ private func giBuildScene(_ s: GiTestScene) -> Bool {
     s.blas = []
     s.triangles = 0
     s.blasBytes = 0
+    s.nodeBuffers = []
     var instances: [MTLAccelerationStructureInstanceDescriptor] = []
+    var tiles: [SIMD4<UInt32>] = []
     for n in s.nodes {
         var starts = [0]
         for c in n.mesh.counts { starts.append(starts.last! + c) }
+        // Zero copy: the node's quads in a buffer of their own, as the LOD's nodes have them (LodMeshNode.buffer).
+        var nodeBuffer: MTLBuffer?
+        if s.route == .zeroCopy {
+            guard let b = dev.makeBuffer(bytes: n.mesh.quads, length: max(n.mesh.quads.count * 4, 16), options: .storageModeShared) else { return false }
+            nodeBuffer = b
+            s.nodeBuffers.append(b)
+        }
         n.mesh.quads.withUnsafeBufferPointer { q in
             for t in 0..<(lodTilesPerSide * lodTilesPerSide) {
-                let (verts, idx, prims) = giTileGeometry(quads: q.baseAddress!, start: starts, tile: t, level: n.level)
-                guard let b = giBuildBlas(verts: verts, idx: idx, prims: s.withPrims ? prims : nil, queue: queue) else { continue }
+                let b: MTLAccelerationStructure?, triangles: Int
+                if let nodeBuffer {
+                    let (verts, idx, ranges) = giTileMesh(quads: q.baseAddress!, start: starts, tile: t, level: n.level)
+                    b = giBuildBlas(verts: verts, idx: idx, prims: nil, ranges: ranges, queue: queue)
+                    if b != nil { tiles.append(giTileEntry(nodeBuffer, ranges)) }
+                    triangles = idx.count / 3
+                } else {
+                    let (verts, idx, prims) = giTileGeometry(quads: q.baseAddress!, start: starts, tile: t, level: n.level)
+                    b = giBuildBlas(verts: verts, idx: idx, prims: s.route == .primitiveData ? prims : nil, queue: queue)
+                    triangles = idx.count / 3
+                }
+                guard let b else { continue }
                 var inst = MTLAccelerationStructureInstanceDescriptor()
                 inst.transformationMatrix = MTLPackedFloat4x3(columns: (MTLPackedFloat3Make(1, 0, 0), MTLPackedFloat3Make(0, 1, 0), MTLPackedFloat3Make(0, 0, 1),
                                                                         MTLPackedFloat3Make(Float(n.x0 - s.origin.x), Float(lodWorldMinY - s.origin.y), Float(n.z0 - s.origin.z))))
@@ -1392,11 +1689,12 @@ private func giBuildScene(_ s: GiTestScene) -> Bool {
                 inst.accelerationStructureIndex = UInt32(s.blas.count)
                 instances.append(inst)
                 s.blas.append(b)
-                s.triangles += idx.count / 3
+                s.triangles += triangles
                 s.blasBytes += b.size
             }
         }
     }
+    s.tiles = tiles.isEmpty ? nil : dev.makeBuffer(bytes: tiles, length: tiles.count * 16, options: .storageModeShared)
     guard !instances.isEmpty,
           let ib = dev.makeBuffer(bytes: instances, length: instances.count * MemoryLayout<MTLAccelerationStructureInstanceDescriptor>.stride, options: .storageModeShared) else { return false }
     let d = MTLInstanceAccelerationStructureDescriptor()
@@ -1413,17 +1711,19 @@ private func giBuildScene(_ s: GiTestScene) -> Bool {
     cb.waitUntilCompleted()
     s.tlas = tlas
     s.buildMs = Date().timeIntervalSince(t0) * 1000
+    if let tiles = s.tiles { s.cache?.tiles = (tiles, s.nodeBuffers) }
     return true
 }
 
 /// Debug: builds the offline test's scene. kind 0: the synthetic scene (giSyntheticGrid) at the origin; kind 1: the save's
 /// region file `path` (r.X.Z.mca) at level 0 (its four quarters) and the 8 regions around it at level 1, as the LOD
-/// meshes them. flags bit 0: no per-triangle data (only to measure what it costs; the cache needs it).
-/// out: triangles, structure bytes (compacted), build ms (meshing and structures), nodes. Returns 1 if it worked.
+/// meshes them. flags bit 0: no per-triangle data at all (what RtShadows builds without the cache, to measure the
+/// routes against; no cache); bit 1: per-triangle data in the structures (primitiveDataBuffer) instead of the game's
+/// zero copy. out: triangles, structure bytes (compacted), build ms (meshing and structures), nodes. Returns 1 if it worked.
 @_cdecl("mmc_debug_gi_scene")
 public func mmc_debug_gi_scene(_ kind: Int32, _ path: UnsafePointer<CChar>?, _ flags: Int32, _ out: UnsafeMutablePointer<Double>) -> Int32 {
     let s = GiTestScene()
-    s.withPrims = flags & 1 == 0
+    s.route = flags & 1 != 0 ? .none : (flags & 2 != 0 ? .primitiveData : .zeroCopy)
     let t0 = Date()
     if kind == 0 {
         // No hidden-air fill: it would fill the closed room.
@@ -1461,9 +1761,10 @@ public func mmc_debug_gi_scene(_ kind: Int32, _ path: UnsafePointer<CChar>?, _ f
     }
     guard giBuildScene(s) else { return 0 }
     out[0] = Double(s.triangles); out[1] = Double(s.blasBytes); out[2] = Date().timeIntervalSince(t0) * 1000; out[3] = Double(s.nodes.count)
-    if s.withPrims {
-        s.cache = GiCache(capacityLog2: giCapacityLog2)
-        if s.cache == nil { return 0 }
+    if s.route != .none {
+        s.cache = GiCache(capacityLog2: giCapacityLog2, zeroCopy: s.route == .zeroCopy)
+        guard let cache = s.cache else { return 0 }
+        if let tiles = s.tiles { cache.tiles = (tiles, s.nodeBuffers) }
     }
     giTest = s
     return 1
@@ -1546,6 +1847,9 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
         cb.waitUntilCompleted()
         times[i].append((cb.gpuEndTime - cb.gpuStartTime) * 1000 / Double(runs))
     }
+    // The light: the prototype's, or lit mode's daylight curve at this sun angle (mmc_debug_gi_lit_light) as gi_light
+    // makes it in the game.
+    if s.litLight { cache.debugDaylightLight(sunAngle: sunA) } else { cache.setLight(giPrototypeLight(sunUp: sunUp)) }
     var p = cache.params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: w, height: h)
     // The G-buffer (what the game's depth buffer and shadow pass would provide), once: the camera doesn't move.
     timed(0) { cb in
@@ -1553,6 +1857,7 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
         enc.setComputePipelineState(cache.pipe("gi_test_primary"))
         enc.setAccelerationStructure(tlas, bufferIndex: 0)
         enc.useResources(s.blas, usage: .read)
+        cache.bindRays(enc)
         enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
         enc.setBytes(&viewProj, length: 64, index: 11)
         enc.setBuffer(depthBuf, offset: 0, index: 12)
@@ -1701,6 +2006,8 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
     venc.setBuffer(cache.value, offset: 0, index: 5)
     venc.setBuffer(cache.meta, offset: 0, index: 6)
     venc.setBuffer(cache.mats, offset: 0, index: 9)
+    venc.setBuffer(cache.light, offset: 0, index: 15)
+    cache.bindRays(venc)
     venc.setTexture(depth, index: 0)
     venc.setTexture(irr, index: 1)
     venc.setTexture(prim, index: 2)
@@ -1738,6 +2045,14 @@ public func mmc_debug_gi_reset() {
     memset(cache.counters.contents(), 0, cache.counters.length)
 }
 
+/// Debug: 1 lights the test scene with lit mode's daylight curve (litDaylightEnv at each run's sun angle, through
+/// gi_light, as in the game without the atmosphere; debug views 6 and 7 are lit mode's relight without and with the
+/// cache), 0 with the prototype's light.
+@_cdecl("mmc_debug_gi_lit_light")
+public func mmc_debug_gi_lit_light(_ on: Int32) {
+    giTest?.litLight = on != 0
+}
+
 /// Debug: the kernels' self-checks on the current scene. out: [key round trips checked, mismatches, rays checked, rays
 /// whose results were wrong], then per test ray (up to 8) no-cull hit, face, front facing, distance, culled hit, face,
 /// distance. The rays (synthetic scene): down onto the ground at (20, 70, 20), up from under the house's roof inside
@@ -1772,6 +2087,7 @@ public func mmc_debug_gi_selftest(_ out: UnsafeMutablePointer<Double>) -> Int32 
     enc.setComputePipelineState(cache.pipe("gi_test_rays"))
     enc.setAccelerationStructure(tlas, bufferIndex: 0)
     enc.useResources(s.blas, usage: .read)
+    cache.bindRays(enc)
     enc.setBuffer(rin, offset: 0, index: 13)
     enc.setBuffer(rout, offset: 0, index: 14)
     enc.dispatchThreads(MTLSize(width: rays.count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: rays.count, height: 1, depth: 1))

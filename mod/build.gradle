@@ -164,14 +164,32 @@ loom {
 			if (project.hasProperty("lodBudget")) {
 				environmentVariable "METALMC_LODBUDGET", project.findProperty("lodBudget").toString()
 			}
-			// Lit mode (-PmetalExp=lit,...): -PlitExposure=<scale, default 1> for the new light, -PlitView=<1-7> for a debug
+			// Lit mode (-PmetalExp=lit,...): -PlitExposure=<scale, default 1> for the new light, -PlitView=<1-8> for a debug
 			// view of the G-buffer and the light (Lit.swift: 1 albedo, 2 face, 3 light levels, 4 AO, 5 light, 6 sun
-			// visibility, 7 the overlay test).
+			// visibility, 7 the overlay test, 8 with the GI cache where its light applied).
 			if (project.hasProperty("litExposure")) {
 				environmentVariable "METALMC_LITEXPOSURE", project.findProperty("litExposure").toString()
 			}
 			if (project.hasProperty("litView")) {
 				environmentVariable "METALMC_LITVIEW", project.findProperty("litView").toString()
+			}
+			// The GI cache with lit mode (-PmetalExp=lit,...,gi; Gi.swift): -PgiBudget=<cells updated a frame, 16384>,
+			// -PgiRange=<blocks where level-0 cells end, 160>, -PgiCap=<log2 of the cells, 21>, -PgiSpp=<samples an
+			// update, 4>, -PgiHistory=<updates averaged, 64>.
+			if (project.hasProperty("giBudget")) {
+				environmentVariable "METALMC_GIBUDGET", project.findProperty("giBudget").toString()
+			}
+			if (project.hasProperty("giRange")) {
+				environmentVariable "METALMC_GIRANGE", project.findProperty("giRange").toString()
+			}
+			if (project.hasProperty("giCap")) {
+				environmentVariable "METALMC_GICAP", project.findProperty("giCap").toString()
+			}
+			if (project.hasProperty("giSpp")) {
+				environmentVariable "METALMC_GISPP", project.findProperty("giSpp").toString()
+			}
+			if (project.hasProperty("giHistory")) {
+				environmentVariable "METALMC_GIHISTORY", project.findProperty("giHistory").toString()
 			}
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"

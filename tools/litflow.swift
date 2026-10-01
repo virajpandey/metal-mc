@@ -12,6 +12,9 @@
 //   target); off: rtshadows only (no lit mode: the baseline main-pass time). "time" adds the timing runs
 //   (LITFLOW_TIMEONLY=1: only those). METALMC_FARFIELD=<level> turns the far field on as in the game;
 //   LITFLOW_VIEW=x,y,z,yaw,pitch moves the camera (default 8,150,8,100,22).
+//   LITFLOW_GI=1 adds the GI cache (METALMC_EXP=...,gi, Gi.swift): pictures and numbers of lit mode with and without the
+//   cache's light in the same frames (mmc_debug_lit_gi), morning, noon and dusk, and with "time" the frame with and
+//   without the cache's frame (mmc_debug_gi_frame). Pictures are named <mode>gi-... then.
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -21,7 +24,9 @@ let args = CommandLine.arguments
 guard args.count >= 4 else { print("usage: litflow <dylib> <world dir> <output dir> [sdr|sky|hdr|off] [time]"); exit(1) }
 let mode = args.count >= 5 ? args[4] : "sdr"
 let timing = args.count >= 6 && args[5] == "time"
-let exp = mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows"))
+let giOn = ProcessInfo.processInfo.environment["LITFLOW_GI"] == "1" && mode != "off"
+let exp = (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
+    + (giOn ? ",gi" : "")
 setenv("METALMC_EXP", exp, 1)
 let lit = mode != "off", sky = mode == "sky" || mode == "hdr", hdr = mode == "hdr"
 guard let lib = dlopen(args[1], RTLD_NOW) else { print("dlopen failed"); exit(1) }
@@ -75,6 +80,10 @@ let litTime = lit ? fn("mmc_debug_lit_time", (@convention(c) (Int64, Int64, Unsa
 let litTimeTaa = lit ? fn("mmc_debug_lit_time_taa", (@convention(c) (Int64, Int64, UnsafePointer<Float>, Int64, Int32, UnsafeMutablePointer<Double>) -> Void).self) : nil
 let taaApply = fn("mmc_taa_apply", (@convention(c) (Int64, Int64, UnsafePointer<Float>, UnsafePointer<Double>, Float, Float, Int32) -> Int32).self)
 if lit { check(fn("mmc_lit_enabled", (@convention(c) () -> Int32).self)() == 1, "lit mode seen by the library") }
+// The GI cache's switches (LITFLOW_GI=1): the relight's use of its light, and its frame in RtShadows.
+let litGiSwitch = giOn ? fn("mmc_debug_lit_gi", (@convention(c) (Int32) -> Int32).self) : nil
+let giFrameSwitch = giOn ? fn("mmc_debug_gi_frame", (@convention(c) (Int32) -> Void).self) : nil
+if let litGiSwitch { check(litGiSwitch(1) == 1, "the GI cache is wired into lit mode (lit,gi)") }
 
 // The world's LOD around the camera.
 let viewSpec = (ProcessInfo.processInfo.environment["LITFLOW_VIEW"] ?? "8,150,8,100,22").split(separator: ",").map { Double($0)! }
@@ -278,7 +287,7 @@ check(tracedFrames > 0, "ray-traced shadows ran during the warm-up")
 
 let W: Int32 = 1728, H: Int32 = 1117   // half the panel each way, for the pictures
 let half = targets(W, H)
-let tag = mode
+let tag = mode + (giOn ? "gi" : "")
 // Lit.swift's depth key and its match (bits 4-19 of the depth, within one step).
 func depthMatches(_ depth: Float, _ key: UInt32) -> Bool {
     let d = ((depth.bitPattern >> 4) &- key) & 0xFFFF
@@ -286,11 +295,13 @@ func depthMatches(_ depth: Float, _ key: UInt32) -> Bool {
 }
 func lumOf(_ px: [UInt8], _ i: Int) -> Double { 0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2]) }
 
-// The forward frame (no relight) and the relit one, morning sun in the east (LITFLOW_TIMEONLY=1 skips to the timing).
+// The forward frame (no relight) and the relit one, morning sun in the east (LITFLOW_TIMEONLY=1 skips to the timing;
+// LITFLOW_GIONLY=1 to the GI cache's comparison).
 let timeOnly = ProcessInfo.processInfo.environment["LITFLOW_TIMEONLY"] == "1"
-let fwd = timeOnly ? Readback() : capture(half, sunAngle: morning, relight: false, frames: 1)
-if !timeOnly { writePNG(fwd.color, Int(W), Int(H), "\(tag)-forward-morning.png") }
-if lit && !timeOnly {
+let giOnly = giOn && ProcessInfo.processInfo.environment["LITFLOW_GIONLY"] == "1"
+let fwd = timeOnly || giOnly ? Readback() : capture(half, sunAngle: morning, relight: false, frames: 1)
+if !timeOnly && !giOnly { writePNG(fwd.color, Int(W), Int(H), "\(tag)-forward-morning.png") }
+if lit && !timeOnly && !giOnly {
     let litM = capture(half, sunAngle: morning, relight: true)
     writePNG(litM.color, Int(W), Int(H), "\(tag)-lit-morning.png")
     // The G-buffer against the depth buffer: terrain pixels whose key matches the final depth (relit), those under the
@@ -406,6 +417,91 @@ if lit && !timeOnly {
     setLightmap(skyFactor: 1)
 }
 
+// The GI cache (LITFLOW_GI=1): lit mode with and without the cache's light in place of its sky term, in the same frames
+// (the cache keeps running either way; mmc_debug_lit_gi picks the relight's sky term). Per time of day: the pictures
+// (means of 16 frames, like the others), the mean 8-bit luma of the relit terrain by kind (shaded: faces the sun doesn't
+// light, turned away from it or edge-on, which only the sky term lights; sunlit tops), how much of the relit terrain the
+// cache covered (debug view 8), and the frame-to-frame change of single frames on the shaded faces (the cache's noise:
+// without it their light doesn't change between frames).
+if let litGiSwitch, !timeOnly {
+    let n = Int(W) * Int(H)
+    let normals: [SIMD3<Float>] = [SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)]
+    // Relit pixels above the translucent band (none is drawn here: extras off) whose G-buffer key matches, by kind.
+    func kinds(_ r: Readback, sunAngle: Float) -> (shaded: [Int], tops: [Int], all: [Int]) {
+        let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
+        var shaded: [Int] = [], tops: [Int] = [], all: [Int] = []
+        for i in 0..<n {
+            let gx = r.gbuf[2 * i], gy = r.gbuf[2 * i + 1]
+            let code = Int(gx >> 29)
+            guard code != 0, code != 7, depthMatches(r.depth[i], gy & 0xFFFF) else { continue }
+            // Light sources (block light 15) are full bright either way.
+            if (gy >> 24) >= 240 { continue }
+            all.append(i)
+            let ndl = simd_dot(normals[code - 1], sun)
+            if ndl < 0.05 { shaded.append(i) } else if code == 3 { tops.append(i) }
+        }
+        return (shaded, tops, all)
+    }
+    func meanLuma(_ px: [UInt8], _ idx: [Int]) -> Double { idx.isEmpty ? 0 : idx.reduce(0.0) { $0 + lumOf(px, 4 * $1) } / Double(idx.count) }
+    // Mean absolute luma change between two frames over idx, relative to their mean luma.
+    func change(_ a: [UInt8], _ b: [UInt8], _ idx: [Int]) -> Double {
+        var d = 0.0, s = 0.0
+        for i in idx { d += abs(lumOf(a, 4 * i) - lumOf(b, 4 * i)); s += lumOf(a, 4 * i) }
+        return s > 0 ? d / s : 0
+    }
+    for (name, angle, skyFactor) in [("morning", morning, Float(1)), ("noon", noon, Float(1)), ("dusk", dusk, Float(0.55))] {
+        setLightmap(skyFactor: skyFactor)
+        // The cache follows the new sun over its history (64 updates): 160 frames at the pictures' size.
+        _ = litGiSwitch(1)
+        for _ in 0..<160 { frame(half, sunAngle: angle, relight: true, extras: false) }
+        _ = litGiSwitch(0)
+        let without = capture(half, sunAngle: angle, relight: true, extras: false)
+        let w1 = capture(half, sunAngle: angle, relight: true, extras: false, frames: 1)
+        let w2 = capture(half, sunAngle: angle, relight: true, extras: false, frames: 1)
+        _ = litGiSwitch(1)
+        let with = capture(half, sunAngle: angle, relight: true, extras: false)
+        let g1 = capture(half, sunAngle: angle, relight: true, extras: false, frames: 1)
+        let g2 = capture(half, sunAngle: angle, relight: true, extras: false, frames: 1)
+        let cover = capture(half, sunAngle: angle, relight: true, view: 8, extras: false, frames: 1)
+        writePNG(without.color, Int(W), Int(H), "\(tag)-lit-\(name).png")
+        writePNG(with.color, Int(W), Int(H), "\(tag)-lit-gi-\(name).png")
+        writePNG(cover.color, Int(W), Int(H), "\(tag)-view-gi-coverage-\(name).png")
+        let k = kinds(with, sunAngle: angle)
+        var green = 0, red = 0
+        for i in k.all {
+            if cover.color[4 * i + 1] > 150 && cover.color[4 * i] < 50 { green += 1 } else if cover.color[4 * i] > 150 { red += 1 }
+        }
+        print(String(format: "      %@: shaded faces (%d px) mean luma lit %.1f, lit+gi %.1f; sunlit tops (%d px) %.1f, %.1f; all relit terrain %.1f, %.1f",
+                     name, k.shaded.count, meanLuma(without.color, k.shaded), meanLuma(with.color, k.shaded), k.tops.count,
+                     meanLuma(without.color, k.tops), meanLuma(with.color, k.tops), meanLuma(without.color, k.all), meanLuma(with.color, k.all)))
+        print(String(format: "      %@: the cache's light on %.1f%% of relit terrain (%.1f%% without data); frame-to-frame change of shaded faces: lit %.2f%%, lit+gi %.2f%%",
+                     name, 100 * Double(green) / Double(max(k.all.count, 1)), 100 * Double(red) / Double(max(k.all.count, 1)),
+                     100 * change(w1.color, w2.color, k.shaded), 100 * change(g1.color, g2.color, k.shaded)))
+    }
+    // A jump in the time of day (/time set): noon, settled, then dusk at once. The shaded faces' mean luma per frame after
+    // the jump against where it settles 192 frames later, and the relight without the cache (its sky term follows at
+    // once). The cells hold light per unit of the frame's daylight, so the change of brightness and color shows at once;
+    // what lags is the new sun direction's pattern of bounced light, over the cells' history.
+    setLightmap(skyFactor: 1)
+    for _ in 0..<160 { frame(half, sunAngle: noon, relight: true, extras: false) }
+    setLightmap(skyFactor: 0.55)
+    var trace: [(Int, Double)] = []
+    var ks: [Int] = []
+    for f in 0..<64 {
+        let r = capture(half, sunAngle: dusk, relight: true, extras: false, frames: 1)
+        if f == 0 { ks = kinds(r, sunAngle: dusk).shaded }
+        if [0, 1, 2, 4, 8, 16, 32, 63].contains(f) { trace.append((f, meanLuma(r.color, ks))) }
+    }
+    for _ in 0..<128 { frame(half, sunAngle: dusk, relight: true, extras: false) }
+    let settled = meanLuma(capture(half, sunAngle: dusk, relight: true, extras: false, frames: 1).color, ks)
+    _ = litGiSwitch(0)
+    let skyTerm = meanLuma(capture(half, sunAngle: dusk, relight: true, extras: false, frames: 1).color, ks)
+    _ = litGiSwitch(1)
+    print("      noon -> dusk at once: shaded faces' mean luma by frame after the jump " + trace.map { String(format: "%d: %.1f", $0.0, $0.1) }.joined(separator: ", ")
+          + String(format: "; settled %.1f (the sky term without the cache: %.1f)", settled, skyTerm))
+    setLightmap(skyFactor: 1)
+}
+
 // Timing at the panel's resolution (3456 x 2234): the relight alone, and the main pass with and without the G-buffer.
 if timing {
     let full = targets(3456, 2234)
@@ -476,6 +572,27 @@ if timing {
                 print(String(format: "      round %d: anti-aliasing resolve at 3456 x 2234 (%@ target): with the relight in its load %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), 60 each",
                              round, hdr ? "RGBA16Float" : "RGBA8", out[0], out[2], out[1], out[3], out[0] - out[1], out[2] - out[3]))
             }
+        }
+    }
+    if let giFrameSwitch {
+        // The GI cache: whole frames at the panel's resolution (sky clear, main pass, shadow rays, the cache's frame, the
+        // relight in its own pass or in the anti-aliasing's resolve) with and without the cache's frame (without it the
+        // relight has no cache light, so its upsample is skipped too), alternating, after 16 frames to settle.
+        for taa in [false, true] {
+            for _ in 0..<16 { frame(full, sunAngle: morning, relight: true, extras: false, taa: taa) }
+            var with: [Double] = [], without: [Double] = []
+            for k in 0..<120 {
+                let on = k % 2 == 0
+                giFrameSwitch(on ? 1 : 0)
+                _ = gpuTimesTake(&times, 4096)
+                frame(full, sunAngle: morning, relight: true, extras: false, taa: taa)
+                let c = Int(gpuTimesTake(&times, 4096))
+                if c > 0 { if on { with.append(times[c - 1] * 1000) } else { without.append(times[c - 1] * 1000) } }
+            }
+            giFrameSwitch(1)
+            let (wm, wf) = stats(with), (om, of) = stats(without)
+            print(String(format: "      frame at 3456 x 2234 (%@, relight %@): with the GI cache %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), 60 each",
+                         hdr ? "RGBA16Float" : "RGBA8", taa ? "in the anti-aliasing's resolve" : "its own pass", wm, wf, om, of, wm - om, wf - of))
         }
     }
 }
