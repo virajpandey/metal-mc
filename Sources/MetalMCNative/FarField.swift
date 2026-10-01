@@ -363,6 +363,10 @@ let farFieldShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
+// Lit mode (METALMC_EXP=lit, Lit.swift): the march also writes the terrain G-buffer.
+#define LIT_MODE \(litEnabled ? 1 : 0)
+\(litShaderHeader)
+
 struct LodUniforms {
     float4x4 proj;
     float4x4 view;
@@ -484,7 +488,11 @@ static float linearFog(float d, float s, float e) {
     return (d - s) / (e - s);
 }
 
+#if LIT_MODE
+struct FFOut { float4 color [[color(0)]]; uint2 gbuf [[color(1)]]; float depth [[depth(less)]]; };
+#else
 struct FFOut { float4 color [[color(0)]]; float depth [[depth(less)]]; };
+#endif
 struct LodSpriteGPU { float4 top; float4 side; float4 luma; };
 
 // Texture detail like the LOD's (lodShade): the texel's luma relative to the texture's mean luma, from a mip picked for
@@ -616,6 +624,9 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         t = tLeave;
     }
     FFOut out;
+#if LIT_MODE
+    out.gbuf = uint2(0u);
+#endif
     if (!hit) {
         if (\(farFieldSteps ? "true" : "false")) { out.color = float4(0.0, 0.0, 0.25, 1.0); out.depth = 0.0; return out; }
         discard_fragment();
@@ -634,6 +645,12 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     float footprint = tHit * 2.0 / (f.viewport.y * u.proj[1][1]) / max(abs(dot(dir, n)), 0.05);
     float mip = max(0.0, log2(footprint * 16.0));
     float3 color;
+#if LIT_MODE
+    // Lit mode: the G-buffer's albedo, AO, face and sky light; water and what's seen through it stay unlit (LIT_NONE).
+    float3 litAlbedo = float3(0.0);
+    float litAO = 1.0, litSky = sky;
+    uint litFace = LIT_NONE;
+#endif
     if (onCanopy) {
         // The canopy: its top with the corner occlusion of taller crowns around it, its sides darker toward the underside
         // (the crown shades itself), its underside lit by what gets under the trees.
@@ -642,8 +659,16 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         float3 lit = face == 3 ? lodLight(u, lightmap, ls, max(0.0, sky - kUnderCanopy)) : light;
         float ao = face == 2 ? columnAO(data, hitCell, hitRing, s, 2, cTop, hitFrac, y, true)
                  : (face == 3 ? 1.0 : mix(kAO[1], 1.0, saturate((y - cBot) / max(1.0, cTop - cBot))));
+#if LIT_MODE
+        litAlbedo = colors[cm * 3u + (face == 2 ? 0u : (face == 3 ? 2u : 1u))].rgb * detail(u, sprites, atlas, atlasSampler, cm, face, rel, mip);
+        color = litAlbedo * kShade[face] * lit * ao;
+        litAO = ao;
+        litSky = face == 3 ? max(0.0, sky - kUnderCanopy) : sky;
+        litFace = uint(face);
+#else
         color = colors[cm * 3u + (face == 2 ? 0u : (face == 3 ? 2u : 1u))].rgb * kShade[face] * lit
               * detail(u, sprites, atlas, atlasSampler, cm, face, rel, mip) * ao;
+#endif
     } else if (depthVox > 0u && face == 2) {
         // Water over its floor, like the LOD's translucent water over its meshed floor (lit for the water above it).
         float depthBlocks = min(15.0, float(depthVox) - 1.0);
@@ -662,9 +687,16 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
               * detail(u, sprites, atlas, atlasSampler, topMat, side ? face : 2, rel, mip) * lodLight(u, lightmap, ls, max(0.0, sky - depthBlocks));
     } else {
         uint mat = (face == 2 || y >= solidTop - min(s, 8.0)) ? topMat : lowMat;
+#if LIT_MODE
+        litAlbedo = colors[mat * 3u + (face == 2 ? 0u : 1u)].rgb * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip);
+        litAO = columnAO(data, hitCell, hitRing, s, face, solidTop, hitFrac, y, false);
+        litFace = uint(face);
+        color = litAlbedo * kShade[face] * light * litAO;
+#else
         color = colors[mat * 3u + (face == 2 ? 0u : 1u)].rgb * kShade[face] * light
               * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip)
               * columnAO(data, hitCell, hitRing, s, face, solidTop, hitFrac, y, false);
+#endif
     }
     if (\(farFieldSteps ? "true" : "false")) color = mix(float3(0.0, 1.0, 0.0), float3(1.0, 0.0, 0.0), saturate(float(steps) / 128.0));
     float horiz = length(rel.xz);
@@ -672,6 +704,9 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     out.color = float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), 1.0);
     float4 clip = u.proj * (u.view * float4(rel, 1.0));
     out.depth = min(clip.z / clip.w, pos.z);
+#if LIT_MODE
+    out.gbuf = litPack(litAlbedo, litAO, litFace, out.depth, litSky, 0.0);
+#endif
     return out;
 }
 """
@@ -743,7 +778,8 @@ final class FarField: @unchecked Sendable {
         d.fragmentFunction = library.makeFunction(name: "ff_fs")
         for (i, f) in colorFormats.enumerated() {
             d.colorAttachments[i].pixelFormat = f
-            if i > 0 { d.colorAttachments[i].writeMask = [] }
+            // Extra targets are left alone, except lit mode's G-buffer (Lit.swift).
+            if i > 0 && !litWritesGbuffer(i, f) { d.colorAttachments[i].writeMask = [] }
         }
         d.depthAttachmentPixelFormat = depth
         do {

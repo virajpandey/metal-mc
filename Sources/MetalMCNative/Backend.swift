@@ -403,14 +403,20 @@ final class PipelineBox {
     /// HDR hook (Hdr.swift, METALMC_EXP=hdr): with `colorFormats` (the pass's), a color attachment whose format differs
     /// from the pipeline's own gets the pass's format in a variant of its own. Vanilla's pipelines declare RGBA8 color
     /// targets, but with HDR the main target is RGBA16Float. Without HDR, callers pass nil and nothing changes.
+    /// Lit hook (Lit.swift, METALMC_EXP=lit): a color attachment the pipeline doesn't declare (the terrain G-buffer in the
+    /// level's main pass) gets the pass's format and no writes, so vanilla's pipelines stay valid in that pass.
     func state(depthFormat: MTLPixelFormat, colorFormats: [MTLPixelFormat]?) -> MTLRenderPipelineState? {
         var key = UInt64(depthFormat.rawValue & 0x3ff)
         var substitute: [(Int, MTLPixelFormat)] = []
+        var unwritten: [(Int, MTLPixelFormat)] = []
         if let colorFormats {
             for (i, f) in colorFormats.enumerated() where i < 5 && f != .invalid {
                 let own = base.colorAttachments[i].pixelFormat
                 if own != .invalid && own != f {
                     substitute.append((i, f))
+                    key |= UInt64(f.rawValue & 0x3ff) << UInt64(10 + 10 * i)
+                } else if own == .invalid && litEnabled {
+                    unwritten.append((i, f))
                     key |= UInt64(f.rawValue & 0x3ff) << UInt64(10 + 10 * i)
                 }
             }
@@ -421,12 +427,16 @@ final class PipelineBox {
         d.depthAttachmentPixelFormat = depthFormat
         if depthFormat == .depth32Float_stencil8 { d.stencilAttachmentPixelFormat = depthFormat }
         for (i, f) in substitute { d.colorAttachments[i].pixelFormat = f }
+        for (i, f) in unwritten {
+            d.colorAttachments[i].pixelFormat = f
+            d.colorAttachments[i].writeMask = []
+        }
         do {
             let s = try ctx.device.makeRenderPipelineState(descriptor: d)
             variants[key] = s
             return s
         } catch {
-            log("pipeline \(name) (depth \(depthFormat.rawValue)\(substitute.isEmpty ? "" : ", colors \(substitute.map { $0.1.rawValue })")) failed: \(error)")
+            log("pipeline \(name) (depth \(depthFormat.rawValue)\(substitute.isEmpty ? "" : ", colors \(substitute.map { $0.1.rawValue })")\(unwritten.isEmpty ? "" : ", unwritten \(unwritten.map { $0.1.rawValue })")) failed: \(error)")
             return nil
         }
     }
@@ -561,6 +571,10 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
                 _ = box.state(depthFormat: .depth32Float, colorFormats: [.rgba16Float])
                 if !hasDepth { _ = box.state(depthFormat: .invalid, colorFormats: [.rgba16Float]) }
             }
+            // Lit hook (Lit.swift): the variant for the level's main pass, whose second target is the terrain G-buffer.
+            if litEnabled && colorCount == 1 && d.colorAttachments[0].pixelFormat == .rgba8Unorm {
+                _ = box.state(depthFormat: .depth32Float, colorFormats: [hdrOutput ? .rgba16Float : .rgba8Unorm, litGbufferFormat])
+            }
             return makeHandle(box)
         } catch {
             writeError("\(error)", err, errLen)
@@ -618,6 +632,14 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
             if count == 0 || w == 0 {
                 w = t.width
                 h = t.height
+            }
+        }
+        // Lit hook (Lit.swift, METALMC_EXP=lit): the level's main pass (marked by mmc_lit_level_pass) gets the terrain
+        // G-buffer as a second color target.
+        if litEnabled && Lit.shared.pendingLevelPass {
+            Lit.shared.pendingLevelPass = false
+            if count == 1, colors[0] != 0, Lit.shared.attach(d, color: (from(colors[0]) as TextureBox).texture) {
+                ctx.passColorFormats.append(litGbufferFormat)
             }
         }
         profAttach(d, "pass \(w)x\(h) colors=\(count) depth=\(depth != 0) clear=\(clearMask)/\(depthClear)")
@@ -684,9 +706,10 @@ public func mmc_rp_set_pipeline(_ h: Int64) -> Int32 {
     guard let enc = ctx.pass else { return 0 }
     let p: PipelineBox = from(h)
     if ctx.pipe === p { return 1 }
-    // HDR hook (Hdr.swift): matched to the pass's color formats (the main target is RGBA16Float).
-    guard let st = hdrOutput ? p.state(depthFormat: ctx.passDepthFormat, colorFormats: ctx.passColorFormats)
-                             : p.state(depthFormat: ctx.passDepthFormat) else {
+    // HDR hook (Hdr.swift): matched to the pass's color formats (the main target is RGBA16Float). Lit hook (Lit.swift):
+    // the same, for the G-buffer target of the level's main pass.
+    guard let st = hdrOutput || litEnabled ? p.state(depthFormat: ctx.passDepthFormat, colorFormats: ctx.passColorFormats)
+                                           : p.state(depthFormat: ctx.passDepthFormat) else {
         ctx.pipe = nil
         return 0
     }

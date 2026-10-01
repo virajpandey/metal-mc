@@ -60,6 +60,14 @@ abstract class GameRendererLodMixin {
             metalmc.backend.MetalShadows.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, strength, Lod.CLOUD_HEIGHT, TemporalAA.ENABLED);
         }
+        // Lit hook (METALMC_EXP=lit, metalmc.backend.MetalLit): the terrain relit from the G-buffer the level's main pass
+        // wrote, after the shadows (it takes their visibility) and before the aerial perspective; with anti-aliasing, in
+        // its resolve as it loads the color.
+        if (metalmc.backend.MetalLit.ENABLED && Lod.SUN_SKY) {
+            metalmc.backend.MetalLit.relight(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
+                cameraState.viewRotationMatrix, Lod.SUN_ANGLE, cameraState.fogData,
+                net.minecraft.client.Minecraft.getInstance().gameRenderer.levelLightmap(), metalmc.sky.Sky.frameActive, TemporalAA.ENABLED);
+        }
         // Sky hook (METALMC_EXP=sky, metalmc.sky.Sky): the level through the air (aerial perspective, the render distance's
         // fade into the sky, the tone curve), after the shadows; with anti-aliasing, as it loads the color.
         if (metalmc.sky.Sky.frameActive) {

@@ -34,8 +34,8 @@ import simd
 /// METALMC_EXP=sky: the physically based sky and aerial perspective.
 let skyEnabled = experiments.contains("sky")
 /// METALMC_SKYEXPOSURE: the sun's illuminance in scene units (vanilla's white is 1). The default puts the noon zenith
-/// near vanilla's sky blue with a bright, hazy horizon.
-private let skyExposure = max(0, Float(ProcessInfo.processInfo.environment["METALMC_SKYEXPOSURE"] ?? "") ?? 12)
+/// near vanilla's sky blue with a bright, hazy horizon. (Lit mode, Lit.swift, scales its light by it.)
+let skyExposure = max(0, Float(ProcessInfo.processInfo.environment["METALMC_SKYEXPOSURE"] ?? "") ?? 12)
 /// METALMC_SKYHAZE: multiplies distances for aerial perspective (2: twice as hazy; 0.5: clearer). Default 1, physical.
 private let skyHaze = max(0, Float(ProcessInfo.processInfo.environment["METALMC_SKYHAZE"] ?? "") ?? 1)
 /// METALMC_SUNSIZE: the sun disk's angular radius in degrees. The default 0.6 matches the ray-traced shadows' penumbra

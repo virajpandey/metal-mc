@@ -12,6 +12,10 @@ let lodShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
+// Lit mode (METALMC_EXP=lit, Lit.swift): the opaque quads also write the terrain G-buffer.
+#define LIT_MODE \(litEnabled ? 1 : 0)
+\(litShaderHeader)
+
 struct LodUniforms {
     float4x4 proj;
     float4x4 view;
@@ -162,6 +166,15 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     // A full-resolution grass side is one grass block: dirt with vanilla's tinted fringe on top (lodShade), not
     // the average of the two that coarser voxels use (the fringe would repeat on every block of a 2-block side).
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
+#if LIT_MODE
+    // Lit mode: the colors go out unlit, and the alpha byte carries the depth field and block light (4 bits each), from
+    // which the fragment shader works k out again (lodLitK): the G-buffer gets the albedo without it.
+    (void)k;
+    o.color = pack_float_to_unorm4x8(float4(grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb,
+                                            float(depth | (uint(blockLevel) << 4)) / 255.0));
+    o.color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb, 0.0))
+             : (deep ? pack_float_to_unorm4x8(float4(float3(0.56, 0.53, 0.45) * lodLight(u, lightmap, lightSampler, 2.0, 13), 0.0)) : 0u);
+#else
     // Varyings cost vertex output bandwidth on this tile-based GPU (a float3 color2 cost 9% of the frame at a
     // million quads), so the colors are flat and packed.
     o.color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
@@ -169,6 +182,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     // Deep water carries the light of its (unmeshed) floor, a dozen or more blocks down, for its blend.
     o.color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0))
              : (deep ? pack_float_to_unorm4x8(float4(float3(0.56, 0.53, 0.45) * lodLight(u, lightmap, lightSampler, 2.0, 13), 0.0)) : 0u);
+#endif
     o.rel = rel;
     float3 c = kCorners[face][corner];
     o.quv = (face < 2 ? c.yz : (face < 4 ? c.xz : c.xy)) * float2(w, h);
@@ -216,9 +230,18 @@ using LodMeshOut = metal::mesh<VOut, LodPrim, 4 * MESH_QUADS, 2 * MESH_QUADS, me
     float blockLevel = (m == MAT_LAVA || m == MAT_MAGMA || (m >= MAT_GLOW_FIRST && m <= MAT_GLOW_LAST)) ? 15.0 : float((q.y >> 24) & 15u);
     float3 k = kShade[face] * lodLight(u, lightmap, lightSampler, max(0.0, float(u.seamInfo.z) - float(depth)), depth, blockLevel);
     bool grassSide = xs.w < 1.5 && faceClass == 1u && u.camFrac.w > 0.5 && ((m >= 64u && m < 96u) || m == MAT_GRASS);
+#if LIT_MODE
+    // Lit mode: unlit colors, the depth field and block light in the alpha byte (as lod_vs).
+    (void)k;
+    uint color = pack_float_to_unorm4x8(float4(grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb,
+                                               float(depth | (uint(blockLevel) << 4)) / 255.0));
+    uint color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb, 0.0))
+                : (deep ? pack_float_to_unorm4x8(float4(float3(0.56, 0.53, 0.45) * lodLight(u, lightmap, lightSampler, 2.0, 13), 0.0)) : 0u);
+#else
     uint color = pack_float_to_unorm4x8(float4((grassSide ? colors[MAT_DIRT * 3 + 1].rgb : colors[m * 3 + faceClass].rgb) * k, 0.0));
     uint color2 = grassSide ? pack_float_to_unorm4x8(float4(colors[m * 3].rgb * k, 0.0))
                 : (deep ? pack_float_to_unorm4x8(float4(float3(0.56, 0.53, 0.45) * lodLight(u, lightmap, lightSampler, 2.0, 13), 0.0)) : 0u);
+#endif
     uint baseMat = (m >= 128u && m < 160u) ? MAT_WATER : ((m >= 96u && m < 128u) ? MAT_LEAVES : ((m >= 64u && m < 96u) ? MAT_GRASS : m));
     uint matFace = baseMat | (face << 8) | (((q.y >> 8) & 63) << 11) | (((q.y >> 16) & 63) << 17) | (grassSide ? 1u << 23 : 0u)
                  | (xs.w < 1.5 ? 1u << 24 : 0u) | (deep ? 1u << 25 : 0u);
@@ -313,10 +336,76 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
     return float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), alpha);
 }
 
-fragment float4 lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
-                       constant LodSpriteGPU* sprites [[buffer(20)]], const device uint* aoBits [[buffer(22)]],
-                       texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
-    return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
+#if LIT_MODE
+// Lit mode: the color and the G-buffer. The water pipelines don't write the G-buffer (water keeps its forward color).
+struct LodOut { float4 color [[color(0)]]; uint2 gbuf [[color(1)]]; };
+
+// The light lod_vs multiplies in without lit mode (the face's shade and vanilla's lightmap), from the depth field and
+// block light it packed into the color's alpha byte; also the sky and block light levels for the G-buffer.
+static float3 lodLitK(VOut in, constant LodUniforms& u, texture2d<float> lightmap, sampler ls, thread float& sky, thread float& block) {
+    uint levels = in.color >> 24;
+    uint depth = levels & 15u;
+    block = float(levels >> 4);
+    sky = max(0.0, float(u.seamInfo.z) - float(depth));
+    return kShade[(in.matFace >> 8) & 7] * lodLight(u, lightmap, ls, sky, depth, block);
+}
+
+// lodShade with unlit vertex colors: the same color (k applied here), and the albedo (material color, texture detail
+// and the grass fringe, without light, shade or AO) for the G-buffer.
+static LodOut lodShadeLit(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites, const device uint* aoBits,
+                          texture2d<float> atlas, sampler atlasSampler, texture2d<float> lightmap, sampler ls) {
+    float ao = lodAO(in, aoBits);
+    float sky, block;
+    float3 k = lodLitK(in, u, lightmap, ls, sky, block);
+    float3 albedo = unpack_unorm4x8_to_float(in.color).rgb;
+    if (u.camFrac.w > 0.5) {
+        uint face = (in.matFace >> 8) & 7, mat = in.matFace & 255;
+        float3 wp = in.rel + u.camFrac.xyz;
+        float2 bc = face < 2 ? float2(wp.z, -wp.y) : (face < 4 ? wp.xz : float2(wp.x, -wp.y));
+        bool top = face == 2 || face == 3;
+        float4 rect = top ? sprites[mat].top : sprites[mat].side;
+        float2 size = rect.zw - rect.xy;
+        float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size, dfdy(bc) * size));
+        float luma = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
+        float mean = top ? sprites[mat].luma.x : sprites[mat].luma.y;
+        albedo *= clamp(mix(mat == MAT_WATER ? 1.0 : TRANSPARENT_SHADE, luma / max(mean, 0.02), t.a), 0.0, 2.0);
+        if ((in.matFace >> 23) & 1) {
+            float4 orect = sprites[GRASS_SIDE_SPRITE].top;
+            float2 osize = orect.zw - orect.xy;
+            float4 o = atlas.sample(atlasSampler, orect.xy + fract(bc) * osize, gradient2d(dfdx(bc) * osize, dfdy(bc) * osize));
+            albedo = mix(albedo, unpack_unorm4x8_to_float(in.color2).rgb * (o.r / GRASS_GRAY), o.a);
+        }
+    }
+    float3 color = albedo * k * ao;
+    float horiz = length(in.rel.xz);
+    float spherical = length(in.rel);
+    float cylindrical = max(horiz, abs(in.rel.y));
+    float fog = max(linearFog(spherical, u.envStart, u.envEnd), linearFog(cylindrical, u.rdStart, u.rdEnd));
+    float alpha = u.alpha;
+    if ((in.matFace >> 25) & 1) {
+        color = color * alpha + unpack_unorm4x8_to_float(in.color2).rgb * (1.0 - alpha);
+        alpha = 1.0;
+    }
+    LodOut out;
+    out.color = float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), alpha);
+    out.gbuf = litPack(albedo, ao, (in.matFace >> 8) & 7, in.pos.z, sky, block);
+    return out;
+}
+
+// The fragment functions' return type, the lightmap they take in lit mode, and the shading they call.
+#define LOD_FS_OUT LodOut
+#define LOD_FS_LIGHTMAP , texture2d<float> lightmap [[texture(29)]], sampler lightSampler [[sampler(14)]]
+#define LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler) lodShadeLit(in, u, sprites, aoBits, atlas, atlasSampler, lightmap, lightSampler)
+#else
+#define LOD_FS_OUT float4
+#define LOD_FS_LIGHTMAP
+#define LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler) lodShade(in, u, sprites, aoBits, atlas, atlasSampler)
+#endif
+
+fragment LOD_FS_OUT lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
+                           constant LodSpriteGPU* sprites [[buffer(20)]], const device uint* aoBits [[buffer(22)]],
+                           texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]] LOD_FS_LIGHTMAP) {
+    return LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler);
 }
 
 // Position-only vertex function, used by the quad-visibility measurement (METALMC_EXP=quadvis). A full "slim" path
@@ -359,10 +448,10 @@ vertex VOutSlim lod_vs_slim(uint vid [[vertex_id]], uint draw [[base_instance]],
 // voxels whose chunk section vanilla drew this frame (a bitmap of sections around the camera). It's exact
 // at any camera height (vanilla picks sections by 3D distance), leaves no gap and never draws LOD over
 // vanilla terrain. Only these tiles pay for the discard, which turns off hidden-surface removal for them.
-fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
-                            constant LodSpriteGPU* sprites [[buffer(20)]],
-                            const device uint* vanilla [[buffer(21)]], const device uint* aoBits [[buffer(22)]],
-                            texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
+fragment LOD_FS_OUT lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
+                                constant LodSpriteGPU* sprites [[buffer(20)]],
+                                const device uint* vanilla [[buffer(21)]], const device uint* aoBits [[buffer(22)]],
+                                texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]] LOD_FS_LIGHTMAP) {
     // A point just inside the voxel this face belongs to.
     float3 p = in.rel + u.camInSection.xyz - kNormal[(in.matFace >> 8) & 7] * 0.01;
     int3 sec = int3(floor(p / 16.0));
@@ -372,7 +461,7 @@ fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buff
         uint bit = uint((iy * W + iz) * W + ix);
         if ((vanilla[bit >> 5] & (1u << (bit & 31))) != 0) discard_fragment();
     }
-    return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
+    return LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler);
 }
 
 // Level transitions: a tile that appears fades in over a few frames through a screen-door pattern, and the tile
@@ -380,11 +469,11 @@ fragment float4 lod_fs_seam(VOut in [[stage_in]], constant LodUniforms& u [[buff
 // the seam bitmap is bound at 21). Every
 // pixel shows one of the two. Only fading tiles pay for the discard (and the seam test, which they always run).
 constant float kBayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
-fragment float4 lod_fs_fade(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
-                            constant LodSpriteGPU* sprites [[buffer(20)]],
-                            const device uint* vanilla [[buffer(21)]], const device uint* aoBits [[buffer(22)]],
-                            constant float4& fade [[buffer(24)]],
-                            texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]]) {
+fragment LOD_FS_OUT lod_fs_fade(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
+                                constant LodSpriteGPU* sprites [[buffer(20)]],
+                                const device uint* vanilla [[buffer(21)]], const device uint* aoBits [[buffer(22)]],
+                                constant float4& fade [[buffer(24)]],
+                                texture2d<float> atlas [[texture(30)]], sampler atlasSampler [[sampler(15)]] LOD_FS_LIGHTMAP) {
     uint2 px = uint2(in.pos.xy) & 3u;
     float t = (kBayer4[px.y * 4 + px.x] + 0.5) / 16.0;
     if (fade.y > 0.5 ? t < fade.x : t >= fade.x) discard_fragment();
@@ -398,7 +487,7 @@ fragment float4 lod_fs_fade(VOut in [[stage_in]], constant LodUniforms& u [[buff
             if ((vanilla[bit >> 5] & (1u << (bit & 31))) != 0) discard_fragment();
         }
     }
-    return lodShade(in, u, sprites, aoBits, atlas, atlasSampler);
+    return LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler);
 }
 
 // Occlusion test. After the LOD is drawn, every candidate tile's bounding box is rasterized in the same
@@ -640,7 +729,7 @@ final class LodRenderer: @unchecked Sendable {
                 d.maxTotalThreadsPerMeshThreadgroup = lodMeshQuads
                 for (i, f) in colorFormats.enumerated() {
                     d.colorAttachments[i].pixelFormat = f
-                    if i > 0 { d.colorAttachments[i].writeMask = [] }
+                    if i > 0 && !(litWritesGbuffer(i, f) && !water) { d.colorAttachments[i].writeMask = [] }
                 }
                 if water {
                     let a = d.colorAttachments[0]!
@@ -661,9 +750,9 @@ final class LodRenderer: @unchecked Sendable {
             d.fragmentFunction = library!.makeFunction(name: box ? "lod_box_fs" : (fade ? "lod_fs_fade" : (seam ? "lod_fs_seam" : "lod_fs")))
             for (i, f) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = f
-                // Only the main color target gets LOD color; extra targets (OIT) are left untouched.
-                // The occlusion boxes write no color at all.
-                if i > 0 || box { d.colorAttachments[i].writeMask = [] }
+                // Only the main color target gets LOD color; extra targets (OIT) are left untouched, except lit mode's
+                // G-buffer, which the opaque quads write. The occlusion boxes write no color at all.
+                if (i > 0 && !(litWritesGbuffer(i, f) && !water)) || box { d.colorAttachments[i].writeMask = [] }
             }
             if water {
                 // Vanilla's translucent blending.
@@ -1304,6 +1393,11 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     u.lightmapOn = r.lightmap != nil && !lodNoLightmap ? 1 : 0
     enc.setVertexTexture(r.lightmap ?? r.dummyTexture, index: 29)
     enc.setVertexSamplerState(r.lightSampler, index: 14)
+    if litEnabled {
+        // Lit mode: the fragment shader lights the unlit vertex colors itself (lodLitK).
+        enc.setFragmentTexture(r.lightmap ?? r.dummyTexture, index: 29)
+        enc.setFragmentSamplerState(r.lightSampler, index: 14)
+    }
     if useMesh {
         enc.setMeshTexture(r.lightmap ?? r.dummyTexture, index: 29)
         enc.setMeshSamplerState(r.lightSampler, index: 14)
@@ -1375,8 +1469,9 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             let p = fading ? (d.water ? fadeWaterPipe : fadePipe) : (d.water ? (d.seam ? seamWaterPipe : waterPipe) : (d.seam ? seamPipe : pipe))
             guard let p else { continue }   // a pipeline that failed to build: skip its draws, not everything after them
             if d.water && !state.water {
-                // Water writes depth only for the ray-traced shadows (its surface, not the floor under it, receives them).
-                enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: lodRtShadows))
+                // Water writes depth only for the ray-traced shadows (its surface, not the floor under it, receives them)
+                // and in lit mode (the relight leaves the floor under it alone: its depth no longer matches).
+                enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: lodRtShadows || litEnabled))
                 u.alpha = lodOpaqueWater ? 1 : lodWaterAlpha
                 enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
             }
