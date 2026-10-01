@@ -1,6 +1,6 @@
 # Near chunks in our own format (rewrite swing 1, first step)
 
-**Status (2026-09-30):** built and checked offline, not yet run in the game. Everything is behind `METALMC_EXP=nearchunks` (`-PmetalExp=nearchunks`), off by default. `METALMC_EXP=nearchunks,nearslim` also leaves the repacked layers out of vanilla's vertex heaps, which is where the memory saving comes from.
+**Status (2026-10-01):** runs in the game. The first in-game run crashed at the first frame (vanilla uploads each draw group's list with List.getLast(), so a group whose draws all went to the near chunks must keep one draw of no indices: LevelRendererFacingMixin.keepNonEmpty). Fidelity tour at the panel's resolution: near band 4.58 against vanilla, far band 3.02 against the level-0 answer key (quads without it: 4.58 and 3.03). Built 2026-09-30 and checked offline first. Everything is behind `METALMC_EXP=nearchunks` (`-PmetalExp=nearchunks`), off by default. `METALMC_EXP=nearchunks,nearslim` also leaves the repacked layers out of vanilla's vertex heaps, which is where the memory saving comes from.
 
 Code:
 - `Sources/MetalMCNative/NearChunks.swift`: codec, arena, shaders, draw.
