@@ -104,8 +104,8 @@ loom {
 			if (project.hasProperty("ffWidth")) {
 				environmentVariable "METALMC_FFWIDTH", project.findProperty("ffWidth").toString()
 			}
-			if (project.hasProperty("farField")) {
-				environmentVariable "METALMC_FARFIELD", project.findProperty("farField").toString()
+			if (project.hasProperty("ffGain")) {
+				environmentVariable "METALMC_FFGAIN", project.findProperty("ffGain").toString()
 			}
 			if (project.hasProperty("shadowScale")) {
 				environmentVariable "METALMC_SHADOWSCALE", project.findProperty("shadowScale").toString()
