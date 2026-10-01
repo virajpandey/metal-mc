@@ -584,6 +584,10 @@ constant float kShade[6] = { 0.6, 0.6, 1.0, 0.5, 0.8, 0.8 };
 // The LOD's ambient occlusion steps for 0-3 occluders at levels 1 and up (kAO in the LOD shader).
 constant float kAO[4] = { 1.0, 0.88, 0.76, 0.64 };
 
+// A side face's foot: vanilla's smooth lighting counts two occluders at a step's bottom corners (the ground in front
+// and the corner beside it), as the quads' voxels do; METALMC_EXP=ffsideao1 counts one as before (brighter by a tenth).
+constant float kSideFoot = \(experiments.contains("ffsideao1") ? "kAO[1]" : "kAO[2]");
+
 // Sky light levels the ground under a canopy loses (vanilla's leaves dim sky light a level per block).
 constant float kUnderCanopy = 3.0;
 
@@ -609,7 +613,7 @@ static float columnAO(texture2d_array<uint, access::read> data, int2 c, uint r, 
     }
     int2 front = face == 0 ? int2(1, 0) : (face == 1 ? int2(-1, 0) : (face == 4 ? int2(0, 1) : int2(0, -1)));
     float v = (y - solidAt(data, c + front, r, false)) / s;
-    return v < 1.0 ? mix(kAO[1], 1.0, saturate(v)) : 1.0;
+    return v < 1.0 ? mix(kSideFoot, 1.0, saturate(v)) : 1.0;
 }
 
 static float3 lodLight(constant LodUniforms& u, texture2d<float> lightmap, sampler s, float skyLevel) {
@@ -811,7 +815,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         float pTop = float(col.y & 511u);
         uint pm = (col.y >> 21) & 255u;
         uint mat = (face == 2 || y >= pTop - min(s, 8.0) || pm != topMat) ? pm : lowMat;
-        float ao = face == 2 ? 1.0 : mix(kAO[1], 1.0, saturate((y - solidTop) / s));
+        float ao = face == 2 ? 1.0 : mix(kSideFoot, 1.0, saturate((y - solidTop) / s));
         color = colors[mat * 3u + (face == 2 ? 0u : 1u)].rgb * kShade[face] * light
               * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip) * ao;
     } else if (depthVox > 0u && face == 2) {
