@@ -23,6 +23,9 @@ for TRY in 1 2 3; do
   fi
   [ -d run/saves/claudeworld ] && mv run/saves/claudeworld "$OUT/old_worlds/claudeworld-$(date +%s)"
   cp -Rp "../fixtures/$FIX" run/saves/claudeworld   # -p keeps mtimes, so the LOD's region cache still matches
+  # Read the fresh copy once now, so the machine's security scanners check its new files here rather than while the
+  # LOD reads them (on 2026-10-01 they made the LOD's first build 2.5x slower, past the bench's wait for it).
+  find run/saves/claudeworld -type f -exec cat {} + > /dev/null
   # Let Spotlight and the security scanners finish with the fresh copy before timing anything.
   sleep ${SETTLE:-30}
   : > "$LOG.dialogs"
