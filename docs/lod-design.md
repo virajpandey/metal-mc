@@ -241,6 +241,12 @@ Offline checks (`tools/smartlod.py`; it opens `fixtures/claudeworld-merged` thro
 
 **In-game checks still needed.** The fidelity tour with `-PmetalExp=smartlod` against the same build without it (`tools/bench/fidcheck.sh`); the uncapped flight with `-PbenchTrace=1` for `per_frame_lod_kquads` and GPU time, and the `LOD smart:` log line (quads counted against the budget, splits, selection time) against the renderer's own `LOD: frame` line (quads drawn) to calibrate the budget; a 120 Hz vsync flight for dropped frames; `-PlodErr=1` and `3`; a view busy enough that the budget binds (`-PlodBudget=1500000`), for popping; the End (`-PbenchTour=end`) and the spyglass.
 
+
+**In game (2026-10-01, native 3456 x 2234).** Fidelity tour: near band 4.58 against vanilla (distance rule 4.58), far
+band 3.15 against the level-0 answer key (3.03). The real-terrain flight, uncapped: 167.2 fps, p99 7.59 ms, 13 frames
+over 8 ms, 1.61 M quads a frame (the distance rule: 158.5 fps, p99 7.80 ms, 20 over 8 ms, 1.77 M). So at its defaults
+it trades about 4% of the far band's accuracy for 9% fewer quads and 5% more frames; a lower error threshold would
+spend some of that on detail. With the far field drawing levels 1 and up, what it decides is mostly where level 0 ends.
 ## What didn't pay
 
 - **Mesh shaders** (`METALMC_EXP=meshshader`, `METALMC_MESHQUADS`, `-PmeshQuads`). One thread per quad computes the quad's color, light and AO lookup once instead of in each of its four vertices, then culls quads that face away or lie entirely off one side of the view. The LOD's share of the main pass is 1.69 ms of vertex work and 1.21 ms of fragment work, so vertex work looked like the target. At the mid orbit it ran 198 fps with 64-quad groups, 210 with 32 and 212 with 16, against 212.5 for indexed vertices. The vertex cost is per primitive, not the repeated per-quad work, so only fewer quads help.

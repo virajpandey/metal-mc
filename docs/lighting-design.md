@@ -199,6 +199,21 @@ stay at most SDR white) and only costs the float target.
   - the aerial perspective adds 0.28 ms to the anti-aliasing's resolve (1.05 → 1.33), or costs 0.38 as its own pass;
   - so with anti-aliasing on, about 0.4-0.45 ms a frame over vanilla's sky pass.
 
+## In game (2026-10-01, native 3456 x 2234, TAA on)
+
+- **Runs.** The render tour (day, sunset, night, rain, the scene, particles, F3, pause, inventory, the Nether, the End) with
+  `-PmetalExp=sky` and with `sky,hdr`: no errors once the render pass accepted vanilla's RGBA8 pipelines on the float
+  main target (FrontendRenderPassMixin; before that, HDR crashed at the first GUI draw). The pause menu's blur works on
+  the float target.
+- **Cost** (the real-terrain flight, uncapped): without the sky 158.5 fps, p99 7.80 ms, 20 frames over 8 ms; with it
+  147.5 fps, p99 8.35 ms, 93 over 8 ms (about 0.5 ms a frame); with sky and HDR 128.8 fps, p99 9.75 ms, 1,327 over
+  8 ms (about 1 ms more: the float main target's bandwidth in every pass, the float history, the float drawable). HDR
+  can't hold 120 Hz as it is. The main target and history as RG11B10Float (32 bits, which the render API has) would
+  halve their bandwidth; its 6-bit mantissas on sRGB-encoded values band smooth gradients unless dithered.
+- **Found:** at the far field's horizon (LOD 262144) the distant terrain shows no haze at all against the pale sky
+  above it (`m3L1`, the LOD tour's high views), while the LOD's terrain within 32 km gets it (`m3T1`, sunset).
+  `METALMC_EXP=skyhazedebug` draws each pixel's distance, haze and fade as colors to find which step drops it.
+
 ## Still to check in game
 
 - The frame with it on (native, TAA on, the real-terrain flight), against off, and with HDR:
