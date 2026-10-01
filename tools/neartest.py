@@ -18,6 +18,9 @@ Checks:
      terrain vertex shader reading the original vertices: pixel differences, with PNGs to look at; then again through
      the game's own draw path (the arena, mmc_pass_begin, mmc_near_draw, mmc_submit), which also checks that a freed
      arena range isn't reused before the GPU finishes the submit that drew it.
+With METALMC_EXP=lit the game's draw path runs in lit mode (Lit.swift): its pass gets the G-buffer, and each arena render
+also checks what the near chunks wrote there (marked pixels, faces, the depth key, and the relight's overlay test on the
+image as drawn). Check 5's vanilla comparison then allows small differences: lit mode samples the lightmap per pixel.
 """
 import ctypes
 import glob
@@ -51,6 +54,10 @@ lib.mmc_near_debug_render.restype = ctypes.c_int32
 lib.mmc_near_debug_render_arena.argtypes = [P, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, P, P, ctypes.c_float, ctypes.c_float, P,
                                             ctypes.c_int32, ctypes.c_int32, P, P, P]
 lib.mmc_near_debug_render_arena.restype = ctypes.c_int32
+# Lit mode (METALMC_EXP=lit): the arena render also checks the G-buffer the near chunks write (mmc_near_debug_lit_stats).
+LIT = "lit" in os.environ.get("METALMC_EXP", "").split(",")
+if LIT:
+    lib.mmc_near_debug_lit_stats.argtypes = [P]
 
 failures = []
 
@@ -329,9 +336,28 @@ def render_arena(data, cutout, origin, cam, yaw, pitch, label, fog=(24.0, 64.0),
     check(r == 1, f"{label}: in-game path ran ({r})")
     if r != 1:
         return
-    # The game's pipeline comes from its own library build, so a rare pixel may round differently (one level at most).
-    check(info[1] <= 1 and info[0] <= max(1, info[2] // 1000), f"{label}: in-game path matches vanilla's shader "
-          f"({info[0]} pixels differ, largest difference {info[1]})")
+    if LIT:
+        # Lit mode (METALMC_EXP=lit): the near shader samples the lightmap per pixel instead of per vertex, so its color is
+        # close to vanilla's, not identical (measured: up to 10 levels on real terrain, where smooth lighting varies across
+        # a face, 32 on the hand-made shapes); and it writes the G-buffer, which the relight's overlay test must find plain
+        # (albedo, face, AO and light levels give back the forward color). Not under a section fade (vis < 1), whose fog
+        # blend the G-buffer doesn't hold.
+        check(info[1] <= 40, f"{label}: in-game path in lit mode within 40 levels of vanilla's shader ({info[0]} pixels differ, "
+              f"largest difference {info[1]})")
+        s = (ctypes.c_int64 * 16)()
+        lib.mmc_near_debug_lit_stats(s)
+        marked = s[0]
+        check(s[14] == 1 and marked > 0, f"{label}: lit mode: G-buffer written ({marked} pixels) and relit")
+        check(s[8] == marked, f"{label}: lit mode: every marked pixel's depth key matches the depth buffer ({s[8]} of {marked})")
+        if vis >= 1.0:
+            check(s[9] >= 0.98 * marked, f"{label}: lit mode: the overlay test finds plain terrain ({s[9]} of {marked} plain, {s[10]} flagged)")
+        print(f"  {label}: lit G-buffer {marked} px, faces +X {s[1]} -X {s[2]} +Y {s[3]} -Y {s[4]} +Z {s[5]} -Z {s[6]} other {s[7]}; "
+              f"key matches {s[8]}; overlay test plain {s[9]}, flagged {s[10]}; largest sky {s[11] / 16:.2f}, block {s[12] / 16:.2f}; "
+              f"mean AO {s[13] / 1000:.3f}; forward vs vanilla: {info[0]} pixels differ, largest {info[1]}")
+    else:
+        # The game's pipeline comes from its own library build, so a rare pixel may round differently (one level at most).
+        check(info[1] <= 1 and info[0] <= max(1, info[2] // 1000), f"{label}: in-game path matches vanilla's shader "
+              f"({info[0]} pixels differ, largest difference {info[1]})")
     check(info[3] == (2 if quads // 3 > 0 else 1), f"{label}: both records drawn ({info[3]})")
     check(info[4] == 1, f"{label}: a freed range isn't reused before its submit completes")
     check(info[5] == 1, f"{label}: a freed range is reused after its submit completes")

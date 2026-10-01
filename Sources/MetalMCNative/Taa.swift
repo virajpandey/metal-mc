@@ -25,12 +25,17 @@ import simd
 // An earlier version used MetalFX's temporal scaler at 1:1. It cost 9 ms per frame at the panel's resolution.
 
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
-private let taaShaderSource = skyShaderHeader + """
+// Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise.
+private let taaShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + litRelightHeader : "") + """
 
 // With the sky on (METALMC_EXP=sky), a second variant of the resolve applies the aerial perspective, the render
 // distance's fade into the sky and the tone curve to each pixel as it loads it (skyLevelColor), after the shadows'
 // shade, so that costs no full-screen pass of its own. The default variant has none of it.
 constant bool taaSky [[function_constant(0)]];
+#if LIT_MODE
+// Lit mode: variants that relight the terrain (litRelightPixel) as each pixel is loaded, before the sky's aerial perspective.
+constant bool taaLit [[function_constant(1)]];
+#endif
 
 struct TaaParams {
     float4x4 invCur;     // inverse of this frame's projection * view rotation (unjittered)
@@ -101,6 +106,13 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         texture3d<float> apScatter [[texture(5), function_constant(taaSky)]],
                         texture3d<float> apTrans [[texture(6), function_constant(taaSky)]],
                         texture2d<float> skyView [[texture(7), function_constant(taaSky)]],
+#if LIT_MODE
+                        constant LitFrame& litFrame [[buffer(2), function_constant(taaLit)]],
+                        constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
+                        texture2d<uint, access::read> litGbuf [[texture(8), function_constant(taaLit)]],
+                        texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
+                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],
+#endif
                         uint2 gid [[thread_position_in_grid]],
                         uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
@@ -113,6 +125,9 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         uint2 q = uint2(clamp(base + int2(i % 18, i / 18), int2(0), size - 1));
         float4 c = color.read(q);
         float d = depth.read(q);
+#if LIT_MODE
+        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv);
+#endif
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
             float haze;
@@ -282,12 +297,33 @@ final class Taa: @unchecked Sendable {
         return true
     }
 
-    /// The resolve, with or without the sky's aerial perspective in its load (the taaSky function constant).
-    func resolveFunction(_ lib: MTLLibrary, sky: Bool) throws -> MTLFunction {
+    /// The resolve, with or without the sky's aerial perspective in its load (the taaSky function constant), and in lit
+    /// mode with or without the relight (taaLit).
+    func resolveFunction(_ lib: MTLLibrary, sky: Bool, lit: Bool = false) throws -> MTLFunction {
         let values = MTLFunctionConstantValues()
         var on = sky
         values.setConstantValue(&on, type: .bool, index: 0)
+        if litEnabled {
+            var relight = lit
+            values.setConstantValue(&relight, type: .bool, index: 1)
+        }
         return try lib.makeFunction(name: "taa_resolve", constantValues: values)
+    }
+
+    /// Lit hook (Lit.swift): the resolve that relights the terrain as it loads each pixel, with or without the sky's aerial
+    /// perspective after it (nil if it failed to build: the plain resolve runs, without the relight).
+    private var litPipes: [Bool: MTLComputePipelineState] = [:]
+    private var litFailed = false
+    func litResolve(sky: Bool) -> MTLComputePipelineState? {
+        if let p = litPipes[sky] { return p }
+        guard let library, !litFailed else { return nil }
+        do {
+            litPipes[sky] = try ctx.device.makeComputePipelineState(function: resolveFunction(library, sky: sky, lit: true))
+        } catch {
+            log("TAA: lit resolve failed: \(error)")
+            litFailed = true
+        }
+        return litPipes[sky]
     }
 
     /// Sky hook (Sky.swift): the resolve variant that applies the aerial perspective as it loads (nil if it failed to
@@ -339,10 +375,13 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     // HDR hook (Hdr.swift): a float frame's values aren't clamped to 1.
     let frameMax: Float = color.pixelFormat == .rgba16Float ? 65504 : 1
     params.range.x = frameMax
+    // Lit hook (Lit.swift): the relight left for the resolve, applied as the color is loaded, before the sky's work.
+    let relight = litEnabled && Lit.shared.hasDeferred(width: color.width, height: color.height)
     // Sky hook (Sky.swift): the level through the air (aerial perspective, the render distance's fade, the tone curve),
     // applied as the color is loaded, after the shadows' shade; on an 8-bit frame, dithered as it's written back.
     var skyDither: Float = 0
-    if let sky = Sky.shared.takeDeferredAerial(width: color.width, height: color.height), let skyPipe = t.skyResolve() {
+    if let sky = Sky.shared.takeDeferredAerial(width: color.width, height: color.height),
+       let skyPipe = relight ? t.litResolve(sky: true) : t.skyResolve() {
         var frame = sky.frame
         enc.setComputePipelineState(skyPipe)
         enc.setBytes(&frame, length: MemoryLayout<SkyFrameGPU>.stride, index: 1)
@@ -351,8 +390,9 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setTexture(sky.skyView, index: 7)
         skyDither = color.pixelFormat == .rgba16Float ? 0 : 1.0 / 255
     } else {
-        enc.setComputePipelineState(pipe)
+        enc.setComputePipelineState(relight ? (t.litResolve(sky: false) ?? pipe) : pipe)
     }
+    if relight { Lit.shared.bindDeferred(enc) }
     enc.setTexture(color, index: 0)
     enc.setTexture(depth, index: 1)
     enc.setTexture(t.history[t.current], index: 2)

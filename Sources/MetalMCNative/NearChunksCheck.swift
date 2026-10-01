@@ -256,7 +256,10 @@ private func nearDebugLib() -> MTLLibrary? {
         opts.languageVersion = .version3_0
         opts.preserveInvariance = true
         do {
-            nearDebugLibrary = try ctx.device.makeLibrary(source: nearShaderSource + nearReferenceShaderSource, options: opts)
+            // Always vanilla's shading here (lit mode's near_fs, METALMC_EXP=lit, lights per pixel and writes a G-buffer): the
+            // reference must stay vanilla's for the comparisons, and these pipelines have no G-buffer target.
+            let source = nearShaderSource.replacingOccurrences(of: "#define LIT_MODE 1", with: "#define LIT_MODE 0")
+            nearDebugLibrary = try ctx.device.makeLibrary(source: source + nearReferenceShaderSource, options: opts)
         } catch {
             log("near chunks debug library: \(error)")
         }
@@ -461,7 +464,7 @@ private final class NearTestScene {
         let cd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
         cd.usage = [.renderTarget, .shaderRead]
         let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: w, height: h, mipmapped: false)
-        dd.usage = [.renderTarget]
+        dd.usage = [.renderTarget, .shaderRead]   // lit mode's relight reads it (mmc_near_debug_lit_stats)
         dd.storageMode = .private
         guard let colorRef = dev.makeTexture(descriptor: cd), let colorNear = dev.makeTexture(descriptor: cd),
               let depth = dev.makeTexture(descriptor: dd) else { return nil }
@@ -658,6 +661,8 @@ public func mmc_near_debug_render_arena(_ vertices: UnsafeRawPointer, _ vertexCo
     ctx.cond.unlock()
     var colors: [Int64] = [colorH]
     var clear: [Float] = [0, 0, 0, 0]
+    // Lit mode: the pass is the level's main pass, with the G-buffer (checked below, after the comparison).
+    if litEnabled { mmc_lit_level_pass() }
     guard mmc_pass_begin(&colors, 1, 1, &clear, depthH, 1, 0, 0, 0, Int32(scene.w), Int32(scene.h)) == 1 else { return 0 }
     let drawn = mmc_near_draw(Int32(cutout != 0 ? 1 : 0), &records, Int32(records.count / 4), submit, &res, 0)
     mmc_pass_end()
@@ -680,5 +685,79 @@ public func mmc_near_debug_render_arena(_ vertices: UnsafeRawPointer, _ vertexCo
     info[3] = Int64(drawn)
     info[4] = earlyAvoided ? 1 : 0
     info[5] = lateReused ? 1 : 0
+    if litEnabled { nearLitCheck(scene, colorH: colorH, depthH: depthH, lightH: lightH, fogStart: p[0], fogEnd: p[1]) }
     return 1
+}
+
+/// Lit mode's check of what the near chunks wrote into the G-buffer (mmc_near_debug_render_arena, then
+/// mmc_near_debug_lit_stats): pixels marked as lit terrain, their faces and the depth key against the depth buffer, and
+/// the relight's overlay test (Lit.swift) on the near image as drawn: with nothing drawn over the terrain, the albedo, face,
+/// AO and light levels must give back the forward color, or the relight would treat the pixel as overlaid.
+private var nearLitStats = [Int64](repeating: 0, count: 16)
+
+private func nearLitCheck(_ scene: NearTestScene, colorH: Int64, depthH: Int64, lightH: Int64, fogStart: Float, fogEnd: Float) {
+    for i in 0..<nearLitStats.count { nearLitStats[i] = 0 }
+    guard let g = Lit.shared.gbuffer, g.width == scene.w, g.height == scene.h,
+          let gb = ctx.device.makeBuffer(length: g.width * g.height * 8, options: .storageModeShared),
+          let db = ctx.device.makeBuffer(length: g.width * g.height * 4, options: .storageModeShared),
+          let cb8 = ctx.device.makeBuffer(length: g.width * g.height * 4, options: .storageModeShared) else { return }
+    // The relight's overlay-test view (7: green plain terrain, red or magenta overlaid), as the game would run it: the
+    // scene's projection and view rotation, its fog, the scene's lightmap.
+    var p = [Float](repeating: 0, count: 42)
+    withUnsafeBytes(of: scene.proj) { r in for k in 0..<16 { p[k] = r.load(fromByteOffset: 4 * k, as: Float.self) } }
+    scene.terrain.withUnsafeBytes { r in for k in 0..<16 { p[16 + k] = r.load(fromByteOffset: 4 * k, as: Float.self) } }
+    p[32] = 0
+    p[33] = 0.62; p[34] = 0.74; p[35] = 0.95; p[36] = 1
+    p[37] = fogStart; p[38] = fogEnd; p[39] = 1000; p[40] = 1200
+    ctx.endBlit()
+    let blit = ctx.blitEncoder()
+    blit.copy(from: g, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: g.width, height: g.height, depth: 1),
+              to: gb, destinationOffset: 0, destinationBytesPerRow: g.width * 8, destinationBytesPerImage: g.width * g.height * 8)
+    blit.copy(from: scene.depth, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+              sourceSize: MTLSize(width: g.width, height: g.height, depth: 1), to: db, destinationOffset: 0,
+              destinationBytesPerRow: g.width * 4, destinationBytesPerImage: g.width * g.height * 4)
+    ctx.endBlit()
+    let view = Lit.shared.view
+    Lit.shared.view = 7
+    // The relight checks that the G-buffer is this color target's (the pass that wrote it has been submitted).
+    Lit.shared.debugTarget(scene.colorNear)
+    let ran = mmc_lit_relight(colorH, depthH, p, lightH, 0) == 1
+    Lit.shared.view = view
+    ctx.blitEncoder().copy(from: scene.colorNear, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                           sourceSize: MTLSize(width: g.width, height: g.height, depth: 1), to: cb8, destinationOffset: 0,
+                           destinationBytesPerRow: g.width * 4, destinationBytesPerImage: g.width * g.height * 4)
+    ctx.endBlit()
+    ctx.cond.lock()
+    let submit = ctx.completed + 1
+    ctx.cond.unlock()
+    mmc_submit(submit)
+    _ = mmc_wait_submit(submit, -1)
+    let gw = gb.contents().bindMemory(to: UInt32.self, capacity: g.width * g.height * 2)
+    let dw = db.contents().bindMemory(to: Float.self, capacity: g.width * g.height)
+    let cw = cb8.contents().bindMemory(to: UInt8.self, capacity: g.width * g.height * 4)
+    var aoSum = 0
+    for i in 0..<(g.width * g.height) {
+        let x = gw[2 * i], y = gw[2 * i + 1]
+        let code = Int(x >> 29)
+        if code == 0 { continue }
+        nearLitStats[0] += 1
+        nearLitStats[1 + code - 1] += 1   // faces 1-6, 7 not axis-aligned at 7
+        let k = ((dw[i].bitPattern >> 4) &- (y & 0xFFFF)) & 0xFFFF
+        if k <= 1 || k == 0xFFFF { nearLitStats[8] += 1 }
+        aoSum += Int((x >> 24) & 31)
+        nearLitStats[11] = max(nearLitStats[11], Int64((y >> 16) & 255))
+        nearLitStats[12] = max(nearLitStats[12], Int64(y >> 24))
+        let r = cw[4 * i], gr = cw[4 * i + 1]
+        if gr > 150 && r < 50 { nearLitStats[9] += 1 } else if r > 150 && gr < 50 { nearLitStats[10] += 1 }
+    }
+    nearLitStats[13] = nearLitStats[0] > 0 ? Int64(aoSum * 1000 / (31 * Int(nearLitStats[0]))) : 0
+    nearLitStats[14] = ran ? 1 : 0
+}
+
+/// Lit mode: the last near-chunk arena render's G-buffer check (see nearLitCheck). out (16): pixels marked lit terrain,
+/// faces +X -X +Y -Y +Z -Z and not axis-aligned (7), depth key matches, relight overlay test plain and overlaid, the
+/// largest sky and block light (levels x 16), mean AO x 1000, 1 if the relight ran.
+@_cdecl("mmc_near_debug_lit_stats")
+public func mmc_near_debug_lit_stats(_ out: UnsafeMutablePointer<Int64>) {
+    for i in 0..<16 { out[i] = nearLitStats[i] }
 }

@@ -160,6 +160,15 @@ loom {
 			if (project.hasProperty("lodBudget")) {
 				environmentVariable "METALMC_LODBUDGET", project.findProperty("lodBudget").toString()
 			}
+			// Lit mode (-PmetalExp=lit,...): -PlitExposure=<scale, default 1> for the new light, -PlitView=<1-7> for a debug
+			// view of the G-buffer and the light (Lit.swift: 1 albedo, 2 face, 3 light levels, 4 AO, 5 light, 6 sun
+			// visibility, 7 the overlay test).
+			if (project.hasProperty("litExposure")) {
+				environmentVariable "METALMC_LITEXPOSURE", project.findProperty("litExposure").toString()
+			}
+			if (project.hasProperty("litView")) {
+				environmentVariable "METALMC_LITVIEW", project.findProperty("litView").toString()
+			}
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
 				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"

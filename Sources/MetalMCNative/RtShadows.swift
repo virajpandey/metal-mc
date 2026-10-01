@@ -9,6 +9,10 @@ import simd
 // facing away from the sun count as shadowed, so it also gives the world directional sunlight. A fullscreen pass then
 // darkens the shadowed pixels before the temporal anti-aliasing, which smooths the half-resolution result and, with
 // the ray jittered across the sun's disk every frame, softens the shadows' edges.
+//
+// Lit mode (METALMC_EXP=lit, Lit.swift): the kernel stores the raw visibility instead (1 lit, 0 shadowed, toward 1 with
+// distance where the haze takes over), toward the sun, or toward the moon while the sun is down, and nothing darkens the
+// color: the relight multiplies the sun's (or moon's) light by it, and the anti-aliasing doesn't apply it again.
 
 /// On with `shadows=true` in config/metalmc.properties (mmc_set_rt_shadows at startup) or METALMC_EXP=rtshadows.
 nonisolated(unsafe) var lodRtShadows = experiments.contains("rtshadows")
@@ -161,6 +165,16 @@ final class RtShadows: @unchecked Sendable {
         defer { deferred = nil }
         guard let d = deferred, d.width == width, d.height == height else { return nil }
         return (d.lit, d.params)
+    }
+
+    /// Lit mode: this frame's raw visibility for the relight (Lit.swift): the texture, pixels per sample along each axis,
+    /// and whether it was traced toward the moon.
+    private var litVisibility: (texture: MTLTexture, scale: Int, moon: Bool, width: Int, height: Int)?
+
+    func takeLitVisibility(width: Int, height: Int) -> (texture: MTLTexture, scale: Int, moon: Bool)? {
+        defer { litVisibility = nil }
+        guard let v = litVisibility, v.width == width, v.height == height else { return nil }
+        return (v.texture, v.scale, v.moon)
     }
 
     func dummyLit() -> MTLTexture {
@@ -403,14 +417,17 @@ final class RtShadows: @unchecked Sendable {
                           SIMD4(p[o + 8], p[o + 9], p[o + 10], p[o + 11]), SIMD4(p[o + 12], p[o + 13], p[o + 14], p[o + 15]))
         }
         // Vanilla's sun: rotated -90 degrees about y, then by the sun angle about x, from straight up.
-        let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
+        var sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
+        // Lit mode: toward the moon (opposite the sun) while the sun is down, and the raw visibility (strength 1).
+        let towardMoon = litEnabled && sun.y < -0.02
+        if towardMoon { sun = -sun }
         // A point on the sun's disk (radius about 0.6 degrees), a different one every frame (golden-angle spiral).
         let k = Float(frame % 64), rad = 0.0105 * (k / 64).squareRoot(), ang = k * 2.39996
         var params = ShadowParams(invViewProj: (mat(0) * mat(16)).inverse, sun: SIMD4(sun, cloudHeight - Float(cam.y)),
                                   sizes: SIMD4(Float(w), Float(h), Float(hw), Float(hh)),
                                   disk: SIMD4(rad * cos(ang), rad * sin(ang), 4000, experiments.contains("shnoray") ? 1 : 0),
                                   camOffset: SIMD4(Float(cam.x - origin.x), Float(cam.y - origin.y), Float(cam.z - origin.z), 0),
-                                  shade: SIMD4(strength, 6000, 20000, 0),
+                                  shade: SIMD4(litEnabled ? 1 : strength, 6000, 20000, 0),
                                   sample: SIMD4(UInt32(sc), UInt32(Self.pattern[Int(frame % 16)].x % UInt32(sc)),
                                                 UInt32(Self.pattern[Int(frame % 16)].y % UInt32(sc)), 0))
         ctx.endBlit()
@@ -436,6 +453,10 @@ final class RtShadows: @unchecked Sendable {
                        Double(DispatchTime.now().uptimeNanoseconds - cpuStart) / 1e6))
             rebuilds = 0
         }
+        if litEnabled {
+            litVisibility = (lit, sc, towardMoon, w, h)
+            return true
+        }
         if deferToTaa {
             deferred = (lit, SIMD4(1, Float(sc), 0, 0), w, h)
             return true
@@ -460,11 +481,12 @@ final class RtShadows: @unchecked Sendable {
 }
 
 /// Shadows for the level just drawn into `color` (see RtShadows). `p`: projection as drawn (jittered), then view
-/// rotation, 32 floats. `sunAngle`: vanilla's sun angle in radians; `strength`: 0 turns them off.
+/// rotation, 32 floats. `sunAngle`: vanilla's sun angle in radians; `strength`: 0 turns them off (in lit mode the
+/// visibility is traced anyway, toward the moon at night, and the strength isn't used).
 @_cdecl("mmc_shadows_apply")
 public func mmc_shadows_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>,
                               _ sunAngle: Float, _ strength: Float, _ cloudHeight: Float, _ taa: Int32) -> Int32 {
-    guard lodRtShadows, strength > 0 else { return 0 }
+    guard lodRtShadows, strength > 0 || litEnabled else { return 0 }
     let taaEnabledThisFrame = taa != 0
     let color = (from(colorHandle) as TextureBox).texture, depth = (from(depthHandle) as TextureBox).texture
     return RtShadows.shared.apply(color: color, depth: depth, p: p, cam: SIMD3(cam[0], cam[1], cam[2]), sunAngle: sunAngle,

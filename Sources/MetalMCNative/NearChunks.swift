@@ -529,6 +529,10 @@ let nearShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
+// Lit mode (METALMC_EXP=lit, Lit.swift): the near chunks also write the terrain G-buffer.
+#define LIT_MODE \(litEnabled ? 1 : 0)
+\(litShaderHeader)
+
 struct NearGlobals {
     packed_int3 cameraBlockPos;
     float glintAlpha;
@@ -621,7 +625,43 @@ struct NearVertex {
     float4 vertexColor;
     float2 texCoord0;
     float chunkVisibility;
+#if LIT_MODE
+    // Lit mode: vertexColor is unlit (rgb: the vertex color, a: its gray level, 1 for generic quads); the light levels
+    // (block, sky) are interpolated like vanilla's light coordinates and the lightmap is sampled per pixel; the face.
+    float2 lightLevels;
+    uint litFace [[flat]];
+#endif
 };
+
+#if LIT_MODE
+// Vanilla's face shade (top 1, bottom 0.5, x 0.6, z 0.8): the gray levels have it, the G-buffer's AO doesn't.
+constant float kNearShade[6] = { 0.6, 0.6, 1.0, 0.5, 0.8, 0.8 };
+
+// Vertex k's gray level (0-255) for an axis-aligned record, 255 for a generic one (its colors aren't split).
+static uint nearGray(device const uint* q, uint slot, uint k) {
+    device const uint* s = q + slot * 8;
+    if ((s[0] & 1u) != 0u) return 255u;
+    return k == 0u ? (s[4] >> 24) : ((s[5] >> (8u * (k - 1u))) & 0xFFu);
+}
+
+// The face for the G-buffer (0-5, the LOD's numbering, or 7): an axis-aligned record's plane axis, facing the camera
+// (back faces are culled, so what's drawn faces it); a generic quad's from its corners, if it's axis-aligned.
+static uint nearFace(device const uint* q, uint slot, float3 rel) {
+    device const uint* s = q + slot * 8;
+    uint axis;
+    if ((s[0] & 1u) == 0u) {
+        axis = (s[0] >> 1) & 3u;
+    } else {
+        float3 a = nearDecode(q, slot, 0u).pos, b = nearDecode(q, slot, 1u).pos, c = nearDecode(q, slot, 2u).pos;
+        float3 n = cross(b - a, c - a);
+        float3 an = abs(n);
+        float m = max(an.x, max(an.y, an.z));
+        if (!(m > 0.0) || m < 0.999 * length(n)) return 7u;
+        axis = an.x == m ? 0u : (an.y == m ? 1u : 2u);
+    }
+    return axis * 2u + (rel[axis] > 0.0 ? 1u : 0u);
+}
+#endif
 
 vertex NearVertex near_vs(uint vid [[vertex_id]], uint section [[base_instance]],
                           device const uint* quads [[buffer(16)]],
@@ -641,7 +681,14 @@ vertex NearVertex near_vs(uint vid [[vertex_id]], uint section [[base_instance]]
     float2 lightUv = clamp((float2(c.light) / 256.0) + 0.5 / 16.0, float2(0.5 / 16.0), float2(15.5 / 16.0));
     // The same unorm conversion as the vertex fetch of vanilla's RGBA8 color (a division by 255 may round differently).
     float4 color = unpack_unorm4x8_to_float(c.rgb.x | (c.rgb.y << 8) | (c.rgb.z << 16) | 0xFF000000u);
+#if LIT_MODE
+    (void)lightUv;
+    o.vertexColor = float4(color.rgb, float(nearGray(quads, vid >> 2, vid & 3u)) / 255.0);
+    o.lightLevels = float2(c.light) / 16.0;
+    o.litFace = nearFace(quads, vid >> 2, pos);
+#else
     o.vertexColor = color * lightmap.sample(lightmapSampler, lightUv, level(0.0));
+#endif
     o.texCoord0 = c.uv;
     float dist = length(pos);
     o.chunkVisibility = mix(1.0, sec.visibility, clamp((dist - 16.0) / 16.0, 0.0, 1.0));
@@ -698,6 +745,40 @@ static float linearFogValue(float vertexDistance, float fogStart, float fogEnd) 
     return (vertexDistance - fogStart) / (fogEnd - fogStart);
 }
 
+#if LIT_MODE
+// Lit mode: the color as without it (the lightmap sampled per pixel at the interpolated light coordinates instead of per
+// vertex), and the G-buffer: the texel times the tint (the vertex color over its gray level), the gray level over the
+// face's shade as AO, the face, the light levels.
+struct NearOut { float4 color [[color(0)]]; uint2 gbuf [[color(1)]]; };
+
+fragment NearOut near_fs(NearVertex in [[stage_in]],
+                         constant NearTerrain& terrain [[buffer(19)]],
+                         constant NearGlobals& globals [[buffer(20)]],
+                         constant NearFog& fog [[buffer(21)]],
+                         texture2d<float> atlas [[texture(17)]], sampler atlasSampler [[sampler(13)]],
+                         texture2d<float> lightmap [[texture(16)]], sampler lightmapSampler [[sampler(12)]]) {
+    float2 pixelSize = 1.0f / float2(terrain.textureSize);
+    float2 du = dfdx(in.texCoord0);
+    float2 dv = dfdy(in.texCoord0);
+    float4 sampled = globals.useRgss == 1 ? sampleRGSS(atlas, atlasSampler, in.texCoord0, pixelSize, du, dv)
+                                          : sampleNearest(atlas, atlasSampler, in.texCoord0, pixelSize, du, dv, sqrt(du * du + dv * dv));
+    float2 lightUv = clamp(in.lightLevels / 16.0 + 0.5 / 16.0, float2(0.5 / 16.0), float2(15.5 / 16.0));
+    float4 color = sampled * float4(in.vertexColor.rgb * lightmap.sample(lightmapSampler, lightUv, level(0.0)).rgb, 1.0);
+    color = mix(fog.color * float4(1, 1, 1, color.a), color, in.chunkVisibility);
+    if (nearCutout && color.a < 0.5) {
+        discard_fragment();
+    }
+    float fogValue = max(linearFogValue(in.sphericalVertexDistance, fog.environmentalStart, fog.environmentalEnd),
+                         linearFogValue(in.cylindricalVertexDistance, fog.renderDistanceStart, fog.renderDistanceEnd));
+    NearOut out;
+    out.color = float4(mix(color.rgb, fog.color.rgb, fogValue * fog.color.a), color.a);
+    float gray = max(in.vertexColor.a, 1.0 / 255.0);
+    float shade = in.litFace < 6u ? kNearShade[in.litFace] : 1.0;
+    out.gbuf = litPack(sampled.rgb * saturate(in.vertexColor.rgb / gray), gray / shade, in.litFace, in.position.z,
+                       in.lightLevels.y, in.lightLevels.x);
+    return out;
+}
+#else
 fragment float4 near_fs(NearVertex in [[stage_in]],
                         constant NearTerrain& terrain [[buffer(19)]],
                         constant NearGlobals& globals [[buffer(20)]],
@@ -717,6 +798,7 @@ fragment float4 near_fs(NearVertex in [[stage_in]],
                          linearFogValue(in.cylindricalVertexDistance, fog.renderDistanceStart, fog.renderDistanceEnd));
     return float4(mix(color.rgb, fog.color.rgb, fogValue * fog.color.a), color.a);
 }
+#endif
 
 // Offline check (mmc_near_debug_decode_gpu): every vertex of `quadCount` records through nearDecode.
 kernel void near_decode_test(device const uint* quads [[buffer(0)]], device float* out [[buffer(1)]],
@@ -773,8 +855,10 @@ final class NearRenderer: @unchecked Sendable {
                     opts.preserveInvariance = true
                     let lib = try ctx.device.makeLibrary(source: nearShaderSource, options: opts)
                     lock.lock(); library = lib; lock.unlock()
-                    // The main pass's usual formats, so the first frame doesn't compile on the render thread.
-                    for cutout in [false, true] { _ = pipeline(cutout: cutout, colorFormats: [.rgba8Unorm], depth: .depth32Float) }
+                    // The main pass's usual formats, so the first frame doesn't compile on the render thread (in lit mode,
+                    // with the G-buffer).
+                    let formats: [MTLPixelFormat] = litEnabled ? [hdrOutput ? .rgba16Float : .rgba8Unorm, litGbufferFormat] : [.rgba8Unorm]
+                    for cutout in [false, true] { _ = pipeline(cutout: cutout, colorFormats: formats, depth: .depth32Float) }
                     lock.lock(); state = 2; lock.unlock()
                     log("near chunks: shaders compiled in \((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) ms")
                 } catch {
@@ -803,8 +887,8 @@ final class NearRenderer: @unchecked Sendable {
             d.fragmentFunction = try lib.makeFunction(name: "near_fs", constantValues: constants)
             for (i, f) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = f
-                // Vanilla's terrain pipelines write color target 0; leave any others alone.
-                d.colorAttachments[i].writeMask = i == 0 ? .all : []
+                // Vanilla's terrain pipelines write color target 0; leave any others alone, except lit mode's G-buffer.
+                d.colorAttachments[i].writeMask = i == 0 || litWritesGbuffer(i, f) ? .all : []
             }
             d.depthAttachmentPixelFormat = depth
             if depth == .depth32Float_stencil8 { d.stencilAttachmentPixelFormat = depth }
@@ -899,6 +983,11 @@ public func mmc_near_draw(_ layer: Int32, _ records: UnsafePointer<Int32>, _ cou
     ctx.bindSampler(enc, 1, (from(res[11]) as SamplerBox).state, nearAtlasSamplerIndex)
     ctx.bindTexture(enc, 0, (from(res[12]) as TextureBox).texture, nearLightmapIndex)
     ctx.bindSampler(enc, 0, (from(res[13]) as SamplerBox).state, nearLightmapSamplerIndex)
+    if litEnabled {
+        // Lit mode: the fragment shader samples the lightmap (per pixel).
+        ctx.bindTexture(enc, 1, (from(res[12]) as TextureBox).texture, nearLightmapIndex)
+        ctx.bindSampler(enc, 1, (from(res[13]) as SamplerBox).state, nearLightmapSamplerIndex)
+    }
 
     var drawn = 0
     arena.lock.lock()
