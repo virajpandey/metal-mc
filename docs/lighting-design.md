@@ -210,9 +210,14 @@ stay at most SDR white) and only costs the float target.
   8 ms (about 1 ms more: the float main target's bandwidth in every pass, the float history, the float drawable). HDR
   can't hold 120 Hz as it is. The main target and history as RG11B10Float (32 bits, which the render API has) would
   halve their bandwidth; its 6-bit mantissas on sRGB-encoded values band smooth gradients unless dithered.
-- **Found:** at the far field's horizon (LOD 262144) the distant terrain shows no haze at all against the pale sky
-  above it (`m3L1`, the LOD tour's high views), while the LOD's terrain within 32 km gets it (`m3T1`, sunset).
-  `METALMC_EXP=skyhazedebug` draws each pixel's distance, haze and fade as colors to find which step drops it.
+- **Found and fixed: no haze past 2 km.** At the far field's horizon (LOD 262144) the distant terrain showed no haze
+  against the pale sky above it (`m3L1`). `METALMC_EXP=skyhazedebug` (each pixel's distance, haze and fade as colors,
+  the sky magenta) showed the far terrain magenta: depth 0, taken for sky. 26.3's Camera.update builds the perspective
+  from depthFar as soon as it sets it, so CameraMixin's push of the far plane (after update returned) never reached the
+  projection: the level kept vanilla's far plane (the cloud range, 2048 blocks). The quads past it were clipped and the
+  far field's march, which isn't, wrote depth 0. The mixin now changes the far plane as it's passed in (`m5L1`: the
+  distant terrain fades into the haze; `m5hz`: no magenta under the horizon). Fidelity inside 2 km is unchanged (quads:
+  far band 3.05, near 4.59).
 
 ## Still to check in game
 
