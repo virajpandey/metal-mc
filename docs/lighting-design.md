@@ -530,6 +530,17 @@ back.
   pass of its own, fastest +1.21 ms (the medians were noise). About 1.1-1.8 ms, against the cache's 1.5 ms budget: with
   the shadows' 1 ms, the sky's 0.5 and lit mode's 1.1, the whole look is further from 120 Hz.
 
+### In game (2026-10-01 morning, native 3456 x 2234, TAA on, the far field on)
+
+- **It runs.** The render tour with `-PmetalExp=lit,nearchunks,rtshadows,sky,gi` (`m12G`) and its coverage view
+  (`-PlitView=8`, `m12Gv`): no errors; "gi: cache of 2097152 cells, 72 MB, hit quads from the LOD's buffers (zero copy)",
+  then about 16,300 cells updated a frame and 45,000 visible cells read.
+- **The look outdoors.** Shaded faces darker than lit mode's open-sky term where the terrain hides the sky (the ravine
+  under the camera, forest floors, the far hills' sides); the sunlit tops as before; at sunset the faces near sunlit
+  ground get some warm bounce. Subtle outdoors, as expected: the room lit through a window (offline) is where it shows.
+- **Cost:** the real-terrain flight with lit, near chunks, shadows and the sky: 115.9 fps without the cache, 93.5 with
+  it (p99 13.2 ms): about 2.1 ms, more than the 1.1-1.8 ms offline. Not for 120 Hz yet.
+
 ### Not done, and what to look at in game
 
 - Not run in game. Not run offline with `hdr`, or on the mesh-shader LOD path.
