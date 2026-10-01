@@ -628,8 +628,8 @@ final class LodWorld: @unchecked Sendable {
     /// Bump when what a quadrant holds changes (materials, downsampling), so older cache files are rebuilt.
     /// 2: 26.3's poplar leaves got their own materials. 3: huge mushrooms, prismarine. 4: light sources, magma.
     /// 5: only light sources whose light can get out. 6: the far field's cells (a light count before the lights, the
-    /// cells after them).
-    static let cacheVersion: UInt8 = 6
+    /// cells after them). 7: the cells' towers.
+    static let cacheVersion: UInt8 = 7
 
     private func cacheURL(_ x: Int, _ z: Int) -> URL? { cacheDir?.appendingPathComponent("r.\(x).\(z).lq") }
 

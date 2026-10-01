@@ -32,6 +32,11 @@ let lodFarCells = lodFarFieldOn && !experiments.contains("ffvoxeltops")
 /// Tree canopies as slabs over the ground (a second word per column). METALMC_EXP=ffpillars draws them as columns down
 /// to the ground as before.
 let lodFarCanopy = !experiments.contains("ffpillars")
+/// Towers (columns v3): a coarse cell whose ground is two heights (a spire or a peak on a lower base, the top of a cliff
+/// the cell straddles) is drawn as its base plus the high part in a rectangle of the cell, at an eighth of a cell's
+/// precision, instead of one mean height over the whole cell (LodFarCell.addTower, at every merge from the blocks up;
+/// the level-2 quadrant cache keeps them). METALMC_EXP=ffnotowers: one height as before.
+let lodFarTowers = lodFarCells && !experiments.contains("ffnotowers")
 /// Debug (METALMC_EXP=ffsteps): color hits by the number of march steps (green few, red many), misses dark blue.
 let farFieldSteps = experiments.contains("ffsteps")
 /// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
@@ -76,10 +81,21 @@ struct LodFarCell: Equatable {
     var bedMat: UInt8 = 0
     var waterMat: UInt8 = 0
     var canopyMat: UInt8 = 0
+    // Towers (every merge from the blocks up): the dry ground as two heights where one can't hold it, a base over
+    // the cell and a high part standing in a rectangle of it (a spire, a peak, the top of a cliff the cell straddles).
+    // `ground` stays the mean over both. peakShare 0: none.
+    var peak: UInt16 = 0            // the high part's top, 1/16 blocks above the world bottom
+    var peakShare: UInt8 = 0        // its share of the dry ground (1-254)
+    var peakRect: UInt16 = 0        // its rectangle in eighths of the cell: x0 | (x1 - 1) << 3 | z0 << 6 | (z1 - 1) << 9
+    var peakMat: UInt8 = 0          // its top block
+
+    /// The base under a tower: the mean of the dry ground that isn't the high part.
+    var towerBase: Int { (Int(ground) * 255 - Int(peak) * Int(peakShare) + (255 - Int(peakShare)) / 2) / (255 - Int(peakShare)) }
 
     /// 2 x 2 cells to their parent: shares add up, heights are means weighted by the share they describe, and each
-    /// material is the one most of that share has (ties: the later cell).
-    static func merge(_ a: LodFarCell, _ b: LodFarCell, _ c: LodFarCell, _ d: LodFarCell) -> LodFarCell {
+    /// material is the one most of that share has (ties: the later cell). `towerLevel` > 0: the parent's level, and it
+    /// gets a tower where its ground is two heights (addTower).
+    static func merge(_ a: LodFarCell, _ b: LodFarCell, _ c: LodFarCell, _ d: LodFarCell, towerLevel: Int = 0) -> LodFarCell {
         @inline(__always) func at(_ i: Int) -> LodFarCell { i == 0 ? a : (i == 1 ? b : (i == 2 ? c : d)) }
         var areaSum = 0, dryW = 0, wetW = 0, covW = 0
         var g = 0, bd = 0, wt = 0, ct = 0, cb = 0, gMax = 0, ctMax = 0
@@ -128,7 +144,104 @@ struct LodFarCell: Equatable {
         p.bedMat = vote(ww) { $0.bedMat }
         p.waterMat = vote(ww) { $0.waterMat }
         p.canopyMat = vote(cw) { $0.canopyMat }
+        if towerLevel > 0 && lodFarTowers && dryW > 0 { p.addTower(a, b, c, d, dw, level: towerLevel) }
         return p
+    }
+
+    /// The parent's tower from its children's dry ground as parts: each child's base over its quadrant and its high part
+    /// in its rectangle (one part over the quadrant if it has no tower). The parts split in two by height where that
+    /// explains the most of their spread (Otsu's split); the high side is the tower if it stands at least a quarter of
+    /// the cell (and 2 blocks) over the rest and its rectangle isn't most of the cell. High parts far apart (a rectangle
+    /// much bigger than their area) would stand the whole cell up: then only the most prominent one is the tower.
+    private mutating func addTower(_ a: LodFarCell, _ b: LodFarCell, _ c: LodFarCell, _ d: LodFarCell,
+                                   _ dw: (Int, Int, Int, Int), level: Int) {
+        let u = LodFarCell.unit, minRise = u * max(2, (1 << level) / 4)
+        var h = SIMD8<Int>(repeating: 0), w = SIMD8<Int>(repeating: 0)   // height (1/16 blocks), weight
+        var rx0 = SIMD8<Int>(repeating: 0), rx1 = SIMD8<Int>(repeating: 0), rz0 = SIMD8<Int>(repeating: 0), rz1 = SIMD8<Int>(repeating: 0)
+        var mat = SIMD8<Int>(repeating: 0)
+        var n = 0, lo = Int.max, hi = Int.min
+        for i in 0..<4 {
+            let x = i == 0 ? a : (i == 1 ? b : (i == 2 ? c : d))
+            let dwi = i == 0 ? dw.0 : (i == 1 ? dw.1 : (i == 2 ? dw.2 : dw.3))
+            if dwi == 0 { continue }
+            let qx = (i & 1) * 8, qz = (i >> 1) * 8   // the child's quadrant, in sixteenths of the parent
+            if x.peakShare > 0 {
+                let hw = dwi * Int(x.peakShare) / 255
+                h[n] = x.towerBase; w[n] = dwi - hw; mat[n] = Int(x.groundMat)
+                rx0[n] = qx; rx1[n] = qx + 8; rz0[n] = qz; rz1[n] = qz + 8
+                lo = min(lo, h[n]); hi = max(hi, h[n])
+                n += 1
+                let r = Int(x.peakRect)   // the child's eighths are the parent's sixteenths
+                h[n] = Int(x.peak); w[n] = hw; mat[n] = Int(x.peakMat)
+                rx0[n] = qx + (r & 7); rx1[n] = qx + ((r >> 3) & 7) + 1; rz0[n] = qz + ((r >> 6) & 7); rz1[n] = qz + ((r >> 9) & 7) + 1
+            } else {
+                h[n] = Int(x.ground); w[n] = dwi; mat[n] = Int(x.groundMat)
+                rx0[n] = qx; rx1[n] = qx + 8; rz0[n] = qz; rz1[n] = qz + 8
+            }
+            lo = min(lo, h[n]); hi = max(hi, h[n])
+            n += 1
+        }
+        // Most cells: no two parts far enough apart in height.
+        if n < 2 || hi - lo < minRise { return }
+        // Parts by height (insertion sort of at most 8), then the split with the most variance between the sides.
+        var order = SIMD8<Int>(0, 1, 2, 3, 4, 5, 6, 7)
+        for i in 1..<n {
+            var j = i
+            while j > 0 && h[order[j - 1]] > h[order[j]] { let t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; j -= 1 }
+        }
+        var total = 0, totalH = 0
+        for i in 0..<n { total += w[i]; totalH += w[i] * h[i] }
+        if total == 0 { return }
+        var best = 0.0, split = 0, lowW = 0, lowH = 0
+        for k in 1..<n {
+            lowW += w[order[k - 1]]; lowH += w[order[k - 1]] * h[order[k - 1]]
+            let highW = total - lowW
+            if lowW == 0 || highW == 0 { continue }
+            let dm = Double(totalH - lowH) / Double(highW) - Double(lowH) / Double(lowW)
+            let between = Double(lowW) * Double(highW) * dm * dm
+            if between > best { best = between; split = k }
+        }
+        if split == 0 { return }
+        var high = 0   // bit per part
+        for k in split..<n { high |= 1 << order[k] }
+        @inline(__always) func bounds(_ m: Int) -> (Int, Int, Int, Int, Int, Int) {   // x0, x1, z0, z1 (sixteenths), weight, weight * height
+            var x0 = 16, x1 = 0, z0 = 16, z1 = 0, hw = 0, hh = 0
+            for i in 0..<n where m & (1 << i) != 0 {
+                x0 = min(x0, rx0[i]); x1 = max(x1, rx1[i]); z0 = min(z0, rz0[i]); z1 = max(z1, rz1[i])
+                hw += w[i]; hh += w[i] * h[i]
+            }
+            return (x0, x1, z0, z1, hw, hh)
+        }
+        var (x0, x1, z0, z1, hw, hh) = bounds(high)
+        if Double((x1 - x0) * (z1 - z0)) / 256 > 2 * Double(hw) / Double(total) + 0.125 {
+            // Spread out: the part standing out most (weight times height over the mean) alone.
+            let mean = Double(totalH) / Double(total)
+            var top = -1, topScore = 0.0
+            for i in 0..<n where high & (1 << i) != 0 {
+                let sc = Double(w[i]) * (Double(h[i]) - mean)
+                if sc > topScore { topScore = sc; top = i }
+            }
+            if top < 0 { return }
+            high = 1 << top
+            (x0, x1, z0, z1, hw, hh) = bounds(high)
+        }
+        let lw = total - hw
+        if hw == 0 || lw == 0 { return }
+        let peakH = (hh + hw / 2) / hw, baseH = (totalH - hh + lw / 2) / lw
+        guard peakH - baseH >= minRise, (x1 - x0) * (z1 - z0) * 4 <= 256 * 3 else { return }
+        // The high parts' top block: the one most of their weight has.
+        var pm = 0, pmW = -1
+        for i in 0..<n where high & (1 << i) != 0 {
+            var sum = 0
+            for j in 0..<n where high & (1 << j) != 0 && mat[j] == mat[i] { sum += w[j] }
+            if sum > pmW { pmW = sum; pm = mat[i] }
+        }
+        // To eighths of the cell, outward.
+        let ex0 = x0 / 2, ex1 = (x1 + 1) / 2, ez0 = z0 / 2, ez1 = (z1 + 1) / 2
+        peak = UInt16(peakH)
+        peakShare = UInt8(min(254, max(1, (hw * 255 + total / 2) / total)))
+        peakRect = UInt16(ex0 | (ex1 - 1) << 3 | ez0 << 6 | (ez1 - 1) << 9)
+        peakMat = UInt8(pm)
     }
 
     /// One block column of a chunk (`b`: 16 x 16 x 384 material ids laid out y, z, x from the world bottom, `top` the
@@ -249,7 +362,9 @@ struct LodFarCell: Equatable {
     /// block's top, which the shader drops 10/9 block to vanilla's surface, as the LOD's quads do from their voxel tops),
     /// 16-23 the top material (the bed's under water), 24-31 the water's material if there's water, else what the
     /// sides show under the top. Word 1, the canopy (0: none): bits 0-8 its top and 9-17 its underside (blocks above the
-    /// world bottom), 18-25 its material. (x, z): the column in its node, which picks the cells that keep a partial canopy.
+    /// world bottom), 18-25 its material. Or, with bit 31 set, a tower (columns v3): bits 0-8 the high part's top, 9-20
+    /// its rectangle (peakRect), 21-28 its top block; word 0 then holds the base under it. (x, z): the column in its node,
+    /// which picks the cells that keep a partial canopy.
     func words(x: Int, z: Int, level: Int, mode: Int = lodFarCanopyMode) -> (UInt32, UInt32) {
         guard area > 0 else { return (0, 0) }
         let u = LodFarCell.unit
@@ -267,19 +382,29 @@ struct LodFarCell: Equatable {
             dryMat = groundMat
         }
         let ct = min(511, blocks(canopyTop))
+        // A tower (dry cells): the base's top in word 0, the high part in word 1 (flag bit 31) unless trees cover at
+        // least half the cell (the canopy then).
+        if peakShare > 0 && wet < 128 && lodFarTowers && !(cover >= 128 && ct > top) {
+            let base = min(511, max(1, (towerBase + u / 2) / u)), pt = min(511, blocks(peak))
+            if pt > base {
+                return (UInt32(base) | UInt32(groundMat) << 16 | UInt32(underMat) << 24,
+                        1 << 31 | UInt32(pt) | UInt32(peakRect) << 9 | UInt32(peakMat) << 21)
+            }
+        }
         guard cover > 0, ct > top, keepsCanopy(x: x, z: z, level: level, mode: mode) else { return (w0, 0) }
         if !lodFarCanopy { return (UInt32(ct) | UInt32(canopyMat) << 16 | UInt32(dryMat) << 24, 0) }
         let cb = min(ct - 1, blocks(canopyBottom))
         return (w0, UInt32(ct) | UInt32(cb) << 9 | UInt32(canopyMat) << 18)
     }
 
-    /// Cells as bytes (18 per cell, little-endian, in field order), LZFSE-compressed: a region's cached quadrant.
+    /// Cells as bytes (24 per cell, little-endian, in field order), LZFSE-compressed: a region's cached quadrant.
     static func encode(_ cells: ArraySlice<LodFarCell>) -> [UInt8] {
         var raw = [UInt8]()
-        raw.reserveCapacity(cells.count * 18)
+        raw.reserveCapacity(cells.count * 24)
         for c in cells {
             for h in [c.ground, c.bed, c.water, c.canopyTop, c.canopyBottom] { raw.append(UInt8(h & 255)); raw.append(UInt8(h >> 8)) }
             raw += [c.area, c.wet, c.cover, c.groundMat, c.underMat, c.bedMat, c.waterMat, c.canopyMat]
+            raw += [UInt8(c.peak & 255), UInt8(c.peak >> 8), c.peakShare, UInt8(c.peakRect & 255), UInt8(c.peakRect >> 8), c.peakMat]
         }
         var packed = [UInt8](repeating: 0, count: raw.count + 1024)
         let n = raw.withUnsafeBufferPointer { compression_encode_buffer(&packed, packed.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
@@ -288,16 +413,18 @@ struct LodFarCell: Equatable {
 
     static func decode(_ bytes: [UInt8], count: Int) -> [LodFarCell]? {
         guard !bytes.isEmpty else { return nil }
-        var raw = [UInt8](repeating: 0, count: count * 18)
+        var raw = [UInt8](repeating: 0, count: count * 24)
         let got = bytes.withUnsafeBufferPointer { compression_decode_buffer(&raw, raw.count, $0.baseAddress!, $0.count, nil, COMPRESSION_LZFSE) }
         guard got == raw.count else { return nil }
         var out = [LodFarCell](repeating: LodFarCell(), count: count)
         for i in 0..<count {
-            let o = i * 18
+            let o = i * 24
             @inline(__always) func h(_ k: Int) -> UInt16 { UInt16(raw[o + 2 * k]) | UInt16(raw[o + 2 * k + 1]) << 8 }
             out[i] = LodFarCell(ground: h(0), bed: h(1), water: h(2), canopyTop: h(3), canopyBottom: h(4),
                                 area: raw[o + 10], wet: raw[o + 11], cover: raw[o + 12], groundMat: raw[o + 13],
-                                underMat: raw[o + 14], bedMat: raw[o + 15], waterMat: raw[o + 16], canopyMat: raw[o + 17])
+                                underMat: raw[o + 14], bedMat: raw[o + 15], waterMat: raw[o + 16], canopyMat: raw[o + 17],
+                                peak: h(9), peakShare: raw[o + 20], peakRect: UInt16(raw[o + 21]) | UInt16(raw[o + 22]) << 8,
+                                peakMat: raw[o + 23])
         }
         return out
     }
@@ -524,7 +651,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     float tHit = 0.0;
     int face = 2;
     uint2 col = uint2(0);
-    bool onCanopy = false;
+    bool onCanopy = false, onTower = false;
     float s = 1.0;
     int2 hitCell = int2(0);
     uint hitRing = 0;
@@ -573,8 +700,10 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
                 uint2 cw = data.read(uint2(cell), r).rg;
                 // Water surfaces sit 10/9 block below the voxel's top, as the LOD draws them (kWaterSurfaceDrop).
                 float top = float((cw.x & 511u) + ((cw.x >> 9) & 127u)) - (((cw.x >> 9) & 127u) != 0u ? 10.0 / 9.0 : 0.0);
-                // The canopy, a slab from its underside to its top over the ground (LodFarCell.words).
-                bool slab = cw.y != 0u;
+                // The canopy, a slab from its underside to its top over the ground (LodFarCell.words). Or a tower: the
+                // ground's high part, a box over a rectangle of the cell up to its top, on the base word 0 holds.
+                bool tower = (cw.y >> 31) != 0u;
+                bool slab = cw.y != 0u && !tower;
                 float cTop = float(cw.y & 511u), cBot = float((cw.y >> 9) & 511u);
                 int sideFace = lastAxis == 0 ? (d.x > 0.0 ? 1 : 0) : (d.z > 0.0 ? 5 : 4);
                 // The ray enters the column through a side (below the ground's top, or into the slab), else meets a top on
@@ -588,10 +717,28 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
                         if (yB <= cTop) { kind = 2; tHit = (cTop - o.y) / d.y; face = 2; }
                     } else if (yB <= top) { kind = 1; tHit = (top - o.y) / d.y; face = 2; }
                 } else if (slab && yA < cBot && yB >= cBot) { kind = 2; tHit = (cBot - o.y) / d.y; face = 3; }
+                if (tower && !(kind == 1 && tHit <= tc)) {
+                    uint rr = (cw.y >> 9) & 4095u;
+                    float2 r0 = cell + float2(float(rr & 7u), float((rr >> 6) & 7u)) * 0.125;
+                    float2 r1 = cell + float2(float(((rr >> 3) & 7u) + 1u), float(((rr >> 9) & 7u) + 1u)) * 0.125;
+                    float pTop = float(cw.y & 511u);
+                    float2 ta = (r0 - o.xz) * inv, tb = (r1 - o.xz) * inv;
+                    float2 tn = min(ta, tb), tf = max(ta, tb);
+                    float tyIn = d.y < 0.0 ? (pTop - o.y) / d.y : (o.y <= pTop ? -INFINITY : INFINITY);
+                    float tyOut = d.y > 0.0 ? (pTop - o.y) / d.y : INFINITY;
+                    float txz = max(tn.x, tn.y);
+                    float tIn = max(max(txz, tyIn), tc), tOut = min(min(min(tf.x, tf.y), tyOut), tExit);
+                    if (tIn <= tOut && (kind == 0 || tIn < tHit)) {
+                        kind = 3;
+                        tHit = tIn;
+                        face = tIn <= tc ? sideFace : (tyIn >= txz ? 2 : (tn.x >= tn.y ? (d.x > 0.0 ? 1 : 0) : (d.z > 0.0 ? 5 : 4)));
+                    }
+                }
                 if (kind != 0) {
                     tHit = clamp(tHit, tc, tExit);
                     col = cw;
                     onCanopy = kind == 2;
+                    onTower = kind == 3;
                     hitCell = int2(cell);
                     hitRing = r;
                     hitFrac = saturate(o.xz + d.xz * tHit - cell);
@@ -627,7 +774,7 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     float solidTop = float(solid);
     uint topMat = (col.x >> 16) & 255u, lowMat = col.x >> 24;
     // Under a canopy the ground gets less of the sky.
-    float sky = max(0.0, float(u.seamInfo.z) - (col.y != 0u && !onCanopy ? kUnderCanopy : 0.0));
+    float sky = max(0.0, float(u.seamInfo.z) - (col.y != 0u && (col.y >> 31) == 0u && !onCanopy ? kUnderCanopy : 0.0));
     float3 light = lodLight(u, lightmap, ls, sky);
     // About one texel per pixel: the pixel's footprint on the face, in blocks, times 16 texels per block.
     float3 n = face == 2 || face == 3 ? float3(0.0, 1.0, 0.0) : (face < 2 ? float3(1.0, 0.0, 0.0) : float3(0.0, 0.0, 1.0));
@@ -644,6 +791,15 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
                  : (face == 3 ? 1.0 : mix(kAO[1], 1.0, saturate((y - cBot) / max(1.0, cTop - cBot))));
         color = colors[cm * 3u + (face == 2 ? 0u : (face == 3 ? 2u : 1u))].rgb * kShade[face] * lit
               * detail(u, sprites, atlas, atlasSampler, cm, face, rel, mip) * ao;
+    } else if (onTower) {
+        // A tower's high part: its own top block, and its sides of it too where it differs from the base's (a stone peak
+        // on grass), else the base's side block under the top few blocks; the sides darken toward the base.
+        float pTop = float(col.y & 511u);
+        uint pm = (col.y >> 21) & 255u;
+        uint mat = (face == 2 || y >= pTop - min(s, 8.0) || pm != topMat) ? pm : lowMat;
+        float ao = face == 2 ? 1.0 : mix(kAO[1], 1.0, saturate((y - solidTop) / s));
+        color = colors[mat * 3u + (face == 2 ? 0u : 1u)].rgb * kShade[face] * light
+              * detail(u, sprites, atlas, atlasSampler, mat, face, rel, mip) * ao;
     } else if (depthVox > 0u && face == 2) {
         // Water over its floor, like the LOD's translucent water over its meshed floor (lit for the water above it).
         float depthBlocks = min(15.0, float(depthVox) - 1.0);

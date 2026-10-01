@@ -338,6 +338,7 @@ struct LodGrid {
         // Far-field cells: each 2 x 2 merged (LodFarCell.merge); a column with voxels but no cell gets one from its voxels.
         if !far.isEmpty {
             if parent.far.isEmpty { parent.far = [LodFarCell](repeating: LodFarCell(), count: n * n) }
+            let towerLevel = parent.level
             parent.far.withUnsafeMutableBufferPointer { out in
                 for pz in 0..<half {
                     for px in 0..<half {
@@ -345,7 +346,7 @@ struct LodGrid {
                             let i = (pz * 2 + dz) * n + px * 2 + dx
                             return far[i].area != 0 ? far[i] : LodFarCell.voxels(self, column: i)
                         }
-                        out[(qz * half + pz) * n + qx * half + px] = LodFarCell.merge(child(0, 0), child(1, 0), child(0, 1), child(1, 1))
+                        out[(qz * half + pz) * n + qx * half + px] = LodFarCell.merge(child(0, 0), child(1, 0), child(0, 1), child(1, 1), towerLevel: towerLevel)
                     }
                 }
             }
@@ -439,7 +440,8 @@ enum LodBuild {
                                 let t = tint[(vz >> 1) * 4 + (vx >> 1)], x = 2 * vx, z = 2 * vz
                                 far[(lz0 + vz) * n + lx0 + vx] = LodFarCell.merge(
                                     LodFarCell.block(b, x: x, z: z, top: top, tint: t), LodFarCell.block(b, x: x + 1, z: z, top: top, tint: t),
-                                    LodFarCell.block(b, x: x, z: z + 1, top: top, tint: t), LodFarCell.block(b, x: x + 1, z: z + 1, top: top, tint: t))
+                                    LodFarCell.block(b, x: x, z: z + 1, top: top, tint: t), LodFarCell.block(b, x: x + 1, z: z + 1, top: top, tint: t),
+                                    towerLevel: 1)
                             }
                         }
                     }
