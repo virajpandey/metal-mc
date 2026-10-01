@@ -23,12 +23,15 @@ for TRY in 1 2 3; do
   fi
   [ -d run/saves/claudeworld ] && mv run/saves/claudeworld "$OUT/old_worlds/claudeworld-$(date +%s)"
   cp -Rp "../fixtures/$FIX" run/saves/claudeworld   # -p keeps mtimes, so the LOD's region cache still matches
-  # Read the fresh copy once now, so the machine's security scanners check its new files here rather than while the
-  # LOD reads them (on 2026-10-01 they made the LOD's first build 2.5x slower, past the bench's wait for it).
-  find run/saves/claudeworld -type f -exec cat {} + > /dev/null
   # Let Spotlight and the security scanners finish with the fresh copy before timing anything.
   sleep ${SETTLE:-30}
   : > "$LOG.dialogs"
+  # The game is forked by gradle's daemon and inherits its priority: a daemon started at background priority (by a build
+  # under taskpolicy -b) runs the game on the efficiency cores, 3-5x slower (2026-10-01). Stop any such daemon first.
+  if ps -Ao pri,command | awk '/GradleDaemon/ && !/awk/ && $1 < 20 { found = 1 } END { exit !found }'; then
+    echo "$(date +%T) stopping a background-priority gradle daemon" >> "$OUT/dialog_waits.log"
+    env JAVA_HOME=/opt/homebrew/opt/openjdk@25 ./gradlew --stop > /dev/null 2>&1
+  fi
   ( sleep "$T"; pkill -f KnotClient ) & WD=$!
   ( while sleep 10; do d=$(dialog); [ -n "$d" ] && echo "METALMC_DIALOG $(date +%T) $d" >> "$LOG.dialogs"; done ) & DW=$!
   env JAVA_HOME=/opt/homebrew/opt/openjdk@25 ./gradlew runClient "$@" > "$LOG" 2>&1
