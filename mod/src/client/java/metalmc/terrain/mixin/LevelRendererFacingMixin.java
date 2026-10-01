@@ -96,7 +96,7 @@ abstract class LevelRendererFacingMixin {
         if (NearChunks.ENABLED && element instanceof DynamicGpuData.IndexedDraw) {
             near = NearChunks.divertedEntry(currentMesh, currentLayer);
             // Vanilla's heap holds a placeholder for a slimmed layer: draw nothing rather than garbage.
-            if (near == 0 && NearChunks.slimmed(currentMesh, currentLayer)) return true;
+            if (near == 0 && NearChunks.slimmed(currentMesh, currentLayer)) return keepNonEmpty(list, element);
         }
         int[] counts = FacingSorter.ENABLED && currentMesh instanceof FacingData data ? data.metalmc$facings(currentLayer) : null;
         if (!(element instanceof DynamicGpuData.IndexedDraw draw) || (counts == null && near == 0)) {
@@ -104,7 +104,7 @@ abstract class LevelRendererFacingMixin {
         }
         if (counts == null) {
             NearChunks.add(currentLayer, near, draw.firstIndex() / 6, draw.indexCount() / 6, draw.baseInstance());
-            return true;
+            return keepNonEmpty(list, element);
         }
         Vec3 cam = levelRenderState.cameraRenderState.pos;
         int mask = FacingSorter.visibleMask(cam.x, cam.y, cam.z, currentX, currentY, currentZ);
@@ -121,6 +121,18 @@ abstract class LevelRendererFacingMixin {
             quad += counts[b];
         }
         if (runStart >= 0) emit(list, draw, runStart, quad, near);
+        return keepNonEmpty(list, element);
+    }
+
+    /**
+     * Vanilla uploads each draw group's list with List.getLast() (DynamicGpuDataStorageMapped.writeDataBatchedMultiple), so a
+     * group whose draws all went elsewhere (to the near chunks, or buckets facing away) must not be left empty: it keeps one
+     * draw of no indices.
+     */
+    private static boolean keepNonEmpty(List<Object> list, Object element) {
+        if (list.isEmpty() && element instanceof DynamicGpuData.IndexedDraw draw) {
+            list.add(new DynamicGpuData.IndexedDraw(0, draw.instanceCount(), draw.firstIndex(), draw.baseVertex(), draw.baseInstance()));
+        }
         return true;
     }
 

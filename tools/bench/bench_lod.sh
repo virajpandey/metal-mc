@@ -12,7 +12,13 @@ OPT=mod/run/options.txt
 RD=${BENCH_RD:-12}
 # Never write a non-numeric renderDistance: Minecraft stops reading options at a bad line and resets the rest.
 # BENCH_VSYNC=true: a real 120 Hz run (count frames_over_16ms as dropped frames); default off (uncapped).
-sed -i '' "s/^fullscreen:.*/fullscreen:true/; s/^renderDistance:.*/renderDistance:$RD/; s/^pauseOnLostFocus:.*/pauseOnLostFocus:false/; s/^enableVsync:.*/enableVsync:${BENCH_VSYNC:-false}/" $OPT
+sed -i '' "s/^fullscreen:.*/fullscreen:true/; s/^renderDistance:.*/renderDistance:$RD/; s/^pauseOnLostFocus:.*/pauseOnLostFocus:false/; s/^enableVsync:.*/enableVsync:${BENCH_VSYNC:-false}/; s/^startedCleanly:.*/startedCleanly:true/" $OPT
+# Fullscreen at the panel's own pixels (1728 x 1117 points at 2x: 3456 x 2234) whatever the desktop's scaling: the
+# exclusive fullscreen takes its mode from fullscreenResolution, and without one it uses the desktop's (More Space:
+# 4112 x 2658 rendered and scaled down by the system). A crash during startup makes the next start windowed and drops
+# the mode (startedCleanly), so both are set before every run.
+MODE='{"width":1728,"height":1117,"red_bits":8,"green_bits":8,"blue_bits":8,"refresh_rate":120.0}'
+if grep -q '^fullscreenResolution:' $OPT; then sed -i '' "s/^fullscreenResolution:.*/fullscreenResolution:$MODE/" $OPT; else echo "fullscreenResolution:$MODE" >> $OPT; fi
 if [ "$FAR" = "0" ]; then LODARGS="-Plod=0"; else LODARGS="-Plod=1 -PlodFar=$FAR"; fi
 FIXTURE=${BENCH_FIXTURE:-claudeworld-huge} caffeinate -di bash "$ROOT/tools/bench/run_mc.sh" "$OUT/run_$LABEL.log" ${BENCH_TIMEOUT:-300} \
   -PmetalBackend=metal -PbenchNoon=1 -PbenchLabel=$LABEL $LODARGS "$@"

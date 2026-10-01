@@ -3,6 +3,7 @@
 	"package": "metalmc.sky.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
+		"FrontendRenderPassMixin",
 		"MainTargetMixin",
 		"RenderTargetMixin",
 		"ScreenshotMixin",
