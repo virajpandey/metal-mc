@@ -280,3 +280,19 @@ and 10 of the 134 long frames within 50 ms of one (`METALMC_EXP=fflog`). The far
 on the GPU (p95 of the frame's GPU time 12.56 against the quads' 11.42 ms), from the march in heavy views; its LOD CPU
 time is lower (0.41 against 0.51 ms). At a locked 120 Hz the two drop about as many frames. Towers cost nothing
 measurable and gain a little in the far band, more where it doesn't reach (cliffs, peaks and ice spikes past 2 km).
+
+**On by default (2026-10-01, end of the night).** Two shading fixes against the level-0 answer key, then the switch:
+
+- A side face's foot now gets two occluders' ambient occlusion (0.76), as vanilla's smooth lighting and the quads'
+  voxels give a step's bottom corners (the ground in front and the corner beside it), not one (0.88): far band 4.24 →
+  3.80, the bias +2.9 → +2.1 RGB (`m6A`; `METALMC_EXP=ffsideao1` for one).
+- What's left is mostly the occlusion of detail finer than a cell: the cells' mean heights smooth away the steps the
+  quads' voxels keep, and with them corners that darken. A land gain (`METALMC_FFGAIN`, applied as occlusion so lit mode
+  relights the same color) fitted at 0.93: far band 3.32 with the bias at +0.6 RGB, the quads' +0.8 (`m6A96` 3.43,
+  `m6A93` 3.32; without the side-foot fix 0.92 gave 3.39).
+- Against the quads (3.05) that's 9% more error in the far band, all of it in the views from 150 blocks up and higher
+  (mid-north 6.07 vs 5.38, high-north 4.67 vs 4.02, mostly snowy terrain whose step sides and spruces the 2-block cells
+  thin out); from the ground the far field is closer to the answer key (east 0.46 vs 0.81, south 1.04 vs 1.61).
+- At a locked 120 Hz the two drop as many frames (4-6 in 60 s), the far field's CPU time is lower, and it's the only
+  one of the two that reaches the horizon: so it's on by default. `METALMC_FARFIELD=0` (`-PfarField=0`) draws quads at
+  every level as before; `tools/bench/verify_all.sh` asks for that explicitly for its quads runs.
