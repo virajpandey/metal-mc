@@ -265,3 +265,18 @@ a node that goes clears its cells. Offline, along a five-view route: the first v
 1.9 M pixels (coarse pyramid cells at the window's edge now hold neighbors from across the torus: more steps, never a
 different hit), a view after a round trip and one reached from two directions are identical; a move writes 262 K cells
 instead of 8.4 M. `METALMC_EXP=fflog` logs every update with its time, to line them up with long frames.
+
+In game (the same night, native resolution; flights on the real-terrain world, 60 s, uncapped unless noted):
+
+| | far band | fps | p99 | frames over 8.33 ms | dropped at 120 Hz (vsync) |
+|---|---|---|---|---|---|
+| quads (`m3`/`m4`) | 3.03 | 158.5 / 158.6 | 7.80 / 7.78 ms | 20 / 20 | 6 |
+| far field, rings refilled whole (`m3F`, `m3ff`) | 4.26 | 155.1 | 9.94 ms | 453 | 4 |
+| rings updated in place, no towers (`m4Fn`, `m4ffn`) | 4.25 | 153.9 | 8.49 ms | 118 | |
+| rings in place and towers (`m4F`, `m4ff`) | 4.22 | 154.3 | 8.53 ms | 134 | 6 |
+
+Updating rings in place cut the long frames by 3.4x. What's left isn't the updates: 47 of them in the flight's 59 s,
+and 10 of the 134 long frames within 50 ms of one (`METALMC_EXP=fflog`). The far field's frames are slower in the tail
+on the GPU (p95 of the frame's GPU time 12.56 against the quads' 11.42 ms), from the march in heavy views; its LOD CPU
+time is lower (0.41 against 0.51 ms). At a locked 120 Hz the two drop about as many frames. Towers cost nothing
+measurable and gain a little in the far band, more where it doesn't reach (cliffs, peaks and ice spikes past 2 km).
