@@ -59,6 +59,7 @@ loom {
 			property "metalmc.pregen", (project.findProperty("benchPregen") ?: "0").toString()
 			property "metalmc.lod", (project.findProperty("lod") ?: "0").toString()
 			property "metalmc.lod.far", (project.findProperty("lodFar") ?: "2048").toString()
+			property "metalmc.lod.extendFar", (project.findProperty("lodExtendFar") ?: "1").toString()
 			property "metalmc.lod.live", (project.findProperty("lodLive") ?: "1").toString()
 			property "metalmc.lod.textures", (project.findProperty("lodTextures") ?: "1").toString()
 			property "metalmc.lod.generate", (project.findProperty("lodGenerate") ?: "1").toString()

@@ -15,6 +15,9 @@ import org.spongepowered.asm.mixin.injection.ModifyArg;
  */
 @Mixin(Camera.class)
 abstract class CameraMixin {
+    /** -PlodExtendFar=0: the perspective keeps vanilla's far plane (only depthFar, which the 3D HUD uses, is pushed). */
+    private static final boolean EXTEND = !"0".equals(System.getProperty("metalmc.lod.extendFar", "1"));
+
     @Shadow
     private float depthFar;
 
@@ -23,6 +26,6 @@ abstract class CameraMixin {
     private float metalmc$extendFar(float far) {
         if (!Lod.active()) return far;
         depthFar = Math.max(depthFar, Lod.FAR * 1.5f);
-        return depthFar;
+        return EXTEND ? depthFar : far;
     }
 }
