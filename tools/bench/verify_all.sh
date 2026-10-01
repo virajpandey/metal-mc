@@ -16,15 +16,15 @@ SHOTS=$ROOT/mod/run/screenshots
 if "$ROOT/bench_out/winlist" | grep -q UserNotificationCenter; then echo "a system dialog is on screen; not starting"; exit 1; fi
 
 fid() { BENCH_NOBUILD=1 BENCH_TIMEOUT=${T:-900} bash tools/bench/fidelity.sh "$@"; }
-fid ${P}Q 12 8192 -PlodGenerate=0 "$@"
+fid ${P}Q 12 8192 -PlodGenerate=0 -PfarField=0 "$@"
 fid ${P}F 12 8192 -PlodGenerate=0 -PfarField=1 "$@"
 T=2400 fid ${P}H 12 262144 -PfarField=1 -PbenchExtraWait=6000 "$@"
 
 fly() { BENCH_NOBUILD=1 BENCH_FIXTURE=claudeworld-merged BENCH_TIMEOUT=900 bash tools/bench/bench_lod.sh "$1" 32768 -PbenchY=150 \
           -PbenchFly=20 -PbenchExtraWait=600 -PbenchHitches=1 -PbenchTrace=1 -Ptaa=true "${@:2}" > /dev/null 2>&1; }
-fly ${P}fq "$@"
+fly ${P}fq -PfarField=0 "$@"
 fly ${P}ff -PfarField=1 "$@"
-BENCH_VSYNC=true fly ${P}vq "$@"
+BENCH_VSYNC=true fly ${P}vq -PfarField=0 "$@"
 BENCH_VSYNC=true fly ${P}vf -PfarField=1 "$@"
 sed -i '' "s/^enableVsync:.*/enableVsync:false/" mod/run/options.txt
 

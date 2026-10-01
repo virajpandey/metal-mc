@@ -24,8 +24,8 @@ import simd
 // window, then ring 1, and so on (each ring's cells are about 3.5 px wide where its window ends). A hit writes the
 // column's color (top or side face, vanilla's lightmap, water over its floor, fog) and its depth.
 
-/// The finest LOD level drawn by the far field (METALMC_FARFIELD); 0: off.
-let lodFarFieldLevel = max(0, Int(ProcessInfo.processInfo.environment["METALMC_FARFIELD"] ?? "") ?? 0)
+/// The finest LOD level drawn by the far field (METALMC_FARFIELD, -PfarField; default 1); 0: off (quads at every level).
+let lodFarFieldLevel = max(0, Int(ProcessInfo.processInfo.environment["METALMC_FARFIELD"] ?? "") ?? 1)
 let lodFarFieldOn = lodFarFieldLevel > 0
 /// Real columns' heights at block precision (LodFarCell), carried from the region files through every level. With
 /// METALMC_EXP=ffvoxeltops they come from the voxels as before: tops rounded to 2-256 blocks, which stood real terrain
