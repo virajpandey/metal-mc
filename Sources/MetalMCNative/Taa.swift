@@ -369,7 +369,7 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     t.lastApply = now
     ctx.endBlit()
     let cb = ctx.ensureCB()
-    guard let enc = cb.makeComputeCommandEncoder() else { return 0 }
+    guard let enc = cb.makeComputeCommandEncoder(descriptor: profComputePass("anti-aliasing resolve (+ aerial perspective, relight)")) else { return 0 }
     var params = TaaParams(invCur: viewProj.inverse, prev: t.prevViewProj,
                            camDelta: restart ? .zero : SIMD4(Float(delta.x), Float(delta.y), Float(delta.z), 0),
                            size: SIMD2(Float(color.width), Float(color.height)), reset: restart ? 1 : 0, blend: taaBlend)

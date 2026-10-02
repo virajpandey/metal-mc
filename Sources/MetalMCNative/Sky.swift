@@ -885,7 +885,7 @@ final class Sky: @unchecked Sendable {
         guard let lowres else { return false }
         var f = levelFrame(color: color, invViewProj: invViewProj, headroom: headroom)
         ctx.endBlit()
-        guard let enc = ctx.ensureCB().makeComputeCommandEncoder() else { return false }
+        guard let enc = ctx.ensureCB().makeComputeCommandEncoder(descriptor: profComputePass("sky, quarter resolution")) else { return false }
         enc.label = "MetalMC sky, quarter resolution"
         enc.setComputePipelineState(lowresPipe)
         enc.setTexture(lowres, index: 0)

@@ -1404,7 +1404,7 @@ final class GiCache: @unchecked Sendable {
         var p = params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: depth.width, height: depth.height)
         p.blockLight = SIMD4(0, 0, 0, evictFrames)
         p.rays.w = cloudHeight - Float(cam.y)
-        guard let enc = cb.makeComputeCommandEncoder() else { return false }
+        guard let enc = cb.makeComputeCommandEncoder(descriptor: profComputePass("GI cache")) else { return false }
         enc.label = "MetalMC GI cache"
         encodeLight(enc, light)
         encodeBegin(enc, params: &p)

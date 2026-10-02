@@ -485,7 +485,7 @@ final class RtShadows: @unchecked Sendable {
                     ? dev.makeBuffer(bytes: gi.tiles, length: gi.tiles.count * 16, options: .storageModeShared).map { ($0, gi.buffers) } : nil
             }
         }
-        guard let enc = cb.makeComputeCommandEncoder() else { return false }
+        guard let enc = cb.makeComputeCommandEncoder(descriptor: profComputePass("ray-traced shadows")) else { return false }
         enc.setComputePipelineState(kernel)
         enc.setAccelerationStructure(tlas, bufferIndex: 0)
         enc.useResources(tlasAccels, usage: .read)

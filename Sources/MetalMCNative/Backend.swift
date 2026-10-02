@@ -250,6 +250,19 @@ func profAttach(_ d: MTLRenderPassDescriptor, _ label: String) {
     ctx.profLabels.append("R" + label)
 }
 
+/// A compute pass descriptor with start/end timestamps when tracing (a plain one otherwise).
+func profComputePass(_ label: String) -> MTLComputePassDescriptor {
+    let d = MTLComputePassDescriptor()
+    guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 4 <= 512 else { return d }
+    let a = d.sampleBufferAttachments[0]!
+    a.sampleBuffer = sb
+    a.startOfEncoderSampleIndex = ctx.profNext
+    a.endOfEncoderSampleIndex = ctx.profNext + 1
+    ctx.profNext += 4
+    ctx.profLabels.append("C" + label)
+    return d
+}
+
 func profAttachBlit(_ d: MTLBlitPassDescriptor, _ label: String) {
     guard ctx.traceFrames > 0, let sb = profBuffer(), ctx.profNext + 4 <= 512 else { return }
     let a = d.sampleBufferAttachments[0]!
@@ -1188,7 +1201,7 @@ public func mmc_submit(_ index: Int64) {
                 func ms(_ a: UInt64, _ b: UInt64) -> Double { (a == 0 || b == 0 || b < a || a == UInt64.max || b == UInt64.max) ? -1 : Double(b - a) / 1e6 }
                 for (k, label) in labels.enumerated() {
                     let t = Array(ts[(4 * k)..<(4 * k + 4)])
-                    if label.hasPrefix("B") {
+                    if label.hasPrefix("B") || label.hasPrefix("C") {
                         lines.append(String(format: "  total %6.3f ms                                  %@", ms(t[0], t[1]), String(label.dropFirst())))
                     } else {
                         lines.append(String(format: "  total %6.3f ms  vertex %6.3f  fragment %6.3f  %@", ms(t[0], t[3]), ms(t[0], t[1]), ms(t[2], t[3]), String(label.dropFirst())))
