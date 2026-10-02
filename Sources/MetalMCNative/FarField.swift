@@ -509,6 +509,8 @@ using namespace metal;
 // Lit mode (METALMC_EXP=lit, Lit.swift): the march also writes the terrain G-buffer.
 #define LIT_MODE \(litEnabled ? 1 : 0)
 \(litShaderHeader)
+// Offline only (FARTEST_STATS, FarFieldDebug): per-pixel march counters into a buffer FarFieldDebug binds.
+#define FF_STATS 0
 
 struct LodUniforms {
     float4x4 proj;
@@ -641,10 +643,19 @@ static float linearFog(float d, float s, float e) {
     return (d - s) / (e - s);
 }
 
-#if LIT_MODE
-struct FFOut { float4 color [[color(0)]]; uint2 gbuf [[color(1)]]; float depth [[depth(less)]]; };
+#if FF_STATS
+// The counters are written to a buffer, which would run the shader on pixels the early depth test skips unless early
+// tests are forced, and then it can't write depth: the depth goes to an unbound color slot (the counters don't need it).
+#define FF_EARLY [[early_fragment_tests]]
+#define FF_DEPTH [[color(7)]]
 #else
-struct FFOut { float4 color [[color(0)]]; float depth [[depth(less)]]; };
+#define FF_EARLY
+#define FF_DEPTH [[depth(less)]]
+#endif
+#if LIT_MODE
+struct FFOut { float4 color [[color(0)]]; uint2 gbuf [[color(1)]]; float depth FF_DEPTH; };
+#else
+struct FFOut { float4 color [[color(0)]]; float depth FF_DEPTH; };
 #endif
 struct LodSpriteGPU { float4 top; float4 side; float4 luma; };
 
@@ -666,13 +677,24 @@ static float detail(constant LodUniforms& u, constant LodSpriteGPU* sprites, tex
     return clamp(mix(mat == \(Mat.water.rawValue)u ? 1.0 : 0.75, luma / max(mean, 0.02), t.a), 0.0, 2.0);
 }
 
-fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(19)]], constant FarUniforms& f [[buffer(25)]],
+FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(19)]], constant FarUniforms& f [[buffer(25)]],
                      constant float4* colors [[buffer(26)]],
                      texture2d_array<uint, access::read> data [[texture(27)]],
                      texture2d_array<ushort, access::read> heights [[texture(28)]],
                      texture2d<float> lightmap [[texture(29)]], sampler ls [[sampler(14)]],
                      constant LodSpriteGPU* sprites [[buffer(20)]], texture2d<float> atlas [[texture(30)]],
-                     sampler atlasSampler [[sampler(15)]], const device uchar* cover [[buffer(28)]]) {
+                     sampler atlasSampler [[sampler(15)]], const device uchar* cover [[buffer(28)]]
+#if FF_STATS
+                     , device uint4* stats [[buffer(29)]]
+#endif
+                     ) {
+#if FF_STATS
+    // Per pixel: steps by kind (advances at a level over 0, descents, level-0 column tests and those that missed,
+    // climbs undone by the next step), rings entered, steps per ring, the hit's ring and step in its ring.
+    uint stAdv = 0, stDesc = 0, stDip = 0, stColMiss = 0, stRings = 0, stWasted = 0, stHitStep = 0;
+    uint stRing[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    bool stClimbed = false;
+#endif
     float2 uv = pos.xy / f.viewport.xy;
     float4 hp = f.invViewProj * float4(uv * 2.0 - 1.0, 1.0, 1.0);
     float3 dir = normalize(hp.xyz / hp.w);
@@ -704,6 +726,9 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
         float tEnter = max(max(tmn.x, tmn.y), t);
         float tLeave = min(min(tmx.x, tmx.y), tMax);
         if (!(tEnter < tLeave)) continue;
+#if FF_STATS
+        stRings++;
+#endif
         int lastAxis = tmn.x > tmn.y ? 0 : 1;
         int l = min(TOP, \(farFieldStartLevel));   // a ray over the terrain climbs a level a step (METALMC_FFSTART)
         float tc = tEnter;
@@ -722,16 +747,32 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
             float tExit = min(min(tt.x, tt.y), tLeave);
             float yA = o.y + d.y * tc, yB = o.y + d.y * tExit;
             bool next = false, column = false;   // on to the next cell at this level; a column to test
+#if FF_STATS
+            stRing[r]++;
+            bool stWasClimb = stClimbed;
+            stClimbed = false;
+#endif
             if (hmax <= 0.0 || min(yA, yB) > hmax) {
                 next = true;
+#if FF_STATS
+                if (l > 0) stAdv++;
+                stClimbed = l < TOP;
+#endif
                 l = min(l + 1, TOP);
             } else if (l > 0) {
+#if FF_STATS
+                stDesc++;
+                if (stWasClimb) stWasted++;
+#endif
                 l--;
             } else {
                 // A column in the quads' area: they draw it, so it's empty here.
                 float2 cb = floor((f.ringCover[r].xy + cell * s) / 64.0);
                 next = all(cb >= 0.0) && all(cb < float(COVER)) && cover[int(cb.y) * COVER + int(cb.x)] != 0;
                 column = !next;
+#if FF_STATS
+                stDip++;
+#endif
             }
             if (column) {
                 uint2 cw = data.read(uint2(int2(cell) & (W - 1)), r).rg;
@@ -780,8 +821,14 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
                     hitRing = r;
                     hitFrac = saturate(o.xz + d.xz * tHit - cell);
                     hit = true;
+#if FF_STATS
+                    stHitStep = uint(i);
+#endif
                     break;
                 }
+#if FF_STATS
+                stColMiss++;
+#endif
                 next = true;
             }
             if (next) {
@@ -802,6 +849,16 @@ fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [[buffer(1
     FFOut out;
 #if LIT_MODE
     out.gbuf = uint2(0u);
+#endif
+#if FF_STATS
+    {
+        uint px = uint(pos.y) * uint(f.viewport.x) + uint(pos.x);
+        stats[2 * px] = uint4(uint(steps) | stRings << 16, stAdv | stDesc << 16, stDip | stColMiss << 16,
+                              (hit ? hitRing : 15u) | stWasted << 8 | stHitStep << 20 | 1u << 31);
+        stats[2 * px + 1] = uint4(min(stRing[0], 255u) | min(stRing[1], 255u) << 8 | min(stRing[2], 255u) << 16 | min(stRing[3], 255u) << 24,
+                                  min(stRing[4], 255u) | min(stRing[5], 255u) << 8 | min(stRing[6], 255u) << 16 | min(stRing[7], 255u) << 24,
+                                  0u, 0u);
+    }
 #endif
     if (!hit) {
         if (\(farFieldSteps ? "true" : "false")) { out.color = float4(0.0, 0.0, 0.25, 1.0); out.depth = 0.0; return out; }
@@ -929,6 +986,11 @@ final class FarField: @unchecked Sendable {
     static let shared = FarField()
 
     private var library: MTLLibrary?
+    private var drawLibrary: MTLLibrary?   // offline (setDrawSource): the draw's shaders from another source
+    /// Offline (FarFieldDebug, FARTEST_STATS): the march's per-pixel counters (a shader with FF_STATS set).
+    var statsBuffer: MTLBuffer?
+    /// The last draw's pre-pass (a command buffer of its own), for the offline timing; none yet.
+    private(set) var lastProfileCB: MTLCommandBuffer?
     private var clearPipe: MTLComputePipelineState?
     private var fillPipe: MTLComputePipelineState?
     private var mipPipe: MTLComputePipelineState?
@@ -974,11 +1036,25 @@ final class FarField: @unchecked Sendable {
         return false
     }
 
-    private func drawPipe(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat) -> MTLRenderPipelineState? {
-        let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)"
+    /// Offline (FarFieldDebug): draws with the shaders of `source` (a variant of farFieldShaderSource), or the built-in
+    /// ones again for nil. The rings' fills keep the built-in shaders.
+    func setDrawSource(_ source: String?) -> Bool {
+        var lib: MTLLibrary?
+        if let source {
+            do { lib = try ctx.device.makeLibrary(source: source, options: nil) } catch {
+                log("far field: draw source failed: \(error)")
+                return false
+            }
+        }
+        lock.lock(); drawLibrary = lib; drawPipes = [:]; lock.unlock()
+        return true
+    }
+
+    private func drawPipe(colorFormats: [MTLPixelFormat], depth: MTLPixelFormat, builtin: Bool = false) -> MTLRenderPipelineState? {
+        let key = colorFormats.map { String($0.rawValue) }.joined(separator: ",") + "/\(depth.rawValue)" + (builtin ? "/b" : "")
         lock.lock(); defer { lock.unlock() }
         if let p = drawPipes[key] { return p }
-        guard let library else { return nil }
+        guard let library = builtin ? library : drawLibrary ?? library else { return nil }
         let d = MTLRenderPipelineDescriptor()
         d.label = "MetalMC far field"
         d.vertexFunction = library.makeFunction(name: "ff_vs")
@@ -1165,10 +1241,12 @@ final class FarField: @unchecked Sendable {
         return ready
     }
 
-    /// Draws the march inside the LOD's pass (after its opaque quads). `u` is the LOD's uniforms for this frame.
+    /// Draws the march inside the LOD's pass (after its opaque quads). `u` is the LOD's uniforms for this frame. `builtin`
+    /// (offline): with the built-in shaders whatever setDrawSource set.
     func draw(_ enc: MTLRenderCommandEncoder, u: LodUniforms, colors: MTLBuffer, lightmap: MTLTexture, lightSampler: MTLSamplerState?,
-              cy: Double, nearest: Double) {
-        guard ready, let data, let heights, let coverBuffer, let pipe = drawPipe(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat) else { return }
+              cy: Double, nearest: Double, builtin: Bool = false) {
+        guard ready, let data, let heights, let coverBuffer,
+              let pipe = drawPipe(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, builtin: builtin) else { return }
         let k = lodFarFieldLevel
         let vp = u.proj * u.view
         var f = FarUniforms(invViewProj: vp.inverse,
@@ -1209,6 +1287,7 @@ final class FarField: @unchecked Sendable {
         enc.setFragmentTexture(lightmap, index: 29)
         enc.setFragmentSamplerState(lightSampler, index: 14)
         enc.setFragmentBuffer(coverBuffer, offset: 0, index: 28)
+        if let statsBuffer { enc.setFragmentBuffer(statsBuffer, offset: 0, index: 29) }
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 64 * 9)
         enc.setCullMode(.back)
     }
