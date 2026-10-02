@@ -85,6 +85,11 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   G-buffer changes in any view checked. Offline it takes the vertex stage down 0.08-0.40 ms depending on how much of
   the view is cullable (15-36%), for a pass that costs 0.17-0.24 ms: 0.03-0.30 ms net. The in-game flight (about 30%
   cullable, cullstats) should land near the top of that range; it becomes the default only if the in-game A/B shows it.
+- **Water that reflects** (built, a look feature, off by default: `METALMC_EXP=water` with lit mode and the sky;
+  docs/lighting-design.md): the sky reflected with Fresnel, the sun's glint (shadowed by the traced visibility), small
+  waves that roughen into the distance, for the far field's and the LOD's water (vanilla's near water not yet: it needs a
+  translucent-pipeline variant). Cost offline: about 0.35 ms a frame with a third of the screen water (0.08 ms with only
+  the far field's sea), bit for bit the old frame without the switch. Next: terrain in the reflections (screen space).
 - **The screen locks itself after a while with no input** (2026-10-02, about 05:30, likely the company's idle-lock
   policy; caffeinate doesn't stop it). The lock screen over the fullscreen game paces it at 120 Hz like a dialog does
   (the GPU's frame time drops below the frame time: the command buffers stop overlapping), so timed flights are void
