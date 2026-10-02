@@ -23,9 +23,15 @@ fid() { BENCH_NOBUILD=1 BENCH_TIMEOUT=900 bash tools/bench/fidelity.sh "$1" 12 8
 near() { for x in "$@"; do (cd "$SHOTS" && "$FS" . nA nB "$x" | tail -1); done; }
 far() { for x in "$@"; do (cd "$SHOTS" && "$FS" . nL0c nA "$x" | tail -1); done; }
 build() { swift build -c release --product MetalMCNative 2>&1 | grep -E 'error|Build complete' | tail -3; }
+# The lock screen (the company's idle lock) over the fullscreen game paces it at 120 Hz: timed jobs wait for an unlock
+# (the runner stops and leaves them queued); fidelity tours, which read the render target, run anyway.
+locked() { bench_out/winlist 2>/dev/null | awk '$1 == "layer" && $2 >= 1900 && $4 > 0 && $5 == "loginwindow" { found = 1 } END { exit !found }'; }
 start=$(date +%s)
 while [ -s "$Q" ] && [ $(( $(date +%s) - start )) -lt 1200 ]; do
   job=$(head -1 "$Q")
+  case "$job" in fly\ *|vfly\ *)
+    if locked; then echo "== $(date +%T) the screen is locked: timed jobs wait (runner stopped)" >> "$L"; break; fi ;;
+  esac
   tail -n +2 "$Q" > "$Q.tmp" && mv "$Q.tmp" "$Q"
   echo "== $(date +%T) $job" >> "$L"
   eval "$job" >> "$L" 2>&1
