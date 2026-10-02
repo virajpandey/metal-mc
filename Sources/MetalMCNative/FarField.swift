@@ -54,6 +54,12 @@ let farFieldGain = max(0, Float(ProcessInfo.processInfo.environment["METALMC_FFG
 let farFieldStartLevel = Int(ProcessInfo.processInfo.environment["METALMC_FFSTART"] ?? "") ?? 6
 /// Debug (METALMC_EXP=fflog): log every ring refill (with its time), to line them up with long frames.
 let farFieldLogFills = experiments.contains("fflog")
+/// The horizon profile (ff_profile; METALMC_EXP=ffnoprofile: none): per ring and azimuth, the steepest rise at which the
+/// camera sees any of the ring's terrain, so a ray rising faster passes the ring without marching it (most of the sky
+/// just over the horizon, and rays crossing near rings to far terrain).
+let farFieldProfile = !experiments.contains("ffnoprofile")
+let farFieldProfileBins = 1024
+let farFieldProfileLevel = 5
 /// Cells per ring side (METALMC_FFWIDTH, a power of two): each level's ring reaches half this many of its cells from the
 /// camera, about as far as the quads use that level.
 let farFieldWidth = Int(ProcessInfo.processInfo.environment["METALMC_FFWIDTH"] ?? "") ?? 2048
@@ -538,6 +544,9 @@ struct ClearParams { int2 base; int2 size; uint ring; uint pad; };
 constant int W = \(farFieldWidth);
 constant int TOP = \(farFieldMips - 1);
 constant int COVER = \(farFieldCoverCells);
+#define FF_PROFILE \(farFieldProfile ? 1 : 0)
+constant int PBINS = \(farFieldProfileBins);   // azimuth bins of the horizon profile
+constant int PLEVEL = \(farFieldProfileLevel);   // the pyramid level it's built from
 
 // A ring is toroidal: the cell (x, z) of its level is texel (x mod W, z mod W), so a window that moves only needs the
 // cells it moved onto written. Clears a rectangle of cells (base, size).
@@ -578,6 +587,58 @@ kernel void ff_mip(uint2 gid [[thread_position_in_grid]], constant uint& slice [
     ushort a = max(src.read(s, slice).r, src.read(s + uint2(1, 0), slice).r);
     ushort b = max(src.read(s + uint2(0, 1), slice).r, src.read(s + uint2(1, 1), slice).r);
     dst.write(ushort4(max(a, b)), gid, slice);
+}
+
+// Floats as ints that order the same, so an atomic max on the ints is a max on the floats.
+static int ffOrdered(float x) { int i = as_type<int>(x); return i >= 0 ? i : i ^ 0x7FFFFFFF; }
+static float ffUnordered(int i) { return as_type<float>(i >= 0 ? i : i ^ 0x7FFFFFFF); }
+
+// The horizon profile, per frame: per ring and azimuth bin, the steepest rise (blocks up per block of horizontal
+// distance) at which the camera sees any of the ring's terrain. One thread per cell of a coarse level of each ring's
+// pyramid: its terrain is no higher than its maximum and no nearer than the cell (nor than the shell, where rays start),
+// so seen from the camera it rises at most (maximum - camera) / nearest distance, or over the farthest distance for
+// terrain under the camera; that goes into every bin the cell spans, and one more each side for rounding. Cells the
+// ring's march never reaches are left out: inside the shell, and inside the window of the ring before (its rays are in
+// that ring there). The buffer starts at -infinity (filled with 0x80 bytes). Per ring and band of distance as well, to
+// start a ring's march where its terrain may first be met, saved little (260 up 3%, elsewhere nothing).
+kernel void ff_profile(uint3 gid [[thread_position_in_grid]], constant FarUniforms& f [[buffer(25)]],
+                       texture2d_array<ushort, access::read> heights [[texture(28)]],
+                       device atomic_int* prof [[buffer(30)]]) {
+    uint r = gid.z, n = uint(W >> PLEVEL);
+    if (gid.x >= n || gid.y >= n || r >= uint(f.viewport.w)) return;
+    float cs = float(1 << PLEVEL);
+    float2 c = floor(f.ringCover[r].zw / cs) + float2(gid.xy);   // the cell, ring coordinates at level PLEVEL
+    float h = float(heights.read(uint2(int2(c)) & (n - 1u), r, PLEVEL).r);
+    if (h <= 0.0) return;
+    float s = f.ring[r].z, shell = f.cam.z * 0.999;
+    float2 lo = (c * cs - f.ring[r].xy) * s, hi = lo + cs * s;   // its square relative to the camera, blocks
+    float far = length(max(abs(lo), abs(hi)));
+    if (far < shell) return;
+    if (r > 0) {
+        float sp = f.ring[r - 1].z;
+        float2 plo = (f.ringCover[r - 1].zw - f.ring[r - 1].xy) * sp, phi = plo + float(W) * sp;
+        if (all(lo >= plo) && all(hi <= phi)) return;
+    }
+    float2 dn = max(max(lo, -hi), 0.0);
+    float nearD = max(length(dn), shell), up = h - f.cam.x;
+    int v = ffOrdered(up >= 0.0 ? up / nearD : up / max(far, nearD));
+    device atomic_int* row = prof + r * uint(PBINS);
+    if (all(dn == 0.0)) {   // the camera over the cell: every direction
+        for (int b = 0; b < PBINS; b++) atomic_fetch_max_explicit(&row[b], v, memory_order_relaxed);
+        return;
+    }
+    // The bins between its corners' directions (a square the camera isn't over spans less than half a turn).
+    float2 mid = (lo + hi) * 0.5;
+    float ac = atan2(mid.y, mid.x), a0 = 0.0, a1 = 0.0;
+    for (int k = 0; k < 4; k++) {
+        float2 p = float2((k & 1) ? hi.x : lo.x, (k & 2) ? hi.y : lo.y);
+        float da = atan2(p.y, p.x) - ac;
+        da -= 2.0 * M_PI_F * round(da / (2.0 * M_PI_F));
+        a0 = min(a0, da); a1 = max(a1, da);
+    }
+    float perBin = float(PBINS) / (2.0 * M_PI_F);
+    int b0 = int(floor((ac + a0 + M_PI_F) * perBin)) - 1, b1 = int(floor((ac + a1 + M_PI_F) * perBin)) + 1;
+    for (int b = b0; b <= b1; b++) atomic_fetch_max_explicit(&row[((b % PBINS) + PBINS) % PBINS], v, memory_order_relaxed);
 }
 
 // The shell: 64 wall segments (6 vertices each) inscribed in the circle of radius cam.z, then the floor (3 each).
@@ -689,6 +750,9 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
                      texture2d<float> lightmap [[texture(29)]], sampler ls [[sampler(14)]],
                      constant LodSpriteGPU* sprites [[buffer(20)]], texture2d<float> atlas [[texture(30)]],
                      sampler atlasSampler [[sampler(15)]], const device uchar* cover [[buffer(28)]]
+#if FF_PROFILE
+                     , const device int* prof [[buffer(30)]]
+#endif
 #if FF_STATS
                      , device uint4* stats [[buffer(29)]]
 #endif
@@ -707,6 +771,13 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
     float t = f.cam.z / max(length(dir.xz), 1e-6) * 0.999;   // nothing to find inside the shell
     // Nothing to find once a rising ray is over the highest terrain.
     float tMax = dir.y > 0.0 ? (f.viewport.z - f.cam.x) / dir.y : INFINITY;
+#if FF_PROFILE
+    // The ray's rise per block of horizontal distance (a hair less, for rounding) and its azimuth bin, as ff_profile
+    // has them: a ring whose terrain all rises less steeply in this direction can't be hit, the ray goes on to the next.
+    float rise = dir.y / max(length(dir.xz), 1e-6);
+    rise -= 1e-6 + abs(rise) * 1e-5;
+    int pbin = clamp(int(floor((atan2(dir.z, dir.x) + M_PI_F) * (float(PBINS) / (2.0 * M_PI_F)))), 0, PBINS - 1);
+#endif
     int steps = 0;
     bool hit = false;
     float tHit = 0.0;
@@ -731,6 +802,9 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
         float tEnter = max(max(tmn.x, tmn.y), t);
         float tLeave = min(min(tmx.x, tmx.y), tMax);
         if (!(tEnter < tLeave)) continue;
+#if FF_PROFILE
+        if (rise > ffUnordered(prof[r * uint(PBINS) + uint(pbin)])) { t = tLeave; continue; }   // over all its terrain here
+#endif
 #if FF_STATS
         stRings++;
 #endif
@@ -1011,12 +1085,14 @@ final class FarField: @unchecked Sendable {
     private var drawLibrary: MTLLibrary?   // offline (setDrawSource): the draw's shaders from another source
     /// Offline (FarFieldDebug, FARTEST_STATS): the march's per-pixel counters (a shader with FF_STATS set).
     var statsBuffer: MTLBuffer?
-    /// The last draw's pre-pass (a command buffer of its own), for the offline timing; none yet.
+    /// The last draw's horizon profile pass (a command buffer of its own), for the offline timing.
     private(set) var lastProfileCB: MTLCommandBuffer?
     private var clearPipe: MTLComputePipelineState?
     private var fillPipe: MTLComputePipelineState?
     private var mipPipe: MTLComputePipelineState?
     private var drawPipes: [String: MTLRenderPipelineState] = [:]
+    private var profilePipe: MTLComputePipelineState?   // ff_profile
+    private var profileBuffer: MTLBuffer?
     private var compiling = false
     private let lock = NSLock()
 
@@ -1050,7 +1126,8 @@ final class FarField: @unchecked Sendable {
                 let c = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "ff_clear")!)
                 let f = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "ff_fill")!)
                 let m = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "ff_mip")!)
-                lock.lock(); library = lib; clearPipe = c; fillPipe = f; mipPipe = m; lock.unlock()
+                let p = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "ff_profile")!)
+                lock.lock(); library = lib; clearPipe = c; fillPipe = f; mipPipe = m; profilePipe = p; lock.unlock()
                 log("far field: shaders compiled")
             } catch {
                 log("far field: shader compile failed: \(error)")
@@ -1313,6 +1390,29 @@ final class FarField: @unchecked Sendable {
         enc.setFragmentSamplerState(lightSampler, index: 14)
         enc.setFragmentBuffer(coverBuffer, offset: 0, index: 28)
         if let statsBuffer { enc.setFragmentBuffer(statsBuffer, offset: 0, index: 29) }
+        // The horizon profile for this camera (ff_profile), in a command buffer of its own committed now: the frame's, with
+        // this pass, is committed at the end of the frame, so it runs first. Its GPU time is not in the main pass's.
+        lastProfileCB = nil
+        if farFieldProfile {
+            let len = rings * farFieldProfileBins * 4
+            if (profileBuffer?.length ?? 0) < len { profileBuffer = ctx.device.makeBuffer(length: len, options: [.storageModePrivate]) }
+            guard let pp = profilePipe, let pb = profileBuffer, let cb = ctx.queue.makeCommandBuffer(),
+                  let bl = cb.makeBlitCommandEncoder() else { return }
+            cb.label = "MetalMC far field horizon profile"
+            bl.fill(buffer: pb, range: 0..<len, value: 0x80)   // as ints, under every float's (ffOrdered)
+            bl.endEncoding()
+            guard let ce = cb.makeComputeCommandEncoder() else { return }
+            ce.setComputePipelineState(pp)
+            ce.setBytes(&f, length: MemoryLayout<FarUniforms>.stride, index: 25)
+            ce.setTexture(heights, index: 28)
+            ce.setBuffer(pb, offset: 0, index: 30)
+            let n = farFieldWidth >> farFieldProfileLevel
+            ce.dispatchThreads(MTLSize(width: n, height: n, depth: rings), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            ce.endEncoding()
+            cb.commit()
+            lastProfileCB = cb
+            enc.setFragmentBuffer(pb, offset: 0, index: 30)
+        }
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 64 * 9)
         enc.setCullMode(.back)
     }
