@@ -79,6 +79,12 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   matches within run-to-run noise. In game: the 2.1 ms measured tonight should come to about 1.5-1.6 (to measure).
   Left for Viraj to decide: half the rays (`-PgiBudget=8192`, or `-PgiSpp=2 -PgiHistory=128`) saves another 0.2-0.3 ms,
   and moves the converged light by about 1.5% (two runs of the defaults differ by about 1%).
+- **LOD quad culling** (built, off by default: `METALMC_EXP=quadcull`; docs/lod-design.md, "Quad culling"): a compute
+  pass leaves out the level-0 quads that can't make a fragment (off screen, no pixel center in the bounding box, both
+  triangles facing away), and the survivors are drawn with indexed indirect draws. Exact: no pixel of color, depth or
+  G-buffer changes in any view checked. Offline it takes the vertex stage down 0.08-0.40 ms depending on how much of
+  the view is cullable (15-36%), for a pass that costs 0.17-0.24 ms: 0.03-0.30 ms net. The in-game flight (about 30%
+  cullable, cullstats) should land near the top of that range; it becomes the default only if the in-game A/B shows it.
 - **The screen locks itself after a while with no input** (2026-10-02, about 05:30, likely the company's idle-lock
   policy; caffeinate doesn't stop it). The lock screen over the fullscreen game paces it at 120 Hz like a dialog does
   (the GPU's frame time drops below the frame time: the command buffers stop overlapping), so timed flights are void
