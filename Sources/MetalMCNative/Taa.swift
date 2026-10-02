@@ -14,8 +14,8 @@ import simd
 //
 // The history is RGB10A2: at a 10% blend an 8-bit history stops converging up to 5 levels from its target, and a
 // 16-bit float one costs 0.3 ms more per frame at the panel's resolution. (With HDR's float frame, METALMC_EXP=hdr, it
-// is RGBA16Float, since the frame holds values above 1.) Each 16 x 16 threadgroup loads its pixels
-// and a 1-pixel border once into threadgroup memory. A draw then writes the new history back into the frame (the frame
+// is RGBA16Float, since the frame holds values above 1.) Each threadgroup loads its 32 x 32 pixels and a 1-pixel border
+// once into threadgroup memory (taa_resolve). A draw then writes the new history back into the frame (the frame
 // isn't writable from shaders, and the resolve reads each pixel's neighbors), sharpened a little: averaging jittered
 // frames is a box filter over each pixel, which softens texture detail.
 //
@@ -87,6 +87,10 @@ static float3 historySample(texture2d<float, access::sample> h, float2 uv, float
     return max(r / w, 0.0);
 }
 
+// taa_resolve's tile: TAA_T x TAA_T pixels per threadgroup, TAA_A with its 1-pixel border.
+#define TAA_T 32
+#define TAA_A 34
+
 // Moves h toward the box's center until it's inside the box.
 static float3 clipToBox(float3 lo, float3 hi, float3 h) {
     float3 c = 0.5 * (hi + lo), e = 0.5 * (hi - lo) + 1e-4;
@@ -113,16 +117,18 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
                         texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")
 #endif
-                        uint2 gid [[thread_position_in_grid]],
                         uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
-    // The threadgroup's 16 x 16 pixels and a 1-pixel border, loaded once: color in YCoCg (alpha in w) and depth.
-    threadgroup half4 tile[18 * 18];
-    threadgroup float dtile[18 * 18];
+    // The threadgroup's 32 x 32 pixels and a 1-pixel border, loaded once: color in YCoCg (alpha in w) and depth. The
+    // border is loaded by both threadgroups beside it, and each load is the heavy part (in lit mode the relight, the
+    // shadows' shade, the aerial perspective): 13% more loads than pixels here, against 27% for a 16 x 16 tile (which
+    // also left most of its threads idle for the last few). 16 x 16 threads, each resolving 4 pixels.
+    threadgroup half4 tile[TAA_A * TAA_A];
+    threadgroup float dtile[TAA_A * TAA_A];
     int2 size = int2(p.size);
-    int2 base = int2(tgid) * 16 - 1;
-    for (uint i = lid.y * 16 + lid.x; i < 18 * 18; i += 256) {
-        uint2 q = uint2(clamp(base + int2(i % 18, i / 18), int2(0), size - 1));
+    int2 base = int2(tgid) * TAA_T - 1;
+    for (uint i = lid.y * 16 + lid.x; i < TAA_A * TAA_A; i += 256) {
+        uint2 q = uint2(clamp(base + int2(i % TAA_A, i / TAA_A), int2(0), size - 1));
         float4 c = color.read(q);
         float d = depth.read(q);
 #if LIT_MODE
@@ -137,50 +143,55 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         dtile[i] = d;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (int(gid.x) >= size.x || int(gid.y) >= size.y) return;
-    uint c0 = (lid.y + 1) * 18 + lid.x + 1;
-    half4 center = tile[c0];
-    half3 cur = center.xyz;
-    half3 lo = cur, hi = cur, m1 = cur, m2 = cur * cur;
-    float nearest = dtile[c0];   // reverse-Z: larger is nearer, 0 is the sky
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            if (dx == 0 && dy == 0) continue;
-            uint k = uint(int(c0) + dy * 18 + dx);
-            half3 c = tile[k].xyz;
-            lo = min(lo, c);
-            hi = max(hi, c);
-            m1 += c;
-            m2 += c * c;
-            nearest = max(nearest, dtile[k]);
+    // The tile's four 16 x 16 quarters in turn, so a SIMD group's pixels stay side by side.
+    for (uint quarter = 0; quarter < 4; quarter++) {
+        uint2 lp = lid + uint2((quarter & 1u) * 16u, (quarter >> 1) * 16u);
+        uint2 gid = tgid * TAA_T + lp;
+        if (int(gid.x) >= size.x || int(gid.y) >= size.y) continue;
+        uint c0 = (lp.y + 1) * TAA_A + lp.x + 1;
+        half4 center = tile[c0];
+        half3 cur = center.xyz;
+        half3 lo = cur, hi = cur, m1 = cur, m2 = cur * cur;
+        float nearest = dtile[c0];   // reverse-Z: larger is nearer, 0 is the sky
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                uint k = uint(int(c0) + dy * TAA_A + dx);
+                half3 c = tile[k].xyz;
+                lo = min(lo, c);
+                hi = max(hi, c);
+                m1 += c;
+                m2 += c * c;
+                nearest = max(nearest, dtile[k]);
+            }
         }
+        half3 result = cur;
+        if (p.reset == 0.0) {
+            float2 uv = (float2(gid) + 0.5) / p.size;
+            float2 ndc = uv * 2.0 - 1.0;
+            float4 prevClip;
+            if (nearest <= 0.0) {
+                // Sky: only the camera's rotation moves it.
+                float4 dir = p.invCur * float4(ndc, 0.0, 1.0);
+                prevClip = p.prev * float4(dir.xyz, 0.0);
+            } else {
+                float4 rel = p.invCur * float4(ndc, nearest, 1.0);
+                rel.xyz /= rel.w;
+                prevClip = p.prev * float4(rel.xyz + p.camDelta.xyz, 1.0);
+            }
+            float2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+            if (prevClip.w > 0.0 && all(prevUV > 0.0) && all(prevUV < 1.0)) {
+                float2 motion = (prevUV - uv) * p.size;
+                // Still: the history pixel itself (Catmull-Rom at a pixel center is that pixel).
+                float3 hs = dot(motion, motion) < 1e-6 ? history.read(gid).rgb : historySample(history, prevUV, p.size);
+                half3 h = half3(toYCoCg(hs));
+                half3 mu = m1 / 9.0h, sigma = sqrt(max(m2 / 9.0h - mu * mu, 0.0h));
+                h = half3(clipToBox(float3(max(lo, mu - 1.25h * sigma)), float3(min(hi, mu + 1.25h * sigma)), float3(h)));
+                result = mix(h, cur, half(mix(p.blend, 0.3, saturate(length(motion) / 16.0))));
+            }
+        }
+        nextHistory.write(float4(clamp(fromYCoCg(float3(result)), 0.0, p.range.x), 1.0), gid);
     }
-    half3 result = cur;
-    if (p.reset == 0.0) {
-        float2 uv = (float2(gid) + 0.5) / p.size;
-        float2 ndc = uv * 2.0 - 1.0;
-        float4 prevClip;
-        if (nearest <= 0.0) {
-            // Sky: only the camera's rotation moves it.
-            float4 dir = p.invCur * float4(ndc, 0.0, 1.0);
-            prevClip = p.prev * float4(dir.xyz, 0.0);
-        } else {
-            float4 rel = p.invCur * float4(ndc, nearest, 1.0);
-            rel.xyz /= rel.w;
-            prevClip = p.prev * float4(rel.xyz + p.camDelta.xyz, 1.0);
-        }
-        float2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
-        if (prevClip.w > 0.0 && all(prevUV > 0.0) && all(prevUV < 1.0)) {
-            float2 motion = (prevUV - uv) * p.size;
-            // Still: the history pixel itself (Catmull-Rom at a pixel center is that pixel).
-            float3 hs = dot(motion, motion) < 1e-6 ? history.read(gid).rgb : historySample(history, prevUV, p.size);
-            half3 h = half3(toYCoCg(hs));
-            half3 mu = m1 / 9.0h, sigma = sqrt(max(m2 / 9.0h - mu * mu, 0.0h));
-            h = half3(clipToBox(float3(max(lo, mu - 1.25h * sigma)), float3(min(hi, mu + 1.25h * sigma)), float3(h)));
-            result = mix(h, cur, half(mix(p.blend, 0.3, saturate(length(motion) / 16.0))));
-        }
-    }
-    nextHistory.write(float4(clamp(fromYCoCg(float3(result)), 0.0, p.range.x), 1.0), gid);
 }
 
 struct CopyVOut {
@@ -349,6 +360,17 @@ final class Taa: @unchecked Sendable {
 /// projection[16] and view rotation[16] (column-major); cam: camera position (world, doubles); jitter: the sub-pixel
 /// offset the frame was drawn with, in pixels (unused: the history is the average of the jittered frames). Returns 1
 /// if it ran.
+/// Debug: the resolve's shader source (with METALMC_EXP=lit,gi in the environment, its lit variants' too), for an offline
+/// compile check (tools/shadercheck.py). Returns its length.
+@_cdecl("mmc_debug_taa_shader_source")
+public func mmc_debug_taa_shader_source(_ out: UnsafeMutablePointer<CChar>, _ len: Int32) -> Int32 {
+    let bytes = Array(taaShaderSource.utf8)
+    guard bytes.count < Int(len) else { return Int32(bytes.count) }
+    for (i, b) in bytes.enumerated() { out[i] = CChar(bitPattern: b) }
+    out[bytes.count] = 0
+    return Int32(bytes.count)
+}
+
 @_cdecl("mmc_taa_apply")
 public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>,
                           _ jitterX: Float, _ jitterY: Float, _ reset: Int32) -> Int32 {
@@ -403,14 +425,16 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     enc.setTexture(t.history[1 - t.current], index: 3)
     enc.setTexture(shadows?.lit ?? RtShadows.shared.dummyLit(), index: 4)
     enc.setBytes(&params, length: MemoryLayout<TaaParams>.stride, index: 0)
-    // Whole threadgroups: every thread helps load the tile, including those past the edge.
-    enc.dispatchThreadgroups(MTLSize(width: (color.width + 15) / 16, height: (color.height + 15) / 16, depth: 1),
+    // Whole threadgroups of 32 x 32 pixels (16 x 16 threads, taa_resolve): every thread helps load the tile, including
+    // those past the edge.
+    enc.dispatchThreadgroups(MTLSize(width: (color.width + 31) / 32, height: (color.height + 31) / 32, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     enc.endEncoding()
     let d = MTLRenderPassDescriptor()
     d.colorAttachments[0].texture = color
     d.colorAttachments[0].loadAction = .dontCare
     d.colorAttachments[0].storeAction = .store
+    profAttach(d, "anti-aliasing copy (+ sharpening)")
     guard let copy = cb.makeRenderCommandEncoder(descriptor: d) else { return 0 }
     copy.setRenderPipelineState(copyPipe)
     copy.setFragmentTexture(t.history[1 - t.current], index: 0)
