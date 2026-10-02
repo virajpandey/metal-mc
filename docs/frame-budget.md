@@ -63,6 +63,21 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   relight costs about 0.75 ms in memory traffic; only a smaller G-buffer (hard: the albedo alone is 24 bits) or keeping
   it on chip would cut that. The change was reverted.
 
+- **The far field's march, cheaper** (done, merged 2026-10-02; docs/far-field-design.md has the details): cheaper steps,
+  climbing only into untested parents, water stored at its drawn surface in the pyramid, and a per-ring horizon
+  profile (rays skip the rings whose terrain they pass over). Offline 19-28% less march time with an exact image (a few
+  hundred pixels change where rays used to hit the step cap). In game (default settings, traced): the main pass's
+  fragment stage 3.02 -> 2.63 ms. Fidelity unchanged (far band 3.35 against 3.33-3.34, near band 4.57 against 4.58), and
+  the horizon tour (LOD 262144) shows no holes (0.004-0.7% of pixels changed against last night's, water animation).
+- **The plain resolve keeps 16 x 16 tiles** (done): with 32 x 32 tiles it took 0.85 ms against 0.74 (its 14 KB of
+  threadgroup memory against 4 costs more than the smaller border saves); only the heavy variants (sky, lit) use 32.
+- **The screen locks itself after a while with no input** (2026-10-02, about 05:30, likely the company's idle-lock
+  policy; caffeinate doesn't stop it). The lock screen over the fullscreen game paces it at 120 Hz like a dialog does
+  (the GPU's frame time drops below the frame time: the command buffers stop overlapping), so timed flights are void
+  until it's unlocked. Fidelity tours (screenshots read from the render target) and offline tests are unaffected. A
+  fidelity tour between flights also makes the next flight rebuild the flight world's LOD cache (the two fixtures share
+  the world's name): keep flights together, or give the first one more -PbenchExtraWait.
+
 ## Next levers, by size (ideas with reasoning; none measured yet)
 
 - **The far field's grazing rays.** In the flight's view the far band (768 blocks to the horizon) is only about 190
