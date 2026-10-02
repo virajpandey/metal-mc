@@ -732,20 +732,26 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
         int lastAxis = tmn.x > tmn.y ? 0 : 1;
         int l = min(TOP, \(farFieldStartLevel));   // a ray over the terrain climbs a level a step (METALMC_FFSTART)
         float tc = tEnter;
-        // Where the ray is (ring cells), kept inside its cell: each crossing puts it half a cell past the boundary it
-        // crossed. Recomputed from the ray a small step past the boundary, rounding put rays nearly along x or z back into
-        // the cell they had just left toward -x or -z, and they spent their steps there: a wedge of the next ring's
-        // terrain (cliff sides) drawn near the camera. METALMC_EXP=ffepsstep steps as before.
-        float2 q = o.xz + d.xz * tc;
+        // The ray's level-0 cell, kept inside the window (its cell at level l is it shifted right l bits; the window's
+        // cells are never negative), and its height where it entered that cell. A crossing sets the crossed axis's cell
+        // to the one past the boundary and only the other from the ray: from the ray alone, rounding put rays nearly
+        // along x or z back into the cell they had just left toward -x or -z, and they spent their steps there (a wedge
+        // of the next ring's terrain, cliff sides, drawn near the camera; METALMC_EXP=ffepsstep steps as then). Found
+        // once per move instead of from the position at every step (floors, divides and the window's clamp at the
+        // step's level): offline, 7% of the march's time at the same steps.
+        float2 qmax = win + float(W - 1);
+        uint2 qi = uint2(clamp(o.xz + d.xz * tc, win, qmax));
+        uint2 up = uint2(d.xz > 0.0);
+        float yA = o.y + d.y * tc;
         for (int i = 0; i < 192; i++) {
             steps++;
-            float cs = float(1 << l);
-            float2 cell = clamp(floor(q / cs), floor(win / cs), floor((win + float(W - 1)) / cs));
-            float hmax = float(heights.read(uint2(int2(cell) & ((W >> l) - 1)), r, l).r);
-            float2 nb = (cell + select(float2(0.0), float2(1.0), d.xz > 0.0)) * cs;
+            uint2 ci = qi >> uint(l);
+            float hmax = float(heights.read(ci & (uint(W - 1) >> uint(l)), r, l).r);
+            float2 nb = float2((ci + up) << uint(l));
             float2 tt = (nb - o.xz) * inv;
             float tExit = min(min(tt.x, tt.y), tLeave);
-            float yA = o.y + d.y * tc, yB = o.y + d.y * tExit;
+            float yB = o.y + d.y * tExit;
+            float2 cell = float2(ci);
             bool next = false, column = false;   // on to the next cell at this level; a column to test
 #if FF_STATS
             stRing[r]++;
@@ -756,9 +762,17 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
                 next = true;
 #if FF_STATS
                 if (l > 0) stAdv++;
-                stClimbed = l < TOP;
 #endif
-                l = min(l + 1, TOP);
+                // Up a level only into a parent not tested from here: a falling ray that stays in the same parent leaves
+                // it as low as before and would fail its test again (a step to fail, one to come back down). So unless
+                // the ray rises, only when the boundary it crosses is the parent's too (an even one at this level).
+                uint nbI = tt.x < tt.y ? ci.x + up.x : ci.y + up.y;
+                if (d.y >= 0.0 || (nbI & 1u) == 0u) {
+#if FF_STATS
+                    stClimbed = l < TOP;
+#endif
+                    l = min(l + 1, TOP);
+                }
             } else if (l > 0) {
 #if FF_STATS
                 stDesc++;
@@ -836,11 +850,14 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
                 lastAxis = tt.x < tt.y ? 0 : 1;
                 if (\(experiments.contains("ffepsstep") ? "true" : "false")) {
                     tc = tExit + max(tExit * 1e-5, 1e-3);
-                    q = o.xz + d.xz * tc;
+                    yA = o.y + d.y * tc;
+                    qi = uint2(clamp(o.xz + d.xz * tc, win, qmax));
                 } else {
                     tc = tExit;
-                    q = o.xz + d.xz * tExit;
-                    if (lastAxis == 0) q.x = nb.x + (d.x > 0.0 ? 0.5 : -0.5); else q.y = nb.y + (d.z > 0.0 ? 0.5 : -0.5);
+                    yA = yB;
+                    // The cell past the crossed boundary (nb: this step's level, l may have risen), the other axis's from
+                    // the ray, chosen before the one clamp to the window.
+                    qi = uint2(clamp(select(o.xz + d.xz * tExit, nb - float2(1u - up), bool2(lastAxis == 0, lastAxis != 0)), win, qmax));
                 }
             }
         }
