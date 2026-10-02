@@ -561,7 +561,12 @@ kernel void ff_fill(uint2 gid [[thread_position_in_grid]], constant FillParams& 
     uint2 t = uint2(cell & (W - 1));
     uint2 c = cols[i.y * 256 + i.x];
     data.write(uint4(c, 0u, 0u), t, p.ring);
-    uint top = max((c.x & 511u) + ((c.x >> 9) & 127u), c.y & 511u);
+    // What a ray can meet in the column: the ground's top, or the water's surface (the march draws it 10/9 block under
+    // its word's top: the block under, rounded up), or the canopy's or tower's top. The water's word top made rays
+    // skimming the sea dip to every column under it and miss the surface a block lower, a step down and a column test
+    // per cell.
+    uint depth = (c.x >> 9) & 127u;
+    uint top = max((c.x & 511u) + depth - (depth != 0u ? 1u : 0u), c.y & 511u);
     heights.write(ushort4(ushort(c.x == 0u ? 0u : top)), t, p.ring);
 }
 
@@ -1022,6 +1027,7 @@ final class FarField: @unchecked Sendable {
     private var origins: [SIMD2<Int>] = []  // per ring: the window's first cell (of its level) for the current camera
     private var filledOrigins: [SIMD2<Int>] = []   // per ring: the same for the window it holds
     private var filledNodes: [[SIMD2<Int>: Int]] = []   // per ring: the nodes written into it (first cell: columns hash)
+    private var filledTops: [Int] = []                  // per ring: their highest column top (blocks above the bottom)
     private var filled: [Bool] = []
     private var lastFill: [Int] = []
     private var coverOrigin = SIMD2<Int>(0, 0)
@@ -1113,6 +1119,7 @@ final class FarField: @unchecked Sendable {
         heights = ht
         rings = n
         filledNodes = [[SIMD2<Int>: Int]](repeating: [:], count: n)
+        filledTops = [Int](repeating: 0, count: n)
         filled = [Bool](repeating: false, count: n)
         filledOrigins = [SIMD2<Int>](repeating: .zero, count: n)
         lastFill = [Int](repeating: 0, count: n)
@@ -1166,9 +1173,6 @@ final class FarField: @unchecked Sendable {
             if cell.x + 256 <= o.x || cell.y + 256 <= o.y || cell.x >= o.x + W || cell.y >= o.y + W { continue }
             perRing[r][cell] = node
         }
-        var top = 0
-        for ring in perRing { for (_, node) in ring { top = max(top, node.columnsTop) } }
-        maxTop = Double(min(top, lodWorldHeight))
         func stale(_ r: Int) -> Bool {
             if !filled[r] || filledOrigins[r] != origins[r] || perRing[r].count != filledNodes[r].count { return true }
             for (cell, node) in perRing[r] where filledNodes[r][cell] != node.columnsHash { return true }
@@ -1250,6 +1254,10 @@ final class FarField: @unchecked Sendable {
         filled[r] = true
         filledOrigins[r] = origins[r]
         filledNodes[r] = perRing[r].mapValues { $0.columnsHash }
+        // The highest terrain in what the rings hold (each as of its last fill), not in the nodes they will hold: until a
+        // ring's refill its old nodes are still drawn, and a shell top under them cut them off.
+        filledTops[r] = perRing[r].values.map { $0.columnsTop }.max() ?? 0
+        maxTop = Double(min(filledTops.max() ?? 0, lodWorldHeight))
         lastFill[r] = self.fills
         if self.fills % 20 == 1 || farFieldLogFills {
             log("far field: fill \(self.fills): ring \(r) of \(rings) from level \(k), \(fresh ? "all" : "\(clears.count) cleared and \(writes.count) written rectangles,") \(cells) cells, \(staleRings.count) stale")
