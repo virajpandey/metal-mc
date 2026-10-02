@@ -375,7 +375,7 @@ measured). In-game per-pass times (`-PbenchTrace=1`) are the numbers to go by.
 
 - Water isn't relit: next to relit land it keeps vanilla's light (most visible at dusk and night). The way: water
   surfaces in the G-buffer with their own albedo, relit by the change in their own light, the floor behind them left as
-  it is.
+  it is. (Water now reflects the sky and the sun, `METALMC_EXP=lit,water`, below; its own color is still vanilla's.)
 - Vanilla's section draws (`nearchunks` off, or a layer the codec refused) aren't relit; translucent terrain never is.
 - Entities aren't lit (and don't cast shadows); a mob's feet and the ground under them are lit differently.
 - The sun crosses the zenith (vanilla's path), so at noon every side face is in shade, darker than vanilla's flat 0.6
@@ -567,3 +567,205 @@ back.
   at once and settles within a second or two); `/weather rain` and back; a fast 180-degree turn (cells without samples
   show the sky term for a few frames, no black); breaking a block in a wall; flying fast at the LOD's speed (cells are
   per block face near the camera: watch for blotches where they're new).
+
+## Water that reflects (prototype, `METALMC_EXP=lit,water`, 2026-10-02)
+
+Lit mode left water as it was drawn: vanilla's water color in vanilla's light, no reflections (`LIT_NONE`). With `water`
+(and `lit`; the reflections need our sky, `sky`, for the light they reflect) water surfaces reflect the sky and the sun.
+Off by default until it's been seen in the game. Without it every shader is the same text as before (its parts are
+spliced in only with `litWater`) and every pixel is the same (checked below). `Sources/MetalMCNative/Lit.swift`
+(`litPackWater`, `litWaterPixel`, the waves' and the sky map's kernels), the far field's water output in `FarField.swift`,
+the relight's call site in `Taa.swift`.
+
+- **The look.** Per water pixel, in scene-linear light (the sky's units, which the relit terrain is in too), in the
+  relight, before the aerial perspective: `drawn x (1 - F x open) + sky(R) x F x open + glint`.
+  - drawn: the water as it was drawn: vanilla's water in vanilla's light over the floor seen through it (shallow water
+    keeps showing its floor).
+  - F: Schlick's Fresnel reflectance for water (F0 0.02): 2% looking straight down, 11% at 22 degrees (water near the
+    camera from the flight's height), most of the light at grazing angles.
+  - sky(R): the sky's light in the reflected direction, without the sun's disk, from a map of the upper hemisphere made
+    each frame from `skyLuminance` (`lit_water_sky`, a 256 x 256 paraboloid map: about half a degree a texel at the
+    horizon). Rays a wave turns under the horizon take the horizon's light.
+  - open: the water's sky light level through vanilla's curve, decoded, as the relight's sky term has it (1 in the open,
+    0.57 at 14, 0.21 at 12): water under cover doesn't reflect a sky it can't see, and keeps its drawn color there.
+  - glint: the sun's disk through a GGX lobe (Smith's height-correlated visibility, Fresnel at the half vector), with the
+    sun's illuminance at the camera's altitude (lit_env's sun term, back in scene units: lit_env leaves its scale in
+    env[0].w with water, as it did for the GI cache), times the traced visibility (shadows fall across the glint), as much
+    as the sky draws of the disk (none in rain), none once the sun has set. A low sun lays a path of it on the water.
+- **Waves.** Eight directional sines, two to an octave (wavelengths 10 down to 1.4 blocks, slopes 0.032 down to 0.02
+  radians, 0.053 RMS together, deep water's speeds: angular frequency sqrt(g k)), summed each frame into a mipmapped tile
+  of their slopes and the slopes' mean squared length (`lit_water_waves`: 64 blocks, 256 texels a side, whole wave
+  numbers across it so it repeats without a seam). Each level holds the waves it can, each whole while its wavelength
+  spans 4 of the level's texels and gone at 2, and adds the variance of the rest to the squared length. A water pixel
+  samples it once at its footprint (along the view, where it's longest): the mean slope there tilts the normal and the
+  slopes' variance goes into the lobe's roughness (LEAN mapping, isotropic), so waves finer than the pixel don't alias:
+  near water sparkles, far water has a smooth, broad sun path (the lobe's alpha from 0.05 up to 0.073). The camera's x
+  and z modulo the tile (the LOD's camera this frame) keep them in place as it moves; their time is the clock's, wrapped
+  every hour. `METALMC_WATERWAVES` scales the slopes (0: flat), `METALMC_WATERROUGH` sets the surface's own alpha under
+  them (0.05). Tried and changed:
+  - one wave to an octave (5): straight parallel stripes at mid distance, where only the longest are left; two to an
+    octave, 70 degrees either side of the wind's direction, cross-hatch;
+  - the sum per pixel (8 cosines, faded by the footprint): the same look, 0.12 ms more in the anti-aliasing's resolve;
+  - mipmaps averaged down from the top level (`generateMipmaps`): a 2 x 2 box filter leaves the waves near a level's
+    limit in it, and the longest waves' crests showed as rays converging on the horizon over mid-distance water (with a
+    32- and a 128-block tile alike, so not the tile repeating); every level summed from the waves instead.
+- **The G-buffer.** A water texel: face code 0, bit 28 set, its face in bits 24-26; y as terrain's (the depth key, so a
+  boat or an entity drawn over water isn't taken for it, and the light levels). Terrain's codes are 1-7 and the clear
+  value is 0, so a code of 0 with bit 28 set was free: AO keeps its 5 bits, and every reader that doesn't know water (the
+  relight's terrain path, the offline checks) sees "not lit terrain" there, as before. `litPackWater` and `litIsWater` in
+  `litShaderHeader`. Gi.swift doesn't read the G-buffer (its requests come from the depth buffer).
+- **Writers.**
+  - The far field's march: a water column's top (its surface, 10/9 block under its word's top) is flagged; its sides stay
+    `LIT_NONE` (terrain seen through the quads' water).
+  - The LOD's water quads: not in this change (Lod.swift belongs to another builder; what its water pipeline must write is
+    below). Until they write it, water from 192 to 768 blocks doesn't reflect and the far field's does: a seam at 768.
+  - Vanilla's water (the near chunks' range): not yet, see "Not done".
+- **Where it runs.** `litWaterPixel`, after `litRelightPixel`, in the anti-aliasing's resolve (both lit variants; the
+  waves' tile and the sky map are its textures 13 and 14) and in the relight's own pass (textures 6 and 7). Without our
+  sky (the daylight curve) water is left as drawn: there's no sky to reflect. Both textures are made in the relight's
+  command buffer each frame with our sky (one compute encoder: a dispatch per level of the waves' tile, one for the sky
+  map).
+- **Debug views** (`METALMC_LITVIEW`): 9 which water reflects (cyan; magenta where something nearer was drawn over it), 10
+  the reflections alone (with the aerial perspective over them).
+
+### For the LOD's water (Lod.swift, its builder)
+
+The water pipelines write the G-buffer with water on, and the shared shading flags water fragments:
+
+```
+// lodShadeLit (the shader), after `out.gbuf = litPack(albedo, ao, (in.matFace >> 8) & 7, in.pos.z, sky, block);`:
+#if LIT_WATER
+    // Water (METALMC_EXP=water, Lit.swift): its surface flagged for the relight's reflections (the water pipelines write
+    // the G-buffer with water on).
+    if ((in.matFace & 255u) == MAT_WATER) out.gbuf = litPackWater((in.matFace >> 8) & 7u, in.pos.z, sky, block);
+#endif
+
+// LodRenderer.makePipeline (Swift), both places that set the extra targets' write masks (the mesh path, the vertex path):
+if i > 0 && !(litWritesGbuffer(i, f) && (!water || litWater)) { d.colorAttachments[i].writeMask = [] }
+if (i > 0 && !(litWritesGbuffer(i, f) && (!water || litWater))) || box { d.colorAttachments[i].writeMask = [] }
+```
+
+and the comment over `LodOut` ("The water pipelines don't write the G-buffer") becomes "The water pipelines write it
+only with water on (METALMC_EXP=water): the flag for the relight's reflections". `LIT_WATER` and `litPackWater` exist
+only with the switch (litShaderHeader), so without it the LOD's text and pipelines are as before. The water quads
+already write depth in lit mode, which the flag's depth key needs. Blending stays on the color target only: the
+G-buffer (an integer format) is written, the last water fragment through the depth test (the nearest: water writes
+depth) wins. Checked in a scratch copy (built, run in litflow; the pictures and numbers below with LOD water come from
+it). It costs about 0.06 ms in the main pass (measured, below).
+
+### Verified offline (2026-10-02, no game)
+
+- `swift build -c release`: clean (the two warnings in `RtShadows.apply` were there before). `litflow ... compile` (a
+  new mode: every variant compiled with the device's compiler, as the library builds them) passes under
+  `lit,rtshadows,sky,water`, `lit,rtshadows,water`, `...,sky,hdr,water`, `...,sky,gi,water` and `...,gi,water`: the
+  anti-aliasing's resolve (16 and 32 pixel tiles; plain, sky, lit, lit and sky), the far field (its march for the level
+  pass's targets and its kernels) and lit mode's own pass (RGBA8, RGBA16Float, RG11B10Float) with its kernels.
+- **Without `water` nothing changed.** The anti-aliasing's and the far field's shader sources under `lit,rtshadows,sky`,
+  `lit,rtshadows`, `...,sky,gi`, `...,sky,hdr`, `...,gi`, `rtshadows,sky` and `sky` are byte for byte the old build's
+  (`mmc_debug_taa_shader_source`, `mmc_debug_far_shader_source`), and litflow's 17 pictures in `sky` and in `sdr` mode
+  (far field on) are bit for bit the old build's (`bench_out/agents/water/exact-old{,-sdr}` against `exact-new2`,
+  `exact-new-sdr`).
+- **"Off" is the old frame.** The old build through the same water section (no switch: only "off" pictures) draws the
+  default view at dusk bit for bit as the new build does with the reflections off (`old-sea` against `committed-sea2`).
+- **The reflections touch water only.** `LITFLOW_WATER=1` draws each time of day with them off and on in the same build,
+  the "on" frames at the same places in every 64-frame cycle (the shadows' disk samples, the sky's dither): the pixels
+  that changed are the flagged water but for 0-933 of 1.93 M, all far land near the horizon that took a new shadow in
+  between (the shadows' tile structures still build in the background after the warm-up; marked in
+  `*-changed-dry.png`).
+- The G-buffer flags 2.6% of the default view (the far field's water) with the committed code, 31.5% with the LOD's
+  water flagged too (the scratch copy), 54.4% from low over the sea; debug view 9 shows all of it reflecting (no
+  magenta: nothing over the water in these views).
+- Pictures (`bench_out/agents/water/`, 1728 x 1117, means of 16 frames, the waves 1/120 s on a frame; `-off` is the
+  frame as before, `-on` with the reflections, `-on-taa` the same through the anti-aliasing's resolve, `-reflections`
+  debug view 10):
+  - `committed-sea2/sky-water-sea-{dusk,noon,sunset}-{off,on,on-taa,reflections}.png`: the default view (8, 150, 8,
+    looking west 22 degrees down) with the committed code: the far field's sea band takes the sky and the sun's path;
+    the LOD's water nearer than 768 blocks doesn't reflect yet (the seam the LOD's write removes).
+  - `lod-sea4/...`: the same view with the LOD's water flagged: the whole sea reflects, the far sea the bright sky low
+    down, near water a little of the sky over its floor, the waves cross-hatched at mid distance.
+  - `lod-lowsea3/sky-water-lowsea-{dusk,sunset,noon}-*.png`: 7 blocks over the open sea looking west (-300, 70, -400, 4
+    degrees down), the sun ahead at dusk (8 degrees up) and sunset (2): the sun's glittering path from the horizon to the
+    camera, broken by the waves near it; at noon the sea takes the sky's blue, brighter toward the horizon.
+    `lod-lowsea-hdr/hdr-water-lowsea-{sunset,noon}-*.png`: the same with HDR's float target (through the screenshot's
+    SDR copy): the path keeps its orange where SDR's clamp per channel whitens it.
+  - `lod-pond/sky-water-pond-{noon,low}-*.png`: a lake in the savanna (-1760, 90, -890, looking east 18 degrees down) at
+    noon, and with the sun 7 degrees up ahead: its path broken by the trees' shadows (the traced visibility).
+  - `lod-river2/sky-water-river-{noon,dusk}-*.png`: a river in a canyon (718, 100, 140, looking south 15 degrees down):
+    the river takes the sky where it should take the canyon's walls, the brightest thing in the canyon at dusk. What's
+    missing: terrain in the reflection, and how much sky the water sees (the LOD's water always has sky light 15).
+
+### Costs (offline, M3 Pro, 3456 x 2234)
+
+`LITFLOW_WATER=1 litflow ... sky time` on the default view, morning sun, RGBA8 target: medians of 60 command buffers each,
+the reflections on and off alternating on the same G-buffer (`mmc_debug_lit_water_time`); "no water" is the same library
+without the switch, run back to back (its shaders are the old build's). The waves' tile and the sky map are made in every
+"on" relight, so their cost is in the "on" figures.
+
+| | no water | water compiled in, reflections off | reflections on |
+|---|---|---|---|
+| anti-aliasing resolve, relight and aerial perspective in its load (31.5% of the frame water: the LOD's flagged) | 2.052-2.062 ms | 2.104-2.105 | 2.348-2.350 |
+| the relight as a pass of its own (no anti-aliasing), same | 0.658-0.664 | 0.710-0.711 | 0.833 |
+| main pass with the G-buffer, same | 3.592 | | 3.654-3.656 |
+| anti-aliasing resolve, committed code (2.6% water: the far field's) | 2.052-2.062 | 2.094-2.100 | 2.128-2.136 |
+| the relight's own pass, committed code | 0.658-0.664 | 0.673-0.688 | 0.684-0.695 |
+| main pass with the G-buffer, committed code | 3.592 | | 3.593-3.594 |
+
+So with a third of the frame water about 0.29 ms in the anti-aliasing's resolve (of which 0.05 is the water code being
+compiled into it, paid with no water in view; the reflections' own work 0.24) plus 0.06 in the main pass (the LOD's
+water pipelines writing the G-buffer): 0.35 ms a frame. With the committed code alone (the far field's water) about
+0.08. Over the open sea from low down (`lowsea`, 54% water) the reflections add about 0.4 ms in the resolve, on against
+off (0.41 a step before the last); the terrain they cover costs the relight about as much, so that view's resolve
+(1.97 ms) stays under the default view's.
+
+Getting there (the resolve, on against off, the default view with the LOD's water flagged):
+
+| | +ms |
+|---|---|
+| first: 8 cosines a pixel for the waves, the sky view table looked up per pixel | 0.37 |
+| the waves summed into a tile once a frame, one sample a pixel | 0.27 |
+| the sky into a map once a frame, one sample a pixel | 0.23 |
+| the tile's levels each summed from the waves (no rays; 9 dispatches, serial) | 0.26 |
+| those dispatches side by side, the levels where every wave has faded made once | 0.24 |
+
+The first version's parts (an instrumented copy that switched each off at run time): the waves 0.12 ms, the sky lookup
+0.08, the glint 0.04, the rest 0.13 (the color decoded and encoded again, six powers; the position; Fresnel). The rest is
+the floor of doing this per pixel in linear light; it's about what the relight costs a terrain pixel. In the frame
+budget's terms: lit mode ran at 120.5 fps in game with 32 x 32 tiles (8.30 ms, frame-budget.md), so 0.35 ms more with a
+third of the screen water puts it past 8.33 ms; something else has to give for 120 Hz with this much water in view.
+
+### Not done, and next
+
+- **The LOD's water** (192-768 blocks): flagged by the code above once its builder adds it. Until then a seam at 768
+  blocks between unreflective and reflective water.
+- **Vanilla's water** (the near chunks' range): not flagged. Its translucent layer (water, stained glass and ice share
+  it; sorted per quad, so the near chunks leave it to vanilla) is vanilla's own pipeline, translated on the Java side,
+  and in the lit pass it gets the G-buffer attachment with no writes (Backend.swift, PipelineBox.state). Flagging it
+  needs a variant of that pipeline whose fragment shader also writes `litPackWater` where its texel comes from the
+  water sprites (the atlas rectangles of block/water_still and block/water_flow, which the Java side knows) and writes
+  the G-buffer's own value back elsewhere (read with programmable blending, so glass and ice leave the terrain behind
+  them as it was), with the face from its position's derivatives (a top if it faces up) and the sky light from its light
+  coordinates; the variant's G-buffer attachment writable. Backend.swift and the Java side, outside this change. Until
+  then near water keeps vanilla's look, with a seam where the LOD's begins.
+- **Terrain in the reflection** (screen-space reflections, next): a march along the reflected ray through the depth
+  buffer, with the sky as the fallback. The canyon river shows what it's for; so do lakes under hills at grazing angles.
+- **How much sky the water sees.** The far field's water has its sky light (12 under a canopy); the LOD's always 15. A
+  canyon or a cave lake reflects the open sky. The traced rays, or the GI cache's cells, could say how open it is.
+- **The water's own color** is still vanilla's light: at dusk and at night it's brighter than the relit land around it
+  (the relight's "Not done"). Its body could be relit by the change in its light, the floor seen through it left as it
+  is.
+- No moon glint at night (the moon is vanilla's; its light the relight's moon term); the glint, for the sun only.
+- Water's sides (falls) and water seen from below don't reflect.
+- Not run in game.
+
+### What to look at in game
+
+- With timings: `BENCH_FIXTURE=claudeworld-merged bash tools/bench/bench_lod.sh litwater 32768 -PbenchY=150 -PbenchFly=20
+  -PbenchExtraWait=600 -PbenchHitches=1 -PbenchTrace=1 -Ptaa=true -PmetalExp=lit,nearchunks,rtshadows,sky,water`, against
+  the same without `water` (label `litnowater`); after the LOD's water is flagged, again.
+- The look: `bash tools/bench/fidelity.sh litWater 12 32768 -PmetalExp=lit,nearchunks,rtshadows,sky,water -Ptaa=true`
+  with `-PfidelityTime=12000` (sunset) and `6000`; `-PlitView=9` (cyan: water that reflects).
+- By hand: the sea at sunset from a hill and from a boat (the path; the boat's pixels keep their color); the waves in
+  motion (no swimming as the camera moves, no shimmer at mid distance); rain (the sky's gray in the water, no glint);
+  night (dark water, no glint); a lake under an overhang (sky light under 15 dims its reflection) and a river in a
+  canyon (the sky where the walls should be); the seams at the LOD's start (vanilla's water) and at 768 blocks (until the
+  LOD writes the flag); `METALMC_WATERWAVES=0` (a mirror) and `2`.
