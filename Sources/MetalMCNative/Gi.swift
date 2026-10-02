@@ -79,44 +79,70 @@ let giBytesPerCell = 36
 /// and lit mode's relight (Lit.swift, Taa.swift, with METALMC_EXP=lit,gi only).
 let giUpsampleHeader = """
 
-// gi_resolve's code word per half-resolution sample: the surface's plane (its camera-relative coordinate along the face's
-// axis, as a half) | face << 16, and GI_CODE_DATA when the irradiance is there, GI_CODE_EMPTY when the surface's cells
-// have no samples yet; 0 for the sky or past the cached range.
+// gi_resolve's output per half-resolution sample, one RG32Uint texel: x the irradiance as RG11B10Float's bits
+// (giPackIrradiance), y the code word: the surface's plane (its camera-relative coordinate along the face's axis, as a
+// half) | face << 16, and GI_CODE_DATA when the irradiance is there, GI_CODE_EMPTY when the surface's cells have no
+// samples yet; 0 for the sky or past the cached range. One texel holds both, so the upsample's common case is one read
+// whose address depends on nothing but the pixel (two textures took the code, then the irradiance it picked).
 #define GI_CODE_DATA (1u << 19)
 #define GI_CODE_EMPTY (1u << 20)
 
+// RG11B10Float's bits back to its value: its 5-bit exponents have the half's bias, so each channel is a half whose low
+// mantissa bits are zero (exact).
+static float3 giUnpackIrradiance(uint v) {
+    return float3(float(as_type<half>(ushort((v & 0x7FFu) << 4))), float(as_type<half>(ushort(((v >> 11) & 0x7FFu) << 4))),
+                  float(as_type<half>(ushort((v >> 22) << 5))));
+}
+
+// The texel of gi_resolve's output that giUpsample starts from for full-resolution pixel `gid` (its 2 x 2 block's own),
+// for callers that read it early (its address depends on nothing else).
+static uint2 giUpsampleTexel(texture2d<uint> gi, uint2 gid) {
+    return gi.read(min(gid / 2u, uint2(gi.get_width() - 1, gi.get_height() - 1))).rg;
+}
+
 // gi_resolve's half-resolution irradiance at full-resolution pixel `gid`, whose surface is on `face` at camera-relative
-// `rel`: its own 2 x 2 block's sample when that is on the same face and plane (most pixels: two reads), else the nearest
-// of the 8 around it that is (an edge, or a face too small for a sample of its own, like the riser of a one-block step:
-// planes up to a block and a half apart count, the next step's light). The samples are bilinear across cells 10 or
-// more pixels wide, so nearest-sample steps of 2 pixels don't show; a bilinear upsample (4 taps, or a gather of the codes
-// and a filtered read) cost 0.5-0.9 ms at the panel's resolution, since so many pixels lie near a face's edge in this
-// world that the taps rarely all match. w: 1 with data; 0 when nothing matched (the caller may take the cells itself,
-// giIrradiance); -1 when the surface's cells have no samples yet (they'd find nothing: not worth the lookups, which just
-// after a turn cost 1 ms).
-static float4 giUpsample(texture2d<float> irr, texture2d<uint> code, uint2 gid, uint face, float3 rel) {
-    int2 hsize = int2(irr.get_width(), irr.get_height());
+// `rel` (`own`: giUpsampleTexel's): its own 2 x 2 block's sample when that is on the same face and plane (most pixels:
+// that one read; 92.6% of the surface pixels in the region test), else the nearest of the 8 around it that is (an edge,
+// or a face too small for a sample of its own, like the riser of a one-block step: planes up to a block and a half apart
+// count, the next step's light). The samples are bilinear across cells 10 or more pixels wide, so nearest-sample steps of
+// 2 pixels don't show; a bilinear upsample (4 taps, or a gather of the codes and a filtered read) cost 0.5-0.9 ms at the
+// panel's resolution, since so many pixels lie near a face's edge in this world that the taps rarely all match. The 8
+// code words come in four 2 x 2 gathers (the anti-aliasing resolve's load loop runs a row of pixels per SIMD group, so
+// nearly every group has a pixel that needs them: 0.07 ms less than 8 reads offline), then one read of the chosen
+// sample's light. w: 1 with data; 0 when nothing matched (the caller may take the cells itself, giIrradiance); -1 when
+// the surface's cells have no samples yet (they'd find nothing: not worth the lookups, which just after a turn cost 1 ms).
+static float4 giUpsample(texture2d<uint> gi, uint2 own, uint2 gid, uint face, float3 rel) {
+    int2 hsize = int2(gi.get_width(), gi.get_height());
     int2 c0 = min(int2(gid / 2u), hsize - 1);
     float plane = rel[face >> 1];
     float tol = max(0.25, 0.002 * length(rel));   // depth precision and the half's fall with distance
-    uint c = code.read(uint2(c0)).r;
-    uint cf = (c >> 16) & 7u;
+    uint fw = face << 16;
+    uint c = own.y;
     float cd = abs(float(as_type<half>(ushort(c & 0xFFFFu))) - plane);
-    if (cf == face && (c & GI_CODE_DATA) != 0u && cd <= tol) return float4(irr.read(uint2(c0)).rgb, 1.0);
-    bool empty = cf == face && (c & GI_CODE_EMPTY) != 0u && cd <= tol;
-    // The 8 around, edge neighbors first, the nearest plane winning.
+    if ((c & ((7u << 16) | GI_CODE_DATA)) == (fw | GI_CODE_DATA) && cd <= tol) return float4(giUnpackIrradiance(own.x), 1.0);
+    bool empty = (c & ((7u << 16) | GI_CODE_EMPTY)) == (fw | GI_CODE_EMPTY) && cd <= tol;
+    // The 3 x 3 code words around c0, gathered at its four corners (clamped at the edges, as the reads were).
+    constexpr sampler sp(coord::pixel, filter::nearest, address::clamp_to_edge);
+    float2 cc = float2(c0);
+    uint4 g00 = gi.gather(sp, cc, int2(0), component::y);                       // x (-1, 0), z (0, -1), w (-1, -1)
+    uint4 g10 = gi.gather(sp, cc + float2(1.0, 0.0), int2(0), component::y);   // y (1, 0), z (1, -1)
+    uint4 g01 = gi.gather(sp, cc + float2(0.0, 1.0), int2(0), component::y);   // x (-1, 1), y (0, 1)
+    uint g11 = gi.gather(sp, cc + float2(1.0, 1.0), int2(0), component::y).y;  // (1, 1)
+    // The 8 around, edge neighbors first, the nearest plane winning (a later one only if nearer by more than 0.01). All
+    // 8 every time: stopping at an exact plane (the same choice) made the anti-aliasing resolve 0.065 ms slower offline
+    // (measured; likely the loop no longer unrolls).
     const int2 around[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, 1), int2(1, -1), int2(-1, -1) };
+    uint codes[8] = { g10.y, g00.x, g01.y, g00.z, g11, g01.x, g10.z, g00.w };
     int best = -1;
     float bestD = tol + 1.5;
     for (int k = 0; k < 8; k++) {
-        uint2 hc = uint2(clamp(c0 + around[k], int2(0), hsize - 1));
-        uint n = code.read(hc).r;
-        if (((n >> 16) & 7u) != face) continue;
+        uint n = codes[k];
+        if ((n & (7u << 16)) != fw) continue;
         float nd = abs(float(as_type<half>(ushort(n & 0xFFFFu))) - plane);
         if ((n & GI_CODE_DATA) == 0u) { empty = empty || ((n & GI_CODE_EMPTY) != 0u && nd <= tol); continue; }
         if (nd < bestD - 0.01) { bestD = nd; best = k; }
     }
-    if (best >= 0) return float4(irr.read(uint2(clamp(c0 + around[best], int2(0), hsize - 1))).rgb, 1.0);
+    if (best >= 0) return float4(giUnpackIrradiance(gi.read(uint2(clamp(c0 + around[best], int2(0), hsize - 1))).r), 1.0);
     return float4(0.0, 0.0, 0.0, empty ? -1.0 : 0.0);
 }
 """
@@ -126,6 +152,17 @@ static float4 giUpsample(texture2d<float> irr, texture2d<uint> code, uint2 gid, 
 /// +54% structure memory; offline comparisons only).
 private func giShaderSource(zeroCopy: Bool) -> String {
     "#define GI_ZERO_COPY \(zeroCopy ? 1 : 0)\n" + skyShaderHeader + giUpsampleHeader + "\n" + giKernelSource
+}
+
+/// Debug: the upsample header and kernels, for an offline compile check, or as the start of a kernel variant to time
+/// against them (mmc_debug_gi_reload, tools/gicache.py exp). Returns their length.
+@_cdecl("mmc_debug_gi_shader_source")
+public func mmc_debug_gi_shader_source(_ out: UnsafeMutablePointer<CChar>, _ len: Int32) -> Int32 {
+    let bytes = Array((giUpsampleHeader + "\n" + giKernelSource).utf8)
+    guard bytes.count < Int(len) else { return Int32(bytes.count) }
+    for (i, b) in bytes.enumerated() { out[i] = CChar(bitPattern: b) }
+    out[bytes.count] = 0
+    return Int32(bytes.count)
 }
 
 private let giKernelSource = """
@@ -261,14 +298,20 @@ static uint giPrint(uint2 k) { return giMix(k.y ^ giMix(k.x + 0x85ebca6bu)) | 1u
 // Level as a real number: 0 inside the level-0 range, then one more per doubling of distance.
 static float giLevelF(constant GiParams& p, float d) { return clamp(log2(max(d, 1.0) / p.camFrac.w) + 1.0, 0.0, float(GI_MAX_LEVEL)); }
 
-// Lookups scan the whole bucket: evictions leave holes, so an empty slot doesn't end the search. Four 16-byte loads.
+// Lookups scan the whole bucket: evictions leave holes, so an empty slot doesn't end the search. Four 16-byte loads,
+// issued together and then the first match in slot order taken: with an early exit after each, a SIMD group waited on
+// them one after another for any lane whose key wasn't there (a bilinear's corners past a surface's edge; the resolve
+// took 0.02 ms longer).
 static int giFind(const device uint* check, uint base, uint fp) {
     const device uint4* b = (const device uint4*)(check + base);
-    for (uint i = 0; i < GI_BUCKET / 4u; i++) {
-        bool4 m = b[i] == uint4(fp);
-        if (any(m)) return int(base + i * 4u + (m.x ? 0u : (m.y ? 1u : (m.z ? 2u : 3u))));
-    }
-    return -1;
+    uint4 b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+    uint4 i0 = select(uint4(16u), uint4(0u, 1u, 2u, 3u), b0 == uint4(fp));
+    uint4 i1 = select(uint4(16u), uint4(4u, 5u, 6u, 7u), b1 == uint4(fp));
+    uint4 i2 = select(uint4(16u), uint4(8u, 9u, 10u, 11u), b2 == uint4(fp));
+    uint4 i3 = select(uint4(16u), uint4(12u, 13u, 14u, 15u), b3 == uint4(fp));
+    uint4 m = min(min(i0, i1), min(i2, i3));
+    uint i = min(min(m.x, m.y), min(m.z, m.w));
+    return i < 16u ? int(base + i) : -1;
 }
 // The same scan in a kernel that also inserts: plain loads (a slot claimed in this dispatch may still read empty; the
 // claim's exchanges then see it).
@@ -391,7 +434,8 @@ kernel void gi_begin(device atomic_uint* counters [[buffer(8)]], uint tid [[thre
 }
 
 static uint giRequestCell(constant GiParams& p, device atomic_uint* check, device uint4* keys, device atomic_uint* stamp, device half4* value,
-                          device uint* meta, device uint* list, device atomic_uint* counters, float3 f, int3 air, uint face, uint level) {
+                          device uint* meta, device atomic_uint* counters, float3 f, int3 air, uint face, uint level, thread uint& listed) {
+    listed = ~0u;
     uint2 k = giKey(giCellOf(air, level), face, level);
     bool created;
     int e = giClaim(check, giBucketOf(p, k), giPrint(k), created);
@@ -400,18 +444,29 @@ static uint giRequestCell(constant GiParams& p, device atomic_uint* check, devic
         giInit(p, check, keys, value, meta, uint(e), k, air, face, level, giRepPoint(p.camBlock.xyz, f, air, face, level));
         atomic_fetch_add_explicit(&counters[2], 1u, memory_order_relaxed);
     }
-    // Seen this frame; the first thread to see it may list it. When more cells are visible than their part of the list
-    // holds, a random share (sched.x, from last frame's count) is listed, a different one each frame: appending all of
-    // them would fill the list with the same cells every frame (the first in dispatch order). Cells without samples
-    // (new ones) are always listed.
-    if (atomic_exchange_explicit(&stamp[e], uint(p.origin.w), memory_order_relaxed) == uint(p.origin.w)) return 0u;
-    if (!giSampled(value[e]) || giMix(uint(e) ^ giMix(uint(p.origin.w))) <= p.sched.x) giEnqueueVisible(p, list, counters, uint(e));
+    // Seen this frame; the first thread to see it may list it (in `listed`). When more cells are visible than their part
+    // of the list holds, a random share (sched.x, from last frame's count) is listed, a different one each frame:
+    // appending all of them would fill the list with the same cells every frame (the first in dispatch order). Cells
+    // without samples (new ones) are always listed. Most touches come after the first (a cell takes about six request
+    // samples a frame): a plain read sees that without an exchange (it may be stale, never ahead: the exchange decides).
+    uint frame = uint(p.origin.w);
+    if (((device uint*)stamp)[e] == frame) return 0u;
+    if (atomic_exchange_explicit(&stamp[e], frame, memory_order_relaxed) == frame) return 0u;
+    if (!giSampled(value[e]) || giMix(uint(e) ^ giMix(frame)) <= p.sched.x) listed = uint(e);
     return 1u;
 }
 
-// One pixel of each sample x sample block (a different one each frame): find or create its surface's cell, mark it
-// seen and list it for an update. Near a level boundary the next level's cell too, since the resolve blends the two.
-// A cell 4 x 4 pixels or larger is touched every frame, so while the budget allows, visible cells update every frame.
+static uint4 giResolveSample(constant GiParams& p, const device uint* check, const device half4* value, constant GiLight& L,
+                             depth2d<float, access::read> depth, uint2 hs);
+
+// Per sample x sample block of pixels (4 x 4), the request and the resolve, in one pass over the depth buffer:
+// - the request: one pixel of the block (a different one each frame) finds or creates its surface's cell, marks it seen
+//   and lists it for an update. Near a level boundary the next level's cell too, since the resolve blends the two. A
+//   cell 4 x 4 pixels or larger is touched every frame, so while the budget allows, visible cells update every frame.
+// - the resolve: the block's 2 x 2 half-resolution samples (giResolveSample), from the cells as last frame's update left
+//   them. The two passes read the whole depth buffer each (31 MB at the panel's resolution: every one of its cache lines,
+//   though the request needs one pixel in 16) and the same visible cells; done together the light no longer waits for
+//   this frame's update, which can then run beside the frame's later passes. A cell's new light shows a frame later.
 kernel void gi_request(constant GiParams& p [[buffer(1)]],
                        device atomic_uint* check [[buffer(2)]],
                        device uint4* keys [[buffer(3)]],
@@ -420,27 +475,47 @@ kernel void gi_request(constant GiParams& p [[buffer(1)]],
                        device uint* meta [[buffer(6)]],
                        device uint* list [[buffer(7)]],
                        device atomic_uint* counters [[buffer(8)]],
+                       constant GiLight& L [[buffer(15)]],
                        depth2d<float, access::read> depth [[texture(0)]],
+                       texture2d<uint, access::write> out [[texture(1)]],
                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(p.sizes.z) || gid.y >= uint(p.sizes.w)) return;
     uint2 full = uint2(p.sizes.xy);
     uint2 q = min(gid * p.sample.x + p.sample.yz, full - 1);
     GiSurface s;
-    uint seen = 0u;
+    uint seen = 0u, l0 = ~0u, l1 = ~0u;
     // (Vanilla's clouds write depth: no cells for them.)
     if (giSurfaceAt(p, depth, q, s) && length(s.rel) <= p.limits.x && !(s.rel.y > p.rays.w - 0.1 && s.rel.y < p.rays.w + 4.1)) {
         float lf = giLevelF(p, length(s.rel));
         uint level = min(uint(lf), GI_MAX_LEVEL);
         float3 f = p.camFrac.xyz + s.rel;
         int3 air = giAirBlock(p.camBlock.xyz, f, s.face);
-        seen = giRequestCell(p, check, keys, stamp, value, meta, list, counters, f, air, s.face, level);
+        seen = giRequestCell(p, check, keys, stamp, value, meta, counters, f, air, s.face, level, l0);
         if (lf - float(level) > 0.75 && level < GI_MAX_LEVEL) {
-            seen += giRequestCell(p, check, keys, stamp, value, meta, list, counters, f, air, s.face, level + 1u);
+            seen += giRequestCell(p, check, keys, stamp, value, meta, counters, f, air, s.face, level + 1u, l1);
         }
     }
     // The visible cells seen this frame (one atomic per SIMD group), for next frame's share.
     uint n = simd_sum(seen);
     if (simd_is_first() && n > 0u) atomic_fetch_add_explicit(&counters[18], n, memory_order_relaxed);
+    // The cells to list, one atomic per SIMD group too (a frame lists up to 12 K: one counter takes them all).
+    uint nl = (l0 != ~0u ? 1u : 0u) + (l1 != ~0u ? 1u : 0u), total = simd_sum(nl);
+    if (total > 0u) {
+        uint base = 0u;
+        if (simd_is_first()) base = atomic_fetch_add_explicit(&counters[0], total, memory_order_relaxed);
+        uint i = simd_broadcast_first(base) + simd_prefix_exclusive_sum(nl), part = giVisiblePart(p);
+        if (l0 != ~0u) {
+            if (i < part) list[i] = l0;
+            i++;
+        }
+        if (l1 != ~0u && i < part) list[i] = l1;
+    }
+    // The resolve's samples of this block.
+    uint2 hsize = uint2(out.get_width(), out.get_height());
+    for (uint j = 0; j < 4u; j++) {
+        uint2 hs = gid * 2u + uint2(j & 1u, j >> 1);
+        if (hs.x < hsize.x && hs.y < hsize.y) out.write(giResolveSample(p, (const device uint*)check, value, L, depth, hs), hs);
+    }
 }
 
 // A slice of the table: evict cells unseen for too long, and list cells that aren't visible (the request lists those)
@@ -460,7 +535,7 @@ kernel void gi_schedule(constant GiParams& p [[buffer(1)]],
         uint age = uint(p.origin.w) - stamp[slot];
         if (age > uint(p.blockLight.w)) {
             // Zeroed (no samples, giSampled) before the slot is freed, so a cell that claims it later never reads another
-        // cell's light.
+            // cell's light.
             value[slot] = half4(0.0h);
             meta[slot] = 0u;
             atomic_store_explicit(&check[slot], 0u, memory_order_relaxed);
@@ -477,6 +552,12 @@ kernel void gi_schedule(constant GiParams& p [[buffer(1)]],
     if (listed && i < p.counts.x / 4u) list[giVisiblePart(p) + i] = slot;
 }
 
+// Threads per cell in the update: its samples are split among them (one each at the default 4), so each thread's chain
+// of dependent rays is a quarter as long and four times as many rays are in flight (16 K cells are only a few hundred
+// SIMD groups on the whole GPU; measured offline, the stage took 0.2 ms less, 15%). A power of two, at most 4, so a
+// cell's lanes sit side by side in one SIMD group.
+static uint giLanes(uint spp) { return spp >= 4u ? 4u : (spp >= 2u ? 2u : 1u); }
+
 // The update's dispatch size from the two parts of the list (each capped at its share of the budget).
 kernel void gi_args(constant GiParams& p [[buffer(1)]], device atomic_uint* counters [[buffer(8)]], uint tid [[thread_position_in_grid]]) {
     if (tid != 0) return;
@@ -485,7 +566,7 @@ kernel void gi_args(constant GiParams& p [[buffer(1)]], device atomic_uint* coun
     atomic_store_explicit(&counters[1], n, memory_order_relaxed);
     atomic_store_explicit(&counters[17], nv, memory_order_relaxed);
     atomic_store_explicit(&counters[19], atomic_load_explicit(&counters[18], memory_order_relaxed), memory_order_relaxed);
-    atomic_store_explicit(&counters[8], max((n + 63u) / 64u, 1u), memory_order_relaxed);
+    atomic_store_explicit(&counters[8], max((n * giLanes(p.sample.w) + 63u) / 64u, 1u), memory_order_relaxed);
     atomic_store_explicit(&counters[9], 1u, memory_order_relaxed);
     atomic_store_explicit(&counters[10], 1u, memory_order_relaxed);
 }
@@ -507,17 +588,23 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
                       constant SkyFrame& sf [[buffer(16)]],
                       texture2d<float> skyView [[texture(6)]]
                       GI_TILES_ARG,
-                      uint tid [[thread_position_in_grid]]) {
-    if (tid >= atomic_load_explicit(&counters[1], memory_order_relaxed)) return;
+                      uint tid [[thread_position_in_grid]],
+                      ushort simdLane [[thread_index_in_simdgroup]]) {
+    // giLanes threads per cell: lane k takes the cell's samples k, k + lanes, ...; the first lane sums them and writes.
+    uint lanes = giLanes(p.sample.w), lane = tid & (lanes - 1u), ci = tid / lanes;
+    if (ci >= atomic_load_explicit(&counters[1], memory_order_relaxed)) return;
     uint nv = atomic_load_explicit(&counters[17], memory_order_relaxed);
-    uint e = list[tid < nv ? tid : giVisiblePart(p) + (tid - nv)];
-    if (atomic_load_explicit(&check[e], memory_order_relaxed) == 0u) return;   // evicted since it was listed
+    uint e = list[ci < nv ? ci : giVisiblePart(p) + (ci - nv)];
+    // What decides the cell's samples, as its first lane saw it, so its lanes agree (they sum their samples in the end).
+    ushort first = simdLane - ushort(lane);
+    uint live = simd_shuffle(atomic_load_explicit(&check[e], memory_order_relaxed), first);
+    if (live == 0u) return;   // evicted since it was listed
     uint4 k = keys[e];
     uint face = (k.y >> 25) & 7u, level = k.y >> 28;
     if (face > 5u || level > GI_MAX_LEVEL) return;
-    uint m = meta[e];
+    uint m = simd_shuffle(meta[e], first);
     uint frame = uint(p.origin.w);
-    bool visible = frame - stamp[e] <= GI_RECENT;
+    bool visible = frame - simd_shuffle(stamp[e], first) <= GI_RECENT;
     int s = 1 << level;
     int3 c = giUnkey(k.xy, int3(giFloorShift(p.origin.x, level), 0, giFloorShift(p.origin.z, level)));
     // The cell's corner relative to the structure's origin, in blocks.
@@ -547,7 +634,7 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
     float3 sumE = 0.0;
     float sumSun = 0.0;
     uint valid = 0, sunSamples = 0, rays = 0, cached = 0, uncached = 0, spawned = 0, repUsed = 0;
-    for (uint i = 0; i < p.sample.w; i++) {
+    for (uint i = lane; i < p.sample.w; i += lanes) {
         uint si = seq + i;
         float2 uv = giR2(si, shiftA);
         float3 o = corner;
@@ -646,6 +733,20 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
         eh += giBlockLight(p, hbl);
         sumE += mats[hm * 4u + giFaceClass(hf)].rgb * eh + mats[hm * 4u + 3u].rgb * p.look.y;
     }
+    // The cell's lanes sum what they found (every lane of the cell gets here: they return early or not together).
+    for (uint d = 1u; d < lanes; d <<= 1) {
+        ushort x = ushort(d);
+        sumE += simd_shuffle_xor(sumE, x);
+        sumSun += simd_shuffle_xor(sumSun, x);
+        valid += simd_shuffle_xor(valid, x);
+        sunSamples += simd_shuffle_xor(sunSamples, x);
+        rays += simd_shuffle_xor(rays, x);
+        cached += simd_shuffle_xor(cached, x);
+        uncached += simd_shuffle_xor(uncached, x);
+        spawned += simd_shuffle_xor(spawned, x);
+        repUsed += simd_shuffle_xor(repUsed, x);
+    }
+    if (lane != 0u) return;
     atomic_fetch_add_explicit(&counters[11], rays, memory_order_relaxed);
     if (cached > 0u) atomic_fetch_add_explicit(&counters[12], cached, memory_order_relaxed);
     if (uncached > 0u) atomic_fetch_add_explicit(&counters[13], uncached, memory_order_relaxed);
@@ -709,23 +810,25 @@ static float4 giInterp(constant GiParams& p, const device uint* check, const dev
     float2 q = float2(local[t.x], local[t.y]) / float(s) - 0.5;
     float2 fl = floor(q), w = q - fl;
     int2 o = int2(fl);
+    // The 4 corners' scans, then their values, with no branch between (their loads in flight together: 0.02 ms less in
+    // the resolve than a loop that skipped ahead), then summed in the order the loop had.
+    int e[4];
+    for (int k = 0; k < 4; k++) {
+        int3 cc = c;
+        cc[t.x] += o.x + (k & 1);
+        cc[t.y] += o.y + (k >> 1);
+        uint2 key = giKey(cc, face, level);
+        e[k] = giFind(check, giBucketOf(p, key), giPrint(key));
+    }
+    half4 v[4];
+    for (int k = 0; k < 4; k++) v[k] = value[max(e[k], 0)];
     float3 sum = 0.0;
     float ws = 0.0;
-    for (int j = 0; j < 2; j++) {
-        for (int i = 0; i < 2; i++) {
-            float wt = (i == 0 ? 1.0 - w.x : w.x) * (j == 0 ? 1.0 - w.y : w.y);
-            if (wt <= 0.0) continue;
-            int3 cc = c;
-            cc[t.x] += o.x + i;
-            cc[t.y] += o.y + j;
-            uint2 k = giKey(cc, face, level);
-            int e = giFind(check, giBucketOf(p, k), giPrint(k));
-            if (e < 0) continue;
-            half4 v = value[e];
-            if (!giSampled(v)) continue;
-            sum += wt * float3(v.rgb);
-            ws += wt;
-        }
+    for (int k = 0; k < 4; k++) {
+        float wt = ((k & 1) == 0 ? 1.0 - w.x : w.x) * ((k >> 1) == 0 ? 1.0 - w.y : w.y);
+        if (wt <= 0.0 || e[k] < 0 || !giSampled(v[k])) continue;
+        sum += wt * float3(v[k].rgb);
+        ws += wt;
     }
     return float4(ws > 0.0 ? sum / ws : float3(0.0), ws);
 }
@@ -743,22 +846,29 @@ static float4 giIrradiance(constant GiParams& p, const device uint* check, const
     return e;
 }
 
-// Indirect irradiance (sky and bounced light) at half resolution: one sample per 2 x 2 pixels, at the block's nearest
-// surface, into an RG11B10 texture, with a code word per sample (GI_CODE_DATA, giUpsampleHeader) so the lighting pass can
-// upsample it by face and plane without the depth buffer (giUpsample). At the panel's resolution a full-resolution
-// resolve cost 1.4-1.6 ms, mostly its lookups (4 per pixel) and its output's bandwidth; a cell spans 10 pixels or more,
-// so a quarter of the lookups loses nothing but the edges, which the upsample keeps. The cells' light is per unit of
-// daylight: times this frame's (GiLight.scale).
-kernel void gi_resolve(constant GiParams& p [[buffer(1)]],
-                       const device uint* check [[buffer(2)]],
-                       const device half4* value [[buffer(5)]],
-                       constant GiLight& L [[buffer(15)]],
-                       depth2d<float, access::read> depth [[texture(0)]],
-                       texture2d<float, access::write> out [[texture(1)]],
-                       texture2d<uint, access::write> code [[texture(5)]],
-                       uint2 gid [[thread_position_in_grid]]) {
-    uint2 full = uint2(p.sizes.xy), base = gid * 2u;
-    if (base.x >= full.x || base.y >= full.y) return;
+// A float as an unsigned small float of RG11B10Float (5 exponent bits, `mbits` mantissa bits), truncated as the
+// texture unit's conversion does on the M3 (not rounded: gi_test_pack checks every case against it). Negative values
+// and -0 give 0; x must be finite.
+static uint giPackSmallFloat(float x, uint mbits) {
+    uint b = as_type<uint>(x);
+    if ((b >> 31) != 0u) return 0u;
+    if (b < 0x38800000u) return uint(x * float(1u << (14u + mbits)));   // under 2^-14: the small float's subnormals
+    return min((b - 0x38000000u) >> (23u - mbits), (31u << mbits) - 1u);   // the exponent rebiased from 127 to 15
+}
+// The irradiance as RG11B10Float's bits (giUnpackIrradiance reads them back).
+static uint giPackIrradiance(float3 c) {
+    return giPackSmallFloat(c.r, 6u) | (giPackSmallFloat(c.g, 6u) << 11) | (giPackSmallFloat(c.b, 5u) << 22);
+}
+
+// Indirect irradiance (sky and bounced light) at half resolution: one sample per 2 x 2 pixels (`hs`), at the block's
+// nearest surface, with its code word (giUpsampleHeader) in one RG32Uint texel so the lighting pass can upsample it by
+// face and plane without the depth buffer (giUpsample). At the panel's resolution a full-resolution resolve cost 1.4-1.6
+// ms, mostly its lookups (4 per pixel) and its output's bandwidth; a cell spans 10 pixels or more, so a quarter of the
+// lookups loses nothing but the edges, which the upsample keeps. The cells' light is per unit of daylight: times this
+// frame's (GiLight.scale).
+static uint4 giResolveSample(constant GiParams& p, const device uint* check, const device half4* value, constant GiLight& L,
+                             depth2d<float, access::read> depth, uint2 hs) {
+    uint2 full = uint2(p.sizes.xy), base = hs * 2u;
     // The block's nearest surface (reverse-Z: the largest depth), so foreground edges get their own sample.
     uint best = 0u;
     float bd = -1.0;
@@ -768,16 +878,23 @@ kernel void gi_resolve(constant GiParams& p [[buffer(1)]],
     }
     uint2 q = min(base + uint2(best & 1u, best >> 1), full - 1);
     GiSurface s;
-    if (bd <= 0.0 || !giSurfaceAt(p, depth, q, s) || length(s.rel) > p.limits.x) {
-        out.write(float4(0.0), gid);
-        code.write(uint4(0u), gid);
-        return;
-    }
+    if (bd <= 0.0 || !giSurfaceAt(p, depth, q, s) || length(s.rel) > p.limits.x) return uint4(0u);
     float3 f = p.camFrac.xyz + s.rel;
     float4 e = giIrradiance(p, check, value, f, giAirBlock(p.camBlock.xyz, f, s.face), s.face, giLevelF(p, length(s.rel)));
     uint pc = uint(as_type<ushort>(half(s.rel[s.face >> 1]))) | (s.face << 16);
-    out.write(float4(e.w > 0.0 ? e.rgb * L.scale.rgb : float3(0.0), 1.0), gid);
-    code.write(uint4(pc | (e.w > 0.0 ? GI_CODE_DATA : GI_CODE_EMPTY)), gid);
+    return uint4(e.w > 0.0 ? giPackIrradiance(e.rgb * L.scale.rgb) : 0u, pc | (e.w > 0.0 ? GI_CODE_DATA : GI_CODE_EMPTY), 0u, 0u);
+}
+
+// The resolve alone, on the cells as they stand (the debug views and tests; a frame's comes with its request, gi_request).
+kernel void gi_resolve(constant GiParams& p [[buffer(1)]],
+                       const device uint* check [[buffer(2)]],
+                       const device half4* value [[buffer(5)]],
+                       constant GiLight& L [[buffer(15)]],
+                       depth2d<float, access::read> depth [[texture(0)]],
+                       texture2d<uint, access::write> out [[texture(1)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+    out.write(giResolveSample(p, check, value, L, depth, gid), gid);
 }
 
 static float3 giTonemap(float3 c) {
@@ -791,8 +908,11 @@ static float3 giTonemap(float3 c) {
 // light), 5 bounced and sky light only (albedo times the cache); lit mode's relight (Lit.swift, without its AO and
 // lightmap: block light by vanilla's curve, sRGB-encoded and clipped like its SDR output) 6 with its sky term (the open
 // sky's light on the face times the sky light level's curve) and 7 with the cache's light in its place where the cache
-// has data. `irr` and `code` are gi_resolve's output; `prim` holds each pixel's primitive data (material, face, block
-// light, sky cover) and `sunVis` its sun visibility; in the game, 1 x 1 stand-ins give white and full sun.
+// has data; 9 what lit mode's relight takes from the cache, unencoded for comparisons (giUpsample on the face the
+// primitive data gives, as the relight's G-buffer does, without lookups of its own: the irradiance where it matched,
+// -1 where nothing did, -2 where the cells have no samples yet, -3 for the sky). `gi` is gi_resolve's output; `prim`
+// holds each pixel's primitive data (material, face, block light, sky cover) and `sunVis` its sun visibility; in the
+// game, 1 x 1 stand-ins give white and full sun.
 kernel void gi_debug_view(constant GiParams& p [[buffer(1)]],
                           const device uint* check [[buffer(2)]],
                           const device half4* value [[buffer(5)]],
@@ -802,11 +922,10 @@ kernel void gi_debug_view(constant GiParams& p [[buffer(1)]],
                           constant SkyFrame& sf [[buffer(16)]],
                           texture2d<float> skyView [[texture(6)]],
                           depth2d<float, access::read> depth [[texture(0)]],
-                          texture2d<float> irr [[texture(1)]],
+                          texture2d<uint> gi [[texture(1)]],
                           texture2d<uint, access::read> prim [[texture(2)]],
                           texture2d<half, access::read> sunVis [[texture(3)]],
                           texture2d<float, access::write> out [[texture(4)]],
-                          texture2d<uint> code [[texture(5)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(p.sizes.x) || gid.y >= uint(p.sizes.y)) return;
     uint mode = uint(p.limits.z);
@@ -814,17 +933,22 @@ kernel void gi_debug_view(constant GiParams& p [[buffer(1)]],
     if (!giSurfaceAt(p, depth, gid, s)) {
         float3 d = normalize(giRelAt(p, gid, 1.0));
         float3 sky = giSky(L, sf, skyView, d) * kGiPi * L.scale.rgb;
-        out.write(float4(mode >= 6u ? skyEncode(saturate(sky * p.look.x / kGiPi)) : giTonemap(sky * p.look.x), 1.0), gid);
+        out.write(mode == 9u ? float4(-3.0) : float4(mode >= 6u ? skyEncode(saturate(sky * p.look.x / kGiPi)) : giTonemap(sky * p.look.x), 1.0), gid);
         return;
     }
     bool dummy = prim.get_width() == 1u;
     uint pd = dummy ? 0u : prim.read(gid).r;
+    if (mode == 9u) {
+        float4 u = giUpsample(gi, giUpsampleTexel(gi, gid), gid, dummy ? s.face : min((pd >> 8) & 7u, 5u), s.rel);
+        out.write(u.w > 0.0 ? float4(u.rgb, 1.0) : float4(u.w < 0.0 ? -2.0 : -1.0), gid);
+        return;
+    }
     uint mat = pd & 255u, bl = (pd >> 11) & 15u, cover = (pd >> 15) & 15u;
     float3 albedo = dummy ? float3(0.6) : mats[mat * 4u + giFaceClass(s.face)].rgb;
     float3 emit = dummy ? float3(0.0) : mats[mat * 4u + 3u].rgb * p.look.z;
     float vis = sunVis.get_width() == 1u ? 1.0 : float(sunVis.read(gid).r);
     float3 sunI = giSunOn(p, L, s.face) * L.scale.rgb * vis;
-    float4 up = giUpsample(irr, code, gid, s.face, s.rel);
+    float4 up = giUpsample(gi, giUpsampleTexel(gi, gid), gid, s.face, s.rel);
     if (up.w == 0.0 && length(s.rel) <= p.limits.x) {
         // No half-resolution sample on this pixel's face and plane (a face a pixel or two wide): its own lookups, which
         // only these few pixels pay for.
@@ -979,10 +1103,9 @@ kernel void gi_test_upsample(constant GiParams& p [[buffer(1)]],
                              const device uint* check [[buffer(2)]],
                              const device half4* value [[buffer(5)]],
                              depth2d<float, access::read> depth [[texture(0)]],
-                             texture2d<float> irr [[texture(1)]],
+                             texture2d<uint> gi [[texture(1)]],
                              texture2d<uint, access::read> prim [[texture(2)]],
                              texture2d<half, access::write> out [[texture(4)]],
-                             texture2d<uint> code [[texture(5)]],
                              device atomic_uint* counters [[buffer(8)]],
                              uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(p.sizes.x) || gid.y >= uint(p.sizes.y)) return;
@@ -997,7 +1120,7 @@ kernel void gi_test_upsample(constant GiParams& p [[buffer(1)]],
         up = float4(s.rel, float(s.face));   // the baseline: the same reads and write without the cache
     } else if (d > 0.0 && length(s.rel) <= p.limits.x) {
         surface = 1u;
-        up = giUpsample(irr, code, gid, s.face, s.rel);
+        up = giUpsample(gi, giUpsampleTexel(gi, gid), gid, s.face, s.rel);
         if (up.w < 0.0) {
             none = 1u;
         } else if (up.w == 0.0) {
@@ -1060,6 +1183,94 @@ kernel void gi_light(constant float4* env [[buffer(16)]], constant float4& opt [
     L.horizon = L.zenith;
     L.ground = float4(env[4].rgb / (kGiPi * d), 0.0);
     for (uint f = 0; f < 6u; f++) L.open[f] = float4(env[1u + f].rgb / d, 0.0);
+}
+
+// Offline test only (mmc_debug_gi_profile): what the game's ray-traced shadows do just before the cache's frame
+// (RtShadows' rt_shadow: one ray toward the sun per 4 x 4 pixels, from the depth buffer's surface), so the cache's stages
+// find the depth buffer and the structures as warm as the game leaves them.
+kernel void gi_test_shadow(instance_acceleration_structure accel [[buffer(0)]],
+                           constant GiParams& p [[buffer(1)]],
+                           depth2d<float, access::read> depth [[texture(0)]],
+                           texture2d<half, access::write> out [[texture(3)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(p.sizes.z) || gid.y >= uint(p.sizes.w)) return;
+    uint2 q = min(gid * p.sample.x + p.sample.yz, uint2(p.sizes.xy) - 1u);
+    GiSurface s;
+    half v = 1.0h;
+    if (giSurfaceAt(p, depth, q, s) && dot(kGiNormal[s.face], p.sun.xyz) > -0.05) {
+        float3 camRel = float3(p.camBlock.xyz - p.origin.xyz) + p.camFrac.xyz;
+        ray r(camRel + s.rel + kGiNormal[s.face] * (0.03 + length(s.rel) * 0.0008), p.sun.xyz, 0.0, p.rays.y);
+        intersector<instancing> isect;
+        isect.accept_any_intersection(true);
+        isect.assume_geometry_type(geometry_type::triangle);
+        v = isect.intersect(r, accel, 0xFF).type == intersection_type::none ? 1.0h : 0.0h;
+    }
+    out.write(half4(v), gid);
+}
+
+// Offline test only (mmc_debug_gi_profile): the anti-aliasing resolve's load loop with lit mode's relight in it
+// (Taa.swift's taa_resolve, Lit.swift's litRelightPixel), reduced to what the cache changes there, to time its share as
+// the game lays the work out: 32 x 32 pixels per threadgroup of 16 x 16 threads, the 34 x 34 loads (a 1-pixel border) in
+// the same order (a SIMD group's loads are a row of pixels, as there), each reading the depth and the primitive data
+// (the G-buffer's stand-in) and, as the relight does, the cache's texel early and giUpsample on the pixel's face; then
+// each pixel's 3 x 3 neighborhood from threadgroup memory. limits.z == 99: without the cache's part (the baseline).
+kernel void gi_test_taa(constant GiParams& p [[buffer(1)]],
+                        depth2d<float, access::read> depth [[texture(0)]],
+                        texture2d<uint> gi [[texture(1)]],
+                        texture2d<uint, access::read> prim [[texture(2)]],
+                        texture2d<half, access::write> out [[texture(4)]],
+                        uint2 lid [[thread_position_in_threadgroup]],
+                        uint2 tgid [[threadgroup_position_in_grid]]) {
+    threadgroup half4 tile[34 * 34];
+    threadgroup float dtile[34 * 34];
+    int2 size = int2(p.sizes.xy);
+    int2 base = int2(tgid) * 32 - 1;
+    bool withGi = p.limits.z != 99.0;
+    for (uint i = lid.y * 16u + lid.x; i < 34u * 34u; i += 256u) {
+        uint2 q = uint2(clamp(base + int2(i % 34u, i / 34u), int2(0), size - 1));
+        float d = depth.read(q);
+        uint pd = prim.read(q).r;
+        float3 c = float3(float(pd & 255u), float((pd >> 15) & 15u), 255.0) / 255.0;
+        if (d > 0.0) {
+            uint2 own = withGi ? giUpsampleTexel(gi, q) : uint2(0u);
+            float3 rel = giRelAt(p, q, d);
+            float fog = saturate(length(rel) / 4096.0);
+            c = c * (1.0 - fog) + fog * 0.5;
+            if (withGi) {
+                float4 g = giUpsample(gi, own, q, min((pd >> 8) & 7u, 5u), rel);
+                if (g.w > 0.0) c *= g.rgb;
+            }
+        }
+        tile[i] = half4(half3(c), 1.0h);
+        dtile[i] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint quarter = 0; quarter < 4u; quarter++) {
+        uint2 lp = lid + uint2((quarter & 1u) * 16u, (quarter >> 1) * 16u);
+        uint2 gid = tgid * 32u + lp;
+        if (int(gid.x) >= size.x || int(gid.y) >= size.y) continue;
+        uint c0 = (lp.y + 1u) * 34u + lp.x + 1u;
+        half3 lo = tile[c0].xyz, hi = lo;
+        float nearest = dtile[c0];
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                uint k = uint(int(c0) + dy * 34 + dx);
+                lo = min(lo, tile[k].xyz);
+                hi = max(hi, tile[k].xyz);
+                nearest = max(nearest, dtile[k]);
+            }
+        }
+        out.write(half4(dot(lo + hi, half3(0.5h)) + half(nearest)), gid);
+    }
+}
+
+// Offline self-test: values through the texture unit's RG11B10Float conversion (a write to `hw`, 256 texels a row) and
+// through giPackIrradiance (into `out`), to compare bit for bit.
+kernel void gi_test_pack(const device float* vals [[buffer(13)]], device uint* out [[buffer(14)]],
+                         texture2d<float, access::write> hw [[texture(1)]], uint tid [[thread_position_in_grid]]) {
+    float v = vals[tid];
+    hw.write(float4(v, v, v, 1.0), uint2(tid & 255u, tid >> 8));
+    out[tid] = giPackIrradiance(float3(v));
 }
 
 // Offline self-test: cell keys of blocks through giAirBlock, giCellOf, giKey and back through giUnkey.
@@ -1186,7 +1397,8 @@ final class GiCache: @unchecked Sendable {
         do {
             let lib = try dev.makeLibrary(source: giShaderSource(zeroCopy: zeroCopy), options: nil)
             for name in ["gi_begin", "gi_request", "gi_schedule", "gi_args", "gi_update", "gi_resolve", "gi_debug_view", "gi_invalidate",
-                         "gi_count", "gi_light", "gi_test_primary", "gi_test_rays", "gi_test_keys", "gi_test_upsample"] {
+                         "gi_count", "gi_light", "gi_test_primary", "gi_test_rays", "gi_test_keys", "gi_test_upsample", "gi_test_pack",
+                         "gi_test_shadow", "gi_test_taa"] {
                 guard let f = lib.makeFunction(name: name) else { log("gi: no function \(name)"); return nil }
                 pipes[name] = try dev.makeComputePipelineState(function: f)
             }
@@ -1300,10 +1512,15 @@ final class GiCache: @unchecked Sendable {
         enc.dispatchThreads(MTLSize(width: max(n, 1), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
     }
 
+    /// This frame's sun and sky light as lit_env made it (Lit.encodeEnv) when encodeLight took it from the atmosphere,
+    /// else nil: the relight reads it rather than run lit_env again on the same sky tables (RtShadows.takeLitGi).
+    private(set) var envThisFrame: MTLBuffer?
+
     /// Lit mode: the frame's GiLight from the relight's light (gi_light), and the sky its bounce rays see.
     private func encodeLight(_ enc: MTLComputeCommandEncoder, _ source: GiLightSource) {
         var opt = SIMD4<Float>.zero
         var daylight: [SIMD4<Float>]
+        envThisFrame = nil
         switch source {
         case .atmosphere(let fallback):
             daylight = fallback
@@ -1313,6 +1530,7 @@ final class GiCache: @unchecked Sendable {
                 skyView = view
                 opt.x = 1
                 daylight = []
+                envThisFrame = envBuffer
             }
         case .daylight(let env):
             daylight = env
@@ -1350,12 +1568,15 @@ final class GiCache: @unchecked Sendable {
         }
     }
 
-    /// Stage 1: request (and list) the cells the depth buffer shows.
-    func encodeRequest(_ enc: MTLComputeCommandEncoder, depth: MTLTexture, params p: inout GiParams) {
+    /// Stage 1: request (and list) the cells the depth buffer shows, and resolve their light at half resolution into `out`
+    /// (rg32Uint, half the depth buffer's size rounded up: the irradiance's bits and the code word, giUpsampleHeader;
+    /// giUpsample is the way back to full resolution) from the cells as the last update left them.
+    func encodeRequest(_ enc: MTLComputeCommandEncoder, depth: MTLTexture, out: MTLTexture, params p: inout GiParams) {
         bindTable(enc)
         enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
         enc.setComputePipelineState(pipe("gi_request"))
         enc.setTexture(depth, index: 0)
+        enc.setTexture(out, index: 1)
         enc.dispatchThreads(MTLSize(width: Int(p.sizes.z), height: Int(p.sizes.w), depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     }
 
@@ -1378,56 +1599,83 @@ final class GiCache: @unchecked Sendable {
         enc.dispatchThreadgroups(indirectBuffer: counters, indirectBufferOffset: 32, threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
     }
 
-    /// Stage 4: indirect irradiance at half resolution into `out` (rg11b10Float) and `code` (r32Uint), both half the depth
-    /// buffer's size rounded up (gi_resolve has the formats, giUpsample the way back to full resolution).
-    func encodeResolve(_ enc: MTLComputeCommandEncoder, depth: MTLTexture, out: MTLTexture, code: MTLTexture, params p: inout GiParams) {
+    /// The resolve alone (the debug views and tests: a frame's comes with its request) into `out`, as encodeRequest's.
+    func encodeResolve(_ enc: MTLComputeCommandEncoder, depth: MTLTexture, out: MTLTexture, params p: inout GiParams) {
         bindTable(enc)
         enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
         enc.setComputePipelineState(pipe("gi_resolve"))
         enc.setTexture(depth, index: 0)
         enc.setTexture(out, index: 1)
-        enc.setTexture(code, index: 5)
         enc.dispatchThreads(MTLSize(width: (depth.width + 1) / 2, height: (depth.height + 1) / 2, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     }
 
     /// Lit mode's frame (METALMC_EXP=lit,gi; RtShadows.trace, once its instance structure is built, after the level is
-    /// drawn): the light from the relight's, then request, schedule, update and resolve, in one encoder, into `out` and
-    /// `code` (half the depth buffer's size rounded up). The instance structure must cover every direction (RtShadows'
-    /// tiles are the LOD's selection, not frustum-culled) and, with zero copy, `tiles` must describe its instances.
+    /// drawn), in two encoders: the light from the relight's, then the request with the resolve into `out` (rg32Uint, half
+    /// the depth buffer's size rounded up); then the schedule and the update. `out` is done in the first (it shows the
+    /// cells as the last frame's update left them), so what reads it later in the frame (the relight) waits for that one
+    /// only, and the update can run beside it. The instance structure must cover every direction (RtShadows' tiles are
+    /// the LOD's selection, not frustum-culled) and, with zero copy, `tiles` must describe its instances.
     /// `cloudHeight`: the cloud layer's bottom (world y). Block light isn't in the cells: the relight's stays vanilla's
-    /// flood fill, and it couldn't follow the daylight's scale.
-    func encodeFrame(_ cb: MTLCommandBuffer, depth: MTLTexture, out: MTLTexture, code: MTLTexture, invViewProj: simd_float4x4, cam: SIMD3<Double>,
+    /// flood fill, and it couldn't follow the daylight's scale. Each encoder comes from `pass` (its label: traced frames'
+    /// timestamps, -PbenchTrace=1, and the offline profile's). `fence` (offline profile only): each encoder waits for it
+    /// and updates it, so none overlaps another and each one's time is its own.
+    func encodeFrame(_ cb: MTLCommandBuffer, depth: MTLTexture, out: MTLTexture, invViewProj: simd_float4x4, cam: SIMD3<Double>,
                      origin: SIMD3<Double>, accel: MTLAccelerationStructure, accels: [MTLAccelerationStructure], sunDir: SIMD3<Float>,
-                     sunUp: Float, cloudHeight: Float, light: GiLightSource) -> Bool {
+                     sunUp: Float, cloudHeight: Float, light: GiLightSource, fence: MTLFence? = nil,
+                     pass: (String) -> MTLComputePassDescriptor = profComputePass) -> Bool {
         if zeroCopy && tiles == nil { return false }
         var p = params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: depth.width, height: depth.height)
         p.blockLight = SIMD4(0, 0, 0, evictFrames)
         p.rays.w = cloudHeight - Float(cam.y)
-        // Traced frames (-PbenchTrace=1) split the stages into encoders of their own, so the profile times each one (every
-        // stage binds what it uses, so they don't need the same encoder).
-        let split = ctx.traceFrames > 0
-        guard var enc = cb.makeComputeCommandEncoder(descriptor: profComputePass(split ? "GI cache: light, begin, request" : "GI cache")) else { return false }
-        enc.label = "MetalMC GI cache"
-        encodeLight(enc, light)
-        encodeBegin(enc, params: &p)
-        encodeRequest(enc, depth: depth, params: &p)
-        if split {
-            enc.endEncoding()
-            guard let e = cb.makeComputeCommandEncoder(descriptor: profComputePass("GI cache: schedule, update (rays)")) else { return false }
-            enc = e
+        func begin(_ label: String) -> MTLComputeCommandEncoder? {
+            let e = cb.makeComputeCommandEncoder(descriptor: pass(label))
+            e?.label = "MetalMC " + label
+            if let fence { e?.waitForFence(fence) }
+            return e
         }
-        encodeSchedule(enc, params: &p)
-        encodeUpdate(enc, accel: accel, accels: accels, params: &p)
-        if split {
-            enc.endEncoding()
-            guard let e = cb.makeComputeCommandEncoder(descriptor: profComputePass("GI cache: resolve (half resolution)")) else { return false }
-            enc = e
+        func end(_ e: MTLComputeCommandEncoder) {
+            if let fence { e.updateFence(fence) }
+            e.endEncoding()
         }
-        encodeResolve(enc, depth: depth, out: out, code: code, params: &p)
-        enc.endEncoding()
+        // (Every stage binds what it uses, so they don't need the same encoder.)
+        guard let first = begin("GI cache: light, begin, request and resolve") else { return false }
+        encodeLight(first, light)
+        encodeBegin(first, params: &p)
+        encodeRequest(first, depth: depth, out: out, params: &p)
+        end(first)
+        guard let second = begin("GI cache: schedule, update (rays)") else { return false }
+        encodeSchedule(second, params: &p)
+        encodeUpdate(second, accel: accel, accels: accels, params: &p)
+        end(second)
         advance()
         return true
+    }
+
+    /// Offline test: recompiles the kernels from `body` (the upsample header and kernels, as mmc_debug_gi_shader_source
+    /// gives them; nil: the built-in ones) and swaps the pipelines, keeping the table.
+    func debugReload(_ body: String?) -> Bool {
+        let src = "#define GI_ZERO_COPY \(zeroCopy ? 1 : 0)\n" + skyShaderHeader + (body ?? (giUpsampleHeader + "\n" + giKernelSource))
+        do {
+            let lib = try ctx.device.makeLibrary(source: src, options: nil)
+            var next: [String: MTLComputePipelineState] = [:]
+            for name in pipes.keys {
+                guard let f = lib.makeFunction(name: name) else { log("gi: reload: no function \(name)"); return false }
+                next[name] = try ctx.device.makeComputePipelineState(function: f)
+            }
+            pipes = next
+            return true
+        } catch {
+            log("gi: reload failed: \(error)")
+            return false
+        }
+    }
+
+    /// Offline test: the CPU's part of the cache's state (frame number, sweep), to save and restore with the table.
+    func debugState() -> [Int64] { [Int64(frame), Int64(sweepPos), Int64(sweepLen), Int64(sweeps)] }
+    func debugRestore(_ s: [Int64]) {
+        guard s.count >= 4 else { return }
+        frame = Int32(truncatingIfNeeded: s[0]); sweepPos = Int(s[1]); sweepLen = Int(s[2]); sweeps = Int(s[3])
     }
 
     /// Offline test: lit mode's light from litDaylightEnv at `sunAngle` (vanilla's, radians) into `light`, as encodeFrame
@@ -1797,12 +2045,184 @@ public func mmc_debug_gi_set_block(_ x: Int32, _ y: Int32, _ z: Int32, _ materia
     return 1
 }
 
+/// The offline test's view: a fixed camera (Minecraft's yaw and pitch in degrees: yaw 0 looks south (+z), 90 west (-x);
+/// positive pitch looks down), a 70 degree vertical field of view and a reverse-Z infinite projection like the game's
+/// (depth 1 at the near plane, 0 at infinity), and the sun at vanilla's angle `sunDeg` (0 noon, -60 mid-morning in the
+/// east).
+private struct GiTestView {
+    let w: Int, h: Int
+    let fwd: SIMD3<Float>
+    let viewProj: simd_float4x4, invViewProj: simd_float4x4
+    let sunA: Float, sunDir: SIMD3<Float>, sunUp: Float
+    let cam: SIMD3<Double>, origin: SIMD3<Double>
+
+    init(_ s: GiTestScene, _ camX: Double, _ camY: Double, _ camZ: Double, _ yawDeg: Float, _ pitchDeg: Float, _ width: Int32, _ height: Int32,
+         _ sunDeg: Float) {
+        w = Int(width); h = Int(height)
+        // View space looks down -z.
+        let yaw = yawDeg * .pi / 180, pitch = pitchDeg * .pi / 180
+        fwd = simd_normalize(SIMD3<Float>(-sin(yaw) * cos(pitch), -sin(pitch), cos(yaw) * cos(pitch)))
+        let right = simd_normalize(simd_cross(fwd, SIMD3<Float>(0, 1, 0)))
+        let up = simd_cross(right, fwd)
+        let view = simd_float4x4(rows: [SIMD4(right, 0), SIMD4(up, 0), SIMD4(-fwd, 0), SIMD4(0, 0, 0, 1)])
+        let f = 1 / tan(Float(35) * .pi / 180), aspect = Float(w) / Float(h), near: Float = 0.05
+        let proj = simd_float4x4(columns: (SIMD4(f / aspect, 0, 0, 0), SIMD4(0, f, 0, 0), SIMD4(0, 0, 0, -1), SIMD4(0, 0, near, 0)))
+        viewProj = proj * view
+        invViewProj = viewProj.inverse
+        sunA = sunDeg * .pi / 180
+        sunDir = SIMD3<Float>(-sin(sunA), cos(sunA), 0)
+        sunUp = sunDir.y > 0.1 ? 1 : max(0, sunDir.y * 10)
+        cam = SIMD3(camX, camY, camZ)
+        origin = SIMD3(Double(s.origin.x), Double(s.origin.y), Double(s.origin.z))
+    }
+
+    func params(_ cache: GiCache) -> GiParams {
+        cache.params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: w, height: h)
+    }
+}
+
+/// The offline test's targets at one size: what the game's depth buffer and shadow pass would give (depth; each pixel's
+/// primitive data, standing in for lit mode's G-buffer; the sun's visibility), the resolve's output, the debug view's,
+/// gi_test_upsample's and gi_test_taa's, and gi_test_shadow's (a quarter of the size each way).
+private final class GiTestTargets {
+    let w: Int, h: Int, hw: Int, hh: Int
+    let depthBuf: MTLBuffer
+    let depth: MTLTexture, prim: MTLTexture, sunVis: MTLTexture, gi: MTLTexture, viewF: MTLTexture, lum: MTLTexture, shadow: MTLTexture
+
+    init?(_ w: Int, _ h: Int) {
+        let dev = ctx.device
+        self.w = w; self.h = h; hw = (w + 1) / 2; hh = (h + 1) / 2
+        func tex(_ format: MTLPixelFormat, _ usage: MTLTextureUsage, half: Bool = false) -> MTLTexture? {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: half ? (w + 1) / 2 : w, height: half ? (h + 1) / 2 : h,
+                                                             mipmapped: false)
+            d.usage = usage
+            d.storageMode = .private
+            return dev.makeTexture(descriptor: d)
+        }
+        guard let db = dev.makeBuffer(length: w * h * 4, options: .storageModePrivate),
+              let dt = tex(.depth32Float, [.shaderRead]), let pr = tex(.r32Uint, [.shaderRead, .shaderWrite]),
+              let sv = tex(.r8Unorm, [.shaderRead, .shaderWrite]), let g = tex(.rg32Uint, [.shaderRead, .shaderWrite], half: true),
+              let vf = tex(.rgba32Float, [.shaderWrite]), let lu = tex(.r16Float, [.shaderWrite]) else { return nil }
+        let sd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: (w + 3) / 4, height: (h + 3) / 4, mipmapped: false)
+        sd.usage = [.shaderWrite]
+        sd.storageMode = .private
+        guard let sh = dev.makeTexture(descriptor: sd) else { return nil }
+        depthBuf = db; depth = dt; prim = pr; sunVis = sv; gi = g; viewF = vf; lum = lu; shadow = sh
+    }
+}
+
+/// The test's G-buffer for view `v` (primary rays, gi_test_primary) into `t`. Blocks until done; returns its GPU ms.
+@discardableResult
+private func giTestPrimary(_ s: GiTestScene, _ cache: GiCache, _ v: GiTestView, _ t: GiTestTargets, _ p: inout GiParams) -> Double {
+    guard let tlas = s.tlas, let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return -1 }
+    var viewProj = v.viewProj
+    enc.setComputePipelineState(cache.pipe("gi_test_primary"))
+    enc.setAccelerationStructure(tlas, bufferIndex: 0)
+    enc.useResources(s.blas, usage: .read)
+    cache.bindRays(enc)
+    enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
+    enc.setBytes(&viewProj, length: 64, index: 11)
+    enc.setBuffer(t.depthBuf, offset: 0, index: 12)
+    enc.setTexture(t.prim, index: 2)
+    enc.setTexture(t.sunVis, index: 3)
+    enc.dispatchThreads(MTLSize(width: t.w, height: t.h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+    enc.endEncoding()
+    guard let b = cb.makeBlitCommandEncoder() else { return -1 }
+    b.copy(from: t.depthBuf, sourceOffset: 0, sourceBytesPerRow: t.w * 4, sourceBytesPerImage: t.w * t.h * 4,
+           sourceSize: MTLSize(width: t.w, height: t.h, depth: 1), to: t.depth, destinationSlice: 0, destinationLevel: 0,
+           destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+    b.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+    return (cb.gpuEndTime - cb.gpuStartTime) * 1000
+}
+
+/// The test's light for view `v`: the prototype's, or lit mode's daylight curve at its sun angle (mmc_debug_gi_lit_light)
+/// as gi_light makes it in the game.
+private func giTestLight(_ s: GiTestScene, _ cache: GiCache, _ v: GiTestView) {
+    if s.litLight { cache.debugDaylightLight(sunAngle: v.sunA) } else { cache.setLight(giPrototypeLight(sunUp: v.sunUp)) }
+}
+
+/// A lighting pass's use of the cache (gi_test_upsample) into `t.lum`, in `enc`. variant (limits.z): 0 as the pass
+/// would, 99 its reads and write without the cache (the baseline), 97 without the cells' own lookups, 98 counting pixels.
+private func giTestUpsample(_ enc: MTLComputeCommandEncoder, _ cache: GiCache, _ t: GiTestTargets, _ p: GiParams, variant: Float) {
+    var q = p
+    q.limits.z = variant
+    enc.setComputePipelineState(cache.pipe("gi_test_upsample"))
+    enc.setBytes(&q, length: MemoryLayout<GiParams>.stride, index: 1)
+    enc.setBuffer(cache.check, offset: 0, index: 2)
+    enc.setBuffer(cache.value, offset: 0, index: 5)
+    enc.setBuffer(cache.counters, offset: 0, index: 8)
+    enc.setTexture(t.depth, index: 0)
+    enc.setTexture(t.gi, index: 1)
+    enc.setTexture(t.prim, index: 2)
+    enc.setTexture(t.lum, index: 4)
+    enc.dispatchThreads(MTLSize(width: t.w, height: t.h, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+}
+
+/// Debug view `mode` (gi_debug_view) of the resolve's output in `t` at `exposure`, into `rgba` (8-bit, top row first,
+/// box-filtered by `scale` each way) and, if given, `floats` (the view's float RGBA, width x height x 4, top row first).
+/// Returns the view's GPU ms.
+@discardableResult
+private func giTestDebugView(_ cache: GiCache, _ t: GiTestTargets, _ p: GiParams, mode: Int32, exposure: Float, scale: Int,
+                             rgba: UnsafeMutablePointer<UInt8>?, floats: UnsafeMutablePointer<Float>?) -> Double {
+    var q = p
+    q.limits.z = Float(mode)
+    q.look.x = exposure
+    let w = t.w, h = t.h
+    guard let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return -1 }
+    enc.setComputePipelineState(cache.pipe("gi_debug_view"))
+    enc.setBytes(&q, length: MemoryLayout<GiParams>.stride, index: 1)
+    enc.setBuffer(cache.check, offset: 0, index: 2)
+    enc.setBuffer(cache.value, offset: 0, index: 5)
+    enc.setBuffer(cache.meta, offset: 0, index: 6)
+    enc.setBuffer(cache.mats, offset: 0, index: 9)
+    enc.setBuffer(cache.light, offset: 0, index: 15)
+    cache.bindRays(enc)
+    enc.setTexture(t.depth, index: 0)
+    enc.setTexture(t.gi, index: 1)
+    enc.setTexture(t.prim, index: 2)
+    enc.setTexture(t.sunVis, index: 3)
+    enc.setTexture(t.viewF, index: 4)
+    enc.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+    let ms = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+    guard let rcb = ctx.queue.makeCommandBuffer(), let rb = rcb.makeBlitCommandEncoder(),
+          let fbuf = ctx.device.makeBuffer(length: w * h * 16, options: .storageModeShared) else { return -1 }
+    rb.copy(from: t.viewF, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: w, height: h, depth: 1),
+            to: fbuf, destinationOffset: 0, destinationBytesPerRow: w * 16, destinationBytesPerImage: w * h * 16)
+    rb.endEncoding()
+    rcb.commit()
+    rcb.waitUntilCompleted()
+    // Texture row 0 is the bottom of the image (the game's convention): flipped.
+    let px = fbuf.contents().bindMemory(to: Float.self, capacity: w * h * 4)
+    if let floats {
+        for y in 0..<h { (floats + y * w * 4).update(from: px + (h - 1 - y) * w * 4, count: w * 4) }
+    }
+    if let rgba {
+        let k = max(1, scale), ow = w / k, oh = h / k
+        for y in 0..<oh {
+            for x in 0..<ow {
+                for ch in 0..<4 {
+                    var acc: Float = 0
+                    for dy in 0..<k { for dx in 0..<k { acc += max(0, min(1, px[((h - 1 - (y * k + dy)) * w + x * k + dx) * 4 + ch])) } }
+                    rgba[(y * ow + x) * 4 + ch] = UInt8(acc / Float(k * k) * 255 + 0.5)
+                }
+            }
+        }
+    }
+    return ms
+}
+
 /// Debug: runs the cache for `frames` frames from a fixed camera (Minecraft yaw and pitch in degrees, 70 degree
 /// vertical field of view) at width x height, then draws debug view `mode` (gi_debug_view) at `exposure` into `rgba`
 /// (width x height x 4 bytes, top row first). The sun is vanilla's at `sunDeg` (0 noon, -60 mid-morning in the east). The
 /// cache persists between calls (mmc_debug_gi_reset clears it).
-/// stats: 0-4 mean GPU ms per frame of the primary rays (test only), request, schedule, update, resolve over the frames
-/// after the first quarter; 5-8 their maxima (request, schedule, update, resolve); 9 live cells; 10 converged cells;
+/// stats: 0-4 mean GPU ms per frame of the primary rays (test only), request (with the resolve, as a frame runs it),
+/// schedule, update, the resolve alone (after the update, for the views) over the frames after the first quarter; 5-8
+/// their maxima (request, schedule, update, resolve); 9 live cells; 10 converged cells;
 /// 11 cells created by the screen (cumulative); 12 bucket-full inserts; 13 evictions; 14 surfaces not found; 15 rays traced in the
 /// last frame; 16 cells updated in the last frame; 17 bounce hits from the cache, 18 without (cumulative);
 /// 19 mean relative change of the resolved irradiance between the last two frames (flicker); 20 resolve samples with
@@ -1816,37 +2236,11 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
                              _ frames: Int32, _ sunDeg: Float, _ mode: Int32, _ exposure: Float, _ rgba: UnsafeMutablePointer<UInt8>,
                              _ stats: UnsafeMutablePointer<Double>) -> Int32 {
     guard let s = giTest, let cache = s.cache, let tlas = s.tlas else { return 0 }
-    let dev = ctx.device, queue = ctx.queue
-    let w = Int(width), h = Int(height)
-    // Camera: Minecraft's yaw 0 looks south (+z), 90 west (-x); positive pitch looks down. View space looks down -z.
-    let yaw = yawDeg * .pi / 180, pitch = pitchDeg * .pi / 180
-    let fwd = simd_normalize(SIMD3<Float>(-sin(yaw) * cos(pitch), -sin(pitch), cos(yaw) * cos(pitch)))
-    let right = simd_normalize(simd_cross(fwd, SIMD3<Float>(0, 1, 0)))
-    let up = simd_cross(right, fwd)
-    let view = simd_float4x4(rows: [SIMD4(right, 0), SIMD4(up, 0), SIMD4(-fwd, 0), SIMD4(0, 0, 0, 1)])
-    // Reverse-Z infinite projection like the game's (depth 1 at the near plane, 0 at infinity).
-    let f = 1 / tan(Float(35) * .pi / 180), aspect = Float(w) / Float(h), near: Float = 0.05
-    let proj = simd_float4x4(columns: (SIMD4(f / aspect, 0, 0, 0), SIMD4(0, f, 0, 0), SIMD4(0, 0, 0, -1), SIMD4(0, 0, near, 0)))
-    var viewProj = proj * view
-    let invViewProj = viewProj.inverse
-    let sunA = sunDeg * .pi / 180
-    let sunDir = SIMD3<Float>(-sin(sunA), cos(sunA), 0)
-    let sunUp: Float = sunDir.y > 0.1 ? 1 : max(0, sunDir.y * 10)
-    let cam = SIMD3<Double>(camX, camY, camZ), origin = SIMD3<Double>(Double(s.origin.x), Double(s.origin.y), Double(s.origin.z))
-    let hw = (w + 1) / 2, hh = (h + 1) / 2
-    func tex(_ format: MTLPixelFormat, _ usage: MTLTextureUsage, half: Bool = false) -> MTLTexture? {
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: half ? hw : w, height: half ? hh : h, mipmapped: false)
-        d.usage = usage
-        d.storageMode = .private
-        return dev.makeTexture(descriptor: d)
-    }
-    guard let depthBuf = dev.makeBuffer(length: w * h * 4, options: .storageModePrivate),
-          let depth = tex(.depth32Float, [.shaderRead]), let prim = tex(.r32Uint, [.shaderRead, .shaderWrite]),
-          let sunVis = tex(.r8Unorm, [.shaderRead, .shaderWrite]), let irr = tex(.rg11b10Float, [.shaderRead, .shaderWrite], half: true),
-          let irrCode = tex(.r32Uint, [.shaderRead, .shaderWrite], half: true),
-          let viewF = tex(.rgba32Float, [.shaderWrite]),
-          let readback = dev.makeBuffer(length: hw * hh * 8, options: .storageModeShared) else { return 0 }
-    func resolve(_ enc: MTLComputeCommandEncoder, _ p: inout GiParams) { cache.encodeResolve(enc, depth: depth, out: irr, code: irrCode, params: &p) }
+    let queue = ctx.queue
+    let v = GiTestView(s, camX, camY, camZ, yawDeg, pitchDeg, width, height, sunDeg)
+    guard let t = GiTestTargets(v.w, v.h), let readback = ctx.device.makeBuffer(length: t.hw * t.hh * 8, options: .storageModeShared) else { return 0 }
+    let hw = t.hw, hh = t.hh
+    func resolve(_ enc: MTLComputeCommandEncoder, _ p: inout GiParams) { cache.encodeResolve(enc, depth: t.depth, out: t.gi, params: &p) }
     // METALMC_GIREPEAT=<n>: the request, update and resolve run n times in their command buffers (times are per run),
     // after a warm-up, so the GPU's clock has ramped up as it would in a busy frame; one run each leaves it idling
     // between tiny command buffers. Repeated requests find their cells listed already (cheaper than the first) and
@@ -1860,29 +2254,10 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
         cb.waitUntilCompleted()
         times[i].append((cb.gpuEndTime - cb.gpuStartTime) * 1000 / Double(runs))
     }
-    // The light: the prototype's, or lit mode's daylight curve at this sun angle (mmc_debug_gi_lit_light) as gi_light
-    // makes it in the game.
-    if s.litLight { cache.debugDaylightLight(sunAngle: sunA) } else { cache.setLight(giPrototypeLight(sunUp: sunUp)) }
-    var p = cache.params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: w, height: h)
+    giTestLight(s, cache, v)
+    var p = v.params(cache)
     // The G-buffer (what the game's depth buffer and shadow pass would provide), once: the camera doesn't move.
-    timed(0) { cb in
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(cache.pipe("gi_test_primary"))
-        enc.setAccelerationStructure(tlas, bufferIndex: 0)
-        enc.useResources(s.blas, usage: .read)
-        cache.bindRays(enc)
-        enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
-        enc.setBytes(&viewProj, length: 64, index: 11)
-        enc.setBuffer(depthBuf, offset: 0, index: 12)
-        enc.setTexture(prim, index: 2)
-        enc.setTexture(sunVis, index: 3)
-        enc.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-        enc.endEncoding()
-        guard let b = cb.makeBlitCommandEncoder() else { return }
-        b.copy(from: depthBuf, sourceOffset: 0, sourceBytesPerRow: w * 4, sourceBytesPerImage: w * h * 4, sourceSize: MTLSize(width: w, height: h, depth: 1),
-               to: depth, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-        b.endEncoding()
-    }
+    times[0].append(giTestPrimary(s, cache, v, t, &p))
     if repeats > 1, let cb = queue.makeCommandBuffer() {
         for _ in 0..<60 { if let enc = cb.makeComputeCommandEncoder() { resolve(enc, &p); enc.endEncoding() } }
         cb.commit()
@@ -1892,14 +2267,14 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
     var lastRays = 0.0, lastUpdated = 0.0
     let n = max(1, Int(frames))
     for fr in 0..<n {
-        p = cache.params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: w, height: h)
+        p = v.params(cache)
         let rays0 = cache.counters.contents().load(fromByteOffset: 44, as: UInt32.self)
         if let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() {
             cache.encodeBegin(enc, params: &p)
             enc.endEncoding()
             cb.commit()
         }
-        timed(1, repeats) { cb in if let enc = cb.makeComputeCommandEncoder() { cache.encodeRequest(enc, depth: depth, params: &p); enc.endEncoding() } }
+        timed(1, repeats) { cb in if let enc = cb.makeComputeCommandEncoder() { cache.encodeRequest(enc, depth: t.depth, out: t.gi, params: &p); enc.endEncoding() } }
         timed(2) { cb in if let enc = cb.makeComputeCommandEncoder() { cache.encodeSchedule(enc, params: &p); enc.endEncoding() } }
         timed(3, repeats) { cb in if let enc = cb.makeComputeCommandEncoder() { cache.encodeUpdate(enc, accel: tlas, accels: s.blas, params: &p); enc.endEncoding() } }
         timed(4, repeats) { cb in if let enc = cb.makeComputeCommandEncoder() { resolve(enc, &p); enc.endEncoding() } }
@@ -1910,18 +2285,16 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
         if fr >= n - 2 {
             // The resolved irradiance of the last two frames, for the flicker measure.
             guard let cb = queue.makeCommandBuffer(), let b = cb.makeBlitCommandEncoder() else { return 0 }
-            b.copy(from: irr, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: hw, height: hh, depth: 1),
-                   to: readback, destinationOffset: 0, destinationBytesPerRow: hw * 4, destinationBytesPerImage: hw * hh * 4)
-            b.copy(from: irrCode, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: hw, height: hh, depth: 1),
-                   to: readback, destinationOffset: hw * hh * 4, destinationBytesPerRow: hw * 4, destinationBytesPerImage: hw * hh * 4)
+            b.copy(from: t.gi, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: hw, height: hh, depth: 1),
+                   to: readback, destinationOffset: 0, destinationBytesPerRow: hw * 8, destinationBytesPerImage: hw * hh * 8)
             b.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()
             // rgb and 1 (data) or 0 per sample.
             let words = readback.contents().bindMemory(to: UInt32.self, capacity: hw * hh * 2)
             var cur = [Float](repeating: 0, count: hw * hh * 4)
-            for i in 0..<(hw * hh) where words[hw * hh + i] & (1 << 19) != 0 {
-                let v = words[i]
+            for i in 0..<(hw * hh) where words[2 * i + 1] & (1 << 19) != 0 {
+                let v = words[2 * i]
                 cur[4 * i] = giUnpackSmallFloat(v & 0x7FF, mantissaBits: 6)
                 cur[4 * i + 1] = giUnpackSmallFloat((v >> 11) & 0x7FF, mantissaBits: 6)
                 cur[4 * i + 2] = giUnpackSmallFloat(v >> 22, mantissaBits: 5)
@@ -1932,65 +2305,29 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
     }
     // The lighting pass's share (gi_test_upsample), timed like the stages, less the same kernel without the cache (the
     // reads and write a deferred pass does anyway).
-    if let lum = tex(.r16Float, [.shaderWrite]) {
-        var ms = [0.0, 0.0, 0.0]
-        for (i, variant) in [Float(0), 99, 97].enumerated() {
-            var q = p
-            q.limits.z = variant
-            timed(0, repeats) { cb in
-                guard let enc = cb.makeComputeCommandEncoder() else { return }
-                enc.setComputePipelineState(cache.pipe("gi_test_upsample"))
-                enc.setBytes(&q, length: MemoryLayout<GiParams>.stride, index: 1)
-                enc.setBuffer(cache.check, offset: 0, index: 2)
-                enc.setBuffer(cache.value, offset: 0, index: 5)
-                enc.setBuffer(cache.counters, offset: 0, index: 8)
-                enc.setTexture(depth, index: 0)
-                enc.setTexture(irr, index: 1)
-                enc.setTexture(prim, index: 2)
-                enc.setTexture(lum, index: 4)
-                enc.setTexture(irrCode, index: 5)
-                enc.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
-                enc.endEncoding()
-            }
-            ms[i] = times[0].last ?? 0
-        }
-        stats[24] = ms[0]; stats[25] = ms[0] - ms[1]; stats[29] = ms[2] - ms[1]
-        // Once more, counting which way the pixels went.
-        var q = p
-        q.limits.z = 98
-        let counts = cache.counters.contents().bindMemory(to: UInt32.self, capacity: 32)
-        counts[20] = 0; counts[21] = 0; counts[22] = 0
-        if let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() {
-            enc.setComputePipelineState(cache.pipe("gi_test_upsample"))
-            enc.setBytes(&q, length: MemoryLayout<GiParams>.stride, index: 1)
-            enc.setBuffer(cache.check, offset: 0, index: 2)
-            enc.setBuffer(cache.value, offset: 0, index: 5)
-            enc.setBuffer(cache.counters, offset: 0, index: 8)
-            enc.setTexture(depth, index: 0)
-            enc.setTexture(irr, index: 1)
-            enc.setTexture(prim, index: 2)
-            enc.setTexture(lum, index: 4)
-            enc.setTexture(irrCode, index: 5)
-            enc.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+    var ms = [0.0, 0.0, 0.0]
+    for (i, variant) in [Float(0), 99, 97].enumerated() {
+        timed(0, repeats) { cb in
+            guard let enc = cb.makeComputeCommandEncoder() else { return }
+            giTestUpsample(enc, cache, t, p, variant: variant)
             enc.endEncoding()
-            cb.commit()
-            cb.waitUntilCompleted()
         }
-        stats[26] = Double(counts[20]); stats[27] = Double(counts[21]); stats[28] = Double(counts[22])
+        ms[i] = times[0].last ?? 0
     }
+    stats[24] = ms[0]; stats[25] = ms[0] - ms[1]; stats[29] = ms[2] - ms[1]
+    // Once more, counting which way the pixels went.
+    let counts = cache.counters.contents().bindMemory(to: UInt32.self, capacity: 32)
+    counts[20] = 0; counts[21] = 0; counts[22] = 0
+    if let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() {
+        giTestUpsample(enc, cache, t, p, variant: 98)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+    stats[26] = Double(counts[20]); stats[27] = Double(counts[21]); stats[28] = Double(counts[22])
     // Statistics, the flicker measure, then the debug view.
-    guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return 0 }
+    giTestCount(cache, &p)
     let c = cache.counters.contents().bindMemory(to: UInt32.self, capacity: 16)
-    c[6] = 0; c[7] = 0
-    enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
-    enc.setBuffer(cache.check, offset: 0, index: 2)
-    enc.setBuffer(cache.meta, offset: 0, index: 6)
-    enc.setBuffer(cache.counters, offset: 0, index: 8)
-    enc.setComputePipelineState(cache.pipe("gi_count"))
-    enc.dispatchThreads(MTLSize(width: cache.slots, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
-    enc.endEncoding()
-    cb.commit()
-    cb.waitUntilCompleted()
     let skip = max(1, n / 4)
     func mean(_ a: [Double], _ from: Int) -> Double { let t = a.count > from ? Array(a[from...]) : a; return t.isEmpty ? 0 : t.reduce(0, +) / Double(t.count) }
     stats[0] = times[0].first ?? 0   // the primary rays (times[0] also holds the upsample's, stats[24])
@@ -2009,43 +2346,326 @@ public func mmc_debug_gi_run(_ camX: Double, _ camY: Double, _ camZ: Double, _ y
     // The resolve writes w = 0 for the sky and for no data alike, so this is over all (half-resolution) samples.
     stats[20] = Double(withData) / Double(hw * hh)
     stats[22] = Double(c[14]); stats[23] = Double(c[15])
-    // The debug view.
-    p.limits.z = Float(mode)
-    p.look.x = exposure
-    guard let vcb = queue.makeCommandBuffer(), let venc = vcb.makeComputeCommandEncoder() else { return 0 }
-    venc.setComputePipelineState(cache.pipe("gi_debug_view"))
-    venc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
-    venc.setBuffer(cache.check, offset: 0, index: 2)
-    venc.setBuffer(cache.value, offset: 0, index: 5)
-    venc.setBuffer(cache.meta, offset: 0, index: 6)
-    venc.setBuffer(cache.mats, offset: 0, index: 9)
-    venc.setBuffer(cache.light, offset: 0, index: 15)
-    cache.bindRays(venc)
-    venc.setTexture(depth, index: 0)
-    venc.setTexture(irr, index: 1)
-    venc.setTexture(prim, index: 2)
-    venc.setTexture(sunVis, index: 3)
-    venc.setTexture(viewF, index: 4)
-    venc.setTexture(irrCode, index: 5)
-    venc.dispatchThreads(MTLSize(width: w, height: h, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
-    venc.endEncoding()
-    vcb.commit()
-    vcb.waitUntilCompleted()
-    stats[21] = (vcb.gpuEndTime - vcb.gpuStartTime) * 1000
-    // Float view into bytes, flipping rows: texture row 0 is the bottom of the image (the game's convention).
-    guard let rcb = queue.makeCommandBuffer(), let rb = rcb.makeBlitCommandEncoder(),
-          let fbuf = dev.makeBuffer(length: w * h * 16, options: .storageModeShared) else { return 0 }
-    rb.copy(from: viewF, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: w, height: h, depth: 1),
-            to: fbuf, destinationOffset: 0, destinationBytesPerRow: w * 16, destinationBytesPerImage: w * h * 16)
-    rb.endEncoding()
-    rcb.commit()
-    rcb.waitUntilCompleted()
-    let px = fbuf.contents().bindMemory(to: Float.self, capacity: w * h * 4)
-    for y in 0..<h {
-        let src = (h - 1 - y) * w * 4, dst = y * w * 4
-        for i in 0..<(w * 4) { rgba[dst + i] = UInt8(max(0, min(255, px[src + i] * 255 + 0.5))) }
-    }
+    stats[21] = giTestDebugView(cache, t, p, mode: mode, exposure: exposure, scale: 1, rgba: rgba, floats: nil)
     return 1
+}
+
+/// Live and converged cells into counters 6 and 7 (gi_count). Blocks until done.
+private func giTestCount(_ cache: GiCache, _ p: inout GiParams) {
+    guard let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return }
+    let c = cache.counters.contents().bindMemory(to: UInt32.self, capacity: 16)
+    c[6] = 0; c[7] = 0
+    enc.setBytes(&p, length: MemoryLayout<GiParams>.stride, index: 1)
+    enc.setBuffer(cache.check, offset: 0, index: 2)
+    enc.setBuffer(cache.meta, offset: 0, index: 6)
+    enc.setBuffer(cache.counters, offset: 0, index: 8)
+    enc.setComputePipelineState(cache.pipe("gi_count"))
+    enc.dispatchThreads(MTLSize(width: cache.slots, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+}
+
+/// Debug: GPU times of the cache's frame as the game runs it: encodeFrame with lit mode's light (its daylight curve, as
+/// gi_light makes it without the sky), with the game profile's per-encoder timestamps, over `frames` frames. Each frame starts with a blit writing `flushMB` MB, standing in for the rest of a
+/// frame's traffic (the cache's reads start cold, as in the game), and ends with the anti-aliasing resolve's load loop
+/// as lit mode runs it (gi_test_taa: its share of the cache's light, the upsample). Frames are committed one at a time,
+/// each once the last is done, so no two frames' encoders overlap (they would: nothing orders one frame's last
+/// encoders before the next one's first). The camera and light are fixed: the first frames converge the cells as
+/// mmc_debug_gi_run's do.
+/// mode: bit 0 first the shadow rays the game traces just before the cache (gi_test_shadow: they warm the depth buffer
+/// and the structures); bit 1 every encoder waits for the one before (a fence: each time is its own; without it,
+/// independent encoders overlap as they do in a frame); bit 2 every other frame without the cache (and the load loop
+/// without its share): the frame's time with the cache less without it is what the cache costs the frame. `fly`: blocks
+/// the camera moves along its view each frame (the game's benchmark is a flight: cells keep coming into view and
+/// changing level), its depth buffer drawn again each frame.
+/// out: per encoder label, in the order they first appear (up to 12), the median GPU ms over the timed frames (after the
+/// first quarter) that have it and the fastest (out[2i], out[2i + 1]); 24-25 the cache's encoders together, the first's
+/// start to the last's end; 26-27 the frame with the cache, 28-29 without it (bit 2); 30 rays a frame (mean over the timed
+/// frames with the cache); 31 cells updated in the last frame; 32 live cells. `labels` gets the labels, separated by '|'.
+/// Returns the number of labels, 0 if it didn't run.
+@_cdecl("mmc_debug_gi_profile")
+public func mmc_debug_gi_profile(_ camX: Double, _ camY: Double, _ camZ: Double, _ yawDeg: Float, _ pitchDeg: Float, _ width: Int32, _ height: Int32,
+                                 _ frames: Int32, _ sunDeg: Float, _ flushMB: Int32, _ mode: Int32, _ fly: Float, _ out: UnsafeMutablePointer<Double>,
+                                 _ labels: UnsafeMutablePointer<CChar>, _ labelsLen: Int32) -> Int32 {
+    guard let s = giTest, let cache = s.cache, let tlas = s.tlas else { return 0 }
+    let dev = ctx.device, queue = ctx.queue
+    var v = GiTestView(s, camX, camY, camZ, yawDeg, pitchDeg, width, height, sunDeg)
+    guard let t = GiTestTargets(v.w, v.h) else { return 0 }
+    // (params moves the sweep's length along: put it back, so only encodeFrame's own calls do.)
+    let state = cache.debugState()
+    var p = v.params(cache)
+    cache.debugRestore(state)
+    giTestPrimary(s, cache, v, t, &p)
+    let shadowFirst = mode & 1 != 0, serial = mode & 2 != 0, ab = mode & 4 != 0
+    guard dev.supportsCounterSampling(.atStageBoundary),
+          let set = dev.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else { return 0 }
+    let sd = MTLCounterSampleBufferDescriptor()
+    sd.counterSet = set
+    sd.storageMode = .shared
+    sd.sampleCount = 32
+    guard let samples = try? dev.makeCounterSampleBuffer(descriptor: sd) else { return 0 }
+    let fence = serial ? dev.makeFence() : nil
+    let flushBytes = Int(max(0, flushMB)) << 20
+    let flush = flushBytes > 0 ? dev.makeBuffer(length: flushBytes, options: .storageModePrivate) : nil
+    let daylight = litDaylightEnv(sunAngle: v.sunA)
+    let n = max(4, Int(frames)), skip = n / 4
+    var names: [String] = [], times: [String: [Double]] = [:]
+    var cacheTotal: [Double] = [], frameWith: [Double] = [], frameWithout: [Double] = []
+    var rays = 0.0, raysFrames = 0
+    for f in 0..<n {
+        let withGi = !ab || f % 2 == 0
+        if fly != 0 && f > 0 {
+            let c = SIMD3<Double>(camX, camY, camZ) + SIMD3<Double>(v.fwd) * Double(fly * Float(f))
+            v = GiTestView(s, c.x, c.y, c.z, yawDeg, pitchDeg, width, height, sunDeg)
+            let st = cache.debugState()
+            p = v.params(cache)
+            cache.debugRestore(st)
+            giTestPrimary(s, cache, v, t, &p)
+        }
+        guard let cb = queue.makeCommandBuffer() else { return 0 }
+        var encs: [String] = [], cacheEncs: [Int] = []
+        func attach(_ a: MTLComputePassSampleBufferAttachmentDescriptor, _ label: String) {
+            a.sampleBuffer = samples
+            a.startOfEncoderSampleIndex = 2 * encs.count
+            a.endOfEncoderSampleIndex = 2 * encs.count + 1
+            encs.append(label)
+        }
+        func plain(_ label: String) -> MTLComputePassDescriptor {
+            let d = MTLComputePassDescriptor()
+            attach(d.sampleBufferAttachments[0]!, label)
+            return d
+        }
+        func pass(_ label: String) -> MTLComputePassDescriptor {
+            cacheEncs.append(encs.count)
+            return plain(label)
+        }
+        if let flush {
+            let bd = MTLBlitPassDescriptor()
+            let a = bd.sampleBufferAttachments[0]!
+            a.sampleBuffer = samples
+            a.startOfEncoderSampleIndex = 2 * encs.count
+            a.endOfEncoderSampleIndex = 2 * encs.count + 1
+            encs.append("flush")
+            guard let b = cb.makeBlitCommandEncoder(descriptor: bd) else { return 0 }
+            if let fence { b.waitForFence(fence) }
+            b.fill(buffer: flush, range: 0..<flushBytes, value: UInt8(truncatingIfNeeded: f))
+            if let fence { b.updateFence(fence) }
+            b.endEncoding()
+        }
+        if shadowFirst {
+            guard let enc = cb.makeComputeCommandEncoder(descriptor: plain("shadow rays (stand-in)")) else { return 0 }
+            if let fence { enc.waitForFence(fence) }
+            var q = p
+            let pat = giRequestPattern[f % 16]
+            q.sample.y = pat.x; q.sample.z = pat.y
+            enc.setComputePipelineState(cache.pipe("gi_test_shadow"))
+            enc.setAccelerationStructure(tlas, bufferIndex: 0)
+            enc.useResources(s.blas, usage: .read)
+            enc.setBytes(&q, length: MemoryLayout<GiParams>.stride, index: 1)
+            enc.setTexture(t.depth, index: 0)
+            enc.setTexture(t.shadow, index: 3)
+            enc.dispatchThreads(MTLSize(width: t.shadow.width, height: t.shadow.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            if let fence { enc.updateFence(fence) }
+            enc.endEncoding()
+        }
+        if withGi {
+            guard cache.encodeFrame(cb, depth: t.depth, out: t.gi, invViewProj: v.invViewProj, cam: v.cam, origin: v.origin, accel: tlas,
+                                    accels: s.blas, sunDir: v.sunDir, sunUp: v.sunUp, cloudHeight: Float(v.cam.y) + 1e9, light: .daylight(daylight),
+                                    fence: fence, pass: pass) else { return 0 }
+        }
+        guard let enc = cb.makeComputeCommandEncoder(descriptor: plain(withGi ? "anti-aliasing load (proxy)" : "anti-aliasing load (proxy) without the cache")) else { return 0 }
+        if let fence { enc.waitForFence(fence) }
+        var q = p
+        q.limits.z = withGi ? 0 : 99
+        enc.setComputePipelineState(cache.pipe("gi_test_taa"))
+        enc.setBytes(&q, length: MemoryLayout<GiParams>.stride, index: 1)
+        enc.setTexture(t.depth, index: 0)
+        enc.setTexture(t.gi, index: 1)
+        enc.setTexture(t.prim, index: 2)
+        enc.setTexture(t.lum, index: 4)
+        enc.dispatchThreadgroups(MTLSize(width: (t.w + 31) / 32, height: (t.h + 31) / 32, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        if let fence { enc.updateFence(fence) }
+        enc.endEncoding()
+        let rays0 = cache.counters.contents().load(fromByteOffset: 44, as: UInt32.self)
+        cb.commit()
+        cb.waitUntilCompleted()
+        guard f >= skip, let data = try? samples.resolveCounterRange(0..<(2 * encs.count)) else { continue }
+        let ts = data.withUnsafeBytes { Array($0.bindMemory(to: UInt64.self)) }
+        func valid(_ x: UInt64) -> Bool { x != 0 && x != UInt64.max }
+        var first = UInt64.max, last: UInt64 = 0
+        for (i, label) in encs.enumerated() where valid(ts[2 * i]) && valid(ts[2 * i + 1]) && ts[2 * i + 1] >= ts[2 * i] {
+            if !names.contains(label) { names.append(label) }
+            times[label, default: []].append(Double(ts[2 * i + 1] - ts[2 * i]) / 1e6)
+            first = min(first, ts[2 * i]); last = max(last, ts[2 * i + 1])
+        }
+        if last > first {
+            if withGi { frameWith.append(Double(last - first) / 1e6) } else { frameWithout.append(Double(last - first) / 1e6) }
+        }
+        if let a = cacheEncs.first, let b = cacheEncs.last, valid(ts[2 * a]), valid(ts[2 * b + 1]), ts[2 * b + 1] > ts[2 * a] {
+            cacheTotal.append(Double(ts[2 * b + 1] - ts[2 * a]) / 1e6)
+        }
+        if withGi {
+            rays += Double(cache.counters.contents().load(fromByteOffset: 44, as: UInt32.self) &- rays0)
+            raysFrames += 1
+        }
+    }
+    func stat(_ v: [Double]) -> (Double, Double) {
+        let s = v.sorted()
+        return s.isEmpty ? (-1, -1) : (s[s.count / 2], s[0])
+    }
+    for i in 0..<33 { out[i] = -1 }
+    for (i, name) in names.prefix(12).enumerated() { (out[2 * i], out[2 * i + 1]) = stat(times[name] ?? []) }
+    (out[24], out[25]) = stat(cacheTotal)
+    (out[26], out[27]) = stat(frameWith)
+    (out[28], out[29]) = stat(frameWithout)
+    out[30] = raysFrames > 0 ? rays / Double(raysFrames) : 0
+    let c = cache.counters.contents().bindMemory(to: UInt32.self, capacity: 20)
+    out[31] = Double(c[1])
+    giTestCount(cache, &p)
+    out[32] = Double(c[6])
+    let text = Array(names.prefix(12).joined(separator: "|").utf8.prefix(Int(labelsLen) - 1))
+    for (i, b) in text.enumerated() { labels[i] = CChar(bitPattern: b) }
+    labels[text.count] = 0
+    return Int32(min(names.count, 12))
+}
+
+/// Debug: debug view `mode` of the cache as it stands, without running a frame (the resolve on the current cells, then
+/// gi_debug_view): the same table, camera and light give the same picture, so two builds can be compared to the bit on a
+/// table one of them saved (mmc_debug_gi_save, _load). Into `rgba` (8-bit, top row first, box-filtered by `scale` each
+/// way: width / scale x height / scale x 4 bytes) and, if `floats` isn't null, the view's float RGBA (width x height x
+/// 4, top row first). Returns 1 if it worked.
+@_cdecl("mmc_debug_gi_view")
+public func mmc_debug_gi_view(_ camX: Double, _ camY: Double, _ camZ: Double, _ yawDeg: Float, _ pitchDeg: Float, _ width: Int32, _ height: Int32,
+                              _ sunDeg: Float, _ mode: Int32, _ exposure: Float, _ scale: Int32, _ rgba: UnsafeMutablePointer<UInt8>,
+                              _ floats: UnsafeMutablePointer<Float>?) -> Int32 {
+    guard let s = giTest, let cache = s.cache else { return 0 }
+    let v = GiTestView(s, camX, camY, camZ, yawDeg, pitchDeg, width, height, sunDeg)
+    guard let t = GiTestTargets(v.w, v.h) else { return 0 }
+    giTestLight(s, cache, v)
+    // (params moves the sweep's length along: put it back, so a view doesn't change the frames after it.)
+    let state = cache.debugState()
+    var p = v.params(cache)
+    cache.debugRestore(state)
+    giTestPrimary(s, cache, v, t, &p)
+    guard let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return 0 }
+    cache.encodeResolve(enc, depth: t.depth, out: t.gi, params: &p)
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+    giTestDebugView(cache, t, p, mode: mode, exposure: exposure, scale: Int(scale), rgba: rgba, floats: floats)
+    return 1
+}
+
+/// Debug: writes the test cache's table, counters and the CPU's state of it to `path` (for mmc_debug_gi_load, in this
+/// build or another with the same table). Returns 1 if it worked.
+@_cdecl("mmc_debug_gi_save")
+public func mmc_debug_gi_save(_ path: UnsafePointer<CChar>) -> Int32 {
+    guard let cache = giTest?.cache else { return 0 }
+    let bufs = [cache.check, cache.keys, cache.stamp, cache.value, cache.meta]
+    let total = bufs.reduce(0) { $0 + $1.length }
+    guard let staging = ctx.device.makeBuffer(length: total, options: .storageModeShared), let cb = ctx.queue.makeCommandBuffer(),
+          let b = cb.makeBlitCommandEncoder() else { return 0 }
+    var off = 0
+    for x in bufs { b.copy(from: x, sourceOffset: 0, to: staging, destinationOffset: off, size: x.length); off += x.length }
+    b.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+    var data = Data()
+    let header: [Int64] = [Int64(cache.slots), Int64(total), Int64(cache.counters.length)] + cache.debugState()
+    header.withUnsafeBytes { data.append(contentsOf: $0) }
+    data.append(Data(bytes: cache.counters.contents(), count: cache.counters.length))
+    data.append(Data(bytes: staging.contents(), count: total))
+    do { try data.write(to: URL(fileURLWithPath: String(cString: path))) } catch { return 0 }
+    return 1
+}
+
+/// Debug: reads a table mmc_debug_gi_save wrote into the test cache (the same number of slots). Returns 1 if it worked.
+@_cdecl("mmc_debug_gi_load")
+public func mmc_debug_gi_load(_ path: UnsafePointer<CChar>) -> Int32 {
+    guard let cache = giTest?.cache, let data = try? Data(contentsOf: URL(fileURLWithPath: String(cString: path))), data.count >= 56 else { return 0 }
+    let header = data.prefix(56).withUnsafeBytes { Array($0.bindMemory(to: Int64.self)) }
+    let bufs = [cache.check, cache.keys, cache.stamp, cache.value, cache.meta]
+    let total = bufs.reduce(0) { $0 + $1.length }
+    guard header[0] == Int64(cache.slots), header[1] == Int64(total), header[2] == Int64(cache.counters.length),
+          data.count == 56 + cache.counters.length + total,
+          let staging = ctx.device.makeBuffer(length: total, options: .storageModeShared), let cb = ctx.queue.makeCommandBuffer(),
+          let b = cb.makeBlitCommandEncoder() else { return 0 }
+    data.withUnsafeBytes { raw in
+        cache.counters.contents().copyMemory(from: raw.baseAddress! + 56, byteCount: cache.counters.length)
+        staging.contents().copyMemory(from: raw.baseAddress! + 56 + cache.counters.length, byteCount: total)
+    }
+    var off = 0
+    for x in bufs { b.copy(from: staging, sourceOffset: off, to: x, destinationOffset: 0, size: x.length); off += x.length }
+    b.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+    cache.debugRestore(Array(header[3...]))
+    return 1
+}
+
+/// Debug: compares two float RGBA pictures of debug view 9 as mmc_debug_gi_view writes them (raw files, 4 floats a pixel:
+/// the irradiance where lit mode's relight takes the cache's light, a negative code where it doesn't). out: 0 pixels,
+/// 1 the same to the bit, 2 with light in both, 3 in one only, 4 in neither but with different codes, 5-6 the mean
+/// luminance of a and b where both have light, 7 the mean absolute difference of their luminance there (relative to
+/// a's mean), 8 the largest relative difference of a channel (of values over 1e-3), 9 pixels with a channel more than
+/// 1/32 apart (relative; RG11B10's steps are 1/64 and 1/32). Returns 1 if it worked.
+@_cdecl("mmc_debug_gi_diff")
+public func mmc_debug_gi_diff(_ pathA: UnsafePointer<CChar>, _ pathB: UnsafePointer<CChar>, _ out: UnsafeMutablePointer<Double>) -> Int32 {
+    guard let a = try? Data(contentsOf: URL(fileURLWithPath: String(cString: pathA))),
+          let b = try? Data(contentsOf: URL(fileURLWithPath: String(cString: pathB))), a.count == b.count, a.count % 16 == 0 else { return 0 }
+    let n = a.count / 16
+    var same = 0, both = 0, one = 0, codes = 0, far = 0
+    var sumA = 0.0, sumB = 0.0, sumD = 0.0, maxRel = 0.0
+    a.withUnsafeBytes { ra in
+        b.withUnsafeBytes { rb in
+            let fa = ra.bindMemory(to: Float.self), fb = rb.bindMemory(to: Float.self)
+            let wa = ra.bindMemory(to: UInt32.self), wb = rb.bindMemory(to: UInt32.self)
+            for i in 0..<n {
+                let o = 4 * i
+                if wa[o] == wb[o] && wa[o + 1] == wb[o + 1] && wa[o + 2] == wb[o + 2] && wa[o + 3] == wb[o + 3] { same += 1 }
+                let ha = fa[o] >= 0, hb = fb[o] >= 0
+                if ha && hb {
+                    both += 1
+                    let la = 0.2126 * Double(fa[o]) + 0.7152 * Double(fa[o + 1]) + 0.0722 * Double(fa[o + 2])
+                    let lb = 0.2126 * Double(fb[o]) + 0.7152 * Double(fb[o + 1]) + 0.0722 * Double(fb[o + 2])
+                    sumA += la; sumB += lb; sumD += abs(la - lb)
+                    var big = false
+                    for ch in 0..<3 {
+                        let x = Double(fa[o + ch]), y = Double(fb[o + ch]), m = max(x, y)
+                        if m > 1e-3 {
+                            let r = abs(x - y) / m
+                            maxRel = max(maxRel, r)
+                            if r > 1.0 / 32.0 { big = true }
+                        }
+                    }
+                    if big { far += 1 }
+                } else if ha != hb {
+                    one += 1
+                } else if fa[o] != fb[o] {
+                    codes += 1
+                }
+            }
+        }
+    }
+    out[0] = Double(n); out[1] = Double(same); out[2] = Double(both); out[3] = Double(one); out[4] = Double(codes)
+    out[5] = both > 0 ? sumA / Double(both) : 0; out[6] = both > 0 ? sumB / Double(both) : 0
+    out[7] = sumA > 0 ? sumD / sumA : 0; out[8] = maxRel; out[9] = Double(far)
+    return 1
+}
+
+/// Debug: recompiles the test cache's kernels from the file at `path` (a variant of mmc_debug_gi_shader_source's text;
+/// null: the built-in source), keeping its table: kernel variants timed against each other in one process (gicache.py
+/// exp). Returns 1 if it worked.
+@_cdecl("mmc_debug_gi_reload")
+public func mmc_debug_gi_reload(_ path: UnsafePointer<CChar>?) -> Int32 {
+    guard let cache = giTest?.cache else { return 0 }
+    var body: String?
+    if let path {
+        guard let s = try? String(contentsOfFile: String(cString: path), encoding: .utf8) else { return 0 }
+        body = s
+    }
+    return cache.debugReload(body) ? 1 : 0
 }
 
 /// Debug: empties the test cache and its statistics.
@@ -2136,5 +2756,49 @@ public func mmc_debug_gi_selftest(_ out: UnsafeMutablePointer<Double>) -> Int32 
         out[base + 4] = Double(b.x); out[base + 5] = Double(b.y); out[base + 6] = Double(Float(bitPattern: b.w))
     }
     out[2] = Double(rays.count); out[3] = Double(rayBad)
+    // The resolve's packing against the texture unit's RG11B10Float conversion: every small float's value, the halfway
+    // points between neighbors and a float's step either side of them (where rounding and truncating part), pseudo-random
+    // values in between, and zero, -0, negatives and values past the largest.
+    var vals: [Float] = [0, -0.0, -1, -1e-20, 1e-30, 1e-8, 65000, 64512, 64600, 65024, 65100, 70000]
+    var rng: UInt32 = 12345
+    for e in -24...15 {
+        for m in 0..<64 {
+            let a = Float(sign: .plus, exponent: e, significand: 1 + Float(m) / 64), b = Float(sign: .plus, exponent: e, significand: 1 + Float(m + 1) / 64)
+            // (Blue keeps 5 mantissa bits: its halfway points are the odd m's a.)
+            let mid = (a + b) / 2
+            vals += [a, a.nextUp, a.nextDown, mid, mid.nextUp, mid.nextDown]
+            for _ in 0..<4 {
+                rng = rng &* 1664525 &+ 1013904223
+                vals.append(a + (b - a) * Float(rng >> 8) / 16777216)
+            }
+        }
+    }
+    while vals.count % 256 != 0 { vals.append(0.5) }
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg11b10Float, width: 256, height: vals.count / 256, mipmapped: false)
+    d.usage = [.shaderWrite, .shaderRead]
+    d.storageMode = .private
+    guard let vb = dev.makeBuffer(bytes: vals, length: vals.count * 4, options: .storageModeShared),
+          let mine = dev.makeBuffer(length: vals.count * 4, options: .storageModeShared),
+          let theirs = dev.makeBuffer(length: vals.count * 4, options: .storageModeShared), let hw = dev.makeTexture(descriptor: d),
+          let pcb = ctx.queue.makeCommandBuffer(), let penc = pcb.makeComputeCommandEncoder() else { return 0 }
+    penc.setComputePipelineState(cache.pipe("gi_test_pack"))
+    penc.setBuffer(vb, offset: 0, index: 13)
+    penc.setBuffer(mine, offset: 0, index: 14)
+    penc.setTexture(hw, index: 1)
+    penc.dispatchThreads(MTLSize(width: vals.count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+    penc.endEncoding()
+    guard let pb = pcb.makeBlitCommandEncoder() else { return 0 }
+    pb.copy(from: hw, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: 256, height: vals.count / 256, depth: 1),
+            to: theirs, destinationOffset: 0, destinationBytesPerRow: 256 * 4, destinationBytesPerImage: vals.count * 4)
+    pb.endEncoding()
+    pcb.commit()
+    pcb.waitUntilCompleted()
+    let mw = mine.contents().bindMemory(to: UInt32.self, capacity: vals.count), tw = theirs.contents().bindMemory(to: UInt32.self, capacity: vals.count)
+    var packBad = 0
+    for i in 0..<vals.count where mw[i] != tw[i] {
+        if packBad == 0 { out[42] = Double(vals[i]); out[43] = Double(tw[i]); out[44] = Double(mw[i]) }
+        packBad += 1
+    }
+    out[40] = Double(vals.count); out[41] = Double(packBad)
     return 1
 }
