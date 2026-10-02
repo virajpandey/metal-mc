@@ -423,6 +423,24 @@ public func mmc_debug_far_render(_ camX: Double, _ camY: Double, _ camZ: Double,
         var sum = 0.0, hits = 0
         for i in 0..<(W * H) where !(px[4 * i] == 0 && px[4 * i + 1] == 0) { sum += Double(px[4 * i]) / 255 * 128; hits += 1 }
         log("far field render: \(hits) of \(W * H) pixels hit, mean steps \(String(format: "%.1f", sum / Double(max(hits, 1))))")
+        // What a SIMD group pays: its 32 pixels (taken as 8 x 4 blocks) step together, so each block costs its slowest
+        // pixel. Misses count as the steps they took too (their red is 0 here, so they count as 0: a lower bound).
+        var blockSum = 0.0, blocks = 0, hist = [Int](repeating: 0, count: 9)
+        for by in stride(from: 0, to: H - 3, by: 4) {
+            for bx in stride(from: 0, to: W - 7, by: 8) {
+                var mx = 0.0, any = false
+                for y in by..<(by + 4) {
+                    for x in bx..<(bx + 8) {
+                        let i = y * W + x
+                        if px[4 * i] == 0 && px[4 * i + 1] == 0 { continue }
+                        any = true
+                        mx = max(mx, Double(px[4 * i]) / 255 * 128)
+                    }
+                }
+                if any { blockSum += mx; blocks += 1; hist[min(8, Int(mx / 16))] += 1 }
+            }
+        }
+        log("far field render: \(blocks) 8x4 blocks with hits, mean of their slowest pixel's steps \(String(format: "%.1f", blockSum / Double(max(blocks, 1)))), by 16s \(hist)")
     }
     var flipped = [UInt8](repeating: 0, count: px.count)
     for y in 0..<H { flipped.replaceSubrange((y * W * 4)..<((y + 1) * W * 4), with: px[((H - 1 - y) * W * 4)..<((H - y) * W * 4)]) }

@@ -1404,13 +1404,26 @@ final class GiCache: @unchecked Sendable {
         var p = params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: depth.width, height: depth.height)
         p.blockLight = SIMD4(0, 0, 0, evictFrames)
         p.rays.w = cloudHeight - Float(cam.y)
-        guard let enc = cb.makeComputeCommandEncoder(descriptor: profComputePass("GI cache")) else { return false }
+        // Traced frames (-PbenchTrace=1) split the stages into encoders of their own, so the profile times each one (every
+        // stage binds what it uses, so they don't need the same encoder).
+        let split = ctx.traceFrames > 0
+        guard var enc = cb.makeComputeCommandEncoder(descriptor: profComputePass(split ? "GI cache: light, begin, request" : "GI cache")) else { return false }
         enc.label = "MetalMC GI cache"
         encodeLight(enc, light)
         encodeBegin(enc, params: &p)
         encodeRequest(enc, depth: depth, params: &p)
+        if split {
+            enc.endEncoding()
+            guard let e = cb.makeComputeCommandEncoder(descriptor: profComputePass("GI cache: schedule, update (rays)")) else { return false }
+            enc = e
+        }
         encodeSchedule(enc, params: &p)
         encodeUpdate(enc, accel: accel, accels: accels, params: &p)
+        if split {
+            enc.endEncoding()
+            guard let e = cb.makeComputeCommandEncoder(descriptor: profComputePass("GI cache: resolve (half resolution)")) else { return false }
+            enc = e
+        }
         encodeResolve(enc, depth: depth, out: out, code: code, params: &p)
         enc.endEncoding()
         advance()

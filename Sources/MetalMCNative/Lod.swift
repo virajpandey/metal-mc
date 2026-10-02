@@ -570,6 +570,10 @@ let lodSubtileFrustum = !experiments.contains("nostfrustum")
 let lodCullFrac = experiments.contains("cullfrac")
 /// METALMC_EXP=quadvis: every 240 frames, count the drawn opaque LOD quads that own at least one final pixel (per level).
 let lodQuadVis = experiments.contains("quadvis")
+/// Profiling (holes in the picture): METALMC_EXP=ffskip doesn't draw the far field, lodskip doesn't draw the LOD's quads,
+/// so a traced flight's main pass minus the plain one is what they cost (tools/bench/passes.py).
+let lodSkipFar = experiments.contains("ffskip")
+let lodSkipQuads = experiments.contains("lodskip")
 nonisolated(unsafe) var lodVisPipe: MTLRenderPipelineState?
 /// Quads per mesh threadgroup (METALMC_MESHQUADS, default 32).
 let lodMeshQuads = Int(ProcessInfo.processInfo.environment["METALMC_MESHQUADS"] ?? "") ?? 32
@@ -1451,7 +1455,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     var farDone = !farOn
     func drawFar() {
         farDone = true
-        if farNearest.isFinite, let colors = r.colorBuffer {
+        if farNearest.isFinite, !lodSkipFar, let colors = r.colorBuffer {
             FarField.shared.draw(enc, u: u, colors: colors, lightmap: r.lightmap ?? r.dummyTexture!, lightSampler: r.lightSampler,
                                  cy: cy, nearest: farNearest)
         }
@@ -1496,7 +1500,9 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             enc.setFragmentBuffer(d.node.ao, offset: 0, index: 22)
             bound = id
         }
-        if useMesh {
+        if lodSkipQuads {
+            continue
+        } else if useMesh {
             var md = SIMD4<UInt32>(UInt32(d.first), UInt32(d.count), UInt32(d.slot), 0)
             enc.setMeshBytes(&md, length: 16, index: 17)
             enc.drawMeshThreadgroups(MTLSize(width: (d.count + lodMeshQuads - 1) / lodMeshQuads, height: 1, depth: 1),

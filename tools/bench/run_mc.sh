@@ -15,12 +15,26 @@ OUT=$ROOT/bench_out
 mkdir -p "$OUT/old_worlds"
 cd "$ROOT/mod" || exit 1
 dialog() { "$OUT/winlist" | grep -E "UserNotificationCenter|SecurityAgent|CoreServicesUIAgent|Agents Overlay|^layer [1-9][0-9]* alpha [^ ]+ NotificationCenter " | head -1; }
+# With the lid closed the built-in display is off: the game can't take it fullscreen and runs in an 854 x 480 window,
+# which made four calibration runs worthless (2026-10-01). Wait for the lid, and run again if fullscreen failed anyway.
+lid() { ioreg -r -k AppleClamshellState -d 4 | grep -q '"AppleClamshellState" = Yes'; }
+# The GPU lock (tools/bench/gpulock.inc), held for the whole run: offline GPU tests (tools/bench/gpuwait.sh) wait for it,
+# and the run waits for them. It lives in the main checkout's bench_out, whichever worktree runs this.
+source "$ROOT/tools/bench/gpulock.inc"
+MAIN=$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk 'NR==1{print $2}')
+LOCK=${MAIN:-$ROOT}/bench_out/gpu.lockdir
+trap 'gpu_unlock "$LOCK"' EXIT
 TIMED=; case " $* " in *" -PbenchFly="*) TIMED=1 ;; esac
 for TRY in 1 2 3; do
+  if lid; then
+    echo "$(date +%T) waiting for the lid to open" >> "$OUT/dialog_waits.log"
+    while lid; do sleep 20; done
+  fi
   if [ -n "$TIMED" ] && [ -n "$(dialog)" ]; then
     echo "$(date +%T) waiting for a clear screen: $(dialog)" >> "$OUT/dialog_waits.log"
     while [ -n "$(dialog)" ]; do sleep 20; done
   fi
+  gpu_lock "$LOCK" "game run $(basename "$LOG")" 2>> "$OUT/dialog_waits.log"
   [ -d run/saves/claudeworld ] && mv run/saves/claudeworld "$OUT/old_worlds/claudeworld-$(date +%s)"
   cp -Rp "../fixtures/$FIX" run/saves/claudeworld   # -p keeps mtimes, so the LOD's region cache still matches
   # Let Spotlight and the security scanners finish with the fresh copy before timing anything.
@@ -38,6 +52,10 @@ for TRY in 1 2 3; do
   echo "exit $?" >> "$LOG"
   kill $WD $DW 2>/dev/null
   cat "$LOG.dialogs" >> "$LOG"
+  if grep -q "Couldn't enter fullscreen" "$LOG" && [ $TRY -lt 3 ]; then
+    echo "$(date +%T) $(basename "$LOG"): the game couldn't go fullscreen (try $TRY), running it again" >> "$OUT/dialog_waits.log"
+    sleep 30; continue
+  fi
   if [ -z "$TIMED" ] || [ ! -s "$LOG.dialogs" ]; then break; fi
   echo "$(date +%T) $(basename "$LOG"): a dialog showed up during the run (try $TRY): $(head -1 "$LOG.dialogs")" >> "$OUT/dialog_waits.log"
 done

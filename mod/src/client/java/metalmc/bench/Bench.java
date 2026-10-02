@@ -158,7 +158,10 @@ public final class Bench {
             case RUNNING -> {
                 place(player, tick);
                 if (tick == RUN_TICKS / 2) screenshot(mc, "mid");
-                if (tick == RUN_TICKS / 4 && isMetal() && "1".equals(System.getProperty("metalmc.bench.trace"))) {
+                // Per-pass GPU timestamps for 3 frames at each eighth of the flight (21 frames), so a profile is a
+                // median over the path rather than one frame's luck (tools/bench/passes.py).
+                if (tick > 0 && tick % Math.max(1, RUN_TICKS / 8) == 0 && tick < RUN_TICKS && isMetal()
+                        && "1".equals(System.getProperty("metalmc.bench.trace"))) {
                     metalmc.backend.MetalStats.traceFrames(3);
                 }
                 if (++tick >= RUN_TICKS) {
