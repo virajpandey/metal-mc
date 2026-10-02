@@ -574,6 +574,63 @@ let lodQuadVis = experiments.contains("quadvis")
 /// so a traced flight's main pass minus the plain one is what they cost (tools/bench/passes.py).
 let lodSkipFar = experiments.contains("ffskip")
 let lodSkipQuads = experiments.contains("lodskip")
+/// METALMC_EXP=cullstats: every 600 frames, the CPU goes over the frame's drawn quads and counts, per level, those that
+/// can't make a fragment: facing away from the camera (each quad, where the draw lists cull by tile), off screen, or
+/// so thin on screen that no pixel center falls in their bounding box. What culling quads before the vertex stage
+/// (whose cost is per vertex invoked) could save, measured before building it.
+let lodCullStats = experiments.contains("cullstats")
+
+/// lodCullStats' counts for the frame's draws (see there): per level, quads drawn, facing away, off screen, too thin.
+func lodCountCullable(_ draws: [(node: LodMeshNode, slot: Int, first: Int, count: Int)], xforms: [SIMD4<Float>],
+                      projView: simd_float4x4, width: Int, height: Int) -> [[Int]] {
+    var out = [[Int]](repeating: [0, 0, 0, 0], count: 9)
+    let corners: [[SIMD3<Float>]] = [
+        [SIMD3(1, 0, 0), SIMD3(1, 1, 0), SIMD3(1, 1, 1), SIMD3(1, 0, 1)],
+        [SIMD3(0, 0, 1), SIMD3(0, 1, 1), SIMD3(0, 1, 0), SIMD3(0, 0, 0)],
+        [SIMD3(0, 1, 0), SIMD3(0, 1, 1), SIMD3(1, 1, 1), SIMD3(1, 1, 0)],
+        [SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(1, 0, 1), SIMD3(0, 0, 1)],
+        [SIMD3(1, 0, 1), SIMD3(1, 1, 1), SIMD3(0, 1, 1), SIMD3(0, 0, 1)],
+        [SIMD3(0, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0), SIMD3(1, 0, 0)],
+    ]
+    let normals: [SIMD3<Float>] = [SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)]
+    let W = Float(width), H = Float(height)
+    for d in draws {
+        let level = min(8, d.node.level)
+        let xs = xforms[d.slot]
+        let q = d.node.buffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: d.node.quadCount)
+        for i in d.first..<(d.first + d.count) {
+            out[level][0] += 1
+            let w0 = q[i].x, w1 = q[i].y
+            let face = Int((w0 >> 25) & 7)
+            if face > 5 { continue }
+            let local = SIMD3(Float(w0 & 255), Float((w0 >> 16) & 511), Float((w0 >> 8) & 255))
+            let w = Float(((w1 >> 8) & 255) + 1), h = Float(((w1 >> 16) & 255) + 1)
+            let ext = face < 2 ? SIMD3<Float>(1, w, h) : (face < 4 ? SIMD3<Float>(w, 1, h) : SIMD3<Float>(w, h, 1))
+            let base = SIMD3(xs.x, xs.y, xs.z)
+            let p0 = base + (local + corners[face][0] * ext) * xs.w
+            // The camera is at the origin: a face can be seen only from in front of its plane.
+            if simd_dot(normals[face], p0) >= 0 { out[level][1] += 1; continue }
+            var lo = SIMD2<Float>(repeating: .infinity), hi = SIMD2<Float>(repeating: -.infinity)
+            var behind = false
+            for c in 0..<4 {
+                let p = base + (local + corners[face][c] * ext) * xs.w
+                let clip = projView * SIMD4(p, 1)
+                if clip.w <= 1e-4 { behind = true; break }
+                let s = SIMD2((clip.x / clip.w * 0.5 + 0.5) * W, (clip.y / clip.w * 0.5 + 0.5) * H)
+                lo = simd_min(lo, s)
+                hi = simd_max(hi, s)
+            }
+            if behind { continue }
+            if hi.x < 0 || hi.y < 0 || lo.x > W || lo.y > H { out[level][2] += 1; continue }
+            // A pixel center k + 0.5 inside [lo, hi] on both axes (a little slack: kept if in doubt).
+            let e: Float = 1e-3
+            let cx = (hi.x + e - 0.5).rounded(.down) >= (lo.x - e - 0.5).rounded(.up)
+            let cy = (hi.y + e - 0.5).rounded(.down) >= (lo.y - e - 0.5).rounded(.up)
+            if !(cx && cy) { out[level][3] += 1 }
+        }
+    }
+    return out
+}
 nonisolated(unsafe) var lodVisPipe: MTLRenderPipelineState?
 /// Quads per mesh threadgroup (METALMC_MESHQUADS, default 32).
 let lodMeshQuads = Int(ProcessInfo.processInfo.environment["METALMC_MESHQUADS"] ?? "") ?? 32
@@ -1366,6 +1423,14 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, chosen per level \(perLevel), K quads per level \(quadsPerLevel.map { $0 / 1000 }), \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames; vanilla drew \(r.vanillaSections.count) sections, compiled \(r.compiledSections.count), distance \(r.vanillaDistance), skip checks \(r.skipDebug)")
         r.skipDebug = [0, 0, 0, 0, 0]
         r.coveredTiles = 0
+    }
+    if lodCullStats && r.frame % 600 == 300 {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let c = lodCountCullable(draws.filter { $0.fade == 0 }.map { ($0.node, $0.slot, $0.first, $0.count) }, xforms: xforms,
+                                 projView: u.proj * u.view, width: ctx.passWidth, height: ctx.passHeight)
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        let rows = c.enumerated().filter { $0.element[0] > 0 }.map { "level \($0.offset): \($0.element[0]) quads, \($0.element[1]) facing away, \($0.element[2]) off screen, \($0.element[3]) too thin" }
+        log("LOD cull stats (frame \(r.frame), \(String(format: "%.0f", ms)) ms): " + rows.joined(separator: "; "))
     }
     let testBoxes = vis.map { !$0.slots.isEmpty } ?? false
     guard !draws.isEmpty || testBoxes || farOn else { return 0 }
