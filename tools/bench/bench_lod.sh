@@ -20,7 +20,9 @@ sed -i '' "s/^fullscreen:.*/fullscreen:true/; s/^renderDistance:.*/renderDistanc
 MODE='{"width":1728,"height":1117,"red_bits":8,"green_bits":8,"blue_bits":8,"refresh_rate":120.0}'
 if grep -q '^fullscreenResolution:' $OPT; then sed -i '' "s/^fullscreenResolution:.*/fullscreenResolution:$MODE/" $OPT; else echo "fullscreenResolution:$MODE" >> $OPT; fi
 if [ "$FAR" = "0" ]; then LODARGS="-Plod=0"; else LODARGS="-Plod=1 -PlodFar=$FAR"; fi
-FIXTURE=${BENCH_FIXTURE:-claudeworld-huge} caffeinate -di bash "$ROOT/tools/bench/run_mc.sh" "$OUT/run_$LABEL.log" ${BENCH_TIMEOUT:-300} \
+# The display is held on only while someone is at the laptop (see runq.sh); the company's idle lock is left alone.
+KEEP=-i; [ "$BENCH_ATTENDED" = 1 ] && KEEP=-di
+FIXTURE=${BENCH_FIXTURE:-claudeworld-huge} caffeinate $KEEP bash "$ROOT/tools/bench/run_mc.sh" "$OUT/run_$LABEL.log" ${BENCH_TIMEOUT:-300} \
   -PmetalBackend=metal -PbenchNoon=1 -PbenchLabel=$LABEL $LODARGS "$@"
 grep -h 'METALMC_BENCH' "$OUT/run_$LABEL.log" | grep -o 'fps_mean=[^ ]*\|ms_p95=[^ ]*\|ms_p99=[^ ]*\|frames_over_[^ ]*\|metal_gpu_ms_mean=[^ ]*\|per_frame_lod_kquads=[^ ]*' | tr '\n' ' '
 echo

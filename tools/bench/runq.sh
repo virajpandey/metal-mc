@@ -4,7 +4,9 @@
 # the queue as it starts, until the queue is empty or 20 minutes have passed: the harness stops a background task after
 # about 30 minutes, so a run is never cut in the middle; start this again for the rest. Output: bench_out/queue.log.
 cd "$(dirname "$0")/../.." || exit 1
-caffeinate -dimsu -w $$ &
+# Keeps the Mac awake for the runs. The display is held on (which also holds off the company's 15-minute idle lock) only
+# while Viraj is at the laptop (BENCH_ATTENDED=1); unattended, the screen locks as the policy says and timed jobs wait.
+if [ "$BENCH_ATTENDED" = 1 ]; then caffeinate -dims -w $$ & else caffeinate -ims -w $$ & fi
 Q=bench_out/queue.txt
 L=bench_out/queue.log
 FS=$PWD/bench_out/fidscore
