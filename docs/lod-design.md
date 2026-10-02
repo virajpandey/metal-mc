@@ -127,6 +127,13 @@ Without it, the LOD ends where the world's generated chunks end, at the edge of 
 
 - **Resource packs.** The base colors come from vanilla's textures, averaged when the mod is built. When the block atlas loads, the mod averages the opaque texels of each LOD material's top and side textures in the loaded pack (`SpriteContents` keeps them in memory). The ratio to vanilla's averages scales that material's colors and texture-detail luma: top faces by the top texture, sides by the side, grass, leaves and water by their base textures. With a test pack (red stone, purple dirt, brighter grass) the far terrain took the pack's colors, with no break at the seam. A pack's biome color maps come through the tints the game reports (above).
 
+**Color calibration checked (2026-10-02).** The knobs `-PtransparentShade`, `-PwaterAlpha`, `-PwaterGain` and `-PgrassGain`
+against the defaults, on the fidelity tour with the quads (`-PfarField=0`, `-PbenchExtraWait=2400` so the LOD is built
+before the screenshots), near band against vanilla: defaults 4.60; transparentShade 1.0 4.88; waterAlpha 0.62 5.07;
+waterGain 1.1,1.12,1.07 5.14 (1.2,1.24,1.14: 5.78); grassGain 1.04 5.16. Each tweak takes the band's overall bias toward
+zero (it's about -2.5 levels darker than vanilla) and makes the error worse: the bias isn't what's wrong. The defaults
+stay. (An earlier round was void: with the lid closed the game couldn't go fullscreen and ran in an 854 x 480 window.)
+
 ## Where the time goes
 
 Per-frame counters from `-PbenchTrace=1` runs: `per_frame_lod_draws`, `per_frame_lod_kquads` and `per_frame_lod_cpu_ms`.
