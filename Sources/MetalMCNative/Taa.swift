@@ -87,9 +87,14 @@ static float3 historySample(texture2d<float, access::sample> h, float2 uv, float
     return max(r / w, 0.0);
 }
 
-// taa_resolve's tile: TAA_T x TAA_T pixels per threadgroup, TAA_A with its 1-pixel border.
+// taa_resolve's tile: TAA_T x TAA_T pixels per threadgroup (16 or 32, a preprocessor macro of the library), TAA_A with
+// its 1-pixel border. The variants whose load is heavy (the sky's aerial perspective, lit mode's relight) take 32: their
+// border's share of the loads is 13% against 27%. The plain resolve takes 16: for it the bigger tile's threadgroup memory
+// (14 KB against 4) costs more than the border saves (0.85 against 0.74 ms at the panel's resolution, measured).
+#ifndef TAA_T
 #define TAA_T 32
-#define TAA_A 34
+#endif
+#define TAA_A (TAA_T + 2)
 
 // Moves h toward the box's center until it's inside the box.
 static float3 clipToBox(float3 lo, float3 hi, float3 h) {
@@ -143,9 +148,9 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         dtile[i] = d;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // The tile's four 16 x 16 quarters in turn, so a SIMD group's pixels stay side by side.
-    for (uint quarter = 0; quarter < 4; quarter++) {
-        uint2 lp = lid + uint2((quarter & 1u) * 16u, (quarter >> 1) * 16u);
+    // The tile's 16 x 16 pieces in turn (one, or four for a 32 x 32 tile), so a SIMD group's pixels stay side by side.
+    for (uint piece = 0; piece < (TAA_T / 16) * (TAA_T / 16); piece++) {
+        uint2 lp = lid + uint2((piece % (TAA_T / 16)) * 16u, (piece / (TAA_T / 16)) * 16u);
         uint2 gid = tgid * TAA_T + lp;
         if (int(gid.x) >= size.x || int(gid.y) >= size.y) continue;
         uint c0 = (lp.y + 1) * TAA_A + lp.x + 1;
@@ -299,7 +304,11 @@ final class Taa: @unchecked Sendable {
         do {
             if library == nil {
                 let lib = try ctx.device.makeLibrary(source: taaShaderSource, options: nil)
-                pipe = try ctx.device.makeComputePipelineState(function: resolveFunction(lib, sky: false))
+                // The plain resolve from a library with 16 x 16 tiles (TAA_T); the variants with a heavy load use 32.
+                let small = MTLCompileOptions()
+                small.preprocessorMacros = ["TAA_T": NSNumber(value: 16)]
+                let plainLib = try ctx.device.makeLibrary(source: taaShaderSource, options: small)
+                pipe = try ctx.device.makeComputePipelineState(function: resolveFunction(plainLib, sky: false))
                 library = lib
             }
             if copyPipes[color.pixelFormat.rawValue] == nil, let lib = library {
@@ -426,6 +435,7 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     // Sky hook (Sky.swift): the level through the air (aerial perspective, the render distance's fade, the tone curve),
     // applied as the color is loaded, after the shadows' shade; on an 8-bit frame, dithered as it's written back.
     var skyDither: Float = 0
+    var tile = 16   // the plain resolve's tile; the variants with a heavy load use 32 (TAA_T in taa_resolve)
     if let sky = Sky.shared.takeDeferredAerial(width: color.width, height: color.height),
        let skyPipe = relight ? t.litResolve(sky: true) : t.skyResolve() {
         var frame = sky.frame
@@ -435,8 +445,12 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setTexture(sky.apTrans, index: 6)
         enc.setTexture(sky.skyView, index: 7)
         skyDither = color.pixelFormat == .rgba16Float ? 0 : (color.pixelFormat == .rg11b10Float ? -1 : 1.0 / 255)
+        tile = 32
+    } else if relight, let litPipe = t.litResolve(sky: false) {
+        enc.setComputePipelineState(litPipe)
+        tile = 32
     } else {
-        enc.setComputePipelineState(relight ? (t.litResolve(sky: false) ?? pipe) : pipe)
+        enc.setComputePipelineState(pipe)
     }
     if relight { Lit.shared.bindDeferred(enc) }
     enc.setTexture(color, index: 0)
@@ -445,9 +459,9 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     enc.setTexture(t.history[1 - t.current], index: 3)
     enc.setTexture(shadows?.lit ?? RtShadows.shared.dummyLit(), index: 4)
     enc.setBytes(&params, length: MemoryLayout<TaaParams>.stride, index: 0)
-    // Whole threadgroups of 32 x 32 pixels (16 x 16 threads, taa_resolve): every thread helps load the tile, including
-    // those past the edge.
-    enc.dispatchThreadgroups(MTLSize(width: (color.width + 31) / 32, height: (color.height + 31) / 32, depth: 1),
+    // Whole threadgroups of 16 x 16 threads, each over a tile of 16 x 16 pixels (the plain resolve) or 32 x 32 (TAA_T):
+    // every thread helps load the tile, including those past the edge.
+    enc.dispatchThreadgroups(MTLSize(width: (color.width + tile - 1) / tile, height: (color.height + tile - 1) / tile, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     enc.endEncoding()
     // The new history into the frame: a draw that waits to be the first of the next pass on the frame (the hand's) with
