@@ -67,7 +67,8 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   climbing only into untested parents, water stored at its drawn surface in the pyramid, and a per-ring horizon
   profile (rays skip the rings whose terrain they pass over). Offline 19-28% less march time with an exact image (a few
   hundred pixels change where rays used to hit the step cap). In game (default settings, traced): the main pass's
-  fragment stage 3.02 -> 2.63 ms. Fidelity unchanged (far band 3.35 against 3.33-3.34, near band 4.57 against 4.58), and
+  fragment stage 3.02 -> 2.63 ms, but the 2.63 is from a run with the lock screen up (paced, no overlap between frames,
+  clocks unknown), so it is unconfirmed until an unlocked flight repeats it. Fidelity unchanged (far band 3.35 against 3.33-3.34, near band 4.57 against 4.58), and
   the horizon tour (LOD 262144) shows no holes (0.004-0.7% of pixels changed against last night's, water animation).
 - **The plain resolve keeps 16 x 16 tiles** (done): with 32 x 32 tiles it took 0.85 ms against 0.74 (its 14 KB of
   threadgroup memory against 4 costs more than the smaller border saves); only the heavy variants (sky, lit) use 32.
