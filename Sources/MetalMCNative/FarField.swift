@@ -978,7 +978,7 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
     // Lit mode: the G-buffer's albedo, AO, face and sky light; water and what's seen through it stay unlit (LIT_NONE).
     float3 litAlbedo = float3(0.0);
     float litAO = 1.0, litSky = sky;
-    uint litFace = LIT_NONE;
+    uint litFace = LIT_NONE;\(litWater ? "\n    bool litWaterTop = false;   // water (METALMC_EXP=water): a water surface, flagged for the relight's reflections" : "")
 #endif
     if (onCanopy) {
         // The canopy: its top with the corner occlusion of taller crowns around it, its sides darker toward the underside
@@ -1020,7 +1020,7 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
         float3 floorColor = colors[topMat * 3u].rgb * detail(u, sprites, atlas, atlasSampler, topMat, 2, rel, mip)
                           * lodLight(u, lightmap, ls, max(0.0, sky - depthBlocks));
         float a = f.cam.y;
-        color = colors[lowMat * 3u].rgb * light * a + floorColor * (1.0 - a);
+        color = colors[lowMat * 3u].rgb * light * a + floorColor * (1.0 - a);\(litWater ? "\n#if LIT_MODE\n        litWaterTop = true;\n#endif" : "")
     } else if (depthVox > 0u) {
         // The side of a water column. Rays that pass under the quads' water reach the first far-field column from the
         // side, below its surface: that's terrain seen through the water (the quads' water surface is drawn over it),
@@ -1057,7 +1057,7 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
     float4 clip = u.proj * (u.view * float4(rel, 1.0));
     out.depth = min(clip.z / clip.w, pos.z);
 #if LIT_MODE
-    out.gbuf = litPack(litAlbedo, litAO, litFace, out.depth, litSky, 0.0);
+    out.gbuf = \(litWater ? "litWaterTop ? litPackWater(2u, out.depth, litSky, 0.0) : " : "")litPack(litAlbedo, litAO, litFace, out.depth, litSky, 0.0);
 #endif
     return out;
 }

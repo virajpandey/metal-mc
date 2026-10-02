@@ -39,9 +39,20 @@ import simd
 // light on the face times the sky light level's curve): the sky as the real openings let it in, plus bounced light,
 // times AO. Everything else is as above. Without gi the shaders are the same text as before (the GI parts are spliced in
 // only with litGi).
+//
+// Water (METALMC_EXP=lit,water, with our sky): the writers that know water (the far field's march; the LOD's water
+// pipeline once it writes litPackWater) mark its surface in the G-buffer, as a texel that isn't lit terrain (face code
+// 0) with a flag bit and a depth key, and the relight reflects the sky and the sun in it (litWaterPixel, after
+// litRelightPixel, before the aerial perspective): the water's color as drawn, mixed toward the sky in the reflected
+// direction by Fresnel's reflectance, plus the sun's glint, over small procedural waves. Without water the shaders are
+// the same text as before (its parts are spliced in only with litWater), and so is every pixel.
 
 /// METALMC_EXP=lit: deferred relighting of terrain.
 let litEnabled = experiments.contains("lit")
+
+/// METALMC_EXP=water (with lit): water surfaces flagged in the G-buffer and the sky and the sun reflected in them, where
+/// our sky gives the atmosphere's light (Sky.swift). Off by default until it's been seen in the game.
+let litWater = litEnabled && experiments.contains("water")
 
 /// The G-buffer's color attachment in the level's main pass (after vanilla's one color target) and its format.
 let litGbufferIndex = 1
@@ -78,7 +89,25 @@ static uint2 litPack(float3 albedo, float ao, uint face, float depth, float sky,
     return uint2(a.r | (a.g << 8) | (a.b << 16) | (uint(round(saturate(ao) * 31.0)) << 24) | (code << 29),
                  litDepthKey(depth) | (uint(round(clamp(sky, 0.0, 15.0) * 16.0)) << 16) | (uint(round(clamp(block, 0.0, 15.0) * 16.0)) << 24));
 }
-#endif
+\(litWater ? litWaterPackHeader : "")#endif
+"""
+
+/// With water (litWater only; spliced into litShaderHeader, so without it every shader is the same text as before): its
+/// texel in the G-buffer. Terrain texels always have a face code (bits 29-31) of 1-7 and the clear value is 0, so a code
+/// of 0 with bit 28 set is free: every reader that doesn't know water (the relight's terrain path, the offline checks)
+/// sees "not lit terrain" there, as before. AO keeps its 5 bits.
+private let litWaterPackHeader = """
+// Water (METALMC_EXP=water): a water surface. x: the face (0-5, the LOD's numbering) in bits 24-26, bit 28 set, face code
+// 0; y as terrain's: the depth key (so a boat or an entity drawn over the water isn't taken for it) and the light levels
+// (the sky light tells open water from water under cover).
+#define LIT_WATER 1
+#define LIT_WATER_FLAG (1u << 28)
+static uint2 litPackWater(uint face, float depth, float sky, float block) {
+    return uint2(LIT_WATER_FLAG | (min(face, 7u) << 24),
+                 litDepthKey(depth) | (uint(round(clamp(sky, 0.0, 15.0) * 16.0)) << 16) | (uint(round(clamp(block, 0.0, 15.0) * 16.0)) << 24));
+}
+static bool litIsWater(uint2 g) { return (g.x >> 28) == 1u; }
+
 """
 
 /// With the GI cache (litGi only; empty otherwise, so the relight's text is unchanged without it): litRelightPixel's
@@ -122,7 +151,7 @@ struct LitFrame {
     float4 fogColor;        // vanilla's fog color, a: its strength (0: no fog)
     float4 fog;             // vanilla's fog: environmental start, end, render-distance start, end
     float4 misc;            // x: 1 if vanilla's lightmap is bound, y: 1 to scale the sun and sky by vanilla's daylight (no atmosphere), z: debug view, w: exposure
-};
+\(litWater ? "    float4 water;           // water: x the waves' time (s), y-z the camera's x and z modulo WATER_TILE, w 1 to reflect (0: offline A/B)\n    float4 water2;          // water: x radians per pixel at the screen's center, y how much of the sun's disk the sky draws (0 in rain)\n" : "")};
 
 constant float3 kLitNormal[6] = { float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
 // Vanilla's face shade (the LOD's kShade): the forward color has it, so the overlay test works it out again.
@@ -250,6 +279,202 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         return saturate(c);
     }
     return o;
+}\(litWater ? "\n" + litWaterHeader : "")
+"""
+
+/// Water's look (litWater): METALMC_WATERWAVES scales the waves' slopes (0: a flat surface), METALMC_WATERROUGH is the
+/// surface's own roughness under them (GGX alpha: the ripples finer than the waves), which keeps a sun glint on the
+/// flattest water.
+private let waterWaveScale = max(0, Double(ProcessInfo.processInfo.environment["METALMC_WATERWAVES"] ?? "") ?? 1)
+private let waterRough = min(max(Double(ProcessInfo.processInfo.environment["METALMC_WATERROUGH"] ?? "") ?? 0.05, 0.005), 1)
+/// The waves' tile: waterTile blocks a side, in a texture of waterTexels a side (4 a block: the shortest wave, 1.4 blocks,
+/// spans 5.6), repeated over the water. Every wave has a whole number of wavelengths across it along x and along z, so the
+/// tile repeats without a seam, and the camera's position can be taken modulo it (float precision).
+private let waterTile: Double = 64
+private let waterTexels = 256
+/// Its mip levels, down to 1 x 1, and how many of them (from the top) hold a wave: the rest, whose texels are at least
+/// half the longest wave apart, have every wave faded and don't change with time (lit_water_waves).
+private let waterLevels = Int(log2(Double(waterTexels))) + 1
+private let waterMovingLevels: Int = {
+    let longest = waterWaveNumbers.map { $0.lambda }.max() ?? 1
+    return (0..<waterLevels).first { waterTile / Double(waterTexels >> $0) >= longest / 2 } ?? waterLevels
+}()
+/// The sky map's size (a paraboloid map of the upper hemisphere): 256 a side puts a texel at about half a degree at the
+/// horizon, where the sky changes fastest (the sky view table is finer there, but a reflection's waves blur it anyway).
+private let waterSkyTexels = 256
+/// Small waves on water: wavelength (blocks, which are metres), direction (degrees from +x toward +z), slope amplitude
+/// (radians, before METALMC_WATERWAVES) and phase. Wind waves on a lake: a few metres long, a degree or two steep each,
+/// moving at deep water's speeds (angular frequency sqrt(g k)); together a slope of 0.053 RMS. Two to an octave, their
+/// directions spread 70 degrees either side of the wind's: with one wave to an octave (a first try, 5 waves), the longest
+/// ones, the last left where the shorter have faded, drew straight parallel stripes. Wavelengths and directions move to
+/// the nearest whole wave numbers across the tile (10.1 blocks at 18 degrees, 8.2 at -40, 6.2 at 61, 4.8 at -13, 3.7 at
+/// 35, 2.7 at -68, 1.9 at 9, 1.4 at 52).
+private let waterWaveSet: [(lambda: Double, angle: Double, steep: Double, phase: Double)] = [
+    (10.0, 18, 0.032, 0.0), (8.3, -42, 0.032, 2.9), (6.1, 64, 0.028, 1.3), (4.9, -12, 0.028, 4.6),
+    (3.6, 36, 0.024, 3.7), (2.7, -68, 0.024, 0.8), (1.9, 8, 0.02, 5.1), (1.4, 52, 0.02, 2.2)]
+/// The waves' whole wave numbers across the tile (along x and z) and the wavelength (blocks) they come to.
+private let waterWaveNumbers: [(n: Double, m: Double, lambda: Double)] = waterWaveSet.map { w in
+    let n = (waterTile / w.lambda * cos(w.angle * .pi / 180)).rounded(), m = (waterTile / w.lambda * sin(w.angle * .pi / 180)).rounded()
+    return (n, m, waterTile / (n * n + m * m).squareRoot())
+}
+
+/// The water's shading (litWaterPixel), appended to litRelightHeader with litWater only.
+private let litWaterHeader: String = {
+    var waves: [String] = [], amps: [String] = []
+    for (w, (n, m, _)) in zip(waterWaveSet, waterWaveNumbers) {
+        let kx = 2 * Double.pi * n / waterTile, kz = 2 * Double.pi * m / waterTile
+        let k = (kx * kx + kz * kz).squareRoot()
+        waves.append(String(format: "float4(%.8f, %.8f, %.6f, %.6f)", kx, kz, (9.81 * k).squareRoot(), 4 * k / (2 * Double.pi)))
+        let s = w.steep * waterWaveScale
+        amps.append(String(format: "float4(%.8f, %.8f, %.4f, %.8f)", s * kx / k, s * kz / k, w.phase, 0.5 * s * s))
+    }
+    return """
+// Water (METALMC_EXP=water, Lit.swift): the sky and the sun reflected in the water surfaces the G-buffer flags
+// (litPackWater), over the color the water was drawn with (vanilla's water, and the floor seen through it), in scene-linear
+// light (the sky's units, which the relit terrain is in too), before the aerial perspective:
+//   drawn x (1 - F x open) + sky(R) x F x open + the sun's glint
+// F: Schlick's Fresnel reflectance of water (F0 0.02, index 1.33): a few percent looking down, most of the light at
+// grazing angles. sky(R): the sky's light in the reflected direction (skyLuminance, without the sun's disk), from a map of
+// the upper hemisphere made each frame (lit_water_sky): one sample instead of the sky view table's coordinates (an arc
+// cosine and three square roots; 0.08 ms at the panel's resolution with a third of it water, measured). open: how much of
+// the open sky the water's sky light level stands for (vanilla's curve, like the relight's sky term; 1 in the open), so
+// water under cover doesn't reflect a sky it can't see (what it would reflect instead isn't known: it keeps its drawn
+// color). The glint: the sun's disk through a GGX lobe with Smith's height-correlated visibility, times the traced
+// visibility. The normal: small waves, directional sines summed each frame into a mipmapped tile of their slopes and the
+// slopes' mean squared length, each level holding the waves it can and the variance of the rest (lit_water_waves), which
+// the pixel samples at its footprint: waves finer than the pixel (they'd alias) turn into the variance of its slopes,
+// which the lobe's roughness takes (LEAN mapping, isotropic): far water has a broad sun path, near water sparkles. One
+// sample a pixel; the sum per pixel (8 cosines) cost 0.12 ms (measured, as above). Terrain isn't reflected (screen-space
+// reflections are the next step): where the reflected ray would meet a hill, the sky shows.
+#define WATER_TILE \(Int(waterTile)).0
+#define WATER_TEXELS_PER_BLOCK \(String(format: "%.1f", Double(waterTexels) / waterTile))
+constant float kWaterF0 = 0.02;
+constant float kWaterRough2 = \(String(format: "%.6f", waterRough * waterRough));   // the surface's own roughness (GGX alpha squared) under the waves
+// Per wave: wave vector (radians per block along x and z), angular frequency (radians per second), 4 over its wavelength
+// (per block); its slope (radians) along x and z at a crest, phase, and its slopes' variance (half the crest's squared).
+constant float4 kWaterWave[\(waves.count)] = { \(waves.joined(separator: ", ")) };
+constant float4 kWaterAmp[\(waves.count)] = { \(amps.joined(separator: ", ")) };
+
+static float litWaterFresnel(float c) {
+    float m = 1.0 - saturate(c), m2 = m * m;
+    return kWaterF0 + (1.0 - kWaterF0) * m2 * m2 * m;
+}
+
+// The sky map's coordinates for a direction of the upper hemisphere (a paraboloid map: the horizon is the circle of
+// radius 1/2 around the middle, the zenith the middle), and back.
+static float2 litWaterSkyUV(float3 dir) { return dir.xz / (1.0 + dir.y) * 0.5 + 0.5; }
+static float3 litWaterSkyDir(float2 uv) {
+    float2 p = uv * 2.0 - 1.0;
+    float r2 = dot(p, p);
+    if (r2 > 1.0) { p *= rsqrt(r2); r2 = 1.0; }   // past the horizon's circle (the corners, which bilinear taps reach): the horizon
+    return float3(2.0 * p.x, 1.0 - r2, 2.0 * p.y) / (1.0 + r2);
+}
+
+// Water pixel q (color c as the relight left it, depth d, G-buffer texel g): its color with the reflections. waves and
+// sky: this frame's waves' tile and sky map (lit_water_waves, lit_water_sky). Anything that isn't water comes back as it
+// came.
+static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half, access::read> vis, constant LitFrame& f,
+                            constant float4* env, texture2d<float> waves, texture2d<float> sky) {
+    // Not water; reflections off (offline A/B); or no atmosphere (the daylight curve), so no sky to reflect.
+    if (!litIsWater(g) || f.water.w <= 0.0 || f.misc.y > 0.5) return c;
+    uint view = uint(f.misc.z);
+    bool shows = litDepthMatches(d, g.y & 0xFFFFu);
+    // Debug view 9: water that reflects (cyan), water with something nearer drawn over it (magenta).
+    if (view == 9u) return shows ? float3(0.0, 0.8, 0.9) : float3(0.9, 0.0, 0.9);
+    // Something nearer was drawn over the water since (a boat, an entity, a cloud): its color stays. Only tops reflect: a
+    // water column's sides (falls, the edges of the world) are rare, and would be foam.
+    if (!shows || ((g.x >> 24) & 7u) != 2u) return c;
+    float2 ndc = (float2(q) + 0.5) / f.size.xy * 2.0 - 1.0;
+    float4 h = f.invViewProj * float4(ndc, d, 1.0);
+    float3 rel = h.xyz / h.w;
+    float dist = length(rel);
+    float3 V = -rel / max(dist, 1e-4);   // toward the camera
+    if (V.y <= 0.0) return c;            // seen from under its surface
+    // The waves at the pixel's footprint on the surface (blocks, along the view, where it's longest; in texels of the
+    // tile's top level, the mip to sample): the mean slope there, and the slopes' variance into the roughness.
+    float foot = dist * f.water2.x / max(V.y, 0.02);
+    constexpr sampler ws(filter::linear, mip_filter::linear, address::repeat);
+    float4 w = waves.sample(ws, (rel.xz + f.water.yz) * (1.0 / WATER_TILE), level(log2(max(foot * WATER_TEXELS_PER_BLOCK, 1.0))));
+    float rough2 = kWaterRough2 + max(w.z - dot(w.xy, w.xy), 0.0);
+    float3 n = normalize(float3(-w.x, 1.0, -w.y));
+    float nv = max(dot(n, V), 1e-3);
+    float F = litWaterFresnel(nv);
+    // The sky in the reflected direction. Rays a wave turns under the horizon take the horizon's light (they'd meet the
+    // next wave's back, which reflects the sky low down).
+    float3 R = reflect(-V, n);
+    R = normalize(float3(R.x, max(R.y, 0.0), R.z));
+    float skyLevel = float((g.y >> 16) & 255u) / 16.0;
+    float open = skyLevel >= 15.0 ? 1.0 : skyDecode(float3(litBrightness(skyLevel))).x;   // (the LOD's water is always 15)
+    constexpr sampler ss(filter::linear, address::clamp_to_edge);
+    float3 refl = sky.sample(ss, litWaterSkyUV(R), level(0.0)).rgb * (F * open);
+    // The sun's glint: its illuminance in scene units (lit_env leaves the scale to the relight's units in env[0].w), as
+    // much as the sky draws of its disk (none in rain: f.water2.y), none once it has set, through the lobe.
+    float3 L = f.sunDir.xyz;
+    float nl = dot(n, L);
+    if (nl > 0.0 && f.water2.y > 0.0 && env[0].w > 0.0 && max(env[0].r, max(env[0].g, env[0].b)) > 0.0) {
+        // Its visibility as the relight's sun term has it: traced where the rays went toward the sun, else the open sky.
+        float vSun = saturate((skyLevel - 12.0) / 3.0);
+        if (f.size.z > 0.0 && f.sunDir.w < 0.5) {
+            uint s = uint(f.size.z);
+            vSun = float(vis.read(min(q / s, uint2(vis.get_width() - 1, vis.get_height() - 1))).r) * saturate(skyLevel / 2.0);
+        }
+        float3 H = normalize(L + V);
+        float nh = saturate(dot(n, H));
+        float dd = nh * nh * (rough2 - 1.0) + 1.0;
+        float D = rough2 / (SKY_PI * dd * dd);
+        float G = 0.5 / (nl * sqrt(nv * nv * (1.0 - rough2) + rough2) + nv * sqrt(nl * nl * (1.0 - rough2) + rough2));
+        refl += env[0].rgb * (f.water2.y / env[0].w * D * G * litWaterFresnel(saturate(dot(V, H))) * nl * vSun);
+    }
+    // Debug view 10: the reflections alone (what the water gets on top of its drawn color's share).
+    if (view == 10u) return saturate(skyEncode(refl));
+    if (view != 0u) return c;
+    float3 o = skyEncode(skyDecode(c) * (1.0 - F * open) + refl);
+    if (f.size.w <= 1.0) o = saturate(o);
+    return max(o, 0.0);
+}
+"""
+}()
+
+/// lit_relight_fs's last line, and with water the lines in its place: the reflections after the relight (this frame's sky
+/// map and waves' tile are bound then, or stand-ins without our sky, when litWaterPixel leaves water alone).
+private let litRelightFsReturn = "    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")), dst.a);"
+private let litRelightFsWater = """
+    float d = depth.read(q);
+    float3 c = litRelightPixel(dst.rgb, q, d, g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : ""));
+    return float4(litWaterPixel(c, q, d, g, vis, f, env, waves, waterSky), dst.a);
+"""
+
+/// With water: the kernels that make its waves' tile and sky map each frame (litWaterPixel samples them), appended to lit
+/// mode's own library.
+private let litWaterKernels = """
+
+// Water's waves (METALMC_EXP=water): one mip level of their tile at time t (out: a view of that level), one thread a
+// texel: the slopes of the waves the level can hold, each whole while its wavelength spans 4 of its texels and gone at 2,
+// and the slopes' mean squared length, which adds the variance of the waves faded out. Every level is made this way, not
+// averaged down from the top: a 2 x 2 box filter leaves waves near a level's limit in it, and the longest waves' crests
+// then showed as rays converging on the horizon over mid-distance water.
+kernel void lit_water_waves(texture2d<float, access::write> out [[texture(0)]], constant float& t [[buffer(0)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+    float spacing = WATER_TILE / float(out.get_width());
+    float2 p = (float2(gid) + 0.5) * spacing;
+    float2 s = 0.0;
+    float faded = 0.0;
+    for (uint i = 0; i < \(waterWaveSet.count)u; i++) {
+        float4 w = kWaterWave[i], a = kWaterAmp[i];
+        float fade = saturate(2.0 - spacing * w.w);
+        s += (fade * cos(dot(w.xy, p) - w.z * t + a.z)) * a.xy;
+        faded += a.w * (1.0 - fade * fade);
+    }
+    out.write(float4(s, dot(s, s) + faded, 0.0), gid);
+}
+
+// Water's sky map: the sky's light (skyLuminance, scene units) over the upper hemisphere, one thread a texel.
+kernel void lit_water_sky(texture2d<float, access::write> out [[texture(0)]], constant SkyFrame& f [[buffer(0)]],
+                          texture2d<float> skyView [[texture(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+    float2 uv = (float2(gid) + 0.5) / float2(out.get_width(), out.get_height());
+    out.write(float4(skyLuminance(f, litWaterSkyDir(uv), skyView), 1.0), gid);
 }
 """
 
@@ -276,11 +501,11 @@ fragment float4 lit_relight_fs(LitVOut in [[stage_in]], float4 dst [[color(0)]],
                                texture2d<half, access::read> vis [[texture(2)]],
                                texture2d<float> lightmap [[texture(3)]],\(litGi ? "\n                               texture2d<float> giStandIn [[texture(4)]],\n                               texture2d<uint> gi [[texture(5)]]," : "")
                                constant LitFrame& f [[buffer(0)]],
-                               constant float4* env [[buffer(1)]]) {
+                               constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]]" : "")) {
     uint2 q = uint2(in.pos.xy);
     uint2 g = gbuf.read(q).rg;
-    if ((g.x >> 29) == 0u && f.misc.z == 0.0) return dst;
-    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")), dst.a);
+    if ((g.x >> 29) == 0u && f.misc.z == 0.0\(litWater ? " && !litIsWater(g)" : "")) return dst;
+\(litWater ? litRelightFsWater : litRelightFsReturn)
 }
 
 // The sun's light and the sky's on each face direction, from the atmosphere's tables (with our sky on), scaled by p.x so
@@ -323,7 +548,7 @@ kernel void lit_env(device float4* out [[buffer(0)]], constant SkyFrame& f [[buf
     float3 ground = f.atmo.planet.w * (up + sun * max(f.sun.y, 0.0));
     float3 tz = skyTransmittanceToSpace(trans, f.atmo, r0, 1.0);
     float scale = 1.0 / max(p.x * dot(tz, float3(0.2126, 0.7152, 0.0722)), 1e-6);
-    out[0] = float4(sun * scale, \(litGi ? "scale" : "0.0"));
+    out[0] = float4(sun * scale, \(litGi || litWater ? "scale" : "0.0"));
     out[1] = float4((px + 0.5 * ground) * scale, 0.0);
     out[2] = float4((nx + 0.5 * ground) * scale, 0.0);
     out[3] = float4(up * scale, 0.0);
@@ -331,10 +556,11 @@ kernel void lit_env(device float4* out [[buffer(0)]], constant SkyFrame& f [[buf
     out[5] = float4((pz + 0.5 * ground) * scale, 0.0);
     out[6] = float4((nz + 0.5 * ground) * scale, 0.0);
     out[7] = float4((0.5 * up + 0.125 * (px + nx + pz + nz) + 0.25 * ground) * scale, 0.0);
-}
+}\(litWater ? litWaterKernels : "")
 """
 
-/// Mirrors LitFrame in the shader.
+/// Mirrors LitFrame in the shader. The last two are water's (litWater); without it the shader's LitFrame ends before them
+/// and doesn't read them.
 private struct LitFrameGPU {
     var invViewProj = matrix_identity_float4x4
     var size = SIMD4<Float>.zero
@@ -343,6 +569,8 @@ private struct LitFrameGPU {
     var fogColor = SIMD4<Float>.zero
     var fog = SIMD4<Float>.zero
     var misc = SIMD4<Float>.zero
+    var water = SIMD4<Float>.zero
+    var water2 = SIMD4<Float>.zero
 }
 
 private func litSmoothstep(_ e0: Float, _ e1: Float, _ x: Float) -> Float {
@@ -407,6 +635,18 @@ final class Lit: @unchecked Sendable {
     /// Whether the last relight had the atmosphere's light (the GI cache, which runs before it in the frame, takes the
     /// same kind of light: a frame late when the sky turns on or off).
     private(set) var lastAtmosphere = false
+    /// With water: whether the relight reflects in it (offline A/B, mmc_debug_lit_water; the G-buffer flags it either
+    /// way), and the waves' time in seconds (offline, for repeatable pictures; below 0 the clock's).
+    var waterOn = true
+    var waterTime: Double = -1
+    /// With water: the waves' tile (RGBA16Float, mipmapped: slopes and their mean squared length; a view of each level for
+    /// the kernel to write) and the sky map (RGBA16Float, the upper hemisphere), and the kernels that make them each frame.
+    private var waves: MTLTexture?
+    private var waveLevels: [MTLTexture] = []
+    private var waveStillLevelsMade = false
+    private var waterSky: MTLTexture?
+    private var wavesPipe: MTLComputePipelineState?
+    private var waterSkyPipe: MTLComputePipelineState?
 
     /// Adds the G-buffer to the level's main pass (mmc_pass_begin), cleared to "not lit terrain".
     func attach(_ d: MTLRenderPassDescriptor, color: MTLTexture) -> Bool {
@@ -436,6 +676,23 @@ final class Lit: @unchecked Sendable {
         do {
             let lib = try ctx.device.makeLibrary(source: litShaderSource, options: nil)
             envPipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "lit_env")!)
+            if litWater {
+                wavesPipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "lit_water_waves")!)
+                waterSkyPipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "lit_water_sky")!)
+                let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: waterTexels, height: waterTexels, mipmapped: true)
+                td.usage = [.shaderRead, .shaderWrite]
+                td.storageMode = .private
+                waves = ctx.device.makeTexture(descriptor: td)
+                waves?.label = "MetalMC water waves"
+                waveLevels = (0..<waterLevels).compactMap {
+                    waves?.makeTextureView(pixelFormat: .rgba16Float, textureType: .type2D, levels: $0..<($0 + 1), slices: 0..<1)
+                }
+                let sd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: waterSkyTexels, height: waterSkyTexels, mipmapped: false)
+                sd.usage = [.shaderRead, .shaderWrite]
+                sd.storageMode = .private
+                waterSky = ctx.device.makeTexture(descriptor: sd)
+                waterSky?.label = "MetalMC water sky map"
+            }
             library = lib
         } catch {
             log("lit: shaders failed: \(error)")
@@ -506,7 +763,7 @@ final class Lit: @unchecked Sendable {
     }
 
     /// Binds the deferred relight's inputs to the anti-aliasing's resolve (its taaLit variant: buffers 2 and 3, textures
-    /// 8-10, and with the GI cache 11 and 12) and forgets it.
+    /// 8-10, with the GI cache 11 and 12, with water 13 and 14) and forgets it.
     func bindDeferred(_ enc: MTLComputeCommandEncoder) {
         guard var d = deferred, let gbuffer else { return }
         deferred = nil
@@ -522,6 +779,10 @@ final class Lit: @unchecked Sendable {
         if let gi = d.gi {
             enc.setTexture(gi.irr, index: 11)
             enc.setTexture(gi.code, index: 12)
+        }
+        if litWater {
+            enc.setTexture(waves ?? dummyLightmap, index: 13)
+            enc.setTexture(waterSky ?? dummyLightmap, index: 14)
         }
     }
 
@@ -579,6 +840,18 @@ final class Lit: @unchecked Sendable {
         let sky = Sky.shared
         let atmosphere = p[41] > 0.5 && sky.ready && sky.transmittance != nil && sky.skyView != nil
         f.misc = SIMD4(lightmap != nil ? 1 : 0, atmosphere ? 0 : 1, view, litExposure)
+        if litWater {
+            // The waves: their time (the clock's, wrapped where a float still holds their phases to a few thousandths of
+            // a radian), and the camera's x and z modulo their tile, from the LOD's draw this frame (the LOD and the far
+            // field it draws are what flags water), so they stay put in the world as the camera moves. And the angle a
+            // pixel spans at the screen's center, which sets the footprint the waves are sampled at (proj[1][1] is the
+            // cotangent of half the vertical field of view).
+            let t = waterTime >= 0 ? waterTime : ProcessInfo.processInfo.systemUptime.truncatingRemainder(dividingBy: 3600)
+            let cam = LodRenderer.shared.lastCamera
+            func wrap(_ x: Double) -> Float { x.isFinite ? Float(x - (x / waterTile).rounded(.down) * waterTile) : 0 }
+            f.water = SIMD4(Float(t), wrap(cam.x), wrap(cam.z), waterOn ? 1 : 0)
+            f.water2 = SIMD4(2 / max(abs(p[5]) * Float(color.height), 1e-6), atmosphere ? sky.frame.sunHoriz.w : 0, 0, 0)
+        }
         var visTexture = dummyVis!
         if let v = RtShadows.shared.takeLitVisibility(width: color.width, height: color.height) {
             visTexture = v.texture
@@ -609,6 +882,29 @@ final class Lit: @unchecked Sendable {
         } else {
             daylight = litDaylightEnv(sunAngle: sunAngle)
         }
+        // With water: this frame's waves summed into the levels of their tile that move (the rest, where every wave has
+        // faded, made once), and the sky map (where the reflections run: with our sky). They write different textures, so
+        // the dispatches run side by side (serial, the small levels' each added their latency: 0.02-0.03 ms, measured).
+        if litWater, atmosphere, waterOn, let wavesPipe, let waterSkyPipe, waveLevels.count == waterLevels, let waterSky,
+           let skyView = sky.skyView, let enc = cb.makeComputeCommandEncoder(dispatchType: .concurrent) {
+            enc.label = "MetalMC water waves and sky map"
+            var t = f.water.x
+            enc.setComputePipelineState(wavesPipe)
+            enc.setBytes(&t, length: 4, index: 0)
+            for (level, view) in waveLevels.enumerated() where level < waterMovingLevels || !waveStillLevelsMade {
+                let n = waterTexels >> level, g = min(n, 16)
+                enc.setTexture(view, index: 0)
+                enc.dispatchThreads(MTLSize(width: n, height: n, depth: 1), threadsPerThreadgroup: MTLSize(width: g, height: g, depth: 1))
+            }
+            waveStillLevelsMade = true
+            var frame = sky.frame
+            enc.setComputePipelineState(waterSkyPipe)
+            enc.setTexture(waterSky, index: 0)
+            enc.setTexture(skyView, index: 1)
+            enc.setBytes(&frame, length: MemoryLayout<SkyFrameGPU>.stride, index: 0)
+            enc.dispatchThreads(MTLSize(width: waterSkyTexels, height: waterSkyTexels, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            enc.endEncoding()
+        }
         if deferToTaa {
             deferred = (f, daylight, env, visTexture, lightmap ?? dummyLightmap!, gi, color.width, color.height)
             countFrame(atmosphere: atmosphere, traced: f.size.z > 0)
@@ -635,6 +931,12 @@ final class Lit: @unchecked Sendable {
             enc.setFragmentBuffer(env, offset: 0, index: 1)
         } else {
             enc.setFragmentBytes(daylight, length: daylight.count * 16, index: 1)
+        }
+        if litWater {
+            // Water's reflections: this frame's sky map and waves' tile (made above with our sky; without it the shader
+            // leaves water alone). The anti-aliasing's resolve gets them from bindDeferred.
+            enc.setFragmentTexture(waterSky ?? dummyLightmap, index: 6)
+            enc.setFragmentTexture(waves ?? dummyLightmap, index: 7)
         }
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
@@ -723,6 +1025,40 @@ final class Lit: @unchecked Sendable {
         log(String(format: "lit: anti-aliasing resolve with the relight at %dx%d: with the GI cache's light %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), %d each",
                    color.width, color.height, on[on.count / 2], on[0], off[off.count / 2], off[0], on[on.count / 2] - off[off.count / 2], on[0] - off[0], on.count))
     }
+
+    /// Offline check with water (litWater): GPU times (ms) over `runs` command buffers each, the reflections on and off
+    /// alternating, on this G-buffer. out[0-3]: the anti-aliasing's resolve with the relight and the sky's aerial
+    /// perspective in its load (its lit and sky variant, where the game runs water), on and off (medians), then on and off
+    /// (the fastest); out[4-7]: the relight as a pass of its own, likewise. Needs our sky's tables (a frame with the sky
+    /// before it) and `p` with our sky on (Lit.relight's 42 floats). Without water "on" and "off" are the same passes: the
+    /// baseline that water's whole cost (its code compiled in, which takes registers, as well as its work) is measured from.
+    func debugTimeWater(color: MTLTexture, depth: MTLTexture, colorHandle: Int64, depthHandle: Int64, p: UnsafePointer<Float>,
+                        lightmap: MTLTexture?, runs: Int, out: UnsafeMutablePointer<Double>) -> Bool {
+        let saved = waterOn
+        defer { waterOn = saved }
+        var cam: [Double] = [0, 0, 0]
+        var t: [[Double]] = [[], [], [], []]
+        for k in 0..<(4 * runs) {
+            let taa = k < 2 * runs
+            waterOn = k % 2 == 0
+            frameTarget = (ObjectIdentifier(color.parent ?? color), color.width, color.height)
+            guard relight(color: color, depth: depth, p: p, lightmap: lightmap, deferToTaa: taa) else { return false }
+            if taa {
+                guard mmc_sky_aerial(colorHandle, depthHandle, p, 1) == 1, mmc_taa_apply(colorHandle, depthHandle, p, &cam, 0, 0, 0) == 1 else { return false }
+            }
+            guard let cb = ctx.cb else { return false }
+            ctx.cb = nil
+            cb.commit()
+            cb.waitUntilCompleted()
+            t[(taa ? 0 : 2) + (waterOn ? 0 : 1)].append((cb.gpuEndTime - cb.gpuStartTime) * 1000)
+        }
+        for i in 0..<4 {
+            let s = t[i].sorted()
+            out[(i / 2) * 4 + i % 2] = s.isEmpty ? -1 : s[s.count / 2]
+            out[(i / 2) * 4 + 2 + i % 2] = s.first ?? -1
+        }
+        return true
+    }
 }
 
 /// 1 if lit mode is on (METALMC_EXP=lit).
@@ -802,4 +1138,39 @@ public func mmc_debug_lit_time(_ colorHandle: Int64, _ depthHandle: Int64, _ p: 
     var fastest = -1.0
     out[0] = Lit.shared.debugTime(color: color, depth: depth, p: p, lightmap: lightmap, runs: Int(runs), fastest: &fastest)
     out[1] = fastest
+}
+
+/// Offline A/B with water (METALMC_EXP=lit,water): `on` 0 relights without the reflections (the G-buffer flags water either
+/// way), 1 (default) with them; `time` >= 0 holds the waves at that time (seconds, for repeatable pictures), below 0 they
+/// follow the clock. Returns 1 if water is on (litWater).
+@_cdecl("mmc_debug_lit_water")
+public func mmc_debug_lit_water(_ on: Int32, _ time: Double) -> Int32 {
+    Lit.shared.waterOn = on != 0
+    Lit.shared.waterTime = time
+    return litWater ? 1 : 0
+}
+
+/// Offline with water: the anti-aliasing's resolve (relight and aerial perspective in its load) and the relight's own pass
+/// with the reflections on and off, `runs` times each, alternating (Lit.debugTimeWater; without water both halves are the
+/// same passes, a baseline); out: 8 doubles. Call after a frame that drew the level with the G-buffer and our sky. Returns
+/// 0 without lit mode.
+@_cdecl("mmc_debug_lit_water_time")
+public func mmc_debug_lit_water_time(_ colorHandle: Int64, _ depthHandle: Int64, _ p: UnsafePointer<Float>, _ lightmapHandle: Int64,
+                                     _ runs: Int32, _ out: UnsafeMutablePointer<Double>) -> Int32 {
+    guard litEnabled else { return 0 }
+    let color = (from(colorHandle) as TextureBox).texture, depth = (from(depthHandle) as TextureBox).texture
+    let lightmap = lightmapHandle == 0 ? nil : (from(lightmapHandle) as TextureBox).texture
+    return Lit.shared.debugTimeWater(color: color, depth: depth, colorHandle: colorHandle, depthHandle: depthHandle, p: p,
+                                     lightmap: lightmap, runs: Int(runs), out: out) ? 1 : 0
+}
+
+/// Debug: lit mode's own shader source (the relight pass, the sun and sky kernel, with water its kernels), for an offline
+/// compile check. Returns its length.
+@_cdecl("mmc_debug_lit_shader_source")
+public func mmc_debug_lit_shader_source(_ out: UnsafeMutablePointer<CChar>, _ len: Int32) -> Int32 {
+    let bytes = Array(litShaderSource.utf8)
+    guard bytes.count < Int(len) else { return Int32(bytes.count) }
+    for (i, b) in bytes.enumerated() { out[i] = CChar(bitPattern: b) }
+    out[bytes.count] = 0
+    return Int32(bytes.count)
 }

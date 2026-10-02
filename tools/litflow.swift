@@ -20,24 +20,37 @@
 //   below; LITFLOW_VIEWS=x,y,z,yaw,pitch;... sets the views, LITFLOW_CULLREF=<file> checks the unculled picture against
 //   another build's).
 //   LITFLOW_GATE=<dir>: take the GPU lock only after the LOD's build (see there).
+//   LITFLOW_WATER=1 adds water (METALMC_EXP=...,water: its reflections, Lit.swift) and runs only the water section: per
+//   time of day (LITFLOW_WATERTIMES, default noon,dusk,sunset; also morning, low (sun 7 degrees up in the east), midnight)
+//   the relit frame with the reflections off and on in the same build (mmc_debug_lit_water; with a library without it only
+//   "off", for before/after against an older build), the waves held at a time that steps 1/120 s a frame, the water
+//   pixels' numbers, the debug views (9: which pixels reflect, 10: the reflections alone) and with the anti-aliasing; with
+//   "time" the reflections' cost in the resolve and in the relight's own pass (without LITFLOW_WATER, the same passes as
+//   the baseline). LITFLOW_NAME names the view in the pictures (<mode>-water-<name>-<time>-off.png, -on.png, -on-taa.png,
+//   -reflections.png, -changed-dry.png if anything but water changed; <mode>-water-<name>-view-water.png).
+//   litflow <dylib> - - compile: compiles every shader variant of the anti-aliasing's resolve, the far field and lit mode's
+//   own pass under METALMC_EXP=$LITFLOW_EXP (default lit,rtshadows,sky,water), then exits (no world, no GPU work).
 import CoreGraphics
 import Foundation
 import ImageIO
+import Metal
 import simd
 
 let args = CommandLine.arguments
-guard args.count >= 4 else { print("usage: litflow <dylib> <world dir> <output dir> [sdr|sky|hdr|off] [time|cull]"); exit(1) }
+guard args.count >= 4 else { print("usage: litflow <dylib> <world dir> <output dir> [sdr|sky|hdr|off|compile] [time|cull]"); exit(1) }
 let mode = args.count >= 5 ? args[4] : "sdr"
 let timing = args.count >= 6 && args[5] == "time"
 let cullRun = args.count >= 6 && args[5] == "cull"
 let giOn = ProcessInfo.processInfo.environment["LITFLOW_GI"] == "1" && mode != "off"
-let exp = (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
-    + (giOn ? ",gi" : "")
+let waterOn = ProcessInfo.processInfo.environment["LITFLOW_WATER"] == "1" && mode != "off"
+let exp = mode == "compile" ? (ProcessInfo.processInfo.environment["LITFLOW_EXP"] ?? "lit,rtshadows,sky,water")
+    : (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
+        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "")
 setenv("METALMC_EXP", exp, 1)
 let lit = mode != "off", sky = mode == "sky" || mode == "hdr", hdr = mode == "hdr"
 guard let lib = dlopen(args[1], RTLD_NOW) else { print("dlopen failed"); exit(1) }
 let outDir = URL(fileURLWithPath: args[3])
-try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+if mode != "compile" { try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true) }
 func fn<T>(_ name: String, _: T.Type) -> T {
     guard let p = dlsym(lib, name) else { print("missing \(name)"); exit(1) }
     return unsafeBitCast(p, to: T.self)
@@ -75,6 +88,75 @@ func check(_ ok: Bool, _ what: String) {
 }
 check(ctxInit() == 1, "context (METALMC_EXP=\(exp))")
 
+// Mode "compile": every variant of the shaders lit mode touches compiles with the device's compiler, as the library would
+// build them under this METALMC_EXP: the anti-aliasing's resolve (both tile sizes; plain, sky, lit, lit and sky), the far
+// field (its march for the level pass's targets, its compute kernels) and lit mode's own pass (each target format) and
+// sun and sky kernel.
+if mode == "compile" {
+    let device = MTLCreateSystemDefaultDevice()!
+    func source(_ name: String) -> String? {
+        guard let p = dlsym(lib, name) else { return nil }
+        let f = unsafeBitCast(p, to: (@convention(c) (UnsafeMutablePointer<CChar>, Int32) -> Int32).self)
+        var buf = [CChar](repeating: 0, count: 1 << 21)
+        let n = f(&buf, Int32(buf.count))
+        return n > 0 && Int(n) < buf.count ? String(cString: buf) : nil
+    }
+    let litOn = exp.split(separator: ",").contains("lit")
+    var failures = 0
+    func attempt(_ what: String, _ body: () throws -> Void) {
+        do { try body(); print("ok    \(what)") } catch { print("FAIL  \(what): \(error)"); failures += 1 }
+    }
+    if let src = source("mmc_debug_taa_shader_source") {
+        for tile in [32, 16] {
+            let opts = MTLCompileOptions()
+            opts.preprocessorMacros = ["TAA_T": NSNumber(value: tile)]
+            for (skyV, litV) in [(false, false), (true, false), (false, true), (true, true)] where litOn || !litV {
+                attempt("anti-aliasing resolve, \(tile) x \(tile) tiles\(skyV ? ", sky" : "")\(litV ? ", lit" : "")") {
+                    let l = try device.makeLibrary(source: src, options: opts)
+                    let v = MTLFunctionConstantValues()
+                    var s = skyV, li = litV
+                    v.setConstantValue(&s, type: .bool, index: 0)
+                    if litOn { v.setConstantValue(&li, type: .bool, index: 1) }
+                    _ = try device.makeComputePipelineState(function: try l.makeFunction(name: "taa_resolve", constantValues: v))
+                }
+            }
+        }
+    } else { print("FAIL  no anti-aliasing source"); failures += 1 }
+    if let src = source("mmc_debug_far_shader_source") {
+        attempt("far field: march (level pass targets\(litOn ? " with the G-buffer" : "")) and kernels") {
+            let l = try device.makeLibrary(source: src, options: nil)
+            for k in ["ff_clear", "ff_fill", "ff_mip", "ff_profile"] { _ = try device.makeComputePipelineState(function: l.makeFunction(name: k)!) }
+            let d = MTLRenderPipelineDescriptor()
+            d.vertexFunction = l.makeFunction(name: "ff_vs")
+            d.fragmentFunction = l.makeFunction(name: "ff_fs")
+            d.colorAttachments[0].pixelFormat = .rgba8Unorm
+            if litOn { d.colorAttachments[1].pixelFormat = .rg32Uint }
+            d.depthAttachmentPixelFormat = .depth32Float
+            _ = try device.makeRenderPipelineState(descriptor: d)
+        }
+    } else { print("FAIL  no far field source"); failures += 1 }
+    if litOn {
+        if let src = source("mmc_debug_lit_shader_source") {
+            for format in [MTLPixelFormat.rgba8Unorm, .rgba16Float, .rg11b10Float] {
+                attempt("lit mode's relight pass (target format \(format.rawValue)), sun and sky kernel\(src.contains("lit_water_waves") ? ", water's waves and sky map kernels" : "")") {
+                    let l = try device.makeLibrary(source: src, options: nil)
+                    _ = try device.makeComputePipelineState(function: l.makeFunction(name: "lit_env")!)
+                    for k in ["lit_water_waves", "lit_water_sky"] {
+                        if let w = l.makeFunction(name: k) { _ = try device.makeComputePipelineState(function: w) }
+                    }
+                    let d = MTLRenderPipelineDescriptor()
+                    d.vertexFunction = l.makeFunction(name: "lit_fullscreen_vs")
+                    d.fragmentFunction = l.makeFunction(name: "lit_relight_fs")
+                    d.colorAttachments[0].pixelFormat = format
+                    _ = try device.makeRenderPipelineState(descriptor: d)
+                }
+            }
+        } else { print("      (no lit mode source in this library: an older build)") }
+    }
+    print(failures == 0 ? "done: every variant compiles" : "FAIL  \(failures) failed")
+    exit(failures == 0 ? 0 : 1)
+}
+
 // Lit entry points (absent from a build without Lit.swift: "off" doesn't need them).
 typealias LitRelightF = @convention(c) (Int64, Int64, UnsafePointer<Float>, Int64, Int32) -> Int32
 let litLevelPass = lit ? fn("mmc_lit_level_pass", (@convention(c) () -> Void).self) : nil
@@ -90,6 +172,16 @@ if lit { check(fn("mmc_lit_enabled", (@convention(c) () -> Int32).self)() == 1, 
 let litGiSwitch = giOn ? fn("mmc_debug_lit_gi", (@convention(c) (Int32) -> Int32).self) : nil
 let giFrameSwitch = giOn ? fn("mmc_debug_gi_frame", (@convention(c) (Int32) -> Void).self) : nil
 if let litGiSwitch { check(litGiSwitch(1) == 1, "the GI cache is wired into lit mode (lit,gi)") }
+// Water's switches (LITFLOW_WATER=1; absent from a library from before water, which then draws the "off" pictures): the
+// reflections on or off, and the waves' time, which frame() steps by 1/120 s a frame so pictures repeat.
+let litWaterSwitch = waterOn ? dlsym(lib, "mmc_debug_lit_water").map { unsafeBitCast($0, to: (@convention(c) (Int32, Double) -> Int32).self) } : nil
+// The resolve and the relight's own pass timed with the reflections on and off (without water both are the same passes:
+// the baseline for water's whole cost).
+let litWaterTime = lit ? dlsym(lib, "mmc_debug_lit_water_time").map {
+    unsafeBitCast($0, to: (@convention(c) (Int64, Int64, UnsafePointer<Float>, Int64, Int32, UnsafeMutablePointer<Double>) -> Int32).self) } : nil
+if waterOn { print(litWaterSwitch.map { $0(1, 100) == 1 ? "ok    water is on (lit,water)" : "FAIL  water isn't on" } ?? "      no water in this library: its pictures are the reflections off") }
+var reflectWater = true
+var framesDrawn = 0
 
 // The world's LOD around the camera.
 let viewSpec = (ProcessInfo.processInfo.environment["LITFLOW_VIEW"] ?? "8,150,8,100,22").split(separator: ",").map { Double($0)! }
@@ -220,6 +312,9 @@ func frame(_ t: Targets, sunAngle: Float, relight: Bool, extras: Bool = true, ta
     passEnd()
     let traced = shadowsApply(t.color, t.depth, &mats, &c, sunAngle, 0.42, 192, 0) == 1
     var ran = false
+    // Water: the reflections on or off, the waves 1/120 s on from the last frame (as at 120 Hz).
+    if let litWaterSwitch { _ = litWaterSwitch(reflectWater ? 1 : 0, 100 + Double(framesDrawn) / 120) }
+    framesDrawn += 1
     if relight, let litRelight {
         // Lit.relight's p: matrices, sun angle, fog color (strength 0: none), fog distances, our sky drew.
         var lp = mats + [sunAngle, 0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, sky ? 1 : 0]
@@ -592,9 +687,9 @@ func lumOf(_ px: [UInt8], _ i: Int) -> Double { 0.2126 * Double(px[i]) + 0.7152 
 // LITFLOW_GIONLY=1 to the GI cache's comparison).
 let timeOnly = ProcessInfo.processInfo.environment["LITFLOW_TIMEONLY"] == "1"
 let giOnly = giOn && ProcessInfo.processInfo.environment["LITFLOW_GIONLY"] == "1"
-let fwd = timeOnly || giOnly ? Readback() : capture(half, sunAngle: morning, relight: false, frames: 1)
-if !timeOnly && !giOnly { writePNG(fwd.color, Int(W), Int(H), "\(tag)-forward-morning.png") }
-if lit && !timeOnly && !giOnly {
+let fwd = timeOnly || giOnly || waterOn ? Readback() : capture(half, sunAngle: morning, relight: false, frames: 1)
+if !timeOnly && !giOnly && !waterOn { writePNG(fwd.color, Int(W), Int(H), "\(tag)-forward-morning.png") }
+if lit && !timeOnly && !giOnly && !waterOn {
     let litM = capture(half, sunAngle: morning, relight: true)
     writePNG(litM.color, Int(W), Int(H), "\(tag)-lit-morning.png")
     // The G-buffer against the depth buffer: terrain pixels whose key matches the final depth (relit), those under the
@@ -710,13 +805,78 @@ if lit && !timeOnly && !giOnly {
     setLightmap(skyFactor: 1)
 }
 
+// Water (LITFLOW_WATER=1): per time of day the relit frame (no extras) with the reflections off and on in the same build,
+// with the anti-aliasing, the reflections alone (debug view 10), and the water pixels' numbers: how many the G-buffer
+// flags with a matching depth (the far field's water now; the LOD's quads' once its water pipeline writes the flag), and
+// their mean 8-bit luma off and on, by the upper and lower half of the frame (far and near water).
+if waterOn && !timeOnly {
+    let n = Int(W) * Int(H)
+    let name = ProcessInfo.processInfo.environment["LITFLOW_NAME"] ?? "view"
+    // Sun angles (vanilla's) and the lightmap's daylight for them: sunset has the sun 2 degrees up in the west, low 7 up in
+    // the east.
+    let suns: [String: (Float, Float)] = ["noon": (noon, 1), "morning": (morning, 1), "dusk": (dusk, 0.55), "sunset": (1.53, 0.4),
+                                          "low": (-1.45, 0.6), "midnight": (midnight, 0.2)]
+    let list = (ProcessInfo.processInfo.environment["LITFLOW_WATERTIMES"] ?? "noon,dusk,sunset").split(separator: ",").map(String.init)
+    func waterPixels(_ r: Readback) -> [Int] {
+        guard !r.gbuf.isEmpty else { return [] }
+        return (0..<n).filter { (r.gbuf[2 * $0] >> 28) == 1 && depthMatches(r.depth[$0], r.gbuf[2 * $0 + 1] & 0xFFFF) }
+    }
+    func meanLuma(_ px: [UInt8], _ idx: [Int]) -> Double { idx.isEmpty ? 0 : idx.reduce(0.0) { $0 + lumOf(px, 4 * $1) } / Double(idx.count) }
+    for t in list {
+        guard let (angle, skyFactor) = suns[t] else { print("      unknown time \(t)"); continue }
+        setLightmap(skyFactor: skyFactor)
+        for _ in 0..<16 { frame(small, sunAngle: angle, relight: true, extras: false) }   // the sky's tables for this sun
+        reflectWater = false
+        let off = capture(half, sunAngle: angle, relight: true, extras: false)
+        writePNG(off.color, Int(W), Int(H), "\(tag)-water-\(name)-\(t)-off.png")
+        guard litWaterSwitch != nil else { continue }
+        // 48 frames more, so the "on" frames have the same places in every 64-frame cycle (the shadows' sun disk samples,
+        // the sky's dither) as the "off" ones: then only water may differ between the two.
+        for _ in 0..<48 { frame(small, sunAngle: angle, relight: true, extras: false) }
+        reflectWater = true
+        let on = capture(half, sunAngle: angle, relight: true, extras: false)
+        writePNG(on.color, Int(W), Int(H), "\(tag)-water-\(name)-\(t)-on.png")
+        let refl = capture(half, sunAngle: angle, relight: true, view: 10, extras: false)
+        writePNG(refl.color, Int(W), Int(H), "\(tag)-water-\(name)-\(t)-reflections.png")
+        let onT = capture(half, sunAngle: angle, relight: true, extras: false, frames: 24, taa: true)
+        writePNG(onT.color, Int(W), Int(H), "\(tag)-water-\(name)-\(t)-on-taa.png")
+        let water = waterPixels(on)
+        let far = water.filter { $0 / Int(W) >= Int(H) / 2 }, near = water.filter { $0 / Int(W) < Int(H) / 2 }   // row 0 is the bottom
+        // Pixels that changed and aren't water: none but where something else changed between the two captures. The
+        // shadows' tile structures still build in the background after the warm-up (nearest first, about one a frame, and
+        // the far field's view has thousands), so far terrain can take a new shadow in between: a few hundred pixels of
+        // it, measured, all far land near the horizon. Marked in a picture (white on the dimmed "on" frame) when there are
+        // any; a change that touched anything but water would show over most of the frame.
+        var isWater = [Bool](repeating: false, count: n)
+        for i in water { isWater[i] = true }
+        var changed = 0, changedDry = 0
+        var dryMask = on.color.map { $0 / 4 }
+        for i in 0..<n where on.color[4 * i] != off.color[4 * i] || on.color[4 * i + 1] != off.color[4 * i + 1] || on.color[4 * i + 2] != off.color[4 * i + 2] {
+            changed += 1
+            if !isWater[i] { changedDry += 1; for k in 0..<3 { dryMask[4 * i + k] = 255 } }
+        }
+        print(String(format: "      %@ %@: water %.1f%% of the frame (upper half %d px, lower %d); mean luma off -> on: all %.1f -> %.1f, upper %.1f -> %.1f, lower %.1f -> %.1f; %d pixels changed, %d of them not water",
+                     name, t, 100 * Double(water.count) / Double(n), far.count, near.count, meanLuma(off.color, water), meanLuma(on.color, water),
+                     meanLuma(off.color, far), meanLuma(on.color, far), meanLuma(off.color, near), meanLuma(on.color, near), changed, changedDry))
+        if changedDry > 0 { writePNG(dryMask, Int(W), Int(H), "\(tag)-water-\(name)-\(t)-changed-dry.png") }
+        check(water.count > 0, "the G-buffer flags water (\(name), \(t))")
+        check(changedDry * 200 < n, "the reflections change water pixels only (but for under 0.5% of the frame, far shadows: \(name), \(t))")
+    }
+    if litWaterSwitch != nil {
+        let cover = capture(half, sunAngle: suns[list.first ?? "noon"]?.0 ?? noon, relight: true, view: 9, extras: false, frames: 1)
+        writePNG(cover.color, Int(W), Int(H), "\(tag)-water-\(name)-view-water.png")
+    }
+    reflectWater = true
+    setLightmap(skyFactor: 1)
+}
+
 // The GI cache (LITFLOW_GI=1): lit mode with and without the cache's light in place of its sky term, in the same frames
 // (the cache keeps running either way; mmc_debug_lit_gi picks the relight's sky term). Per time of day: the pictures
 // (means of 16 frames, like the others), the mean 8-bit luma of the relit terrain by kind (shaded: faces the sun doesn't
 // light, turned away from it or edge-on, which only the sky term lights; sunlit tops), how much of the relit terrain the
 // cache covered (debug view 8), and the frame-to-frame change of single frames on the shaded faces (the cache's noise:
 // without it their light doesn't change between frames).
-if let litGiSwitch, !timeOnly {
+if let litGiSwitch, !timeOnly, !waterOn {
     let n = Int(W) * Int(H)
     let normals: [SIMD3<Float>] = [SIMD3(1, 0, 0), SIMD3(-1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, -1, 0), SIMD3(0, 0, 1), SIMD3(0, 0, -1)]
     // Relit pixels above the translucent band (none is drawn here: extras off) whose G-buffer key matches, by kind.
@@ -864,6 +1024,23 @@ if timing {
                 litTimeTaa(full.color, full.depth, &lp, lightmap, 60, &out)
                 print(String(format: "      round %d: anti-aliasing resolve at 3456 x 2234 (%@ target): with the relight in its load %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), 60 each",
                              round, hdr ? "RGBA16Float" : "RGBA8", out[0], out[2], out[1], out[3], out[0] - out[1], out[2] - out[3]))
+            }
+        }
+        // Water: the reflections' cost on this frame's G-buffer, on and off alternating, in the anti-aliasing's resolve
+        // (with the relight and the aerial perspective in its load, as the game runs them with the sky) and in the relight's
+        // own pass. Without water the same passes once, for the baseline.
+        if let litWaterTime, sky {
+            var out = [Double](repeating: 0, count: 8)
+            for round in 0..<2 {
+                guard litWaterTime(full.color, full.depth, &lp, lightmap, 60, &out) == 1 else { print("FAIL  water timing"); break }
+                if waterOn {
+                    print(String(format: "      round %d: water at 3456 x 2234 (%@ target): the anti-aliasing resolve with the reflections %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f); the relight's own pass %.3f (fastest %.3f) against %.3f (fastest %.3f): +%.3f (fastest +%.3f); 60 each",
+                                 round, hdr ? "RGBA16Float" : "RGBA8", out[0], out[2], out[1], out[3], out[0] - out[1], out[2] - out[3],
+                                 out[4], out[6], out[5], out[7], out[4] - out[5], out[6] - out[7]))
+                } else {
+                    print(String(format: "      round %d: no water, at 3456 x 2234 (%@ target): the anti-aliasing resolve with the relight and the aerial perspective %.3f ms (fastest %.3f); the relight's own pass %.3f (fastest %.3f); 120 each",
+                                 round, hdr ? "RGBA16Float" : "RGBA8", (out[0] + out[1]) / 2, min(out[2], out[3]), (out[4] + out[5]) / 2, min(out[6], out[7])))
+                }
             }
         }
     }
