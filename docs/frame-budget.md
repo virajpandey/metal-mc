@@ -71,6 +71,14 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   the horizon tour (LOD 262144) shows no holes (0.004-0.7% of pixels changed against last night's, water animation).
 - **The plain resolve keeps 16 x 16 tiles** (done): with 32 x 32 tiles it took 0.85 ms against 0.74 (its 14 KB of
   threadgroup memory against 4 costs more than the smaller border saves); only the heavy variants (sky, lit) use 32.
+- **The GI cache, cheaper** (done, merged 2026-10-02; docs/gi-design.md has the details): the light and its code word in
+  one texel per half-resolution sample (the upsample's common case is one read), the fallback's neighbors by gathers,
+  each cell's 4 samples on 4 lanes (four times the rays in flight), request and resolve fused into one pass over the depth,
+  faster hash lookups, and the relight reusing the cache's sun and sky light. Offline the cache's cost per frame went
+  from +1.61 to +1.27 ms (litflow, the game's call sequence: +1.51 -> +1.13, and +1.18 on the merged build); the light
+  matches within run-to-run noise. In game: the 2.1 ms measured tonight should come to about 1.5-1.6 (to measure).
+  Left for Viraj to decide: half the rays (`-PgiBudget=8192`, or `-PgiSpp=2 -PgiHistory=128`) saves another 0.2-0.3 ms,
+  and moves the converged light by about 1.5% (two runs of the defaults differ by about 1%).
 - **The screen locks itself after a while with no input** (2026-10-02, about 05:30, likely the company's idle-lock
   policy; caffeinate doesn't stop it). The lock screen over the fullscreen game paces it at 120 Hz like a dialog does
   (the GPU's frame time drops below the frame time: the command buffers stop overlapping), so timed flights are void
