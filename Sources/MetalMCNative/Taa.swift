@@ -24,6 +24,18 @@ import simd
 //
 // An earlier version used MetalFX's temporal scaler at 1:1. It cost 9 ms per frame at the panel's resolution.
 
+// Lit hook (Lit.swift): the relight as the resolve loads each pixel; with water (METALMC_EXP=lit,water) its reflections
+// after it (this frame's waves' tile and sky map are textures 13 and 14, which Lit.bindDeferred binds; without our sky
+// litWaterPixel leaves water alone).
+private let taaRelightLoad = "        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : ""));"
+private let taaWaterLoad = """
+        if (taaLit) {
+            uint2 g = litGbuf.read(q).rg;
+            c.rgb = litRelightPixel(c.rgb, q, d, g, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : ""));
+            c.rgb = litWaterPixel(c.rgb, q, d, g, litVis, litFrame, litEnv, litWaves, litWaterSky);
+        }
+"""
+
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
 // Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise.
 private let taaShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "") + """
@@ -120,7 +132,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
                         texture2d<uint, access::read> litGbuf [[texture(8), function_constant(taaLit)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
-                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")
+                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]]," : "")
 #endif
                         uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
@@ -137,7 +149,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         float4 c = color.read(q);
         float d = depth.read(q);
 #if LIT_MODE
-        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : ""));
+\(litWater ? taaWaterLoad : taaRelightLoad)
 #endif
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
