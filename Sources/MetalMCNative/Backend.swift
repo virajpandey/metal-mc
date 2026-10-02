@@ -65,11 +65,12 @@ final class SamplerBox {
     init(_ s: MTLSamplerState) { state = s }
 }
 
-/// METALMC_EXP=fold: pass folding. A clear of a single-level texture waits to become the load action of the next pass that
-/// draws into it, and the anti-aliasing's copy into the frame the first draw of the next pass on the frame (the hand's),
-/// whose load it makes unneeded. Without it each is a pass of its own: it stores the whole texture (31 MB for the frame at
-/// the panel's resolution) and the next pass loads it back.
-let passFolding = experiments.contains("fold")
+/// Pass folding (on; METALMC_EXP=nofold turns it off). A clear of a single-level texture waits to become the load action
+/// of the next pass that draws into it, and the anti-aliasing's copy into the frame the first draw of the next pass on the
+/// frame (the hand's), whose load it makes unneeded. Without it each is a pass of its own: it stores the whole texture
+/// (31 MB for the frame at the panel's resolution) and the next pass loads it back. Measured (2026-10-02, lit mode, the
+/// real-terrain flight): 2 clears and the copy fold every frame, 118.3 -> 119.9 fps; the frame is unchanged.
+let passFolding = !experiments.contains("nofold")
 
 struct PendingClear {
     let texture: MTLTexture
