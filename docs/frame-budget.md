@@ -91,10 +91,14 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   waves that roughen into the distance, for the far field's and the LOD's water (vanilla's near water not yet: it needs a
   translucent-pipeline variant). Cost offline: about 0.35 ms a frame with a third of the screen water (0.08 ms with only
   the far field's sea), bit for bit the old frame without the switch. Next: terrain in the reflections (screen space).
-- **The screen locks itself after a while with no input** (2026-10-02, about 05:30, likely the company's idle-lock
-  policy; caffeinate doesn't stop it). The lock screen over the fullscreen game paces it at 120 Hz like a dialog does
-  (the GPU's frame time drops below the frame time: the command buffers stop overlapping), so timed flights are void
-  until it's unlocked. Fidelity tours (screenshots read from the render target) and offline tests are unaffected. A
+- **The screen locks itself after 15 minutes with no input** (2026-10-02 at 05:15:37; the screen saver's idle time and
+  password are set by the Mac's managed policy). loginwindow checks every 15 minutes and starts the screen saver unless
+  something holds a display-sleep assertion; the game holds one while it runs and `caffeinate -d` does too (its log says
+  so: "PMNoDisplaySleepEnabled so do not launch screen saver"), so it locked in an 8-minute gap between two runner
+  starts. runq.sh holds `caffeinate -dims` while it runs, and a separate keep-awake covers the gaps on test nights. The
+  lock screen over the fullscreen game paces it at 120 Hz like a dialog does (the GPU's frame time drops below the
+  frame time: the command buffers stop overlapping), so timed flights are void until it's unlocked; runq.sh holds them
+  while it's locked. Fidelity tours (screenshots read from the render target) and offline tests are unaffected. A
   fidelity tour between flights also makes the next flight rebuild the flight world's LOD cache (the two fixtures share
   the world's name): keep flights together, or give the first one more -PbenchExtraWait.
 
