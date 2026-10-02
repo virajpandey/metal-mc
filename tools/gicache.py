@@ -3,7 +3,8 @@ libMetalMCNative, outside the game: builds a scene's acceleration structures, ru
 fixed camera, prints GPU times and cache statistics, and writes debug views as PNGs.
 
 usage:
-  python3 gicache.py selftest                       key round trips and ray/winding checks on the synthetic scene
+  python3 gicache.py selftest                       key round trips and ray/winding checks on the synthetic scene, and
+                                                    the resolve's RG11B10 packing against the texture unit's
   python3 gicache.py synth <outdir> [w h frames]    the synthetic scene's views (house, glowstone room, tunnel, outside)
   python3 gicache.py litsynth <outdir> [w h frames] lit mode's relight without and with the cache (debug views 6 and 7)
                                                     on the synthetic scene, in lit mode's light (its daylight curve, as
@@ -11,6 +12,31 @@ usage:
                                                     at dusk, and outside
   python3 gicache.py edit <outdir>                  opens the house's east wall after convergence: invalidation
   python3 gicache.py region <r.X.Z.mca> <outdir> [x y z yaw pitch]   real terrain at the panel's resolution (3456 x 2234)
+  python3 gicache.py bench <r.X.Z.mca> <outdir> [tag=<prefix>] [load=<table.bin>] [frames=160] [timed=96] [flush=96]
+                    [fly=<blocks a frame>] [view=x,y,z,yaw,pitch]
+                                                    the game's frame for the cache on real terrain at the panel's
+                                                    resolution in lit mode's light (mmc_debug_gi_profile): each frame
+                                                    after `flush` MB of other traffic (cold caches, as in a frame) and
+                                                    the game's shadow rays, then the cache's encoders with the game
+                                                    profile's timestamps and the anti-aliasing resolve's load loop with
+                                                    the cache's share (a proxy); once with the encoders one after
+                                                    another (each one's own time), once alternating frames with and
+                                                    without the cache (what it costs the frame), and with fly= while
+                                                    flying. Saves the converged table (<tag>table.bin; load= starts
+                                                    from one instead) and writes what the relight takes from the cache
+                                                    as floats (<tag>up9.f32, for cmp) and the irradiance and lit mode
+                                                    views
+  python3 gicache.py cmp <a.f32> <b.f32>            compares two bench pictures (to the bit, and the light's statistics)
+  python3 gicache.py src <out.metal>                the upsample header and kernels as built (the start of a variant)
+  python3 gicache.py exp <r.X.Z.mca> <outdir> <variant.metal ...> [rounds=3] [timed=64] [conv=256] [convfor=<names>]
+                    [fly=<blocks a frame>]
+                                                    kernel variants (src's text, edited) against the built-in kernels
+                                                    in one process: their times on one converged table, alternating;
+                                                    what the relight takes on that table (to the bit); the light
+                                                    converged from empty against two built-in runs
+  python3 gicache.py lag <r.X.Z.mca> <outdir> [variant.metal ...]
+                                                    how fast the light follows a 20 degree jump of the sun (the
+                                                    built-in kernels, or variants): against the light settled there
 
 The structures are built as RtShadows builds them with METALMC_EXP=lit,gi (zero copy: one geometry per quad range, a
 hit's quad read from the node's buffer); GICACHE_PRIMDATA=1 builds them with per-triangle data instead (the other route,
@@ -37,6 +63,28 @@ lib.mmc_debug_gi_selftest.argtypes = [ctypes.POINTER(ctypes.c_double)]
 lib.mmc_debug_gi_selftest.restype = ctypes.c_int32
 lib.mmc_debug_gi_lit_light.argtypes = [ctypes.c_int32]
 lib.mmc_debug_gi_lit_light.restype = None
+lib.mmc_debug_gi_reset.argtypes = []
+lib.mmc_debug_gi_reset.restype = None
+
+
+def bind(name, argtypes, restype):
+    """Binds a debug entry point if this build has it (an older build, METALMC_DYLIB, lacks the newer ones)."""
+    if hasattr(lib, name):
+        f = getattr(lib, name)
+        f.argtypes, f.restype = argtypes, restype
+
+
+bind("mmc_debug_gi_profile", [ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
+                              ctypes.c_int32, ctypes.c_int32, ctypes.c_float, ctypes.c_int32, ctypes.c_int32, ctypes.c_float,
+                              ctypes.POINTER(ctypes.c_double), ctypes.c_char_p, ctypes.c_int32], ctypes.c_int32)
+bind("mmc_debug_gi_view", [ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
+                           ctypes.c_int32, ctypes.c_float, ctypes.c_int32, ctypes.c_float, ctypes.c_int32,
+                           ctypes.POINTER(ctypes.c_uint8), ctypes.c_void_p], ctypes.c_int32)
+bind("mmc_debug_gi_save", [ctypes.c_char_p], ctypes.c_int32)
+bind("mmc_debug_gi_load", [ctypes.c_char_p], ctypes.c_int32)
+bind("mmc_debug_gi_diff", [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_double)], ctypes.c_int32)
+bind("mmc_debug_gi_reload", [ctypes.c_char_p], ctypes.c_int32)
+bind("mmc_debug_gi_shader_source", [ctypes.c_char_p, ctypes.c_int32], ctypes.c_int32)
 
 # The structures' route for the cache (mmc_debug_gi_scene flags bit 1: per-triangle data instead of zero copy).
 ROUTE = 2 if os.environ.get("GICACHE_PRIMDATA") == "1" else 0
@@ -125,7 +173,9 @@ def selftest():
         b = 4 + i * 7
         print(f"  {n}: no cull hit {out[b]:.0f} face {out[b + 1]:.0f} front {out[b + 2]:.0f} at {out[b + 3]:.2f}; "
               f"back culled hit {out[b + 4]:.0f} face {out[b + 5]:.0f} at {out[b + 6]:.2f}")
-    return out[1] == 0 and out[3] == 0
+    print(f"RG11B10 packing (the resolve's) against the texture unit's: {out[40]:.0f} values, {out[41]:.0f} differ"
+          + (f" (first: {out[42]!r} gives {int(out[43]):#010x} there, {int(out[44]):#010x} here)" if out[41] else ""))
+    return out[1] == 0 and out[3] == 0 and out[40] > 0 and out[41] == 0
 
 
 VIEWS = {
@@ -232,6 +282,177 @@ def region(path, outdir, cam=None, yaw=0.0, pitch=20.0):
     run(cam, yaw + 180, pitch, w, h, 31, -45.0, 0, os.path.join(outdir, "region-turn-32.png"), scale=3)
 
 
+# mmc_debug_gi_profile's modes: the game's shadow rays first; encoders one after another (each time its own); every
+# other frame without the cache (the frame's time with it less without it: what it costs the frame).
+SHADOW, SERIAL, AB = 1, 2, 4
+
+
+def profile(cam, yaw, pitch, w, h, frames, sun, flush, quiet=False, mode=SHADOW | SERIAL, fly=0.0):
+    """The game's frame for the cache (mmc_debug_gi_profile): per-encoder GPU ms, medians and fastest. fly: blocks the
+    camera moves along its view each frame."""
+    out = (ctypes.c_double * 40)()
+    labels = ctypes.create_string_buffer(2048)
+    n = lib.mmc_debug_gi_profile(cam[0], cam[1], cam[2], yaw, pitch, w, h, frames, sun, flush, mode, fly, out, labels, len(labels))
+    if n <= 0:
+        sys.exit("profile failed")
+    names = labels.value.decode().split("|")
+    r = ({name: (out[2 * i], out[2 * i + 1]) for i, name in enumerate(names)}
+         | {"cache": (out[24], out[25]), "frame": (out[26], out[27]), "frame without the cache": (out[28], out[29]),
+            "rays": (out[30], out[30]), "updated": (out[31], out[31])})
+    if not quiet:
+        how = (("encoders one after another" if mode & SERIAL else "encoders overlapping as in a frame")
+               + (", every other frame without the cache" if mode & AB else "") + (f", flying {fly} blocks a frame" if fly else ""))
+        print(f"  {frames} frames at {w}x{h}, {flush} MB flushed before each, {how} (medians over the last 3/4, fastest):")
+        for i, name in enumerate(names):
+            print(f"    {out[2 * i]:6.3f} ({out[2 * i + 1]:6.3f})  {name}")
+        print(f"    {out[24]:6.3f} ({out[25]:6.3f})  the cache's encoders, first start to last end")
+        print(f"    {out[26]:6.3f} ({out[27]:6.3f})  the frame" + (f"; without the cache {out[28]:.3f} ({out[29]:.3f}): +{out[26] - out[28]:.3f}" if mode & AB else ""))
+        print(f"    rays a frame {out[30]:.0f}, cells updated in the last frame {out[31]:.0f}, live cells {out[32]:.0f}", flush=True)
+    return r
+
+
+def view(cam, yaw, pitch, w, h, sun, mode, exposure, png=None, scale=1, floats_path=None):
+    """Debug view `mode` of the cache as it stands (mmc_debug_gi_view: no frame run)."""
+    ow, oh = w // scale, h // scale
+    buf = (ctypes.c_uint8 * (ow * oh * 4))()
+    fl = (ctypes.c_float * (w * h * 4))() if floats_path else None
+    if not lib.mmc_debug_gi_view(cam[0], cam[1], cam[2], yaw, pitch, w, h, sun, mode, exposure, scale, buf,
+                                 ctypes.cast(fl, ctypes.c_void_p) if fl is not None else None):
+        sys.exit("view failed")
+    if png:
+        write_png(png, ow, oh, bytes(buf))
+    if floats_path:
+        with open(floats_path, "wb") as f:
+            f.write(bytes(fl))
+
+
+def cmp(a, b):
+    """Two debug-view-9 float pictures (mmc_debug_gi_diff)."""
+    out = (ctypes.c_double * 16)()
+    if not lib.mmc_debug_gi_diff(a.encode(), b.encode(), out):
+        sys.exit("diff failed (sizes?)")
+    n = out[0]
+    print(f"  {a} vs {b}: {out[1] / n * 100:.3f}% of pixels the same to the bit; light in both {out[2] / n * 100:.2f}%, "
+          f"in one only {out[3] / n * 100:.4f}% ({out[3]:.0f} px), different no-data codes {out[4]:.0f} px; mean luminance "
+          f"{out[5]:.5f} vs {out[6]:.5f} ({(out[6] / max(out[5], 1e-9) - 1) * 100:+.3f}%), mean |difference| {out[7] * 100:.3f}%, "
+          f"largest {out[8] * 100:.2f}%, {out[9]:.0f} px over 1/32", flush=True)
+    return out
+
+
+def bench(path, outdir, cam=None, yaw=0.0, pitch=20.0, tag="", load=None, frames=160, timed=96, flush=96, fly=0.0):
+    """The game's frame for the cache on real terrain at the panel's resolution, in lit mode's light: converge (or load
+    a saved table), profile it per encoder, save the table, and write debug view 9 as floats (for cmp) and the
+    irradiance and lit mode views as PNGs. The views run no frame, so two builds give the same pictures on the same
+    table to the bit if they resolve and upsample alike."""
+    os.makedirs(outdir, exist_ok=True)
+    name = os.path.basename(path).split(".")
+    rx, rz = int(name[1]), int(name[2])
+    scene(1, path, ROUTE)
+    if cam is None:
+        cam = (rx * 512 + 256.5, 140.0, rz * 512 + 40.5)
+    w, h, sun = 3456, 2234, -45.0
+    lib.mmc_debug_gi_lit_light(1)
+    lib.mmc_debug_gi_reset()
+    pre = os.path.join(outdir, tag)
+    if load:
+        if not lib.mmc_debug_gi_load(load.encode()):
+            sys.exit(f"couldn't load {load}")
+        print(f"loaded {load}")
+    else:
+        print(f"converging ({frames} frames):")
+        profile(cam, yaw, pitch, w, h, frames, sun, flush)
+        if not lib.mmc_debug_gi_save((pre + "table.bin").encode()):
+            sys.exit("save failed")
+    # The views first (they run no frame), then the timed frames.
+    view(cam, yaw, pitch, w, h, sun, 9, 1.0, floats_path=pre + "up9.f32")
+    view(cam, yaw, pitch, w, h, sun, 1, 1.0, pre + "irradiance.png", scale=2)
+    view(cam, yaw, pitch, w, h, sun, 7, 1.0, pre + "litmode-gi.png", scale=2)
+    print("timed:")
+    r = profile(cam, yaw, pitch, w, h, timed, sun, flush, mode=SHADOW | SERIAL)
+    if load:
+        lib.mmc_debug_gi_load(load.encode())
+    else:
+        lib.mmc_debug_gi_load((pre + "table.bin").encode())
+    r = r | {"ab": profile(cam, yaw, pitch, w, h, 2 * timed, sun, flush, mode=SHADOW | AB)}
+    if fly:
+        # Flying from the converged table: cells come into view and change level every frame, as in the game's benchmark.
+        print(f"flying {fly} blocks a frame:")
+        lib.mmc_debug_gi_load((load or pre + "table.bin").encode())
+        r["fly"] = profile(cam, yaw, pitch, w, h, timed, sun, flush, mode=SHADOW | SERIAL, fly=fly)
+        lib.mmc_debug_gi_load((load or pre + "table.bin").encode())
+        r["flyab"] = profile(cam, yaw, pitch, w, h, 2 * timed, sun, flush, mode=SHADOW | AB, fly=fly)
+    return r
+
+
+def exp(path, outdir, variants, cam=None, yaw=0.0, pitch=20.0, frames=160, timed=64, flush=96, rounds=3, conv=256, convfor=None, fly=0.0):
+    """Kernel variants (files of the upsample header and kernels, mmc_debug_gi_reload) against the built-in ones in one
+    process, on one scene: per-encoder times on the converged table, alternating; what the relight takes on the same
+    table (to the bit); and the light after converging from empty (two built-in runs give the noise)."""
+    os.makedirs(outdir, exist_ok=True)
+    name = os.path.basename(path).split(".")
+    rx, rz = int(name[1]), int(name[2])
+    scene(1, path, ROUTE)
+    if cam is None:
+        cam = (rx * 512 + 256.5, 140.0, rz * 512 + 40.5)
+    w, h, sun = 3456, 2234, -45.0
+    lib.mmc_debug_gi_lit_light(1)
+    names = ["builtin"] + variants
+
+    def load(v):
+        if not lib.mmc_debug_gi_reload(None if v == "builtin" else v.encode()):
+            sys.exit(f"reload {v} failed")
+
+    lib.mmc_debug_gi_reset()
+    print(f"converging ({frames} frames, built-in kernels)", flush=True)
+    profile(cam, yaw, pitch, w, h, frames, sun, flush, quiet=True)
+    table = os.path.join(outdir, "table.bin")
+    lib.mmc_debug_gi_save(table.encode())
+    times = {v: [] for v in names}
+    costs = {v: [] for v in names}
+    for r in range(rounds):
+        for v in names:
+            load(v)
+            lib.mmc_debug_gi_load(table.encode())
+            times[v].append(profile(cam, yaw, pitch, w, h, timed, sun, flush, quiet=True, mode=SHADOW | SERIAL, fly=fly))
+            lib.mmc_debug_gi_load(table.encode())
+            ab = profile(cam, yaw, pitch, w, h, 2 * timed, sun, flush, quiet=True, mode=SHADOW | AB, fly=fly)
+            costs[v].append((ab["frame"][0] - ab["frame without the cache"][0], ab["frame"][1] - ab["frame without the cache"][1]))
+    print(f"per encoder, ms (median of {timed} frames, flush {flush} MB, encoders one after another; each round from the same table),")
+    print("then what the cache costs the frame (frames with it less without it, alternating, encoders overlapping as in a frame):")
+    for v in names:
+        keys = [k for k in times[v][0] if k not in ("flush", "frame without the cache")]
+        print(f"  {os.path.basename(v)}:")
+        for k in keys:
+            vals = [t[k][0] for t in times[v]]
+            print(f"    {' '.join(f'{x:6.3f}' for x in vals)}   {k}")
+        print(f"    {' '.join(f'{x[0]:6.3f}' for x in costs[v])}   the cache's cost in the frame (median; fastest {' '.join(f'{x[1]:.3f}' for x in costs[v])})")
+    # The relight's input on the same table, each variant's resolve and upsample.
+    print("what the relight takes, on the converged table:")
+    base = None
+    for v in names:
+        load(v)
+        lib.mmc_debug_gi_load(table.encode())
+        f = os.path.join(outdir, os.path.basename(v) + ".table.f32")
+        view(cam, yaw, pitch, w, h, sun, 9, 1.0, floats_path=f)
+        if base is None:
+            base = f
+        else:
+            cmp(base, f)
+    # Converged from empty: two built-in runs (the noise), then each variant.
+    print(f"converged from empty ({conv} frames):")
+    runs = []
+    for v in ["builtin"] + [v for v in names if convfor is None or v == "builtin" or os.path.basename(v) in convfor]:
+        load(v)
+        lib.mmc_debug_gi_reset()
+        profile(cam, yaw, pitch, w, h, conv, sun, flush, quiet=True)
+        f = os.path.join(outdir, os.path.basename(v) + f".conv{len(runs)}.f32")
+        view(cam, yaw, pitch, w, h, sun, 9, 1.0, floats_path=f)
+        runs.append(f)
+    for f in runs[1:]:
+        cmp(runs[0], f)
+    load("builtin")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "selftest"
     if cmd == "selftest":
@@ -250,5 +471,56 @@ if __name__ == "__main__":
             region(sys.argv[2], sys.argv[3], tuple(extra[:3]), extra[3], extra[4])
         else:
             region(sys.argv[2], sys.argv[3])
+    elif cmd == "bench":
+        opts = dict(a.split("=", 1) for a in sys.argv[4:] if "=" in a)
+        view_at = [float(v) for v in opts["view"].split(",")] if "view" in opts else None
+        bench(sys.argv[2], sys.argv[3], tuple(view_at[:3]) if view_at else None, view_at[3] if view_at else 0.0,
+              view_at[4] if view_at else 20.0, tag=opts.get("tag", ""), load=opts.get("load"), frames=int(opts.get("frames", 160)),
+              timed=int(opts.get("timed", 96)), flush=int(opts.get("flush", 96)), fly=float(opts.get("fly", 0)))
+    elif cmd == "lag":
+        # How fast the light follows a jump of the sun (converged at -45 degrees, then at -25): what the relight takes
+        # after 32, 128 and 384 frames against the built-in kernels converged at -25 from empty.
+        path, outdir, variants = sys.argv[2], sys.argv[3], [a for a in sys.argv[4:]]
+        os.makedirs(outdir, exist_ok=True)
+        name = os.path.basename(path).split(".")
+        rx, rz = int(name[1]), int(name[2])
+        scene(1, path, ROUTE)
+        cam, w, h = (rx * 512 + 256.5, 140.0, rz * 512 + 40.5), 3456, 2234
+        lib.mmc_debug_gi_lit_light(1)
+        ref = os.path.join(outdir, "ref.f32")
+        lib.mmc_debug_gi_reload(None)
+        lib.mmc_debug_gi_reset()
+        profile(cam, 0.0, 20.0, w, h, 512, -25.0, 96, quiet=True)
+        view(cam, 0.0, 20.0, w, h, -25.0, 9, 1.0, floats_path=ref)
+        for v in ["builtin"] + variants:
+            if not lib.mmc_debug_gi_reload(None if v == "builtin" else v.encode()):
+                sys.exit(f"reload {v} failed")
+            lib.mmc_debug_gi_reset()
+            r = profile(cam, 0.0, 20.0, w, h, 320, -45.0, 96, quiet=True)
+            print(f"{os.path.basename(v)}: converged at -45, {r['rays'][0]:.0f} rays and {r['updated'][0]:.0f} cells a frame; then at -25:", flush=True)
+            done = 0
+            for n in (32, 128, 384):
+                profile(cam, 0.0, 20.0, w, h, n - done, -25.0, 96, quiet=True)
+                done = n
+                f = os.path.join(outdir, f"{os.path.basename(v)}.{n}.f32")
+                view(cam, 0.0, 20.0, w, h, -25.0, 9, 1.0, floats_path=f)
+                cmp(ref, f)
+        lib.mmc_debug_gi_reload(None)
+    elif cmd == "cmp":
+        cmp(sys.argv[2], sys.argv[3])
+    elif cmd == "src":
+        buf = ctypes.create_string_buffer(1 << 20)
+        n = lib.mmc_debug_gi_shader_source(buf, len(buf))
+        if n >= len(buf):
+            sys.exit(f"the source is {n} bytes, over the buffer's")
+        with open(sys.argv[2], "w") as f:
+            f.write(buf.value.decode())
+        print(f"{n} bytes")
+    elif cmd == "exp":
+        args = [a for a in sys.argv[4:] if "=" not in a]
+        opts = dict(a.split("=", 1) for a in sys.argv[4:] if "=" in a)
+        exp(sys.argv[2], sys.argv[3], args, timed=int(opts.get("timed", 64)), rounds=int(opts.get("rounds", 3)),
+            convfor=opts["convfor"].split(",") if "convfor" in opts else None, fly=float(opts.get("fly", 0)),
+            flush=int(opts.get("flush", 96)), conv=int(opts.get("conv", 256)))
     else:
         sys.exit(__doc__)
