@@ -171,18 +171,20 @@ final class RtShadows: @unchecked Sendable {
     private var tlasAccels: [MTLAccelerationStructure] = []   // the structures the current instance structure references
     /// With the GI cache: the current instance structure's GiTile table and the node buffers it points into.
     private var tlasGi: (table: MTLBuffer, buffers: [MTLBuffer])?
-    /// With the GI cache: its half-resolution light and code words this frame, for the relight (takeLitGi).
-    private var giIrr: MTLTexture?, giCode: MTLTexture?
-    private var litGiOut: (irr: MTLTexture, code: MTLTexture, width: Int, height: Int)?
+    /// With the GI cache: its half-resolution light and code words this frame (one RG32Uint texel each, gi_resolve), and
+    /// the sun and sky light it took from the atmosphere (GiCache.envThisFrame), for the relight (takeLitGi).
+    private var giOut: MTLTexture?
+    private var litGiOut: (gi: MTLTexture, env: MTLBuffer?, width: Int, height: Int)?
     private var giRuns = 0
     /// Offline timing (mmc_debug_gi_frame): 0 skips the cache's frame.
     var giOn = true
 
-    /// Lit mode with the GI cache: this frame's light from it (gi_resolve's output and code words, half the frame's size).
-    func takeLitGi(width: Int, height: Int) -> (irr: MTLTexture, code: MTLTexture)? {
+    /// Lit mode with the GI cache: this frame's light from it (gi_resolve's output, half the frame's size) and, if it
+    /// made them from the atmosphere, the relight's sun and sky light (lit_env's output).
+    func takeLitGi(width: Int, height: Int) -> (gi: MTLTexture, env: MTLBuffer?)? {
         defer { litGiOut = nil }
         guard let g = litGiOut, g.width == width, g.height == height else { return nil }
-        return (g.irr, g.code)
+        return (g.gi, g.env)
     }
 
     func takeDeferred(width: Int, height: Int) -> (lit: MTLTexture, params: SIMD4<Float>)? {
@@ -536,24 +538,21 @@ final class RtShadows: @unchecked Sendable {
                           cloudHeight: Float, tlas: MTLAccelerationStructure, width w: Int, height h: Int) {
         guard let cache = GiCache.shared, let gi = tlasGi else { return }
         let hw = (w + 1) / 2, hh = (h + 1) / 2
-        if giIrr == nil || giIrr!.width != hw || giIrr!.height != hh {
-            func tex(_ format: MTLPixelFormat) -> MTLTexture? {
-                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: hw, height: hh, mipmapped: false)
-                d.usage = [.shaderRead, .shaderWrite]
-                d.storageMode = .private
-                return ctx.device.makeTexture(descriptor: d)
-            }
-            giIrr = tex(.rg11b10Float)
-            giCode = tex(.r32Uint)
+        if giOut == nil || giOut!.width != hw || giOut!.height != hh {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg32Uint, width: hw, height: hh, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            giOut = ctx.device.makeTexture(descriptor: d)
+            giOut?.label = "MetalMC GI cache light"
         }
-        guard let irr = giIrr, let code = giCode else { return }
+        guard let out = giOut else { return }
         cache.tiles = gi
         let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
         let daylight = litDaylightEnv(sunAngle: sunAngle)
         let light: GiLightSource = Lit.shared.lastAtmosphere ? .atmosphere(fallback: daylight) : .daylight(daylight)
-        guard cache.encodeFrame(cb, depth: depth, out: irr, code: code, invViewProj: invViewProj, cam: cam, origin: origin, accel: tlas,
+        guard cache.encodeFrame(cb, depth: depth, out: out, invViewProj: invViewProj, cam: cam, origin: origin, accel: tlas,
                                 accels: tlasAccels, sunDir: sun, sunUp: sun.y > -0.05 ? 1 : 0, cloudHeight: cloudHeight, light: light) else { return }
-        litGiOut = (irr, code, w, h)
+        litGiOut = (out, cache.envThisFrame, w, h)
         giRuns += 1
         if giRuns % 1200 == 0 {
             let c = cache.counters.contents().bindMemory(to: UInt32.self, capacity: 20)

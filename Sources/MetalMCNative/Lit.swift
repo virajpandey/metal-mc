@@ -82,9 +82,20 @@ static uint2 litPack(float3 albedo, float ao, uint face, float depth, float sky,
 """
 
 /// With the GI cache (litGi only; empty otherwise, so the relight's text is unchanged without it): litRelightPixel's
-/// extra arguments, and the sky term taken from the cache.
-private let litGiRelightArgsDoc = litGi ? "\n// giIrr, giCode: the GI cache's half-resolution light and code words (gi_resolve; 1 x 1 stand-ins when it didn't run)." : ""
-private let litGiRelightArgs = litGi ? ", texture2d<float> giIrr, texture2d<uint> giCode" : ""
+/// extra arguments, its early read of the cache's texel, and the sky term taken from the cache.
+private let litGiRelightArgsDoc = litGi ? """
+
+// gi: the GI cache's half-resolution light and code words (gi_resolve's RG32Uint; a 1 x 1 stand-in when it didn't run).
+// giStandIn: unused (where the light was before it shared a texel with its code; the anti-aliasing's resolve still binds
+// one there).
+""" : ""
+private let litGiRelightArgs = litGi ? ", texture2d<float> giStandIn, texture2d<uint> gi" : ""
+private let litGiTexel = litGi ? """
+
+    // The GI cache's texel for the pixel (giUpsample's common case needs no other), read now: its address depends on
+    // nothing else, so its latency hides behind the work below.
+    uint2 giOwn = giUpsampleTexel(gi, q);
+""" : ""
 private let litGiSkyTerm = litGi ? """
 
         // The GI cache (Gi.swift) where it has data for the pixel's face and plane: the sky's light as the real openings
@@ -92,9 +103,9 @@ private let litGiSkyTerm = litGi ? """
         // made from it), so the daylight curve's scale and the exposure apply as before. Faces that aren't axis-aligned
         // (plants) take the top face's beside them. Debug view 8: green where it applied, red where it didn't, blue for
         // light sources.
-        if (giIrr.get_width() > 1u) {
-            float4 gi = giUpsample(giIrr, giCode, q, fi < 6u ? fi : 2u, rel);
-            if (gi.w > 0.0) { skyAmb = gi.rgb * ao; giUsed = true; }
+        if (gi.get_width() > 1u) {
+            float4 cl = giUpsample(gi, giOwn, q, fi < 6u ? fi : 2u, rel);
+            if (cl.w > 0.0) { skyAmb = cl.rgb * ao; giUsed = true; }
         }
 """ : ""
 
@@ -151,7 +162,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
     uint view = uint(f.misc.z);
     if (code == 0u) return view != 0u ? float3(0.0) : dst;
     // Something nearer was drawn over the terrain since (an entity, water, a cloud): its color stays.
-    if (!litDepthMatches(d, g.y & 0xFFFFu)) return view != 0u ? float3(0.2, 0.0, 0.2) : dst;
+    if (!litDepthMatches(d, g.y & 0xFFFFu)) return view != 0u ? float3(0.2, 0.0, 0.2) : dst;\(litGiTexel)
     float3 albedo = float3(float(g.x & 255u), float((g.x >> 8) & 255u), float((g.x >> 16) & 255u)) / 255.0;
     float ao = float((g.x >> 24) & 31u) / 31.0;
     float sky = float((g.y >> 16) & 255u) / 16.0, block = float(g.y >> 24) / 16.0;
@@ -263,13 +274,13 @@ fragment float4 lit_relight_fs(LitVOut in [[stage_in]], float4 dst [[color(0)]],
                                depth2d<float, access::read> depth [[texture(0)]],
                                texture2d<uint, access::read> gbuf [[texture(1)]],
                                texture2d<half, access::read> vis [[texture(2)]],
-                               texture2d<float> lightmap [[texture(3)]],\(litGi ? "\n                               texture2d<float> giIrr [[texture(4)]],\n                               texture2d<uint> giCode [[texture(5)]]," : "")
+                               texture2d<float> lightmap [[texture(3)]],\(litGi ? "\n                               texture2d<float> giStandIn [[texture(4)]],\n                               texture2d<uint> gi [[texture(5)]]," : "")
                                constant LitFrame& f [[buffer(0)]],
                                constant float4* env [[buffer(1)]]) {
     uint2 q = uint2(in.pos.xy);
     uint2 g = gbuf.read(q).rg;
     if ((g.x >> 29) == 0u && f.misc.z == 0.0) return dst;
-    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giIrr, giCode" : "")), dst.a);
+    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")), dst.a);
 }
 
 // The sun's light and the sky's on each face direction, from the atmosphere's tables (with our sky on), scaled by p.x so
@@ -378,8 +389,13 @@ final class Lit: @unchecked Sendable {
     private var envBuffer: MTLBuffer?
     private var dummyLightmap: MTLTexture?
     private var dummyVis: MTLTexture?
-    /// With the GI cache: 1 x 1 stand-ins for its light and code words when it didn't run this frame.
+    /// With the GI cache: the relight's two GI textures when the cache didn't run this frame (1 x 1 stand-ins; the first
+    /// stands in always: litRelightPixel's giStandIn).
     private var dummyGi: (irr: MTLTexture, code: MTLTexture)?
+    /// Offline timing with the GI cache: the cache's last light the relight took (the timing runs reuse it; the cache
+    /// runs once a frame), and the textures to take instead of this frame's (debugTimeTaa).
+    private var lastGi: (irr: MTLTexture, code: MTLTexture)?
+    private var debugGi: (irr: MTLTexture, code: MTLTexture)?
     private var failed = false
     private var frames = 0, relit = 0, missed = 0, giFrames = 0
     /// Debug view (METALMC_LITVIEW, see lit_relight_fs; mmc_lit_set_view offline).
@@ -436,7 +452,7 @@ final class Lit: @unchecked Sendable {
         if litGi {
             let d3 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg11b10Float, width: 1, height: 1, mipmapped: false)
             d3.usage = .shaderRead
-            let d4 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Uint, width: 1, height: 1, mipmapped: false)
+            let d4 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg32Uint, width: 1, height: 1, mipmapped: false)
             d4.usage = .shaderRead
             if let a = ctx.device.makeTexture(descriptor: d3), let b = ctx.device.makeTexture(descriptor: d4) { dummyGi = (a, b) }
         }
@@ -478,9 +494,10 @@ final class Lit: @unchecked Sendable {
         return true
     }
 
-    /// Left for the anti-aliasing's resolve this frame (see bindDeferred).
-    private var deferred: (frame: LitFrameGPU, daylight: [SIMD4<Float>], vis: MTLTexture, lightmap: MTLTexture, gi: (irr: MTLTexture, code: MTLTexture)?,
-                           width: Int, height: Int)?
+    /// Left for the anti-aliasing's resolve this frame (see bindDeferred). `env`: the sun and sky light's buffer (with the
+    /// atmosphere; `daylight` is empty then).
+    private var deferred: (frame: LitFrameGPU, daylight: [SIMD4<Float>], env: MTLBuffer, vis: MTLTexture, lightmap: MTLTexture,
+                           gi: (irr: MTLTexture, code: MTLTexture)?, width: Int, height: Int)?
 
     /// True if this frame's relight was left for the anti-aliasing's resolve (Taa.swift), at this size.
     func hasDeferred(width: Int, height: Int) -> Bool {
@@ -491,11 +508,11 @@ final class Lit: @unchecked Sendable {
     /// Binds the deferred relight's inputs to the anti-aliasing's resolve (its taaLit variant: buffers 2 and 3, textures
     /// 8-10, and with the GI cache 11 and 12) and forgets it.
     func bindDeferred(_ enc: MTLComputeCommandEncoder) {
-        guard var d = deferred, let gbuffer, let envBuffer else { return }
+        guard var d = deferred, let gbuffer else { return }
         deferred = nil
         enc.setBytes(&d.frame, length: MemoryLayout<LitFrameGPU>.stride, index: 2)
         if d.daylight.isEmpty {
-            enc.setBuffer(envBuffer, offset: 0, index: 3)
+            enc.setBuffer(d.env, offset: 0, index: 3)
         } else {
             enc.setBytes(d.daylight, length: d.daylight.count * 16, index: 3)
         }
@@ -508,12 +525,21 @@ final class Lit: @unchecked Sendable {
         }
     }
 
+    /// With the GI cache: the sun and sky light it made this frame from the atmosphere (lit_env on the same sky tables the
+    /// relight would run it on: the relight takes it instead), set by giTextures.
+    private var frameGiEnv: MTLBuffer?
+
     /// With the GI cache: this frame's light from it (RtShadows ran it), or the stand-ins.
     private func giTextures(width: Int, height: Int) -> (irr: MTLTexture, code: MTLTexture)? {
+        frameGiEnv = nil
         guard litGi, let dummyGi else { return nil }
-        guard let g = RtShadows.shared.takeLitGi(width: width, height: height), useGi else { return dummyGi }
+        if let debugGi { return debugGi }
+        guard let g = RtShadows.shared.takeLitGi(width: width, height: height) else { return dummyGi }
+        frameGiEnv = g.env
+        lastGi = (dummyGi.irr, g.gi)
+        guard useGi else { return dummyGi }
         giFrames += 1
-        return (g.irr, g.code)
+        return (dummyGi.irr, g.gi)
     }
 
     /// Relights the terrain of the level just drawn into `color` (see the top of this file). Needs no pass open.
@@ -564,7 +590,11 @@ final class Lit: @unchecked Sendable {
         ctx.endBlit()
         let cb = ctx.ensureCB()
         var daylight: [SIMD4<Float>] = []
-        if atmosphere, let trans = sky.transmittance, let skyView = sky.skyView, let enc = cb.makeComputeCommandEncoder() {
+        var env = envBuffer
+        if atmosphere, let giEnv = frameGiEnv {
+            // The GI cache ran lit_env on this frame's sky tables already (its light is made from the relight's).
+            env = giEnv
+        } else if atmosphere, let trans = sky.transmittance, let skyView = sky.skyView, let enc = cb.makeComputeCommandEncoder() {
             enc.label = "MetalMC lit sun and sky"
             var frame = sky.frame
             var scale = SIMD4<Float>(1.12 * skyExposure, 0, 0, 0)
@@ -580,7 +610,7 @@ final class Lit: @unchecked Sendable {
             daylight = litDaylightEnv(sunAngle: sunAngle)
         }
         if deferToTaa {
-            deferred = (f, daylight, visTexture, lightmap ?? dummyLightmap!, gi, color.width, color.height)
+            deferred = (f, daylight, env, visTexture, lightmap ?? dummyLightmap!, gi, color.width, color.height)
             countFrame(atmosphere: atmosphere, traced: f.size.z > 0)
             return true
         }
@@ -602,7 +632,7 @@ final class Lit: @unchecked Sendable {
         }
         enc.setFragmentBytes(&f, length: MemoryLayout<LitFrameGPU>.stride, index: 0)
         if daylight.isEmpty {
-            enc.setFragmentBuffer(envBuffer, offset: 0, index: 1)
+            enc.setFragmentBuffer(env, offset: 0, index: 1)
         } else {
             enc.setFragmentBytes(daylight, length: daylight.count * 16, index: 1)
         }
@@ -671,6 +701,27 @@ final class Lit: @unchecked Sendable {
         out[1] = without.isEmpty ? -1 : without[without.count / 2]
         out[2] = with.first ?? -1
         out[3] = without.first ?? -1
+        // With the GI cache: the resolve with the relight taking the cache's light (its last output) and without it (the
+        // sky term), alternating, `runs` each: what the cache's upsample costs in the anti-aliasing's resolve. Logged.
+        guard litGi, let gi = lastGi, let dummyGi else { return }
+        var on: [Double] = [], off: [Double] = []
+        for k in 0..<(2 * runs) {
+            debugGi = k % 2 == 0 ? gi : dummyGi
+            frameTarget = (ObjectIdentifier(color.parent ?? color), color.width, color.height)
+            _ = relight(color: color, depth: depth, p: p, lightmap: lightmap, deferToTaa: true)
+            guard mmc_taa_apply(colorHandle, depthHandle, p, &cam, 0, 0, 0) == 1, let cb = ctx.cb else { break }
+            ctx.cb = nil
+            cb.commit()
+            cb.waitUntilCompleted()
+            let ms = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+            if k % 2 == 0 { on.append(ms) } else { off.append(ms) }
+        }
+        debugGi = nil
+        on.sort()
+        off.sort()
+        guard !on.isEmpty, !off.isEmpty else { return }
+        log(String(format: "lit: anti-aliasing resolve with the relight at %dx%d: with the GI cache's light %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), %d each",
+                   color.width, color.height, on[on.count / 2], on[0], off[off.count / 2], off[0], on[on.count / 2] - off[off.count / 2], on[0] - off[0], on.count))
     }
 }
 

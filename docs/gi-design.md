@@ -46,22 +46,35 @@ the key is a block face, so no surface parameterization is needed and walls a bl
   bucket ever full; after turning around, 463 K. Cells unseen for 10 s are evicted. What is visible scales with pixels,
   not with the world, so the table's size doesn't depend on the LOD distance.
 
-## Each frame (one compute encoder, five dispatches)
+## Each frame (two compute encoders)
 
-1. **Request** (a sixteenth of the pixels, a different one of each 4 x 4 block each frame, Bayer order): rebuild the
-   surface from the depth buffer (position, and the face from the neighbors' depths, as `rt_shadow` does), find or create
-   its cell (near a level boundary the next level's too), mark it seen. A new cell starts from its parent's light (the
-   next level's cell holding it) counted as two updates, so moving closer refines the light instead of starting black.
-   The first thread to touch a cell in a frame lists it for an update; a cell covering 7 x 7 pixels or more holds a whole
-   aligned 4 x 4 block and is touched every frame. When more cells are visible than their part of the list holds, a
-   random share of them (from last frame's count) is listed, a different one each frame: appending them all filled the
-   list with the same cells every frame, the first in dispatch order: 23% of the resolve's samples had light after 128
-   frames, against 74% now (the rest is sky).
+The first encoder makes the frame's light (`gi_light`), clears the counters (`gi_begin`) and runs the request with the
+resolve (`gi_request`); the second runs the schedule (`gi_schedule`, `gi_args`) and the update (`gi_update`). The relight
+reads only what the first wrote, so it waits for that one alone and the update runs beside the frame's later passes; the
+resolve shows the cells as the last frame's update left them (a cell's new light shows a frame later).
+
+1. **Request and resolve** (one thread per 4 x 4 pixels, one pass over the depth buffer):
+   - **Request** (one pixel of the block, a different one each frame, Bayer order): rebuild the surface from the depth
+     buffer (position, and the face from the neighbors' depths, as `rt_shadow` does), find or create its cell (near a
+     level boundary the next level's too), mark it seen. A new cell starts from its parent's light (the next level's
+     cell holding it) counted as two updates, so moving closer refines the light instead of starting black. The first
+     thread to touch a cell in a frame lists it for an update; a cell covering 7 x 7 pixels or more holds a whole aligned
+     4 x 4 block and is touched every frame. When more cells are visible than their part of the list holds, a random
+     share of them (from last frame's count) is listed, a different one each frame: appending them all filled the list
+     with the same cells every frame, the first in dispatch order: 23% of the resolve's samples had light after 128
+     frames, against 74% now (the rest is sky).
+   - **Resolve** (the block's 2 x 2 half-resolution samples): per 2 x 2 pixels, the nearest surface; bilinear across
+     the 2 x 2 nearest cells on that surface's plane (cells that don't exist or have no samples are left out, so light
+     doesn't cross a wall), blended toward the next level in the last quarter of each level's range. Output: one RG32Uint
+     texel per sample, the irradiance as RG11B10Float's bits (packed in the shader, truncated as the M3's texture unit
+     converts: the self-test checks it) and a code word (the surface's plane as a half, its face, and whether its cells
+     have samples).
 2. **Schedule** (a slice of the table, 1/64 to 1/8 of it, sized so the cells it lists fill their quarter of the budget):
    evict cells unseen for 10 s; list cells that aren't visible every 8th time the sweep passes them, and cells with no
    samples yet whenever it does.
 3. **Update** (the list, up to 16,384 cells: three quarters for visible cells, one quarter for the rest, so light off
-   screen keeps flowing). Per cell, 4 samples, each:
+   screen keeps flowing). Per cell, 4 samples, one per thread (the cell's 4 threads sit side by side in a SIMD group and
+   sum their samples with shuffles), each:
    - a point on the face (level 0: on the face's plane; coarser: a probe ray from the cell's far side back along the
      normal finds the surface, passing through solid with back faces culled; if the faces don't cover that part of the
      cell, the cell's first-seen point instead);
@@ -75,13 +88,11 @@ the key is a block face, so no surface parameterization is needed and walls a bl
    (behind the camera, around corners), which then keep light bouncing off them; bounce rays of other cells create
    nothing, or the cache grows into everything rays can reach (the first version reached 928 K cells in 128 frames and
    filled buckets).
-4. **Resolve** (half resolution): per 2 x 2 pixels, the block's nearest surface; bilinear across the 2 x 2 nearest cells
-   on that surface's plane (cells that don't exist or have no samples are left out, so light doesn't cross a wall),
-   blended toward the next level in the last quarter of each level's range. Output: irradiance (RG11B10) and a code word
-   (the surface's plane as a half, its face, and whether its cells have samples).
-5. **Upsample, in the lighting pass** (`giUpsample`): each pixel takes its own block's sample if it's on the same face and
-   plane, else the nearest of the 8 around that is (planes up to a block and a half apart count: the riser of a one-block
-   step is often a pixel wide). If none matches, the cells' own lookups (`giIrradiance`), except where the code says the
+4. **Upsample, in the lighting pass** (`giUpsample`): each pixel takes its own block's sample if it's on the same face and
+   plane (one read, issued as soon as the pixel is known to be terrain: its address depends on nothing else), else the
+   nearest of the 8 around that is (planes up to a block and a half apart count: the riser of a one-block step is often a
+   pixel wide; their code words from four 2 x 2 gathers, then one read of the chosen sample). If none matches, the
+   cells' own lookups (`giIrradiance`; lit mode's relight leaves its own sky term there), except where the code says the
    cells have no samples yet.
 
 ## What shading does with it
@@ -167,6 +178,104 @@ GPU address in a per-instance table, `GiTile`): 41.8 bytes per triangle, the sam
 3.41 M triangles, 136.0 MB either way), and the dependent read per bounce hit costs nothing measurable (update 0.41 ms
 against 0.46 with the data, back to back).
 
+## Cutting the frame cost (2026-10-02)
+
+In the game (native, the full look with the cache, a flight over real terrain, medians of traced frames) the cache cost
+about 2.1 ms against its 1.5 ms budget: light, begin and request 0.38 ms; schedule and update 0.68; the resolve 0.52;
+and the upsample, in the anti-aliasing resolve with lit mode's relight, 0.55 (2.35 ms against 1.80 without the cache).
+None of the changes below changes the light: what the relight takes from the cache is the same to the bit on one saved
+table, or, where a change moves when cells update, it differs from the old build's by no more than two runs of the old
+build differ from each other.
+
+**How it was measured** (offline, M3 Pro; `python3 tools/gicache.py bench <r.0.0.mca> <dir>`): the region view above at
+3456 x 2234 in lit mode's light (sun at -45 degrees), the cache's frame as the game encodes it, each frame after 96 MB of
+other traffic (the cache's reads start cold, as in a frame) and the shadow rays' stand-in (`gi_test_shadow`), then the
+anti-aliasing resolve's load loop with the relight's use of the cache (`gi_test_taa`, a proxy: Taa.swift's 32 x 32
+tiles, a row of pixels per SIMD group, the depth and a G-buffer stand-in read per pixel). Per encoder with the game
+profile's timestamps, the encoders one after another (a fence: each time is its own; without one, a frame's encoders
+overlap and so do the end of one frame and the start of the next, which made the first per-encoder numbers
+meaningless), and the frames with the cache less the frames without it, alternating, the encoders overlapping as in the
+game: what the cache costs the frame. Kernel variants ran against the built-in kernels in one process, alternating, on
+one converged table (`exp`); `tools/litflow.swift` (the game's own calls on the real-terrain fixture with the sky, at
+the panel's resolution) gave the anti-aliasing resolve with and without the cache's light (`Lit.debugTimeTaa`) and whole
+frames with and without the cache.
+
+| GPU ms, *measured* (medians; ranges over runs) | before | after |
+|---|---|---|
+| light, begin, request | 0.225-0.229 | one pass with the resolve: |
+| resolve (half resolution) | 0.478-0.482 | **0.58-0.59** for both |
+| schedule, update (rays) | 0.453-0.460 | **0.30-0.35** |
+| the cache's encoders, first start to last end | 1.16-1.18 | 0.89-0.93 |
+| the upsample in the anti-aliasing resolve (the proxy with it less without) | 0.39 | 0.28-0.29 |
+| **what the cache costs the frame** | **+1.61-1.62** | **+1.27-1.28** (+1.27 flying 0.17 blocks a frame) |
+| litflow: the anti-aliasing resolve with the cache's light less without | +0.35-0.45 | +0.23 |
+| litflow: the frame with the cache less without (the relight in its own pass / in the anti-aliasing resolve) | +1.41 / +1.51 | +1.06 / +1.13 |
+
+The bench's "before" is the old kernels with the new one-texel output (which the bench needs); litflow's "before" is the
+old build. What changed, and what each was worth (*measured*, the bench unless noted):
+
+- **The light and its code word in one texel** (RG32Uint, where an RG11B10Float texture and an R32Uint one were). The
+  upsample's common case (93% of the surface pixels) is one read whose address depends only on the pixel, and the
+  relight issues it right after its depth test; it read the code word, then the light the code picked. The shader packs
+  the irradiance into RG11B10Float's bits itself, truncating as the M3's texture unit converts (rounding to nearest
+  differed from the hardware's conversion in 16,592 of 25,856 test values; truncating, in none: `selftest` checks it),
+  so the bits are the old ones: what the relight takes was the same to the bit as the old build's on a saved table.
+- **The update in lanes:** each of a cell's 4 samples on a thread of its own (`giLanes`; the 4 threads sit side by side
+  in a SIMD group, take what decides the samples from the first lane and sum by shuffles), so each thread's chain of
+  dependent rays is a quarter as long and four times as many rays are in flight (16 K cells are only a few hundred SIMD
+  groups on the whole GPU). With one atomic per SIMD group for the request's list (it was one per listed cell) and a
+  plain read of a cell's stamp before the exchange (a cell takes about six request samples a frame; only the first
+  needs the exchange): the update 0.460 -> 0.343, the frame -0.12. The sums' order changed (by shuffles), so the
+  light converged from empty differs from the old build's by 1.25% (mean absolute difference of the relight's input),
+  as two runs of the old build differ (1.24%).
+- **The request and the resolve in one pass** over the depth buffer (`gi_request`; `gi_resolve` stays for the views and
+  tests). Both read all of it (31 MB at the panel's resolution: every cache line, though the request needs one pixel in
+  16) and the same visible cells: 0.711 -> 0.623 together, the frame -0.06. The resolve now shows the cells as the last
+  frame's update left them, so the update has an encoder of its own and runs beside the frame's later passes: the relight
+  waits for the first encoder only (in the game it waited for all of the cache's work, one encoder outside traced
+  frames). A cell's new light shows a frame later; the light converged from empty: 1.26% from the old build's (noise
+  1.24%).
+- **The upsample's neighbors in four gathers:** when its own sample doesn't match (an edge, a face too small for a
+  sample), the 8 neighbors' code words come from four 2 x 2 gathers, not 8 reads (the anti-aliasing resolve runs a row
+  of pixels per SIMD group, so nearly every group has a pixel that needs them): the proxy 0.983 -> 0.913, the frame
+  -0.07; the same bits.
+- **The lookups:** a bucket's four 16-byte loads issued together and the first match taken after them (an early exit
+  after each made a SIMD group wait for them one after another), and the bilinear's four corners' scans, then their
+  values, with no branch between: the request and resolve 0.622 -> 0.580, the frame -0.05; the same bits but for a few
+  pixels one RG11B10 step apart (none over 1/32; likely the compiler fusing multiply-adds differently).
+- **The relight takes the cache's sun and sky light:** with the atmosphere the cache runs `lit_env` on the frame's sky
+  tables for its own light, and the relight ran it again in a compute encoder of its own; now it reads the cache's
+  (the same kernel on the same tables in the same frame: the same values).
+
+Measured and dropped:
+
+- The G-buffer's face in the resolve and the request instead of the depth buffer's neighbors: the resolve +0.035 ms,
+  the request +0.134 (its 8 bytes a pixel against the depth reads it saves), and the resolve's samples changed at
+  edges.
+- The resolve's lookups shared across a SIMD group (a lane looks up a cell its neighbors need too): +0.06 (only a
+  quarter of the lookups were shared). Shared by a thread's four samples instead (their cells looked up once, all
+  together: 4 lookups where 16 were, most often): +0.42, the same bits (likely the four samples' state held at once:
+  more registers, fewer threads in flight). The resolve's 2 x 2 depths in one gather: no change.
+- The upsample's scan of the 8 neighbors stopping at one on the pixel's own plane (the same choice): +0.065 in the
+  anti-aliasing resolve.
+- Intersector hints for the update (geometry type, opacity; the hit's face from the quad, not the triangle data): no
+  change. Updating converged cells less often (every 2nd, 4th, 8th time): nothing saved at this budget (the list fills
+  anyway), and the light follows the sun more slowly.
+- Fewer rays: `METALMC_GIBUDGET=8192`, or `METALMC_GISPP=2` with `METALMC_GIHISTORY=128` (the same samples per average),
+  halve the update's rays (143 K a frame to 72 K): the update 0.35 -> 0.22 or 0.25 ms, the frame's cost +1.29 -> +1.16
+  or +1.21. But the converged light moves from the defaults' by 1.53-1.56% (mean absolute difference, against
+  0.87-1.24% between two default runs), and 384 frames after a 20-degree jump of the sun it is 2.85-2.92% from the
+  light settled there, against 2.52%: more noise and more lag. Not taken.
+
+In the game (not run here): traced frames show the cache as two encoders, "GI cache: light, begin, request and resolve"
+and "GI cache: schedule, update (rays)"; the flight and the fidelity tour in lighting-design.md ("Lit mode with the GI
+cache") give its cost (with `gi` less without) and the look (against the old build's: the same light, within its
+noise). By the offline ratios per stage the 2.1 ms there should come to about 1.5-1.6 ms (*estimate*), short of the
+1.0 ms asked for. What is left is set by what the cache does more than by how: about 140 K rays a frame, the depth
+buffer read once (31 MB at the panel's resolution), and the half-resolution light written once and read once in the
+anti-aliasing resolve (15 MB each). Half the rays (above) would save about 0.2-0.3 ms more there (*estimate*: the
+update costs about twice the offline one in the game), with their noise and lag.
+
 ## Emissive light (torches, lava, glowstone)
 
 - **Now:** direct block light is vanilla's flood fill (per face, `giBlockLight`, vanilla's lightmap curve); the cache
@@ -214,8 +323,11 @@ steps per column over 2048^2 columns per ring, spread over the refill (which alr
   the kernels `gi_light`, `gi_request`, `gi_schedule`, `gi_args`, `gi_update`, `gi_resolve`, `gi_invalidate`,
   `gi_count`, the lighting pass's `giUpsample` (`giUpsampleHeader`, shared with lit mode's relight) and the debug view
   `gi_debug_view` (lit, irradiance, cells, samples, without the cache, bounce only, and lit mode's relight without and
-  with the cache), plus offline-test kernels and entry points (`mmc_debug_gi_scene`, `_run`, `_set_block`, `_reset`,
-  `_selftest`, `_lit_light`, and `mmc_debug_gi_frame`, `mmc_debug_lit_gi` for lit mode's A/B).
+  with the cache, and 9: what the relight takes from the cache, as floats for comparisons), plus offline-test kernels
+  and entry points (`mmc_debug_gi_scene`, `_run`, `_set_block`, `_reset`, `_selftest`, `_lit_light`; `_profile`, the
+  game's frame with its timestamps; `_view`, `_save`, `_load`, `_diff`, for pictures of one table compared to the bit;
+  `_shader_source`, `_reload`, for kernel variants timed against the built-in ones in one process; and
+  `mmc_debug_gi_frame`, `mmc_debug_lit_gi` for lit mode's A/B).
 - The light (`GiLight`, buffer 15): the sun, the sky (the atmosphere's sky view table or a gradient), the ground below the
   horizon, the open sky on each face direction, and the scale the cells' light is read at. The offline test fills it with
   the prototype's light (scale 1); lit mode makes it each frame (`gi_light`) from the relight's own light, per unit of
@@ -230,7 +342,11 @@ steps per column over 2048^2 columns per ring, spread over the refill (which alr
   data). The synthetic scene is a LOD grid built in code (a house with a window and a door,
   a white floor and a red wall, a closed room lit by glowstone, a hill with a tunnel); the region test meshes a fixture
   region as the LOD does. `selftest` checks 1,500 key round trips (both signs, both sides of 2^23, the world's bottom and
-  top, every face and level) and ray-winding cases.
+  top, every face and level), ray-winding cases, and the resolve's RG11B10 packing against the texture unit's (25,856
+  values). Costs: `bench <r.X.Z.mca> <dir>` (the game's frame per encoder, and what it costs the frame; "Cutting the
+  frame cost" below), `cmp` (two pictures of what the relight takes, to the bit and statistically), `src`, `exp` (kernel
+  variants against the built-in ones: times, pictures on one table, the light converged from empty against two built-in
+  runs) and `lag` (how fast the light follows a jump of the sun).
 - Found on the way: the LOD's faces, counterclockwise seen from outside, are back faces to Metal's intersector with a
   counterclockwise front winding: `clockwise` is right (`gi_test_rays`).
 
@@ -240,7 +356,9 @@ steps per column over 2048^2 columns per ring, spread over the refill (which alr
    per-instance table points into the node buffers (`GiTile`, `giHitQuad`). `primitiveDataBuffer` (`giTileGeometry`,
    +54% structure memory) remains for offline comparisons.
 2. **Per frame: done.** In `RtShadows.trace`, after the shadow rays, on the same depth, jittered projection, origin and
-   instance structure: `GiCache.shared.encodeFrame`, into half-resolution light and code textures the relight takes.
+   instance structure: `GiCache.shared.encodeFrame`, into a half-resolution RG32Uint texture (light and code word) the
+   relight takes, with the sun and sky light the cache made from the atmosphere (`lit_env`'s output: the relight's
+   own, so it doesn't run it again).
 3. **Shading: done, in lit mode's relight** (its G-buffer has the albedo): `giUpsample` replaces the sky term where it
    has data, times AO.
 4. **Edits.** Block changes near the player (a client-side block update hook) call `GiCache.invalidate`; a chunk the LOD
