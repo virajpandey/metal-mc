@@ -438,7 +438,8 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
 }
 
 #if LIT_MODE
-// Lit mode: the color and the G-buffer. The water pipelines don't write the G-buffer (water keeps its forward color).
+// Lit mode: the color and the G-buffer. The water pipelines write it only with water on (METALMC_EXP=water): the flag for
+// the relight's reflections (litPackWater; without it water keeps its forward color).
 struct LodOut { float4 color [[color(0)]]; uint2 gbuf [[color(1)]]; };
 
 // The light lod_vs multiplies in without lit mode (the face's shade and vanilla's lightmap), from the depth field and
@@ -490,6 +491,11 @@ static LodOut lodShadeLit(VOut in, constant LodUniforms& u, constant LodSpriteGP
     LodOut out;
     out.color = float4(mix(color, u.fogColor.rgb, fog * u.fogColor.a), alpha);
     out.gbuf = litPack(albedo, ao, (in.matFace >> 8) & 7, in.pos.z, sky, block);
+#if LIT_WATER
+    // Water (METALMC_EXP=water, Lit.swift): its surface flagged for the relight's reflections (the water pipelines write
+    // the G-buffer with water on).
+    if ((in.matFace & 255u) == MAT_WATER) out.gbuf = litPackWater((in.matFace >> 8) & 7u, in.pos.z, sky, block);
+#endif
     return out;
 }
 
@@ -1125,7 +1131,7 @@ final class LodRenderer: @unchecked Sendable {
                 d.maxTotalThreadsPerMeshThreadgroup = lodMeshQuads
                 for (i, f) in colorFormats.enumerated() {
                     d.colorAttachments[i].pixelFormat = f
-                    if i > 0 && !(litWritesGbuffer(i, f) && !water) { d.colorAttachments[i].writeMask = [] }
+                    if i > 0 && !(litWritesGbuffer(i, f) && (!water || litWater)) { d.colorAttachments[i].writeMask = [] }
                 }
                 if water {
                     let a = d.colorAttachments[0]!
@@ -1147,8 +1153,8 @@ final class LodRenderer: @unchecked Sendable {
             for (i, f) in colorFormats.enumerated() {
                 d.colorAttachments[i].pixelFormat = f
                 // Only the main color target gets LOD color; extra targets (OIT) are left untouched, except lit mode's
-                // G-buffer, which the opaque quads write. The occlusion boxes write no color at all.
-                if (i > 0 && !(litWritesGbuffer(i, f) && !water)) || box { d.colorAttachments[i].writeMask = [] }
+                // G-buffer, which the opaque quads write (and with water on, the water). The occlusion boxes write no color.
+                if (i > 0 && !(litWritesGbuffer(i, f) && (!water || litWater))) || box { d.colorAttachments[i].writeMask = [] }
             }
             if water {
                 // Vanilla's translucent blending.
