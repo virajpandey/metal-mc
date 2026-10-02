@@ -15,15 +15,21 @@
 //   LITFLOW_GI=1 adds the GI cache (METALMC_EXP=...,gi, Gi.swift): pictures and numbers of lit mode with and without the
 //   cache's light in the same frames (mmc_debug_lit_gi), morning, noon and dusk, and with "time" the frame with and
 //   without the cache's frame (mmc_debug_gi_frame). Pictures are named <mode>gi-... then.
+//   "cull" instead of "time": the LOD's quad culling (METALMC_EXP=quadcull, Lod.swift) checked and timed: the main pass
+//   bit for bit with and without it in several views, and its time at the panel's resolution (see the "cull" section
+//   below; LITFLOW_VIEWS=x,y,z,yaw,pitch;... sets the views, LITFLOW_CULLREF=<file> checks the unculled picture against
+//   another build's).
+//   LITFLOW_GATE=<dir>: take the GPU lock only after the LOD's build (see there).
 import CoreGraphics
 import Foundation
 import ImageIO
 import simd
 
 let args = CommandLine.arguments
-guard args.count >= 4 else { print("usage: litflow <dylib> <world dir> <output dir> [sdr|sky|hdr|off] [time]"); exit(1) }
+guard args.count >= 4 else { print("usage: litflow <dylib> <world dir> <output dir> [sdr|sky|hdr|off] [time|cull]"); exit(1) }
 let mode = args.count >= 5 ? args[4] : "sdr"
 let timing = args.count >= 6 && args[5] == "time"
+let cullRun = args.count >= 6 && args[5] == "cull"
 let giOn = ProcessInfo.processInfo.environment["LITFLOW_GI"] == "1" && mode != "off"
 let exp = (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
     + (giOn ? ",gi" : "")
@@ -100,6 +106,14 @@ while stable < 24 && Date().timeIntervalSince(t0) < 600 {
     Thread.sleep(forTimeInterval: 0.25)
 }
 check(st[0] == 2, "LOD built: \(st[1]) nodes, \(st[2]) quads in \(Int(Date().timeIntervalSince(t0))) s")
+// LITFLOW_GATE=<dir>: the LOD's build (about 100 s of CPU at background priority, no GPU work) runs before the GPU lock is
+// taken: litflow writes <dir>/ready and waits for <dir>/go, which a wrapper writes once it holds the lock
+// (tools/bench/gpuwait.sh), so the lock is held only for the GPU work.
+if let gate = ProcessInfo.processInfo.environment["LITFLOW_GATE"] {
+    FileManager.default.createFile(atPath: gate + "/ready", contents: nil)
+    while !FileManager.default.fileExists(atPath: gate + "/go") { Thread.sleep(forTimeInterval: 0.2) }
+    print("ok    GPU lock taken")
+}
 
 // Vanilla's lightmap (lightmap.fsh): block light along x, sky light along y, at a sky factor (1 at noon, about 0.2 at
 // midnight), the default brightness (0.5), no ambient (the overworld's).
@@ -270,6 +284,285 @@ func writePNG(_ px: [UInt8], _ w: Int, _ h: Int, _ name: String) {
     CGImageDestinationAddImage(dest, img, nil)
     CGImageDestinationFinalize(dest)
     print("      wrote \(name)")
+}
+
+// "cull": the LOD's quad culling (METALMC_EXP=quadcull). Per view, the level's main pass as the timing runs draw it (the
+// sky's clear, then the LOD and the far field through mmc_lod_draw) without and with culling, switched in one process
+// (mmc_debug_lod_paths). The check: color, depth and (lit mode) the G-buffer must match bit for bit at the panel's
+// resolution, at three sub-pixel shifts of the projection (as the anti-aliasing's jitter moves it), and with vanilla
+// sections around the camera cut out (the seam variants). The timing: the variants alternate, 40 frames each, and then
+// run back to back with two frames in flight; the culling pass is a command buffer of its own, timed apart and as the
+// span from its start to the frame's end.
+if cullRun {
+    setbuf(stdout, nil)   // in order with the library's log lines (the traced frames' stage times)
+    let setVanilla = fn("mmc_lod_set_vanilla", (@convention(c) (UnsafePointer<Int64>, Int32) -> Void).self)
+    let traceFrames = fn("mmc_trace_frames", (@convention(c) (Int32) -> Void).self)
+    // A library without quad culling (the build before it) only renders the reference (LITFLOW_CULLREF, below).
+    let refOnly = dlsym(lib, "mmc_debug_lod_paths") == nil
+    typealias PathsF = @convention(c) (Int32, Int32, Int32) -> Int32
+    typealias CullLastF = @convention(c) (UnsafeMutablePointer<Double>) -> Int32
+    typealias PipelinesF = @convention(c) () -> Int32
+    let pathsC: PathsF? = refOnly ? nil : fn("mmc_debug_lod_paths", PathsF.self)
+    let cullLastC: CullLastF? = refOnly ? nil : fn("mmc_debug_lod_quadcull_last", CullLastF.self)
+    let pipelinesC: PipelinesF? = refOnly ? nil : fn("mmc_debug_lod_pipelines", PipelinesF.self)
+    func debugPaths(_ mesh: Int32, _ cull: Int32, _ flags: Int32) -> Int32 { pathsC?(mesh, cull, flags) ?? 1 }
+    func debugCullLast(_ out: UnsafeMutablePointer<Double>) -> Int32 { cullLastC?(out) ?? 0 }
+    func debugPipelines() -> Int32 { pipelinesC?() ?? 0 }
+    struct View { let name: String; let pos: SIMD3<Double>; let yaw: Float; let pitch: Float }
+    var views: [View] = []
+    if let spec = ProcessInfo.processInfo.environment["LITFLOW_VIEWS"] {
+        for (i, v) in spec.split(separator: ";").enumerated() {
+            let n = v.split(separator: ",").map { Double($0)! }
+            views.append(View(name: "view\(i)", pos: SIMD3(n[0], n[1], n[2]), yaw: Float(n[3]), pitch: Float(n[4])))
+        }
+    } else {
+        // The default view and the other three directions at y 150 looking 22 degrees down (the real-terrain flight's
+        // height), two lower and flatter, and one high.
+        views = [View(name: "y150-yaw100", pos: SIMD3(8, 150, 8), yaw: 100, pitch: 22), View(name: "y150-yaw10", pos: SIMD3(8, 150, 8), yaw: 10, pitch: 22),
+                 View(name: "y150-yaw190", pos: SIMD3(8, 150, 8), yaw: 190, pitch: 22), View(name: "y150-yaw280", pos: SIMD3(8, 150, 8), yaw: 280, pitch: 22),
+                 View(name: "y110-yaw100", pos: SIMD3(8, 110, 8), yaw: 100, pitch: 8), View(name: "y110-yaw280", pos: SIMD3(8, 110, 8), yaw: 280, pitch: 8),
+                 View(name: "y260-yaw100", pos: SIMD3(8, 260, 8), yaw: 100, pitch: 35)]
+    }
+    // The camera of `matrices`, per view, with the projection shifted by `jitter` pixels (as TemporalAA.jitter does).
+    func viewMatrices(_ t: Targets, _ v: View, jitter: SIMD2<Float>) -> [Float] {
+        let yw = v.yaw * .pi / 180, pt = v.pitch * .pi / 180
+        let fwd = SIMD3<Float>(-sin(yw) * cos(pt), -sin(pt), cos(yw) * cos(pt))
+        let right = simd_normalize(simd_cross(fwd, SIMD3(0, 1, 0))), up = simd_cross(right, fwd)
+        let view = simd_float4x4(rows: [SIMD4(right, 0), SIMD4(up, 0), SIMD4(-fwd, 0), SIMD4(0, 0, 0, 1)])
+        let f = 1 / tan(35 * Float.pi / 180), aspect = Float(t.w) / Float(t.h)
+        let jx = 2 * jitter.x / Float(t.w), jy = 2 * jitter.y / Float(t.h)
+        let proj = simd_float4x4(SIMD4(f / aspect, 0, 0, 0), SIMD4(0, f, 0, 0), SIMD4(-jx, -jy, 0, -1), SIMD4(0, 0, 0.05, 0))
+        var m = [Float](repeating: 0, count: 32)
+        for c in 0..<4 { for r in 0..<4 { m[c * 4 + r] = proj[c][r]; m[16 + c * 4 + r] = view[c][r] } }
+        return m
+    }
+    // Vanilla's sections for the seam variants: every section within 5 of the camera's (SectionPos.asLong keys), and the
+    // matching half-size of vanilla's area for mmc_lod_draw's discard radius.
+    func vanillaKeys(_ v: View) -> [Int64] {
+        let cx = Int64((v.pos.x / 16).rounded(.down)), cz = Int64((v.pos.z / 16).rounded(.down))
+        var keys: [Int64] = []
+        for x in (cx - 5)...(cx + 5) { for z in (cz - 5)...(cz + 5) { for y in Int64(-4)...19 {
+            keys.append(((x & 0x3FFFFF) << 42) | ((z & 0x3FFFFF) << 20) | (y & 0xFFFFF))
+        } } }
+        return keys
+    }
+    struct Capture { var color: [UInt32] = []; var depth: [UInt32] = []; var gbuf: [UInt32] = [] }
+    let n = 3456 * 2234
+    let full = targets(3456, 2234)
+    let cbuf = bufferCreate(Int64(n * 4)), dbuf = bufferCreate(Int64(n * 4)), gbuf = bufferCreate(Int64(n * 8))
+    /// One main pass of view `v` (submitted and waited for); with `read`, its color, depth and G-buffer.
+    @discardableResult
+    func mainPass(_ t: Targets, _ v: View, jitter: SIMD2<Float> = .zero, seam: Bool = false, read: Bool = false) -> Capture {
+        let keys = seam ? vanillaKeys(v) : [0]
+        keys.withUnsafeBufferPointer { setVanilla($0.baseAddress!, seam ? Int32(keys.count) : 0) }
+        var h = t.color
+        var clear: [Float] = [0.62, 0.75, 0.95, 1]
+        _ = passBegin(&h, 1, 1, &clear, t.depth, 1, 0, 0, 0, t.w, t.h)
+        passEnd()
+        litLevelPass?()
+        _ = passBegin(&h, 1, 0, &clear, t.depth, 0, 0, 0, 0, t.w, t.h)
+        var p = viewMatrices(t, v, jitter: jitter) + [0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, seam ? 96 : 0, 1]
+        var c = [v.pos.x, v.pos.y, v.pos.z]
+        _ = lodDraw(&p, &c)
+        passEnd()
+        var gotG = false
+        if read {
+            copyToBuffer(t.color, 0, 0, 0, t.w, t.h, cbuf, 0, t.w * 4)
+            copyToBuffer(t.depth, 0, 0, 0, t.w, t.h, dbuf, 0, t.w * 4)
+            gotG = litCopyGbuffer?(gbuf, 0) == 1
+        }
+        submit(submitIndex)
+        if waitSubmit(submitIndex, 10_000_000_000) != 1 { check(false, "frame \(submitIndex) done") }
+        submitIndex += 1
+        var r = Capture()
+        if read {
+            let k = Int(t.w) * Int(t.h)
+            r.color = Array(UnsafeBufferPointer(start: UnsafeRawPointer(bitPattern: Int(bufferContents(cbuf)))!.assumingMemoryBound(to: UInt32.self), count: k))
+            r.depth = Array(UnsafeBufferPointer(start: UnsafeRawPointer(bitPattern: Int(bufferContents(dbuf)))!.assumingMemoryBound(to: UInt32.self), count: k))
+            if gotG {
+                r.gbuf = Array(UnsafeBufferPointer(start: UnsafeRawPointer(bitPattern: Int(bufferContents(gbuf)))!.assumingMemoryBound(to: UInt32.self), count: 2 * k))
+            }
+        }
+        return r
+    }
+    // Warm-up at a small size: the LOD's pipelines compile in the background and the far field's rings fill.
+    let small = targets(432, 280)
+    for _ in 0..<120 { mainPass(small, views[0]) }
+    mainPass(full, views[0])
+    let failed = debugPipelines()
+    if !refOnly {
+        check(failed == 0, "every LOD pipeline variant compiles (\(lit ? "lit" : "no lit") mode: vertex and mesh paths; plain, seam, water, fade, boxes) and the culling pass: \(failed) failed")
+    }
+    // The default path against another build's (LITFLOW_CULLREF=<file>): per view and case, a hash of the color and depth
+    // after the same frames from the same start, written by the first run (e.g. with the library before quad culling) and
+    // checked by the next. The rest of the run doesn't come before it, so both see the same frames.
+    let cases: [(jitter: SIMD2<Float>, seam: Bool)] = [(SIMD2(0, 0), false), (SIMD2(0.25, -0.1667), false), (SIMD2(-0.375, 0.2778), true),
+                                                       (SIMD2(0, 0), true)]
+    if let refPath = ProcessInfo.processInfo.environment["LITFLOW_CULLREF"] {
+        func hash(_ a: [UInt32]) -> UInt64 { a.reduce(UInt64(0xcbf2_9ce4_8422_2325)) { ($0 ^ UInt64($1)) &* 0x100_0000_01b3 } }
+        // Settled first: two seconds of frames (the far field fills its rings over frames, the LOD's last nodes land),
+        // then the first view until two captures 8 frames apart agree.
+        let t0 = Date()
+        while Date().timeIntervalSince(t0) < 2 { mainPass(full, views[0]) }
+        var last: UInt64 = 0
+        for _ in 0..<20 {
+            for _ in 0..<7 { mainPass(full, views[0]) }
+            let h = hash(mainPass(full, views[0], read: true).color)
+            if h == last { break }
+            last = h
+        }
+        var lines: [String] = []
+        for v in views {
+            for c in cases {
+                for _ in 0..<12 { mainPass(full, v, jitter: c.jitter, seam: c.seam) }
+                let cap = mainPass(full, v, jitter: c.jitter, seam: c.seam, read: true)
+                for _ in 0..<3 { mainPass(full, v, jitter: c.jitter, seam: c.seam) }
+                let again = mainPass(full, v, jitter: c.jitter, seam: c.seam, read: true)
+                // Pixels the LOD or the far field drew (not the clear color): a blank capture would match anything.
+                let drawn = cap.depth.reduce(0) { $0 + ($1 != 0 ? 1 : 0) }
+                let stable = hash(cap.color) == hash(again.color) && hash(cap.depth) == hash(again.depth)
+                lines.append("\(v.name) \(c.jitter.x) \(c.jitter.y) \(c.seam) \(String(hash(cap.color), radix: 16)) \(String(hash(cap.depth), radix: 16)) drawn \(drawn)\(stable ? "" : " unsettled")")
+            }
+        }
+        if let old = try? String(contentsOfFile: refPath, encoding: .utf8) {
+            let before = old.split(separator: "\n").map(String.init)
+            let same = before == lines
+            for (a, b) in zip(before, lines) where a != b { print("      reference: was \(a), now \(b)") }
+            print((same ? "ok    " : "FAIL  ") + "the default path draws the same as the reference build (\(lines.count) views and cases, color and depth hashes, \(refPath))")
+        } else {
+            try? lines.joined(separator: "\n").write(toFile: refPath, atomically: true, encoding: .utf8)
+            print("ok    reference written: \(lines.count) views and cases (\(refPath))")
+        }
+    }
+    if refOnly { print("done"); exit(0) }
+    // flags: 2 has the culling pass keep every quad (the cost of the pass and the indirect draws alone).
+    let paths: [(name: String, mesh: Int32, cull: Int32, flags: Int32)] = [("unculled", 0, 0, 0), ("culled", 0, 1, 0), ("keep-all", 0, 1, 2)]
+    func use(_ k: Int) { _ = debugPaths(paths[k].mesh, paths[k].cull, paths[k].flags) }
+    // Pixels that differ between two captures: color, depth, G-buffer; and a picture of where (color red, depth green,
+    // G-buffer blue).
+    func differ(_ a: Capture, _ b: Capture, picture: String?) -> (Int, Int, Int) {
+        var dc = 0, dd = 0, dg = 0
+        var px: [UInt8] = picture == nil ? [] : [UInt8](repeating: 0, count: n * 4)
+        for i in 0..<n {
+            let c = a.color[i] != b.color[i], d = a.depth[i] != b.depth[i]
+            let g = !a.gbuf.isEmpty && (a.gbuf[2 * i] != b.gbuf[2 * i] || a.gbuf[2 * i + 1] != b.gbuf[2 * i + 1])
+            if c { dc += 1 }
+            if d { dd += 1 }
+            if g { dg += 1 }
+            if picture != nil && (c || d || g) { px[4 * i] = c ? 255 : 0; px[4 * i + 1] = d ? 255 : 0; px[4 * i + 2] = g ? 255 : 0 }
+        }
+        if let picture, dc + dd + dg > 0 { writePNG(px, 3456, 2234, picture) }
+        return (dc, dd, dg)
+    }
+    var allExact = true
+    var stats = [Double](repeating: 0, count: 8)
+    for v in views {
+        print("      view \(v.name): (\(v.pos.x), \(v.pos.y), \(v.pos.z)) yaw \(v.yaw) pitch \(v.pitch)")
+        for c in cases {
+            // The view settles first (the occlusion test's results come from earlier frames, and a change in the picture
+            // takes a few frames to go through them). Then unculled, culled and unculled again: the two unculled ones must
+            // match (the view had settled) for the comparison to count.
+            use(0)
+            for _ in 0..<10 { mainPass(full, v, jitter: c.jitter, seam: c.seam) }
+            func cap(_ k: Int) -> Capture {
+                use(k)
+                for _ in 0..<2 { mainPass(full, v, jitter: c.jitter, seam: c.seam) }
+                return mainPass(full, v, jitter: c.jitter, seam: c.seam, read: true)
+            }
+            let c0 = cap(0), c1 = cap(1)
+            let kept = debugCullLast(&stats) == 1 ? String(format: ", kept %.1f%% of %.0f quads", 100 * stats[2] / max(stats[1], 1), stats[1]) : ""
+            let d = differ(c0, c1, picture: "cull-diff-\(v.name)-\(Int(c.jitter.x * 1000))\(c.seam ? "-seam" : "").png")
+            let s = differ(c0, cap(0), picture: nil)
+            let settled = s.0 + s.1 + s.2 == 0
+            if settled && d.0 + d.1 + d.2 > 0 { allExact = false }
+            print("      \(v.name) jitter (\(c.jitter.x), \(c.jitter.y))\(c.seam ? " seam" : ""): culled against unculled: \(d.0) color, \(d.1) depth, \(d.2) G-buffer pixels differ\(kept)"
+                  + (settled ? "" : " (NOT SETTLED: \(s.0), \(s.1), \(s.2) differ between the unculled ones)"))
+        }
+    }
+    use(0)
+    // Reported, not fatal: the timing still runs.
+    print((allExact ? "ok    " : "FAIL  ") + "culling leaves the main pass bit for bit the same (color, depth\(lit ? ", G-buffer" : "")) in every view, jitter and seam case")
+    // Timing: the variants alternate, frame by frame, 40 each per view, after the view settled.
+    func stat(_ s: [Double]) -> (Double, Double) {
+        let t = s.sorted()
+        return t.isEmpty ? (-1, -1) : (t[t.count / 2], t[0])
+    }
+    var times = [Double](repeating: 0, count: 4096)
+    /// Frames back to back with two in flight, as the game runs: wall time per frame (ms), GPU-bound.
+    func throughput(_ v: View, frames: Int) -> Double {
+        var h = full.color
+        var clear: [Float] = [0.62, 0.75, 0.95, 1]
+        let none: [Int64] = [0]
+        none.withUnsafeBufferPointer { setVanilla($0.baseAddress!, 0) }
+        let t0 = Date()
+        for k in 0..<frames {
+            _ = passBegin(&h, 1, 1, &clear, full.depth, 1, 0, 0, 0, full.w, full.h)
+            passEnd()
+            litLevelPass?()
+            _ = passBegin(&h, 1, 0, &clear, full.depth, 0, 0, 0, 0, full.w, full.h)
+            var p = viewMatrices(full, v, jitter: .zero) + [0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, 0, 1]
+            var c = [v.pos.x, v.pos.y, v.pos.z]
+            _ = lodDraw(&p, &c)
+            passEnd()
+            submit(submitIndex)
+            if k >= 1 { _ = waitSubmit(submitIndex - 1, 10_000_000_000) }
+            submitIndex += 1
+        }
+        _ = waitSubmit(submitIndex - 1, 10_000_000_000)
+        _ = gpuTimesTake(&times, 4096)
+        return Date().timeIntervalSince(t0) * 1000 / Double(frames)
+    }
+    for v in views {
+        use(0)
+        for _ in 0..<6 { mainPass(full, v) }
+        // The frame's own GPU time (its command buffer), and with culling the span from the culling pass's start to the
+        // frame's end: the culling pass runs as the frame's first passes start, and its draws wait for it.
+        var main = [[Double]](repeating: [], count: paths.count), pre = [[Double]](repeating: [], count: paths.count)
+        var span = [[Double]](repeating: [], count: paths.count)
+        var kept = 0.0, total = 0.0, jobs = 0.0
+        for k in 0..<(40 * paths.count) {
+            let i = k % paths.count
+            use(i)
+            _ = gpuTimesTake(&times, 4096)
+            mainPass(full, v)
+            let c = Int(gpuTimesTake(&times, 4096))
+            if c > 0 { main[i].append(times[c - 1] * 1000) }
+            if debugCullLast(&stats) == 1 {
+                pre[i].append(stats[0])
+                if stats[4] > 0 { span[i].append(stats[4]) }
+                if i == 1 { kept = stats[2]; total = stats[1]; jobs = stats[3] }
+            }
+        }
+        // Throughput: 3 rounds of 60 frames per path, alternating.
+        var tput = [[Double]](repeating: [], count: paths.count)
+        for _ in 0..<3 {
+            for (i, _) in paths.enumerated() {
+                use(i)
+                _ = throughput(v, frames: 8)
+                tput[i].append(throughput(v, frames: 60))
+            }
+        }
+        let s = main.map { stat($0) }, sp = pre.map { stat($0) }, ss = span.map { stat($0) }
+        print(String(format: "      %@ (%@), at 3456 x 2234; culling kept %.0f of %.0f quads (%.1f%%) in %.0f jobs. Sky clear + main pass, median (fastest) of 40 frames each, alternating; with culling, the span from its pass's start; then frames back to back (two in flight), ms per frame, median of 3 x 60:",
+                     v.name, lit ? "lit" : "no lit", kept, total, 100 * kept / max(total, 1), jobs))
+        for (i, pth) in paths.enumerated() {
+            print(String(format: "        %-18@ %.3f (%.3f)", pth.name, s[i].0, s[i].1)
+                  + (pre[i].isEmpty ? "" : String(format: ", culling pass %.3f (%.3f), span %.3f (%.3f)", sp[i].0, sp[i].1, ss[i].0, ss[i].1))
+                  + String(format: "; back to back %.3f", stat(tput[i]).0))
+        }
+        // Stage times (the library logs a traced frame's passes: total, vertex, fragment).
+        for (i, pth) in paths.enumerated() {
+            use(i)
+            mainPass(full, v)
+            print("        traced: \(pth.name)")
+            traceFrames(1)
+            mainPass(full, v)
+            _ = debugCullLast(&stats)
+        }
+        use(0)
+    }
+    print("done")
+    exit(0)
 }
 
 // Warm-up at a small size: shaders compile in the background, the far field's rings fill, and the shadows' tile

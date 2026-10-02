@@ -193,6 +193,107 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
     return o;
 }
 
+// Quad culling (METALMC_EXP=quadcull): quads that can't make a single fragment aren't issued to the vertex stage, whose
+// cost on this GPU is per vertex invoked, culled or not (docs/lod-design.md, "What didn't pay"). A quad makes no fragment
+// if no pixel center lies in its bounding box on screen (off screen, or thinner than the gap between pixel centers), or if
+// both its triangles face away from the camera. The test is conservative: each projected corner may be off by `margin`
+// pixels (the rasterizer snaps vertices to a sub-pixel grid, and lod_vs rounds a little differently from this), more for
+// corners far outside the view, and quads with a corner near or behind the camera's plane are kept.
+struct LodCullParams {
+    float4x4 viewProj;   // proj * view, as lod_vs applies them (before its vertical flip, which changes nothing here)
+    float2 viewport;     // the pass's size in pixels: its viewport is the whole target
+    float margin;        // pixels; negative keeps every quad (measuring the culling pass and the indirect draws alone)
+    float minW;          // a corner with clip w under this keeps the quad (the near plane is at 0.05)
+    uint jobs;           // lod_cull's job count
+    uint pad[3];
+};
+static float lodL1(float2 v) { return abs(v.x) + abs(v.y); }
+static bool lodQuadCulled(uint2 q, float4 xs, constant LodCullParams& cp) {
+    uint face = (q.x >> 25) & 7;
+    if (face > 5 || cp.margin < 0.0) return false;
+    float3 local = float3(q.x & 255, (q.x >> 16) & 511, (q.x >> 8) & 255);
+    float w = float(((q.y >> 8) & 255) + 1), h = float(((q.y >> 16) & 255) + 1);
+    float3 ext = extentScale(face, w, h) * xs.w;   // blocks along x, y and z (a voxel along the normal)
+    uint m = q.y & 255;
+    bool water = (m >= 128u && m < 160u) || m == MAT_WATER;
+    float drop = water ? (xs.w < 1.5 ? kWaterSurfaceDrop0 : kWaterSurfaceDrop) : 0.0;
+    // Corner c is base + kCorners[face][c] * ext, its y lowered by `drop` where kCorners' y is 1 (lod_vs's water tops),
+    // so its clip position is base's plus the matrix's columns scaled by the extents, those kCorners has.
+    float4 cb = cp.viewProj * float4(xs.xyz + local * xs.w, 1.0);
+    float4 cx = cp.viewProj[0] * ext.x, cy = cp.viewProj[1] * (ext.y - drop), cz = cp.viewProj[2] * ext.z;
+    float2 hv = 0.5 * cp.viewport;
+    float2 s[4];
+    for (uint c = 0; c < 4; c++) {
+        float3 k = kCorners[face][c];
+        float4 clip = cb + k.x * cx + k.y * cy + k.z * cz;
+        if (!(clip.w > cp.minW)) return false;
+        s[c] = clip.xy / clip.w * hv;   // pixels from the viewport's center
+    }
+    float2 lo = min(min(s[0], s[1]), min(s[2], s[3])), hi = max(max(s[0], s[1]), max(s[2], s[3]));
+    float e = cp.margin + 1e-5 * max(max(abs(lo.x), abs(hi.x)), max(abs(lo.y), abs(hi.y)));
+    // Pixel centers lie at k + 0.5 from the viewport's corner, k = 0 ..< size (with the vertical flip too: the size is
+    // whole). The rasterizer only samples there.
+    float2 k0 = max(ceil(lo - e + hv - 0.5), float2(0.0)), k1 = min(floor(hi + e + hv - 0.5), cp.viewport - 1.0);
+    if (k0.x > k1.x || k0.y > k1.y) return true;
+    // Facing away: front faces wind counterclockwise here (y up), so both triangles (corners 0 1 2 and 0 2 3) have
+    // negative doubled area, by more than moving each corner up to e can change it (2e(|a|1 + |b|1) + 8e^2 for
+    // cross(a, b)) or rounding the products can.
+    float2 a = s[1] - s[0], b = s[2] - s[0], d = s[3] - s[0];
+    float a1 = a.x * b.y - a.y * b.x, a2 = b.x * d.y - b.y * d.x;
+    float m1 = 2.0 * e * (lodL1(a) + lodL1(b)) + 8.0 * e * e + 1e-6 * (abs(a.x * b.y) + abs(a.y * b.x));
+    float m2 = 2.0 * e * (lodL1(b) + lodL1(d)) + 8.0 * e * e + 1e-6 * (abs(b.x * d.y) + abs(b.y * d.x));
+    return a1 < -m1 && a2 < -m2;
+}
+
+// The culling pass: per job (a run of at most lodCullJobQuads consecutive quads of one draw), its surviving quads and
+// their AO offsets, in their order, to [outBase, outBase + survivors) of the frame's lists, and the indexed indirect draw
+// that draws them with lod_vs unchanged: the same quads and draw slot, so the same vertices. Order matters (water
+// blends, and equal depths go to the later quad). Copies rather than indices, so lod_vs stays as it is: an indexed
+// variant drew the same picture as itself but not quite lod_vs's (the compiler rounds the shared code differently), and
+// what it saved in the culling pass it lost in the vertex stage (measured).
+struct LodCullJob { const device uint2* quads; const device uint* aoOffsets; uint count; uint slot; uint outBase; uint pad; };
+struct LodDrawArgs { uint indexCount; uint instanceCount; uint indexStart; int baseVertex; uint baseInstance; };
+// One SIMD group per job, no threadgroup memory or barriers: each step takes 4 runs of 32 quads (a quad per lane in
+// each, their loads in flight together) and writes each run's survivors after the last's. The pass runs at memory speed:
+// it reads 8 bytes a quad and 4 and writes 12 per survivor.
+kernel void lod_cull(const device LodCullJob* jobs [[buffer(0)]], constant LodCullParams& cp [[buffer(1)]],
+                     const device Xform* xforms [[buffer(2)]], device uint2* outQuads [[buffer(3)]],
+                     device uint* outAo [[buffer(4)]], device LodDrawArgs* args [[buffer(5)]],
+                     uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                     uint groups [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint job = tg * groups + sg;
+    if (job >= cp.jobs) return;   // the whole SIMD group
+    LodCullJob j = jobs[job];
+    float4 xs = xforms[j.slot].offsetScale;
+    uint total = 0;
+    for (uint base = 0; base < j.count; base += 128) {
+        uint2 q[4];
+        for (uint r = 0; r < 4; r++) {
+            uint i = base + 32 * r + lane;
+            q[r] = i < j.count ? j.quads[i] : uint2(0);
+        }
+        for (uint r = 0; r < 4; r++) {
+            uint i = base + 32 * r + lane;
+            bool keep = i < j.count && !lodQuadCulled(q[r], xs, cp);
+            uint rank = simd_prefix_exclusive_sum(uint(keep));   // every lane active
+            if (keep) {
+                outQuads[j.outBase + total + rank] = q[r];
+                outAo[j.outBase + total + rank] = j.aoOffsets[i];
+            }
+            total += simd_sum(uint(keep));
+        }
+    }
+    if (lane == 0) {
+        LodDrawArgs a;
+        a.indexCount = 6 * total;
+        a.instanceCount = 1;
+        a.indexStart = 0;
+        a.baseVertex = int(4 * j.outBase);
+        a.baseInstance = j.slot;
+        args[job] = a;
+    }
+}
+
 // Mesh-shader path (METALMC_EXP=meshshader): one thread per quad, 64 quads per threadgroup. The per-quad work
 // (decode, color, lighting, AO lookup) runs once instead of in each of the quad's four vertices, and quads
 // facing away from the camera or entirely off one side of the view are culled before rasterization.
@@ -574,6 +675,8 @@ let lodQuadVis = experiments.contains("quadvis")
 /// so a traced flight's main pass minus the plain one is what they cost (tools/bench/passes.py).
 let lodSkipFar = experiments.contains("ffskip")
 let lodSkipQuads = experiments.contains("lodskip")
+/// lodSkipQuads, or an offline A/B's (mmc_debug_lod_paths).
+nonisolated(unsafe) var lodSkipQuadsOn = lodSkipQuads
 /// METALMC_EXP=cullstats: every 600 frames, the CPU goes over the frame's drawn quads and counts, per level, those that
 /// can't make a fragment: facing away from the camera (each quad, where the draw lists cull by tile), off screen, or
 /// so thin on screen that no pixel center falls in their bounding box. What culling quads before the vertex stage
@@ -635,6 +738,235 @@ nonisolated(unsafe) var lodVisPipe: MTLRenderPipelineState?
 /// Quads per mesh threadgroup (METALMC_MESHQUADS, default 32).
 let lodMeshQuads = Int(ProcessInfo.processInfo.environment["METALMC_MESHQUADS"] ?? "") ?? 32
 
+/// METALMC_EXP=quadcull: quads that can't make a single fragment (lodQuadCulled in the shaders: no pixel center in their
+/// bounding box on screen, or facing away) aren't issued to the vertex stage, whose cost is per vertex invoked. A compute
+/// pass ahead of the frame writes each draw's surviving quads, in order, and the indirect draws that draw them
+/// (LodQuadCull). The picture is the same: only quads that would make no fragment are left out. The vertex path only
+/// (with meshshader the LOD draws as before).
+let lodQuadCullEnv = experiments.contains("quadcull")
+/// The paths in use: the switches above, or an offline A/B's in one process (mmc_debug_lod_paths).
+nonisolated(unsafe) var lodQuadCullOn = lodQuadCullEnv
+nonisolated(unsafe) var lodMeshOn = lodMeshShaders
+/// Pixels each projected corner may be off by in the culling test (METALMC_CULLMARGIN): the rasterizer snaps vertices
+/// to a sub-pixel grid, and lod_vs rounds a little differently from the test. On this GPU a covered pixel center lies
+/// at most 0.0023 px outside its triangle (measured over 41 K random thin triangles: 8 fractional bits), so 1/16 is
+/// about 27 times that, and it would still cover snapping to 4 bits.
+let lodCullMargin = Float(ProcessInfo.processInfo.environment["METALMC_CULLMARGIN"] ?? "") ?? 0.0625
+/// Quads per culling job (one SIMD group, one indirect draw, METALMC_CULLJOB): longer draws are split into consecutive
+/// jobs, which draw in the same order.
+let lodCullJobQuads = max(32, Int(ProcessInfo.processInfo.environment["METALMC_CULLJOB"] ?? "") ?? 4096)
+/// Measuring (mmc_debug_lod_paths): the culling pass keeps every quad, so the frame pays for the pass and the indirect
+/// draws without culling anything.
+nonisolated(unsafe) var lodCullKeepAll = false
+
+/// Must match LodCullParams in the shaders.
+struct LodCullParams {
+    var viewProj: simd_float4x4
+    var viewport: SIMD2<Float>
+    var margin: Float
+    var minW: Float
+    var jobs: UInt32 = 0
+    var pad0: UInt32 = 0, pad1: UInt32 = 0, pad2: UInt32 = 0
+}
+/// Must match LodCullJob in the shaders: GPU addresses of the job's first quad and AO offset.
+struct LodCullJob {
+    var quads: UInt64
+    var aoOffsets: UInt64
+    var count: UInt32
+    var slot: UInt32
+    var outBase: UInt32
+    var pad: UInt32 = 0
+}
+
+/// One frame's culling buffers: the job table and transforms (written by the CPU), the surviving quads and AO offsets
+/// and the indirect draws (written by the culling pass, read by the frame's main pass).
+final class LodCullFrame {
+    var jobs: MTLBuffer?
+    var xforms: MTLBuffer?
+    var quads: MTLBuffer?
+    var ao: MTLBuffer?
+    var args: MTLBuffer?
+    var pending = 0          // command buffers still to complete (the culling pass and the frame); LodQuadCull.lock
+    var counted = true       // its survivors are in the stats
+    var jobCount = 0
+    var quadsIn = 0
+    var gpuSeconds = 0.0
+    var cb: MTLCommandBuffer?
+    // The node buffers the jobs read through their GPU addresses, held until the frame completes: a node the LOD drops
+    // meanwhile must not free them before the culling pass has run.
+    var reads: [MTLResource] = []
+    // GPU start and end of the culling pass's command buffer and of the frame's (measuring: the culling pass runs while
+    // the frame's first passes start, and the frame's draws wait for it).
+    var cullTimes = (start: 0.0, end: 0.0), frameTimes = (start: 0.0, end: 0.0)
+}
+
+/// The vertex path's quad culling (lodQuadCullOn): see lod_cull.
+final class LodQuadCull: @unchecked Sendable {
+    static let shared = LodQuadCull()
+    let lock = NSLock()
+    var frames: [LodCullFrame] = []
+    var pipe: MTLComputePipelineState?
+    var last: LodCullFrame?
+    // Since the last log line: frames, quads submitted to the pass, quads it kept, its GPU time.
+    var statFrames = 0, statIn = 0, statOut = 0, statGpu = 0.0
+
+    /// The culling pipeline, nil until it's compiled (the frame draws directly until then). `compile`: compile it now
+    /// from the LOD's library if it isn't. The LOD's background warm-up does that with the switch on; on the render thread
+    /// only an offline A/B that turned culling on does (mmc_debug_lod_paths).
+    func pipeline(compile: Bool) -> MTLComputePipelineState? {
+        lock.lock(); let p = pipe; lock.unlock()
+        if let p { return p }
+        guard compile, let fn = LodRenderer.shared.library?.makeFunction(name: "lod_cull") else { return nil }
+        var made: MTLComputePipelineState?
+        do {
+            made = try ctx.device.makeComputePipelineState(function: fn)
+        } catch {
+            log("LOD quad culling: pipeline failed: \(error)")
+        }
+        lock.lock(); defer { lock.unlock() }
+        if pipe == nil { pipe = made }
+        return pipe
+    }
+
+    /// Adds a finished frame's survivors to the stats (render thread, under the lock).
+    private func count(_ f: LodCullFrame) {
+        guard !f.counted, let args = f.args else { return }
+        f.counted = true
+        let a = args.contents().bindMemory(to: UInt32.self, capacity: 5 * f.jobCount)
+        var kept = 0
+        for j in 0..<f.jobCount { kept += Int(a[5 * j]) / 6 }
+        statFrames += 1
+        statIn += f.quadsIn
+        statOut += kept
+        statGpu += f.gpuSeconds
+    }
+
+    /// A frame's buffers that no command buffer still uses, big enough for `quads` quads and `jobs` jobs.
+    private func acquire(quads: Int, jobs: Int, xforms: Int) -> LodCullFrame? {
+        lock.lock()
+        for f in frames where f.pending == 0 { count(f) }
+        var free = frames.first { $0.pending == 0 }
+        if free == nil && frames.count < 4 {
+            free = LodCullFrame()
+            frames.append(free!)
+        }
+        lock.unlock()
+        guard let f = free else { return nil }
+        func grow(_ b: MTLBuffer?, _ bytes: Int, _ options: MTLResourceOptions, _ label: String) -> MTLBuffer? {
+            if let b, b.length >= bytes { return b }
+            let made = ctx.device.makeBuffer(length: max(4096, bytes + bytes / 2), options: options)
+            made?.label = label
+            return made
+        }
+        f.jobs = grow(f.jobs, jobs * MemoryLayout<LodCullJob>.stride, .storageModeShared, "MetalMC LOD cull jobs")
+        f.xforms = grow(f.xforms, xforms * 16, .storageModeShared, "MetalMC LOD cull transforms")
+        f.quads = grow(f.quads, quads * 8, .storageModePrivate, "MetalMC LOD culled quads")
+        f.ao = grow(f.ao, quads * 4, .storageModePrivate, "MetalMC LOD culled AO offsets")
+        f.args = grow(f.args, jobs * 20, .storageModeShared, "MetalMC LOD culled draws")
+        guard f.jobs != nil, f.xforms != nil, f.quads != nil, f.ao != nil, f.args != nil else { return nil }
+        return f
+    }
+
+    /// Culls this frame's draws (node, first quad, count, transform slot), in the order they'll be drawn: encodes the
+    /// culling pass in a command buffer of its own and commits it now, ahead of the frame's (committed when the frame
+    /// is submitted), like the far field's fill. Returns the buffers and each draw's jobs (its indirect draws in the
+    /// frame's args), or nil to draw directly this frame.
+    func encode(_ draws: [(node: LodMeshNode, first: Int, count: Int, slot: Int)], xforms: [SIMD4<Float>], viewProj: simd_float4x4,
+                width: Int, height: Int) -> (frame: LodCullFrame, jobs: [Range<Int>])? {
+        guard let pipe = pipeline(compile: !lodQuadCullEnv), let frameCB = ctx.cb, width > 0, height > 0 else { return nil }
+        var jobCount = 0, total = 0
+        for d in draws {
+            jobCount += (d.count + lodCullJobQuads - 1) / lodCullJobQuads
+            total += d.count
+        }
+        guard jobCount > 0, let f = acquire(quads: total, jobs: jobCount, xforms: xforms.count),
+              let jobsBuffer = f.jobs, let xformBuffer = f.xforms, let quads = f.quads, let ao = f.ao, let args = f.args,
+              let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return nil }
+        let jobs = jobsBuffer.contents().bindMemory(to: LodCullJob.self, capacity: jobCount)
+        var ranges: [Range<Int>] = []
+        ranges.reserveCapacity(draws.count)
+        var j = 0, out = 0
+        var seen = Set<ObjectIdentifier>()
+        var read: [MTLResource] = []
+        for d in draws {
+            let j0 = j
+            var k = 0
+            while k < d.count {
+                let n = min(lodCullJobQuads, d.count - k)
+                jobs[j] = LodCullJob(quads: d.node.buffer.gpuAddress + UInt64(8 * (d.first + k)),
+                                     aoOffsets: d.node.aoOffsets.gpuAddress + UInt64(4 * (d.first + k)),
+                                     count: UInt32(n), slot: UInt32(d.slot), outBase: UInt32(out))
+                j += 1
+                k += n
+                out += n
+            }
+            ranges.append(j0..<j)
+            if seen.insert(ObjectIdentifier(d.node)).inserted {
+                read.append(d.node.buffer)
+                read.append(d.node.aoOffsets)
+            }
+        }
+        xforms.withUnsafeBytes { xformBuffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+        var params = LodCullParams(viewProj: viewProj, viewport: SIMD2(Float(width), Float(height)), margin: lodCullKeepAll ? -1 : lodCullMargin,
+                                   minW: 0.05, jobs: UInt32(jobCount))
+        cb.label = "MetalMC LOD quad culling"
+        enc.label = "MetalMC LOD quad culling"
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(jobsBuffer, offset: 0, index: 0)
+        enc.setBytes(&params, length: MemoryLayout<LodCullParams>.stride, index: 1)
+        enc.setBuffer(xformBuffer, offset: 0, index: 2)
+        enc.setBuffer(quads, offset: 0, index: 3)
+        enc.setBuffer(ao, offset: 0, index: 4)
+        enc.setBuffer(args, offset: 0, index: 5)
+        // The jobs reach the nodes' buffers through their GPU addresses.
+        enc.useResources(read, usage: .read)
+        // A SIMD group per job, 8 to a threadgroup.
+        let groups = max(1, min(8, pipe.maxTotalThreadsPerThreadgroup / pipe.threadExecutionWidth))
+        enc.dispatchThreadgroups(MTLSize(width: (jobCount + groups - 1) / groups, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: groups * pipe.threadExecutionWidth, height: 1, depth: 1))
+        enc.endEncoding()
+        lock.lock()
+        f.pending = 2
+        f.counted = false
+        f.jobCount = jobCount
+        f.quadsIn = total
+        f.cb = cb
+        f.reads = read
+        last = f
+        lock.unlock()
+        cb.addCompletedHandler { [self] cb in
+            lock.lock()
+            f.gpuSeconds = cb.gpuEndTime - cb.gpuStartTime
+            f.cullTimes = (cb.gpuStartTime, cb.gpuEndTime)
+            f.pending -= 1
+            if f.pending == 0 { f.reads = [] }
+            lock.unlock()
+            if cb.status == .error { log("LOD quad culling: GPU error \(cb.error.map { "\($0)" } ?? "")") }
+        }
+        frameCB.addCompletedHandler { [self] fcb in
+            lock.lock()
+            f.frameTimes = (fcb.gpuStartTime, fcb.gpuEndTime)
+            f.pending -= 1
+            if f.pending == 0 { f.reads = [] }
+            lock.unlock()
+        }
+        cb.commit()
+        return (f, ranges)
+    }
+
+    /// "kept of submitted (share), culling pass GPU ms per frame" since the last call, or nil with no finished frame.
+    func takeStats() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        for f in frames where f.pending == 0 { count(f) }
+        guard statFrames > 0 else { return nil }
+        let s = String(format: "%d of %d quads issued (%.1f%%), culling pass %.3f ms GPU, per frame over %d frames",
+                       statOut / statFrames, statIn / statFrames, 100 * Double(statOut) / Double(max(statIn, 1)),
+                       1000 * statGpu / Double(statFrames), statFrames)
+        statFrames = 0; statIn = 0; statOut = 0; statGpu = 0
+        return s
+    }
+}
+
 /// METALMC_EXP=nolightmap lights the LOD with the old daylight curve instead of vanilla's lightmap (A/B).
 let lodNoLightmap = experiments.contains("nolightmap")
 
@@ -684,6 +1016,7 @@ final class LodRenderer: @unchecked Sendable {
     var indexQuads = 0
     var pipelines: [String: MTLRenderPipelineState] = [:]
     var library: MTLLibrary?
+    var lastFormats: (colors: [MTLPixelFormat], depth: MTLPixelFormat)?   // of the last pass the LOD drew into (debug)
     // Texture detail: Minecraft's block atlas and the sprite table (render thread).
     var atlas: MTLTexture?
     var spriteBuffer: MTLBuffer?
@@ -751,6 +1084,8 @@ final class LodRenderer: @unchecked Sendable {
                         _ = makePipeline(key: k, colorFormats: colorFormats, depth: depth, box: box, seam: seam, water: water, mesh: mesh, fade: fade)
                     }
                 }
+                // Quad culling's pass (its pipeline doesn't depend on the pass's formats).
+                if lodQuadCullEnv { _ = LodQuadCull.shared.pipeline(compile: true) }
                 pipelineLock.lock(); compiling.remove(formats); compiled.insert(formats); pipelineLock.unlock()
                 log("LOD: pipelines for \(formats) compiled in \((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) ms")
             }
@@ -1139,7 +1474,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     guard let w else { return 0 }
     let snap = w.snapshot()
     guard !snap.meshes.isEmpty else { return 0 }
-    let useMesh = lodMeshShaders
+    let useMesh = lodMeshOn
+    r.lastFormats = (ctx.passColorFormats, ctx.passDepthFormat)
     guard let pipe = r.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, mesh: useMesh) else { return 0 }
     r.ensureColors()
     let cx = cam[0], cy = cam[1], cz = cam[2]
@@ -1423,6 +1759,15 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         log("LOD: frame \(r.frame): \(draws.count) draws, \(draws.reduce(0) { $0 + $1.count }) quads, chosen per level \(perLevel), K quads per level \(quadsPerLevel.map { $0 / 1000 }), \(chosen.filter { $0.0.level == 0 }.count) level-0 nodes, \(r.coveredTiles) tiles covered by vanilla in 1000 frames; vanilla drew \(r.vanillaSections.count) sections, compiled \(r.compiledSections.count), distance \(r.vanillaDistance), skip checks \(r.skipDebug)")
         r.skipDebug = [0, 0, 0, 0, 0]
         r.coveredTiles = 0
+        if let s = LodQuadCull.shared.takeStats() { log("LOD quad culling: \(s)") }
+    }
+    if lodCullStats && r.frame % 600 == 300 {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let c = lodCountCullable(draws.filter { $0.fade == 0 }.map { ($0.node, $0.slot, $0.first, $0.count) }, xforms: xforms,
+                                 projView: u.proj * u.view, width: ctx.passWidth, height: ctx.passHeight)
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        let rows = c.enumerated().filter { $0.element[0] > 0 }.map { "level \($0.offset): \($0.element[0]) quads, \($0.element[1]) facing away, \($0.element[2]) off screen, \($0.element[3]) too thin" }
+        log("LOD cull stats (frame \(r.frame), \(String(format: "%.0f", ms)) ms): " + rows.joined(separator: "; "))
     }
     if lodCullStats && r.frame % 600 == 300 {
         let t0 = DispatchTime.now().uptimeNanoseconds
@@ -1495,6 +1840,13 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         + draws.filter { !$0.water && $0.fade > 0 }
         + draws.filter { $0.water && !$0.seam && $0.fade == 0 } + draws.filter { $0.water && $0.seam && $0.fade == 0 }
         + draws.filter { $0.water && $0.fade > 0 }
+    // Quad culling (lodQuadCullOn): the culling pass for this frame's draws, in the order they're drawn (nil: drawn
+    // directly, e.g. while its pipeline compiles).
+    let culled = useMesh || lodSkipQuadsOn || !lodQuadCullOn ? nil
+        : LodQuadCull.shared.encode(ordered.map { ($0.node, $0.first, $0.count, $0.slot) }, xforms: xforms, viewProj: u.proj * u.view,
+                                    width: ctx.passWidth, height: ctx.passHeight)
+    var culledBound = false             // the culling pass's lists are bound for the vertex stage
+    var vertexNode: ObjectIdentifier?   // or the buffers of this node
     // The occlusion test's boxes go after the opaque LOD and before the water, which (with ray-traced shadows on)
     // writes depth: the test must not see water surfaces as occluders of the floors under them.
     var boxesDone = false
@@ -1526,11 +1878,13 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         }
     }
     var state = (seam: false, water: false, fade: false)
-    for d in ordered {
+    for (di, d) in ordered.enumerated() {
         if d.water && !boxesDone {
             if !farDone { drawFar() }
             runBoxes()
             bound = nil
+            culledBound = false
+            vertexNode = nil
             state = (seam: false, water: false, fade: false)
         }
         let fading = d.fade > 0
@@ -1558,14 +1912,11 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             if useMesh {
                 enc.setMeshBuffer(d.node.buffer, offset: 0, index: 18)
                 enc.setMeshBuffer(d.node.aoOffsets, offset: 0, index: 22)
-            } else {
-                enc.setVertexBuffer(d.node.buffer, offset: 0, index: 18)
-                enc.setVertexBuffer(d.node.aoOffsets, offset: 0, index: 22)
             }
             enc.setFragmentBuffer(d.node.ao, offset: 0, index: 22)
             bound = id
         }
-        if lodSkipQuads {
+        if lodSkipQuadsOn {
             continue
         } else if useMesh {
             var md = SIMD4<UInt32>(UInt32(d.first), UInt32(d.count), UInt32(d.slot), 0)
@@ -1573,7 +1924,25 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             enc.drawMeshThreadgroups(MTLSize(width: (d.count + lodMeshQuads - 1) / lodMeshQuads, height: 1, depth: 1),
                                      threadsPerObjectThreadgroup: MTLSize(width: 1, height: 1, depth: 1),
                                      threadsPerMeshThreadgroup: MTLSize(width: lodMeshQuads, height: 1, depth: 1))
+        } else if let culled, !culled.jobs[di].isEmpty, let quads = culled.frame.quads, let ao = culled.frame.ao, let args = culled.frame.args {
+            // The draw's surviving quads, as consecutive indirect draws (one per job) from the frame's lists.
+            if !culledBound {
+                enc.setVertexBuffer(quads, offset: 0, index: 18)
+                enc.setVertexBuffer(ao, offset: 0, index: 22)
+                culledBound = true
+                vertexNode = nil
+            }
+            for j in culled.jobs[di] {
+                enc.drawIndexedPrimitives(type: .triangle, indexType: .uint32, indexBuffer: ib, indexBufferOffset: 0,
+                                          indirectBuffer: args, indirectBufferOffset: 20 * j)
+            }
         } else {
+            if vertexNode != id {
+                enc.setVertexBuffer(d.node.buffer, offset: 0, index: 18)
+                enc.setVertexBuffer(d.node.aoOffsets, offset: 0, index: 22)
+                vertexNode = id
+                culledBound = false
+            }
             enc.drawIndexedPrimitives(type: .triangle, indexCount: d.count * 6, indexType: .uint32, indexBuffer: ib,
                                       indexBufferOffset: 0, instanceCount: 1, baseVertex: 4 * d.first, baseInstance: d.slot)
         }
@@ -1704,6 +2073,71 @@ public func mmc_lod_set_lightmap(_ view: Int64) {
 @_cdecl("mmc_lod_set_vanilla")
 public func mmc_lod_set_vanilla(_ keys: UnsafePointer<Int64>, _ count: Int32) {
     LodRenderer.shared.vanillaSections = Array(UnsafeBufferPointer(start: keys, count: Int(count)))
+}
+
+/// Offline A/B in one process (tools/litflow.swift): the mesh path on (1) or off (0) and quad culling on or off, in place
+/// of METALMC_EXP's meshshader and quadcull; -1 leaves one as it is. flags: 1 doesn't draw the LOD's quads (lodskip),
+/// 2 has the culling pass keep every quad. Returns 1.
+@_cdecl("mmc_debug_lod_paths")
+public func mmc_debug_lod_paths(_ mesh: Int32, _ cull: Int32, _ flags: Int32) -> Int32 {
+    if mesh >= 0 { lodMeshOn = mesh != 0 }
+    if cull >= 0 { lodQuadCullOn = cull != 0 }
+    lodSkipQuadsOn = lodSkipQuads || flags & 1 != 0
+    lodCullKeepAll = flags & 2 != 0
+    return 1
+}
+
+/// Debug: makes every LOD pipeline for the formats of the last pass the LOD drew into (vertex and mesh paths; plain, seam,
+/// water, fade and their mixes; the occlusion boxes) and the culling pass, waiting up to 20 s for the background warm-up
+/// first. Returns how many failed (logged as "LOD pipeline failed"), or -1 if the LOD hasn't drawn yet.
+@_cdecl("mmc_debug_lod_pipelines")
+public func mmc_debug_lod_pipelines() -> Int32 {
+    let r = LodRenderer.shared
+    guard let (colors, depth) = r.lastFormats else { return -1 }
+    let t0 = Date()
+    while r.pipeline(colorFormats: colors, depth: depth) == nil && Date().timeIntervalSince(t0) < 20 { Thread.sleep(forTimeInterval: 0.05) }
+    var failed = 0
+    for mesh in [false, true] {
+        for (box, seam, water, fade) in [(false, false, false, false), (false, true, false, false), (false, false, true, false),
+                                         (false, true, true, false), (false, false, false, true), (false, false, true, true),
+                                         (true, false, false, false)] where !(box && mesh) {
+            if r.pipeline(colorFormats: colors, depth: depth, box: box, seam: seam, water: water, mesh: mesh, fade: fade) == nil {
+                log("LOD pipeline check: failed: mesh \(mesh), box \(box), seam \(seam), water \(water), fade \(fade)")
+                failed += 1
+            }
+        }
+    }
+    if LodQuadCull.shared.pipeline(compile: true) == nil { failed += 1 }
+    return Int32(failed)
+}
+
+/// The vertex path's last culling pass, waited for: out = its GPU time (ms), quads submitted to it, quads it kept, jobs,
+/// and once its frame completed (call after waiting for that), the frame's GPU span from the earlier of the two command
+/// buffers' starts to the frame's end (ms), and the frame's own GPU time (ms). Returns 0 if there was none since the last
+/// call.
+@_cdecl("mmc_debug_lod_quadcull_last")
+public func mmc_debug_lod_quadcull_last(_ out: UnsafeMutablePointer<Double>) -> Int32 {
+    let q = LodQuadCull.shared
+    q.lock.lock(); let f = q.last; q.last = nil; q.lock.unlock()
+    guard let f, let cb = f.cb, let args = f.args else { return 0 }
+    cb.waitUntilCompleted()
+    // The frame's completion handler may run a moment after its waiter wakes.
+    for _ in 0..<1000 {
+        q.lock.lock(); let done = f.pending == 0; q.lock.unlock()
+        if done { break }
+        Thread.sleep(forTimeInterval: 0.0005)
+    }
+    let a = args.contents().bindMemory(to: UInt32.self, capacity: 5 * f.jobCount)
+    var kept = 0
+    for j in 0..<f.jobCount { kept += Int(a[5 * j]) / 6 }
+    q.lock.lock(); let ct = f.cullTimes, ft = f.frameTimes; q.lock.unlock()
+    out[0] = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+    out[1] = Double(f.quadsIn)
+    out[2] = Double(kept)
+    out[3] = Double(f.jobCount)
+    out[4] = ft.end > 0 ? (ft.end - min(ct.start, ft.start)) * 1000 : -1
+    out[5] = ft.end > 0 ? (ft.end - ft.start) * 1000 : -1
+    return 1
 }
 
 /// Every section vanilla has compiled in its view area (SectionPos.asLong keys) and its render distance in
