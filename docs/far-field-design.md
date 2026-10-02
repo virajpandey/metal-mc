@@ -313,3 +313,115 @@ cost 4.0 ms of GPU time with no near geometry in front of it, 29.4 steps per hit
   blocks up 6.04 → 5.50, near the ground 2.94 → 2.38 (level 4: 3.35, 5.39, 2.86); 6 of 7.7 M pixels differ (rays at the
   step cap). `METALMC_FFSTART` sets it.
 - A top face's corner occlusion read 12 neighbors for 8 distinct ones; now each once (the image is identical).
+
+## Where the march's time goes, and a cheaper march (2026-10-02, offline)
+
+New tools first:
+
+- `tools/fartest.py serve` loads the world once and runs commands from a directory (JSON): views × shader variants
+  (`fartest.py shader`'s output, edited; `fartest.py compile` checks they compile, with and without the counters),
+  rounds interleaved; each variant's median GPU time, and how its image differs from the first variant's (pixels, by how
+  much, where, and a picture marking them; `mmc_debug_far_compare`). It holds the GPU lock (tools/bench/gpulock.inc, as
+  gpuwait.sh takes it) for the world's load and while commands run, not between.
+- Counters (a variant run with stats, `FF_STATS`): per pixel the steps by kind (advances over level 0, descents,
+  level-0 column tests and their misses, climbs undone by the next step), the rings, the steps in each ring, the hit's
+  ring and step; logged as means and as what 8 × 4 pixel groups (a SIMD group) pay, their slowest pixel, by eighths of
+  the image. The shader runs with early fragment tests then (it writes a buffer, which would otherwise run it on pixels
+  the depth test skips).
+- **The game's nearer geometry, stood in for** (`FARTEST_NEAR`, `near` in a command). With nothing in front of the
+  march, as the numbers above were taken, rays toward terrain inside the shell start under it and "hit" at once (7
+  steps each): half the flight view's pixels and a third of its steps, work the game never does (its quads and chunks
+  cover those pixels and the early depth test skips them). A first draw from 16 blocks out (with the built-in shaders)
+  fills the depth and the timed draws test against it, so only pixels whose terrain lies past the shell run the march.
+  "Near mode" below.
+
+Where the time went (near mode, the march as it was; ms of GPU, median of 11 draws, 3 rounds; the parts from variants of
+its shader):
+
+| | flight (y 150, 10° down) | 260 up (12° down) | near the ground (y 80, 3° down) |
+|---|---|---|---|
+| the march | 2.50-2.59 | 5.00-5.29 | 1.15-1.22 |
+| the shell rasterized, every ray discarded | 0.31 | 0.33 | 0.29 |
+| shading without the march (each ray "hits" its first column) | 0.41 | 0.39 | 0.40 |
+| the traversal alone (the first level-0 dip is the hit, no shading) | 1.97 | 3.32 | 0.88 |
+| + the column tests, no shading | 2.30 | 4.59 | 1.09 |
+
+So the traversal is two thirds of the time, the column tests (with the steps after their misses) a fifth to a quarter,
+the shading under a tenth. Steps per 8 × 4 group 19.7, 39.3 and 8.5; per hit pixel 36.5, 35.6 and 41.0. By eighths of
+the image from the top, the flight view's steps were 22% in the eighth just over the horizon (sky: rays that pass over
+everything, 13.8 steps a group) and 71% in the one under it (the far band's terrain, 48 a group); from 260 up 23/46/25%
+in the three around the horizon. After the changes below: 13% and 84% (5.2 and 37 a group). A pixel's own steps barely matter: a group pays its slowest pixel, about a third more.
+
+What a step costs (probes, 260 up): one more texture read per step +12% (of the same texel, so cached: +6%), the same
+read on the step's critical path +24%, 24 more ALU ops +8.5% (+10% on the critical path), the traversal run twice per
+pixel (the second finds every texel cached) 2.03-2.1x. So it's neither memory- nor latency-bound: the steps' issue
+(instructions, and the branches a SIMD group runs for all its lanes) is the cost; the levers are fewer instructions per
+step and fewer steps in the groups that pay most.
+
+What changed (exact: the image is the same but for rays at the step cap, which now get further):
+
+- **A cheaper step.** The ray's level-0 cell is kept as integers inside the window (its cell at level l is it shifted
+  l bits), set once per move, instead of floors, divides and the window's clamp at the step's level every step; a
+  crossing sets the crossed axis's cell to the one past the boundary and the other from the ray (as the half-cell nudge
+  did, so rays along x or z still don't fall back into the cell they left). 260 up: 5.33 → 4.96 ms at the same steps.
+- **Up a level only into a parent not tested from here.** After a step at level l the march went up to l + 1; a ray
+  going down that's still in the same parent leaves it as low as before and fails its test again (a step to fail, one
+  back down). It goes up only when the boundary it crosses is the parent's too (an even one at level l), or when the
+  ray rises. Climbs undone by the next step: 3.9 → 1.5 per pixel (flight), 8.5 → 2.2 (260 up).
+- **Water in the pyramid at its drawn surface.** The pyramid held a water column's word top; the march draws the
+  surface 10/9 block lower, so rays skimming the sea dipped to level 0 in every column under them and missed the
+  surface (a descent, a column test and the climb back per cell). It holds the block under (the surface rounded up)
+  now: from 260 up, level-0 tests 2.1 → 1.0 per pixel and their misses 1.3 → 0.2.
+- **The horizon profile** (the coordinator's idea, sized against these counters). A compute pass per frame (from
+  pyramid level 5, one thread per cell, 1024 azimuth bins per ring) finds per ring and direction the steepest rise at
+  which the camera sees any of the ring's terrain past the shell; a ray rising faster passes the ring without marching
+  it: most of the sky over the horizon, and rays crossing near rings toward far terrain. 0.014 ms; its own command
+  buffer, committed ahead of the frame's as the rings' fills are, so it isn't in the main pass's GPU time.
+  `METALMC_EXP=ffnoprofile` turns it off.
+- **The shell's top from what the rings hold.** The highest terrain was taken from the nodes the rings should hold;
+  until a ring's refill its old nodes are still drawn, and a shell top under them would cut them off.
+
+Before and after (ms of GPU as above; before and after from two sessions, the pyramid change needing its own build):
+
+| | flight | 260 up | near the ground |
+|---|---|---|---|
+| near mode, before | 2.53 | 5.04 | 1.21 |
+| near mode, after | 2.05 (-19%) | 3.67 (-27%) | 0.87 (-28%) |
+| near mode, after without the profile | 2.22 | 3.85 | 1.09 |
+| nothing in front, before | 3.59 | 5.71 | 2.51 |
+| nothing in front, after | 2.91 (-19%) | 4.24 (-26%) | 1.94 (-22%) |
+| steps per 8 × 4 group (near mode) | 19.7 → 12.6 | 39.3 → 26.8 | 8.5 → 4.1 |
+| steps per hit pixel (near mode) | 36.5 → 27.8 | 35.6 → 24.6 | 41.0 → 33.3 |
+| rays at a ring's step cap (nothing in front) | 34 → 28 | 417 → 241 | 166 → 49 |
+
+With nothing in front 2, 175 and 116 of the 7.7 M pixels differ: as many as the rays no longer at the step cap, which
+used to give up on the rest of a ring (dots over the sea at grazing angles, and under the horizon, that drew a cliff
+side or black instead of the water) and now find their hit (`bench_out/agents/far/img/final-vs-orig-*-diff.png`,
+local). With the nearer geometry stood in for, a few more at the edge of its depth (5, 207 and 143). Each change was
+checked the same way: the cheaper step and the parent rule differ only at the cap, the profile and the last trims are
+identical.
+
+Tried and dropped (near mode unless noted):
+
+- One loop over all rings instead of one per ring: a group pays its slowest lane either way (13.0 against 12.8 steps a
+  group), and the single loop's extra live state made it 8-10% slower.
+- The column test's details after the loop (in the loop only whether there's a hit): 9-16% slower, twice.
+- Two pyramid levels a step (l and l - 1 read together, descending two a step): 42% fewer steps a group from 260 up,
+  each dearer: no faster than the cheaper step with the parent rule.
+- Heights read from a buffer instead of the texture: 0-5%.
+- A beam pass (per 8 × 4 tile, a compute pass marching the tile's rays together, as a box, against the pyramid, so each
+  pixel starts where its tile may first meet terrain). An oracle (each group starting at its nearest hit) cut the far
+  band's steps 45%, and the real beams 47-68% of all steps, yet the pass cost 0.27-0.37 ms (0.20-0.28 with corners
+  only) and the fragment work fell only 8-12%: the steps it saves are the cheap ones (coherent, coarse levels); the
+  ones near the hits remain. Net -3.5% (flight), -10% (260 up), +3% (ground).
+- The shell's walls topped per sector at the steepest terrain seen (from the nodes' tops): 21% fewer pixels marched in
+  the flight view, but they were the sky's cheapest groups (2% of the steps); no measurable gain and a CPU cost a frame.
+- The horizon profile per band of distance as well (to start a ring's march where its terrain may first be met): -3.7%
+  from 260 up, ±2% elsewhere.
+
+Not the 2x hoped for. What's left is mostly the traversal near the hits (the band under the horizon, three quarters of
+the flight view's steps): the coherent coarse steps are gone (the profile, and the beams showed the approach is
+cheap), and a group still pays its slowest pixel. The levers left: fewer instructions per step (a walk within a level
+that steps its boundary times instead of recomputing them; its rounding needs the care the half-cell nudge took), and
+divergence, which a fragment shader can't rebalance. In the game: the quads' area (the cover test) was empty offline,
+so its level-0 tests weren't measured; lit mode compiles and shades as before.

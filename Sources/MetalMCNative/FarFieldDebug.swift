@@ -397,23 +397,62 @@ public func mmc_debug_far_render(_ camX: Double, _ camY: Double, _ camZ: Double,
     guard let sampler = ctx.device.makeSamplerState(descriptor: sd) else { return -1 }
     // FARTEST_REPEAT=n: draw the march n times and log the median GPU time of a draw (the first is a warm-up).
     let repeats = max(1, Int(ProcessInfo.processInfo.environment["FARTEST_REPEAT"] ?? "") ?? 1)
-    var times: [Double] = []
+    // With a shader whose FF_STATS is set (mmc_debug_far_set_shader): its per-pixel counters, two uint4 per pixel.
+    if farDebugStats {
+        guard let b = ctx.device.makeBuffer(length: W * H * 32, options: [.storageModeShared]) else { return -1 }
+        memset(b.contents(), 0, W * H * 32)
+        FarField.shared.statsBuffer = b
+    }
+    defer { FarField.shared.statsBuffer = nil }
+    // FARTEST_NEAR=<blocks>: the game's nearer geometry stood in for. In the game the far field's shell (at the nearest far
+    // tile) is drawn after the quads, and the early depth test skips its pixels wherever they're nearer; with nothing in
+    // front, rays toward terrain inside the shell start under it and "hit" at once (7 steps), half the screen of work the
+    // game doesn't do. A first draw marches from <blocks> out to fill the depth (not timed); the timed draws, from the
+    // shell, test against it, so only pixels whose terrain lies past the shell run the march, as in the game.
+    let nearShell = Float(ProcessInfo.processInfo.environment["FARTEST_NEAR"] ?? "") ?? 0
+    if nearShell > 0 {
+        rp.depthAttachment.storeAction = .store
+        guard let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeRenderCommandEncoder(descriptor: rp) else { return -1 }
+        enc.setFragmentBuffer(colors, offset: 0, index: 20)
+        enc.setFragmentTexture(lightmap, index: 30)
+        enc.setFragmentSamplerState(sampler, index: 15)
+        FarField.shared.draw(enc, u: u, colors: colors, lightmap: lightmap, lightSampler: sampler, cy: camY, nearest: Double(nearShell), builtin: true)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        if cb.status != .completed { return -1 }
+        rp.depthAttachment.loadAction = .load
+        if let b = FarField.shared.statsBuffer { memset(b.contents(), 0, W * H * 32) }
+    }
+    var times: [Double] = [], cpu: [Double] = [], preTimes: [Double] = []
     for _ in 0..<repeats {
         guard let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeRenderCommandEncoder(descriptor: rp) else { return -1 }
         // Texture detail is off (camFrac.w 0), but its slots get something bound, as the LOD's pass does in the game.
         enc.setFragmentBuffer(colors, offset: 0, index: 20)
         enc.setFragmentTexture(lightmap, index: 30)
         enc.setFragmentSamplerState(sampler, index: 15)
+        let c0 = DispatchTime.now().uptimeNanoseconds
         FarField.shared.draw(enc, u: u, colors: colors, lightmap: lightmap, lightSampler: sampler, cy: camY, nearest: Double(shell))
+        cpu.append(Double(DispatchTime.now().uptimeNanoseconds - c0) / 1e3)
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
         if cb.status != .completed { return -1 }
-        times.append((cb.gpuEndTime - cb.gpuStartTime) * 1000)
+        var ms = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+        // The horizon profile's pass runs in a command buffer of its own, before the draw's.
+        if let bcb = FarField.shared.lastProfileCB {
+            bcb.waitUntilCompleted()
+            preTimes.append((bcb.gpuEndTime - bcb.gpuStartTime) * 1000)
+            ms += preTimes.last!
+        }
+        times.append(ms)
     }
     if repeats > 1 {
         let t = times.dropFirst().sorted()
-        log(String(format: "far field render: march %.3f ms GPU (median of %d, min %.3f)", t[t.count / 2], t.count, t.first ?? 0))
+        let c = cpu.dropFirst().sorted(), b = preTimes.dropFirst().sorted()
+        log(String(format: "far field render: march %.3f ms GPU (median of %d, min %.3f)%@; draw's CPU %.0f us", t[t.count / 2], t.count,
+                   t.first ?? 0, b.isEmpty ? "" : String(format: ", of which the profile %.3f", b[b.count / 2]), c[c.count / 2]))
+        farDebugLastMs = t[t.count / 2]
     }
     // Rows come out bottom-up (the march's shell flips y like the game's GL-style targets).
     var px = [UInt8](repeating: 0, count: W * H * 4)
@@ -442,6 +481,7 @@ public func mmc_debug_far_render(_ camX: Double, _ camY: Double, _ camZ: Double,
         }
         log("far field render: \(blocks) 8x4 blocks with hits, mean of their slowest pixel's steps \(String(format: "%.1f", blockSum / Double(max(blocks, 1)))), by 16s \(hist)")
     }
+    if let b = FarField.shared.statsBuffer { farDebugAnalyze(b.contents().bindMemory(to: UInt32.self, capacity: W * H * 8), W, H) }
     var flipped = [UInt8](repeating: 0, count: px.count)
     for y in 0..<H { flipped.replaceSubrange((y * W * 4)..<((y + 1) * W * 4), with: px[((H - 1 - y) * W * 4)..<((H - y) * W * 4)]) }
     guard let provider = CGDataProvider(data: Data(flipped) as CFData),
@@ -477,4 +517,165 @@ public func mmc_debug_far_cells(_ level: Int32, _ cx0: Int32, _ cz0: Int32, _ w:
         }
     }
     return found
+}
+
+/// Offline: whether the draw's shader keeps per-pixel march counters (mmc_debug_far_set_shader with stats).
+private var farDebugStats = false
+/// Offline: the last render's median GPU time of the march (FARTEST_REPEAT > 1), ms.
+private var farDebugLastMs = 0.0
+
+@_cdecl("mmc_debug_far_last_ms")
+public func mmc_debug_far_last_ms() -> Double { farDebugLastMs }
+
+/// Debug: the far field's draw shaders from the source in `path` (a variant of `fartest.py shader`'s output; empty: the
+/// built-in source), with FF_STATS set if `stats` (mmc_debug_far_render then logs the march's counters). 1 if it compiled.
+@_cdecl("mmc_debug_far_set_shader")
+public func mmc_debug_far_set_shader(_ pathC: UnsafePointer<CChar>, _ stats: Int32) -> Int32 {
+    let path = String(cString: pathC)
+    var src = farFieldShaderSource
+    if !path.isEmpty {
+        guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+        src = s
+    }
+    if stats != 0 { src = src.replacingOccurrences(of: "#define FF_STATS 0", with: "#define FF_STATS 1") }
+    let ok = FarField.shared.setDrawSource(path.isEmpty && stats == 0 ? nil : src)
+    farDebugStats = ok && stats != 0
+    return ok ? 1 : 0
+}
+
+/// The march's counters (FF_STATS: two uint4 per pixel, see ff_fs) over the image: where the steps go, and what SIMD
+/// groups (taken as 8 x 4 pixel blocks of the target) pay. With the rings marched one after the other a group pays each
+/// ring's slowest pixel ("now"); one loop over all rings would pay the slowest pixel's total ("one loop").
+private func farDebugAnalyze(_ s: UnsafePointer<UInt32>, _ W: Int, _ H: Int) {
+    @inline(__always) func ringSteps(_ a: UnsafePointer<UInt32>, _ r: Int) -> Int { Int((a[4 + r / 4] >> UInt32(8 * (r % 4))) & 255) }
+    var marched = 0, hits = 0, capped = 0
+    var steps = 0.0, hitSteps = 0.0, adv = 0.0, desc = 0.0, dip = 0.0, colMiss = 0.0, wasted = 0.0, rings = 0.0
+    var perRing = [Double](repeating: 0, count: 8), hitRing = [Int](repeating: 0, count: 9)
+    for i in 0..<(W * H) {
+        let a = s + 8 * i
+        if a[3] >> 31 == 0 { continue }
+        marched += 1
+        let st = Double(a[0] & 0xFFFF)
+        steps += st
+        rings += Double(a[0] >> 16)
+        adv += Double(a[1] & 0xFFFF); desc += Double(a[1] >> 16)
+        dip += Double(a[2] & 0xFFFF); colMiss += Double(a[2] >> 16)
+        wasted += Double((a[3] >> 8) & 0xFFF)
+        let hr = Int(a[3] & 0xFF)
+        if hr != 15 { hits += 1; hitSteps += st; hitRing[min(hr, 7)] += 1 } else { hitRing[8] += 1 }
+        var cap = false
+        for r in 0..<8 { let n = ringSteps(a, r); perRing[r] += Double(n); if n >= 192 { cap = true } }
+        if cap { capped += 1 }
+    }
+    let m = Double(max(marched, 1))
+    func f1(_ x: Double) -> String { String(format: "%.1f", x) }
+    log("far field stats: \(marched) pixels marched, \(hits) hit, \(capped) at a ring's step cap; per marched pixel: steps \(f1(steps / m))"
+        + " (hits \(f1(hitSteps / Double(max(hits, 1))))), advances over level 0 \(f1(adv / m)), descents \(f1(desc / m)),"
+        + " level-0 tests \(f1(dip / m)) (missed \(f1(colMiss / m))), climbs undone \(f1(wasted / m)), rings \(String(format: "%.2f", rings / m))")
+    log("far field stats: steps per ring (per marched pixel) \(perRing.map { f1($0 / m) }), hits by ring \(Array(hitRing.dropLast())), misses \(hitRing[8])")
+    var groups = 0, flat = 0.0, nested = 0.0, mean = 0.0, hitKeys = 0.0
+    var hist = [Int](repeating: 0, count: 10)
+    let bands = 8
+    var bandNested = [Double](repeating: 0, count: bands), bandFlat = [Double](repeating: 0, count: bands), bandGroups = [Int](repeating: 0, count: bands)
+    var keys = [Int](repeating: 0, count: 32)
+    for by in stride(from: 0, to: H - 3, by: 4) {
+        for bx in stride(from: 0, to: W - 7, by: 8) {
+            var mx = 0, sum = 0, n = 0, nk = 0
+            var rmx = [Int](repeating: 0, count: 8)
+            for y in by..<(by + 4) {
+                for x in bx..<(bx + 8) {
+                    let a = s + 8 * (y * W + x)
+                    if a[3] >> 31 == 0 { continue }
+                    n += 1
+                    let st = Int(a[0] & 0xFFFF)
+                    mx = max(mx, st); sum += st
+                    for r in 0..<8 { rmx[r] = max(rmx[r], ringSteps(a, r)) }
+                    // Distinct steps (ring, step in it) at which a lane hits: the hit's column test runs once per such step.
+                    let hr = Int(a[3] & 0xFF)
+                    if hr != 15 {
+                        let k = hr << 16 | Int((a[3] >> 20) & 0x7FF)
+                        if !keys[0..<nk].contains(k) { keys[nk] = k; nk += 1 }
+                    }
+                }
+            }
+            if n == 0 { continue }
+            let nst = rmx.reduce(0, +)
+            groups += 1
+            flat += Double(mx); nested += Double(nst); mean += Double(sum) / Double(n); hitKeys += Double(nk)
+            hist[min(9, nst / 32)] += 1
+            let band = (H - 1 - by) * bands / H   // image rows from the top (the target's rows are bottom-up)
+            bandNested[band] += Double(nst); bandFlat[band] += Double(mx); bandGroups[band] += 1
+        }
+    }
+    let g = Double(max(groups, 1))
+    log("far field stats: \(groups) 8x4 groups marched; per group: mean pixel \(f1(mean / g)), slowest pixel (one loop) \(f1(flat / g)),"
+        + " rings one after another (now) \(f1(nested / g)), distinct hit steps \(f1(hitKeys / g)); now by 32s \(hist)")
+    let total = max(bandNested.reduce(0, +), 1)
+    log("far field stats: by eighths of the image from the top: share of the groups' steps \(bandNested.map { String(format: "%.0f%%", 100 * $0 / total) }),"
+        + " per group now \((0..<bands).map { f1(bandNested[$0] / Double(max(bandGroups[$0], 1))) }), one loop \((0..<bands).map { f1(bandFlat[$0] / Double(max(bandGroups[$0], 1))) })")
+}
+
+/// Debug: two PNGs of the same size: out[0] pixels that differ at all, [1] by more than 2 levels in a channel, [2] by more
+/// than 16, [3] the largest difference, [4-7] the differing pixels' bounding box (x0, y0, x1, y1, rows from the top).
+/// Writes `outPath` (unless empty): the first image dimmed, differing pixels marked 5 x 5 (red where the second is
+/// brighter, blue where darker) so single pixels show. Returns 1, or 0 if they can't be read or differ in size.
+@_cdecl("mmc_debug_far_compare")
+public func mmc_debug_far_compare(_ aC: UnsafePointer<CChar>, _ bC: UnsafePointer<CChar>, _ outC: UnsafePointer<CChar>,
+                                  _ out: UnsafeMutablePointer<Double>) -> Int32 {
+    func load(_ path: String) -> (Int, Int, [UInt8])? {
+        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+        let w = img.width, h = img.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        guard let c = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        c.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return (w, h, px)
+    }
+    guard let (w, h, a) = load(String(cString: aC)), let (w2, h2, b) = load(String(cString: bC)), w == w2, h == h2 else { return 0 }
+    var any = 0, over2 = 0, over16 = 0, largest = 0, x0 = w, y0 = h, x1 = -1, y1 = -1
+    var mark = [Int8](repeating: 0, count: w * h)
+    for y in 0..<h {
+        for x in 0..<w {
+            let o = 4 * (y * w + x)
+            var dm = 0, sa = 0, sb = 0
+            for c in 0..<3 { dm = max(dm, abs(Int(a[o + c]) - Int(b[o + c]))); sa += Int(a[o + c]); sb += Int(b[o + c]) }
+            if dm == 0 { continue }
+            any += 1
+            if dm > 2 { over2 += 1 }
+            if dm > 16 { over16 += 1 }
+            largest = max(largest, dm)
+            x0 = min(x0, x); y0 = min(y0, y); x1 = max(x1, x); y1 = max(y1, y)
+            mark[y * w + x] = sb >= sa ? 1 : -1
+        }
+    }
+    out[0] = Double(any); out[1] = Double(over2); out[2] = Double(over16); out[3] = Double(largest)
+    out[4] = Double(x0); out[5] = Double(y0); out[6] = Double(x1); out[7] = Double(y1)
+    let outPath = String(cString: outC)
+    if !outPath.isEmpty {
+        var img = [UInt8](repeating: 255, count: w * h * 4)
+        for i in 0..<(w * h) {
+            let v = UInt8((Int(a[4 * i]) + Int(a[4 * i + 1]) + Int(a[4 * i + 2])) / 9)
+            img[4 * i] = v; img[4 * i + 1] = v; img[4 * i + 2] = v
+        }
+        for y in 0..<h {
+            for x in 0..<w where mark[y * w + x] != 0 {
+                for yy in max(0, y - 2)...min(h - 1, y + 2) {
+                    for xx in max(0, x - 2)...min(w - 1, x + 2) {
+                        let o = 4 * (yy * w + xx)
+                        img[o] = mark[y * w + x] > 0 ? 255 : 0; img[o + 1] = 0; img[o + 2] = mark[y * w + x] > 0 ? 0 : 255
+                    }
+                }
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(img) as CFData),
+              let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue), provider: provider,
+                                  decode: nil, shouldInterpolate: false, intent: .defaultIntent),
+              let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outPath) as CFURL, "public.png" as CFString, 1, nil)
+        else { return 0 }
+        CGImageDestinationAddImage(dest, image, nil)
+        _ = CGImageDestinationFinalize(dest)
+    }
+    return 1
 }
