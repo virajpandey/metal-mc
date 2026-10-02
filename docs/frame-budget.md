@@ -100,7 +100,19 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   rate it invokes vertices, a fixed-function limit, while its ALUs have room. Work that doesn't depend on this frame's
   depth (the GI cache's rays for last frame's requests, the sky's tables) could run at the same time on a second
   queue, synchronized with events.
-- **Fewer pixels shaded, reconstructed temporally.** Every per-pixel cost here scales with the panel's 7.7 M pixels, and
+- **Fewer pixels shaded, reconstructed temporally** (measured offline, 2026-10-02: tools/litflow.swift's lit frame with
+  the sky and the GI cache, the merged build, rendered at a fraction of the panel's resolution on each axis):
+
+  | Scale | Pixels | Main pass | Relight | Resolve (with relight) | Frame with GI | Frame without GI |
+  |---|---|---|---|---|---|---|
+  | 1.0 | 7.72 M | 3.48 | 0.70 | 1.79 | 7.06 | 5.91 |
+  | 0.75 | 4.34 M | 2.52 | 0.42 | 1.03 | 4.85 (-2.21) | 3.93 (-1.98) |
+  | 0.667 | 3.43 M | 2.32 | 0.33 | 0.83 | 4.32 (-2.74) | 3.47 (-2.44) |
+
+  The reconstruction would run at the panel's resolution (the anti-aliasing core, about 0.74 ms, plus the upsampling
+  filter), so at 0.75 the realistic saving is about 1.4 ms (lit) to 1.6 ms (lit with GI), the biggest single lever
+  measured.
+  Every per-pixel cost here scales with the panel's 7.7 M pixels, and
   at 254 pixels per inch the panel resolves finer than the eye does at a normal viewing distance (a pixel is about 0.7
   arcminutes at 50 cm). Rendering the level at 0.75 scale (56% of the pixels) and reconstructing native resolution in
   the anti-aliasing resolve would save about 2 ms of the lit frame. MetalFX's temporal scaler cost 9 ms here (Taa.swift),
