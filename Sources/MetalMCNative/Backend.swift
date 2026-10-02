@@ -173,15 +173,26 @@ final class MetalContext: @unchecked Sendable {
     }
 
     func ensureCB() -> MTLCommandBuffer {
-        let made: MTLCommandBuffer
-        if let cb {
-            made = cb
-        } else {
-            made = queue.makeCommandBuffer()!
-            cb = made
-        }
+        let made = ensureCBNoFlush()
         if pass == nil && (!pendingClears.isEmpty || pendingCopy != nil) { runPending(made) }
         return made
+    }
+
+    /// The command buffer without running the waiting clears and copy: for work that can't touch them (buffer uploads),
+    /// which Minecraft does between a clear and the pass it folds into.
+    func ensureCBNoFlush() -> MTLCommandBuffer {
+        if let cb { return cb }
+        let made = queue.makeCommandBuffer()!
+        cb = made
+        return made
+    }
+
+    /// Runs the waiting clears and copy first if any of them is for one of `textures` (a blit is about to touch it).
+    func flushPending(touching textures: [MTLTexture]) {
+        guard pass == nil else { return }
+        let hit = pendingClears.contains { c in textures.contains { sameImage($0, c.texture) || $0 === c.texture } }
+            || pendingCopy.map { p in textures.contains { sameImage($0, p.texture) || $0 === p.texture } } == true
+        if hit { runPending(ensureCBNoFlush()) }
     }
 
     /// The waiting clears and copy (passFolding) as passes of their own, as they'd have run without folding.
@@ -218,9 +229,9 @@ final class MetalContext: @unchecked Sendable {
         if traceFrames > 0 {
             let d = MTLBlitPassDescriptor()
             profAttachBlit(d, "blit")
-            made = ensureCB().makeBlitCommandEncoder(descriptor: d)!
+            made = ensureCBNoFlush().makeBlitCommandEncoder(descriptor: d)!
         } else {
-            made = ensureCB().makeBlitCommandEncoder()!
+            made = ensureCBNoFlush().makeBlitCommandEncoder()!
         }
         blit = made
         return made
@@ -1099,6 +1110,7 @@ public func mmc_copy_buffer_to_texture(_ src: Int64, _ srcOff: Int64, _ bytesPer
     guard w > 0, h > 0 else { return }
     autoreleasepool {
         let s = (from(src) as BufferBox).buffer, t = (from(tex) as TextureBox).texture
+        ctx.flushPending(touching: [t])
         ctx.blitEncoder().copy(from: s, sourceOffset: Int(srcOff), sourceBytesPerRow: Int(bytesPerRow),
                                sourceBytesPerImage: Int(bytesPerRow) * Int(h), sourceSize: MTLSize(width: Int(w), height: Int(h), depth: 1),
                                to: t, destinationSlice: Int(layer), destinationLevel: Int(mip),
@@ -1112,6 +1124,7 @@ public func mmc_copy_texture_to_buffer(_ tex: Int64, _ mip: Int32, _ x: Int32, _
     guard w > 0, h > 0 else { return }
     autoreleasepool {
         let t = (from(tex) as TextureBox).texture, d = (from(dst) as BufferBox).buffer
+        ctx.flushPending(touching: [t])
         let opts: MTLBlitOption = t.pixelFormat == .depth32Float_stencil8 ? .depthFromDepthStencil : []
         ctx.blitEncoder().copy(from: t, sourceSlice: 0, sourceLevel: Int(mip), sourceOrigin: MTLOrigin(x: Int(x), y: Int(y), z: 0),
                                sourceSize: MTLSize(width: Int(w), height: Int(h), depth: 1), to: d, destinationOffset: Int(dstOff),
@@ -1125,6 +1138,7 @@ public func mmc_copy_texture_to_texture(_ src: Int64, _ dst: Int64, _ mip: Int32
     guard w > 0, h > 0 else { return }
     autoreleasepool {
         let s = (from(src) as TextureBox).texture, d = (from(dst) as TextureBox).texture
+        ctx.flushPending(touching: [s, d])
         ctx.blitEncoder().copy(from: s, sourceSlice: 0, sourceLevel: Int(mip), sourceOrigin: MTLOrigin(x: Int(sx), y: Int(sy), z: 0),
                                sourceSize: MTLSize(width: Int(w), height: Int(h), depth: 1), to: d, destinationSlice: 0,
                                destinationLevel: Int(mip), destinationOrigin: MTLOrigin(x: Int(dx), y: Int(dy), z: 0))
