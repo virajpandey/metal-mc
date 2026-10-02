@@ -1,12 +1,12 @@
 #!/bin/bash
 # usage: tools/bench/runq.sh  (in the background; start it again when it stops, for the rest)
 # Runs jobs from bench_out/queue.txt (one shell command per line, using the functions below) in order, taking each off
-# the queue as it starts, until the queue is empty or 20 minutes have passed: the harness stops a background task after
-# about 30 minutes, so a run is never cut in the middle; start this again for the rest. Output: bench_out/queue.log.
+# the queue as it starts, until the queue is empty or $RUNQ_MINUTES (70) minutes have passed. Start it as a background
+# task with the longest timeout (2 hours; the default is 30 minutes): 70 minutes plus the longest job (a 40-minute
+# horizon tour) fits, so a job is never cut in the middle. Start it again for the rest. Output: bench_out/queue.log.
 cd "$(dirname "$0")/../.." || exit 1
-# Keeps the Mac awake for the runs. The display is held on (which also holds off the company's 15-minute idle lock) only
-# while Viraj is at the laptop (BENCH_ATTENDED=1); unattended, the screen locks as the policy says and timed jobs wait.
-if [ "$BENCH_ATTENDED" = 1 ]; then caffeinate -dims -w $$ & else caffeinate -ims -w $$ & fi
+# Keeps the Mac and its display awake while jobs run: the lock screen over the game paces it at 120 Hz.
+caffeinate -dims -w $$ &
 Q=bench_out/queue.txt
 L=bench_out/queue.log
 FS=$PWD/bench_out/fidscore
@@ -29,7 +29,7 @@ build() { swift build -c release --product MetalMCNative 2>&1 | grep -E 'error|B
 # (the runner stops and leaves them queued); fidelity tours, which read the render target, run anyway.
 locked() { bench_out/winlist 2>/dev/null | awk '$1 == "layer" && $2 >= 1900 && $4 > 0 && $5 == "loginwindow" { found = 1 } END { exit !found }'; }
 start=$(date +%s)
-while [ -s "$Q" ] && [ $(( $(date +%s) - start )) -lt 1200 ]; do
+while [ -s "$Q" ] && [ $(( $(date +%s) - start )) -lt $(( ${RUNQ_MINUTES:-70} * 60 )) ]; do
   job=$(head -1 "$Q")
   case "$job" in fly\ *|vfly\ *)
     if locked; then echo "== $(date +%T) the screen is locked: timed jobs wait (runner stopped)" >> "$L"; break; fi ;;
