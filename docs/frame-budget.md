@@ -62,3 +62,24 @@ Frame times: default 150.2 fps (6.66 ms, p99 10.4); lit 117.1 fps (8.54 ms), 120
   tiles' borders, is 70 MB, 0.46 ms at 150 GB/s. With the G-buffer's store in the main pass (0.22-0.34 ms), the deferred
   relight costs about 0.75 ms in memory traffic; only a smaller G-buffer (hard: the albedo alone is 24 bits) or keeping
   it on chip would cut that. The change was reverted.
+
+## Next levers, by size (ideas with reasoning; none measured yet)
+
+- **The far field's grazing rays.** In the flight's view the far band (768 blocks to the horizon) is only about 190
+  pixel rows: a camera 80 blocks above the terrain sees land 768 m away 6 degrees down and land 4 km away 1.1 degrees
+  down, while a pixel is 0.031 degrees. So the march's 1.78 ms is spent on well under a tenth of the screen, thousands of
+  cycles per pixel: rays near the horizon skim the terrain through every ring (each ring starts its march over), and
+  the sky just above the horizon pays for proving that nothing is hit. A per-frame horizon profile per ring (for each
+  azimuth, the highest elevation angle any terrain in that ring reaches from the camera, conservative over the azimuth
+  bin and the cell, from a coarse level of the max pyramid) would let a ray skip every ring it passes over and skip the
+  march outright where it's above the horizon of all of them: exact, and one table read per ring.
+- **Overlapping compute with the main pass's vertex stage.** For about 1.7 ms each frame the GPU is bound by the
+  rate it invokes vertices, a fixed-function limit, while its ALUs have room. Work that doesn't depend on this frame's
+  depth (the GI cache's rays for last frame's requests, the sky's tables) could run at the same time on a second
+  queue, synchronized with events.
+- **Fewer pixels shaded, reconstructed temporally.** Every per-pixel cost here scales with the panel's 7.7 M pixels, and
+  at 254 pixels per inch the panel resolves finer than the eye does at a normal viewing distance (a pixel is about 0.7
+  arcminutes at 50 cm). Rendering the level at 0.75 scale (56% of the pixels) and reconstructing native resolution in
+  the anti-aliasing resolve would save about 2 ms of the lit frame. MetalFX's temporal scaler cost 9 ms here (Taa.swift),
+  so it would be our own resolve. It changes the image (softer in motion), so it's a fidelity trade to measure, not a
+  given; and the hand and the HUD must stay at native resolution, which means splitting vanilla's main target.
