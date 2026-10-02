@@ -65,6 +65,32 @@ final class SamplerBox {
     init(_ s: MTLSamplerState) { state = s }
 }
 
+/// METALMC_EXP=fold: pass folding. A clear of a single-level texture waits to become the load action of the next pass that
+/// draws into it, and the anti-aliasing's copy into the frame the first draw of the next pass on the frame (the hand's),
+/// whose load it makes unneeded. Without it each is a pass of its own: it stores the whole texture (31 MB for the frame at
+/// the panel's resolution) and the next pass loads it back.
+let passFolding = experiments.contains("fold")
+
+struct PendingClear {
+    let texture: MTLTexture
+    let color: MTLClearColor?
+    let depth: Double?
+}
+
+/// The anti-aliasing's copy as a draw into a pass whose color attachment 0 is `texture`, given the formats of that pass's
+/// depth and stencil attachments (.invalid for none).
+struct PendingCopy {
+    let texture: MTLTexture
+    let draw: (MTLRenderCommandEncoder, MTLPixelFormat, MTLPixelFormat) -> Void
+}
+
+/// True if a and b (textures or views of one) are the same single image: one 2D level, one slice, one format.
+func sameImage(_ a: MTLTexture, _ b: MTLTexture) -> Bool {
+    let ra = a.parent ?? a, rb = b.parent ?? b
+    return ra === rb && ra.mipmapLevelCount == 1 && ra.arrayLength == 1 && ra.textureType == .type2D
+        && a.pixelFormat == ra.pixelFormat && b.pixelFormat == rb.pixelFormat
+}
+
 // MARK: - Context (device, queue, the one command stream)
 
 final class MetalContext: @unchecked Sendable {
@@ -97,6 +123,12 @@ final class MetalContext: @unchecked Sendable {
 
     var pendingDrawables: [CAMetalDrawable] = []
 
+    // Folding (passFolding): clears and the anti-aliasing's copy wait here to become the load action or first draw of the
+    // next render pass on their texture, instead of passes of their own (each of which stores the whole texture for the
+    // next pass to load back). Anything else that encodes GPU work runs them first, as they were (ensureCB).
+    var pendingClears: [PendingClear] = []
+    var pendingCopy: PendingCopy?
+
     // Indirect command buffers for multi-draw-indirect: free list, and the ones used by the current submit
     // (returned to the free list when that submit completes).
     var icbFree: [MTLIndirectCommandBuffer] = []
@@ -117,6 +149,7 @@ final class MetalContext: @unchecked Sendable {
     var profLabels: [String] = []
     var profNext = 0
     var statPasses = 0, statDraws = 0, statBlits = 0, statClears = 0, statSubmits = 0, statPassPixels = 0
+    var statClearsFolded = 0, statCopiesFolded = 0   // pass folding (passFolding)
     // LOD: draw calls, quads submitted, CPU nanoseconds spent in mmc_lod_draw.
     var statLodDraws = 0, statLodQuads = 0, statLodNanos: UInt64 = 0
     // Indexed-indirect draw calls (terrain): calls, draws, CPU nanoseconds inside the native call.
@@ -140,10 +173,35 @@ final class MetalContext: @unchecked Sendable {
     }
 
     func ensureCB() -> MTLCommandBuffer {
-        if let cb { return cb }
-        let made = queue.makeCommandBuffer()!
-        cb = made
+        let made: MTLCommandBuffer
+        if let cb {
+            made = cb
+        } else {
+            made = queue.makeCommandBuffer()!
+            cb = made
+        }
+        if pass == nil && (!pendingClears.isEmpty || pendingCopy != nil) { runPending(made) }
         return made
+    }
+
+    /// The waiting clears and copy (passFolding) as passes of their own, as they'd have run without folding.
+    func runPending(_ cb: MTLCommandBuffer) {
+        endBlit()
+        let clears = pendingClears
+        pendingClears = []
+        for c in clears { encodeClearPass(cb, c.texture, level: 0, color: c.color, depth: c.depth) }
+        if let p = pendingCopy {
+            pendingCopy = nil
+            let d = MTLRenderPassDescriptor()
+            d.colorAttachments[0].texture = p.texture
+            d.colorAttachments[0].loadAction = .dontCare
+            d.colorAttachments[0].storeAction = .store
+            profAttach(d, "anti-aliasing copy (+ sharpening)")
+            if let enc = cb.makeRenderCommandEncoder(descriptor: d) {
+                p.draw(enc, .invalid, .invalid)
+                enc.endEncoding()
+            }
+        }
     }
 
     func endBlit() {
@@ -606,9 +664,12 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
                            _ ax: Int32, _ ay: Int32, _ aw: Int32, _ ah: Int32) -> Int32 {
     autoreleasepool { () -> Int32 in
         ctx.endBlit()
-        let cb = ctx.ensureCB()
         let d = MTLRenderPassDescriptor()
         var w = 0, h = 0
+        // Pass folding (passFolding): a waiting clear of an attachment becomes its load action, and the anti-aliasing's
+        // waiting copy into color attachment 0 the pass's first draw (so it needn't load). What isn't folded runs first,
+        // as passes of its own (ensureCB below).
+        var foldedCopy: PendingCopy?
         ctx.passColorFormats = (0..<Int(count)).map { colors[$0] != 0 ? (from(colors[$0]) as TextureBox).texture.pixelFormat : .invalid }
         for i in 0..<Int(count) where colors[i] != 0 {
             let t = (from(colors[i]) as TextureBox).texture
@@ -619,6 +680,18 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
                 att.loadAction = .clear
                 att.clearColor = MTLClearColor(red: Double(clearColors[4 * i]), green: Double(clearColors[4 * i + 1]),
                                                blue: Double(clearColors[4 * i + 2]), alpha: Double(clearColors[4 * i + 3]))
+                // This clear overwrites whatever was waiting for the texture.
+                ctx.pendingClears.removeAll { $0.color != nil && sameImage($0.texture, t) }
+                if let p = ctx.pendingCopy, sameImage(p.texture, t) { ctx.pendingCopy = nil }
+            } else if let k = ctx.pendingClears.firstIndex(where: { $0.color != nil && sameImage($0.texture, t) }) {
+                att.loadAction = .clear
+                att.clearColor = ctx.pendingClears[k].color!
+                ctx.pendingClears.remove(at: k)
+                ctx.statClearsFolded += 1
+            } else if i == 0, let p = ctx.pendingCopy, sameImage(p.texture, t) {
+                att.loadAction = .dontCare   // the copy writes every pixel
+                foldedCopy = p
+                ctx.pendingCopy = nil
             } else {
                 att.loadAction = .load
             }
@@ -626,6 +699,7 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
             h = t.height
         }
         ctx.passDepthFormat = .invalid
+        var stencilFormat = MTLPixelFormat.invalid
         if depth != 0 {
             let t = (from(depth) as TextureBox).texture
             d.depthAttachment.texture = t
@@ -633,6 +707,12 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
             if depthClear != 0 {
                 d.depthAttachment.loadAction = .clear
                 d.depthAttachment.clearDepth = Double(depthValue)
+                ctx.pendingClears.removeAll { $0.depth != nil && sameImage($0.texture, t) }
+            } else if let k = ctx.pendingClears.firstIndex(where: { $0.depth != nil && sameImage($0.texture, t) }) {
+                d.depthAttachment.loadAction = .clear
+                d.depthAttachment.clearDepth = ctx.pendingClears[k].depth!
+                ctx.pendingClears.remove(at: k)
+                ctx.statClearsFolded += 1
             } else {
                 d.depthAttachment.loadAction = .load
             }
@@ -640,6 +720,7 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
                 d.stencilAttachment.texture = t
                 d.stencilAttachment.loadAction = .load
                 d.stencilAttachment.storeAction = .store
+                stencilFormat = t.pixelFormat
             }
             ctx.passDepthFormat = t.pixelFormat
             if count == 0 || w == 0 {
@@ -647,6 +728,7 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
                 h = t.height
             }
         }
+        let cb = ctx.ensureCB()
         // Lit hook (Lit.swift, METALMC_EXP=lit): the level's main pass (marked by mmc_lit_level_pass) gets the terrain
         // G-buffer as a second color target.
         if litEnabled && Lit.shared.pendingLevelPass {
@@ -659,6 +741,12 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
         guard let enc = cb.makeRenderCommandEncoder(descriptor: d) else { return 0 }
         ctx.statPasses += 1
         ctx.statPassPixels += w * h
+        if let foldedCopy {
+            // First, before Minecraft's state is set up below: the whole target, no depth test (the encoder's default).
+            enc.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(w), height: Double(h), znear: 0, zfar: 1))
+            foldedCopy.draw(enc, ctx.passDepthFormat, stencilFormat)
+            ctx.statCopiesFolded += 1
+        }
         if ctx.traceFrames > 0 {
             var desc: [String] = []
             for i in 0..<Int(count) where colors[i] != 0 {
@@ -1045,38 +1133,56 @@ public func mmc_copy_texture_to_texture(_ src: Int64, _ dst: Int64, _ mip: Int32
 
 // MARK: - Clears
 
-/// Clears every mip level (layer 0) of a color and/or depth texture, like vkCmdClear*Image.
+/// A pass that only clears level `level` of `t` (color or depth).
+func encodeClearPass(_ cb: MTLCommandBuffer, _ t: MTLTexture, level: Int, color: MTLClearColor?, depth: Double?) {
+    let d = MTLRenderPassDescriptor()
+    if let color {
+        d.colorAttachments[0].texture = t
+        d.colorAttachments[0].level = level
+        d.colorAttachments[0].loadAction = .clear
+        d.colorAttachments[0].storeAction = .store
+        d.colorAttachments[0].clearColor = color
+        profAttach(d, "clear color \(t.width >> level)x\(t.height >> level) fmt=\(t.pixelFormat.rawValue)")
+    } else {
+        d.depthAttachment.texture = t
+        d.depthAttachment.level = level
+        d.depthAttachment.loadAction = .clear
+        d.depthAttachment.storeAction = .store
+        d.depthAttachment.clearDepth = depth ?? 0
+        profAttach(d, "clear depth \(t.width >> level)x\(t.height >> level)")
+    }
+    cb.makeRenderCommandEncoder(descriptor: d)?.endEncoding()
+    ctx.statClears += 1
+}
+
+/// Clears every mip level (layer 0) of a color and/or depth texture, like vkCmdClear*Image. With pass folding a
+/// single-level texture's clear waits for the next pass on it instead (MetalContext.pendingClears).
 @_cdecl("mmc_clear_textures")
 public func mmc_clear_textures(_ color: Int64, _ rgba: UnsafePointer<Float>, _ depth: Int64, _ depthValue: Float) {
     autoreleasepool {
+        // A blit encoder left open would run before the clear if the clear waits: close it, so the next one comes
+        // through ensureCB, which runs the waiting clear first.
         ctx.endBlit()
-        let cb = ctx.ensureCB()
+        func fold(_ t: MTLTexture, color: MTLClearColor?, depth: Double?) -> Bool {
+            guard passFolding, ctx.pass == nil, sameImage(t, t) else { return false }
+            if let p = ctx.pendingCopy, sameImage(p.texture, t) { ctx.pendingCopy = nil }   // the clear overwrites it all
+            ctx.pendingClears.removeAll { sameImage($0.texture, t) && ($0.color != nil) == (color != nil) }
+            ctx.pendingClears.append(PendingClear(texture: t, color: color, depth: depth))
+            return true
+        }
         if color != 0 {
             let t = (from(color) as TextureBox).texture
-            for level in 0..<t.mipmapLevelCount {
-                let d = MTLRenderPassDescriptor()
-                d.colorAttachments[0].texture = t
-                d.colorAttachments[0].level = level
-                d.colorAttachments[0].loadAction = .clear
-                d.colorAttachments[0].storeAction = .store
-                d.colorAttachments[0].clearColor = MTLClearColor(red: Double(rgba[0]), green: Double(rgba[1]), blue: Double(rgba[2]), alpha: Double(rgba[3]))
-                profAttach(d, "clear color \(t.width >> level)x\(t.height >> level) fmt=\(t.pixelFormat.rawValue)")
-                cb.makeRenderCommandEncoder(descriptor: d)?.endEncoding()
-                ctx.statClears += 1
+            let value = MTLClearColor(red: Double(rgba[0]), green: Double(rgba[1]), blue: Double(rgba[2]), alpha: Double(rgba[3]))
+            if !fold(t, color: value, depth: nil) {
+                let cb = ctx.ensureCB()
+                for level in 0..<t.mipmapLevelCount { encodeClearPass(cb, t, level: level, color: value, depth: nil) }
             }
         }
         if depth != 0 {
             let t = (from(depth) as TextureBox).texture
-            for level in 0..<t.mipmapLevelCount {
-                let d = MTLRenderPassDescriptor()
-                d.depthAttachment.texture = t
-                d.depthAttachment.level = level
-                d.depthAttachment.loadAction = .clear
-                d.depthAttachment.storeAction = .store
-                d.depthAttachment.clearDepth = Double(depthValue)
-                profAttach(d, "clear depth \(t.width >> level)x\(t.height >> level)")
-                cb.makeRenderCommandEncoder(descriptor: d)?.endEncoding()
-                ctx.statClears += 1
+            if !fold(t, color: nil, depth: Double(depthValue)) {
+                let cb = ctx.ensureCB()
+                for level in 0..<t.mipmapLevelCount { encodeClearPass(cb, t, level: level, color: nil, depth: Double(depthValue)) }
             }
         }
     }
@@ -1231,6 +1337,11 @@ public func mmc_submit(_ index: Int64) {
         cb.commit()
         ctx.cb = nil
         ctx.statSubmits += 1
+        if passFolding && ctx.statSubmits % 2000 == 0 {
+            log("pass folding: \(ctx.statClearsFolded) clears and \(ctx.statCopiesFolded) anti-aliasing copies folded into the next pass over the last 2000 submits")
+            ctx.statClearsFolded = 0
+            ctx.statCopiesFolded = 0
+        }
         if ctx.traceFrames > 0 {
             log("trace submit \(index)")
             ctx.traceFrames -= 1

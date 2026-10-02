@@ -266,6 +266,26 @@ final class Taa: @unchecked Sendable {
     var skyFailed = false
     var frames = 0                   // frames anti-aliased, for the sky's dither
     var copyPipes: [UInt: MTLRenderPipelineState] = [:]   // by the frame's pixel format
+    var foldedCopyPipes: [String: MTLRenderPipelineState] = [:]   // the copy inside another pass (pass folding), by formats
+
+    /// The copy for a pass with these depth and stencil attachment formats (.invalid for none): the copy's own pass has
+    /// none, the hand's pass it's folded into (pass folding, Backend.swift) has the frame's depth.
+    func copyPipe(color: MTLPixelFormat, depth: MTLPixelFormat, stencil: MTLPixelFormat) -> MTLRenderPipelineState? {
+        if depth == .invalid && stencil == .invalid { return copyPipes[color.rawValue] }
+        let k = "\(color.rawValue)/\(depth.rawValue)/\(stencil.rawValue)"
+        if let p = foldedCopyPipes[k] { return p }
+        guard let lib = library else { return nil }
+        let d = MTLRenderPipelineDescriptor()
+        d.label = "MetalMC TAA copy (folded)"
+        d.vertexFunction = lib.makeFunction(name: "taa_copy_vs")
+        d.fragmentFunction = lib.makeFunction(name: "taa_copy_fs")
+        d.colorAttachments[0].pixelFormat = color
+        d.depthAttachmentPixelFormat = depth
+        d.stencilAttachmentPixelFormat = stencil
+        guard let p = try? ctx.device.makeRenderPipelineState(descriptor: d) else { return nil }
+        foldedCopyPipes[k] = p
+        return p
+    }
     var valid = false                // the current history holds a frame
     var prevViewProj = matrix_identity_float4x4
     var prevCam = SIMD3<Double>(repeating: .nan)
@@ -430,18 +450,23 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     enc.dispatchThreadgroups(MTLSize(width: (color.width + 31) / 32, height: (color.height + 31) / 32, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     enc.endEncoding()
-    let d = MTLRenderPassDescriptor()
-    d.colorAttachments[0].texture = color
-    d.colorAttachments[0].loadAction = .dontCare
-    d.colorAttachments[0].storeAction = .store
-    profAttach(d, "anti-aliasing copy (+ sharpening)")
-    guard let copy = cb.makeRenderCommandEncoder(descriptor: d) else { return 0 }
-    copy.setRenderPipelineState(copyPipe)
-    copy.setFragmentTexture(t.history[1 - t.current], index: 0)
-    var sharpen = SIMD4<Float>(taaSharpen, frameMax, skyDither, Float(t.frames % 64))
-    copy.setFragmentBytes(&sharpen, length: 16, index: 0)
-    copy.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-    copy.endEncoding()
+    // The new history into the frame: a draw that waits to be the first of the next pass on the frame (the hand's) with
+    // pass folding, else a pass of its own now (Backend.swift: runPending encodes it).
+    let newHistory = t.history[1 - t.current]
+    let sharpen = SIMD4<Float>(taaSharpen, frameMax, skyDither, Float(t.frames % 64))
+    let colorFormat = color.pixelFormat
+    ctx.pendingCopy = PendingCopy(texture: color) { enc, depthFormat, stencilFormat in
+        guard let p = t.copyPipe(color: colorFormat, depth: depthFormat, stencil: stencilFormat) ?? (depthFormat == .invalid ? copyPipe : nil) else {
+            log("TAA: no copy pipeline for depth \(depthFormat.rawValue), stencil \(stencilFormat.rawValue)")
+            return
+        }
+        enc.setRenderPipelineState(p)
+        enc.setFragmentTexture(newHistory, index: 0)
+        var sc = sharpen
+        enc.setFragmentBytes(&sc, length: 16, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    }
+    if !passFolding { ctx.runPending(cb) }
     t.current = 1 - t.current
     t.frames += 1
     t.valid = true
