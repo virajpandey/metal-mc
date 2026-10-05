@@ -29,6 +29,8 @@ def git(*args):
 
 
 def ledger_path():
+    if os.environ.get("LEDGER_PATH"):   # tests only
+        return os.environ["LEDGER_PATH"]
     main = ""
     for line in git("worktree", "list", "--porcelain").splitlines():
         if line.startswith("worktree "):
