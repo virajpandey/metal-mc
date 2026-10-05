@@ -77,8 +77,16 @@ abstract class GameRendererLodMixin {
             metalmc.backend.MetalSky.aerial(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, TemporalAA.ENABLED);
         }
-        if (!TemporalAA.ENABLED) return;
-        metalmc.backend.MetalTaa.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), TemporalAA.UNJITTERED,
-            cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, TemporalAA.jitterX, TemporalAA.jitterY, false);
+        if (TemporalAA.ENABLED) {
+            metalmc.backend.MetalTaa.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), TemporalAA.UNJITTERED,
+                cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, TemporalAA.jitterX, TemporalAA.jitterY, false);
+        }
+        // Post hook (METALMC_EXP=post, metalmc.backend.MetalPost): bloom, eye adaptation, light shafts and the tone curve
+        // over the level's scene-linear light (our sky drew it), after the anti-aliasing, before the hand.
+        if (metalmc.backend.MetalPost.ENABLED && metalmc.sky.Sky.frameActive) {
+            metalmc.backend.MetalPost.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(),
+                TemporalAA.ENABLED ? TemporalAA.UNJITTERED : Lod.LEVEL_PROJECTION, cameraState.viewRotationMatrix,
+                cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, TemporalAA.ENABLED);
+        }
     }
 }

@@ -861,7 +861,7 @@ final class NearRenderer: @unchecked Sendable {
                     lock.lock(); library = lib; lock.unlock()
                     // The main pass's usual formats, so the first frame doesn't compile on the render thread (in lit mode,
                     // with the G-buffer).
-                    let formats: [MTLPixelFormat] = litEnabled ? [hdrOutput ? hdrTargetFormat : .rgba8Unorm, litGbufferFormat] : [.rgba8Unorm]
+                    let formats: [MTLPixelFormat] = litEnabled ? [floatMainTarget ? hdrTargetFormat : .rgba8Unorm, litGbufferFormat] : [.rgba8Unorm]
                     for cutout in [false, true] { _ = pipeline(cutout: cutout, colorFormats: formats, depth: .depth32Float) }
                     lock.lock(); state = 2; lock.unlock()
                     log("near chunks: shaders compiled in \((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) ms")

@@ -652,13 +652,13 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
             if !hasDepth { _ = box.state(depthFormat: .invalid) }
             if precreate != 0, let pf = MTLPixelFormat(rawValue: UInt(precreate)), pf != .depth32Float { _ = box.state(depthFormat: pf) }
             // HDR hook (Hdr.swift): the variant for the float main target too, so the render thread doesn't compile it.
-            if hdrOutput && colorCount > 0 && d.colorAttachments[0].pixelFormat == .rgba8Unorm {
+            if floatMainTarget && colorCount > 0 && d.colorAttachments[0].pixelFormat == .rgba8Unorm {
                 _ = box.state(depthFormat: .depth32Float, colorFormats: [hdrTargetFormat])
                 if !hasDepth { _ = box.state(depthFormat: .invalid, colorFormats: [hdrTargetFormat]) }
             }
             // Lit hook (Lit.swift): the variant for the level's main pass, whose second target is the terrain G-buffer.
             if litEnabled && colorCount == 1 && d.colorAttachments[0].pixelFormat == .rgba8Unorm {
-                _ = box.state(depthFormat: .depth32Float, colorFormats: [hdrOutput ? hdrTargetFormat : .rgba8Unorm, litGbufferFormat])
+                _ = box.state(depthFormat: .depth32Float, colorFormats: [floatMainTarget ? hdrTargetFormat : .rgba8Unorm, litGbufferFormat])
             }
             return makeHandle(box)
         } catch {
@@ -827,7 +827,7 @@ public func mmc_rp_set_pipeline(_ h: Int64) -> Int32 {
     if extPassActive { return extSetPipeline(p) }   // ExtPipe hook: vanilla's pipeline routed to a program, or skipped
     // HDR hook (Hdr.swift): matched to the pass's color formats (the main target is RGBA16Float). Lit hook (Lit.swift):
     // the same, for the G-buffer target of the level's main pass.
-    guard let st = hdrOutput || litEnabled ? p.state(depthFormat: ctx.passDepthFormat, colorFormats: ctx.passColorFormats)
+    guard let st = floatMainTarget || litEnabled ? p.state(depthFormat: ctx.passDepthFormat, colorFormats: ctx.passColorFormats)
                                            : p.state(depthFormat: ctx.passDepthFormat) else {
         ctx.pipe = nil
         return 0
