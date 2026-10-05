@@ -72,6 +72,7 @@ public final class MetalExtPipe {
         static final MethodHandle FRAME_BEGIN = h("mmc_ext_frame_begin", JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG);
         static final MethodHandle REDIRECT = h("mmc_ext_redirect", null, JAVA_INT);
         static final MethodHandle TRANSLUCENT = h("mmc_ext_translucent", JAVA_INT);
+        static final MethodHandle HAND = h("mmc_ext_hand", JAVA_INT);
         static final MethodHandle FRAME_END = h("mmc_ext_frame_end", null);
     }
 
@@ -398,6 +399,16 @@ public final class MetalExtPipe {
         if (reopened == 1 && MetalDevice.current != null) {
             MetalRenderPass pass = MetalDevice.current.encoder().currentRenderPass();
             if (pass != null) pass.rebindAll();
+        }
+    }
+
+    /** True if the description wants the first-person hand in its G-buffer this frame (metalmc.extpipe.ExtHand). */
+    public static boolean handWanted() {
+        if (!frameActive) return false;
+        try {
+            return (int) Native.HAND.invokeExact() == 1;
+        } catch (Throwable t) {
+            throw rethrow(t);
         }
     }
 
