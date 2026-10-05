@@ -2,8 +2,10 @@
 # usage: bench_lod.sh <label> <lodFar or 0> [extra gradle args...]
 # Fullscreen, render distance $BENCH_RD (12), noon, on fixtures/$BENCH_FIXTURE (claudeworld-huge); prints the bench
 # summary. Log: bench_out/run_<label>.log. Note gradle's runClient rebuilds the Swift library from the working tree
-# on every run (BENCH_NOBUILD only skips the explicit build here), so don't edit Swift mid-batch.
+# on every run (BENCH_NOBUILD only skips the explicit build here), so don't edit Swift mid-batch. Every run appends a
+# line to the run ledger (tools/bench/ledger.py: the main checkout's bench_out/ledger.jsonl).
 LABEL=$1; FAR=$2; shift 2
+START=$(date +%s)
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=$ROOT/bench_out
 cd "$ROOT" || exit 1
@@ -25,4 +27,5 @@ FIXTURE=${BENCH_FIXTURE:-claudeworld-huge} caffeinate -di bash "$ROOT/tools/benc
 grep -h 'METALMC_BENCH' "$OUT/run_$LABEL.log" | grep -o 'fps_mean=[^ ]*\|ms_p95=[^ ]*\|ms_p99=[^ ]*\|frames_over_[^ ]*\|metal_gpu_ms_mean=[^ ]*\|per_frame_lod_kquads=[^ ]*' | tr '\n' ' '
 echo
 grep -h 'exit\|Exception\|error:' "$OUT/run_$LABEL.log" | grep -v 'Realms\|SignedJWT' | head -5
+python3 "$ROOT/tools/bench/ledger.py" "$LABEL" "$OUT/run_$LABEL.log" "${BENCH_FIXTURE:-claudeworld-huge}" "$START" "$FAR" "$@"
 python3 "$ROOT/tools/bench/prune_worlds.py" 2
