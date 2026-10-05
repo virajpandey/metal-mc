@@ -969,7 +969,10 @@ distance 12, 63 MB).
   - The mineshaft corridor lit by its own wall torches (`mineshaft`): warmer, and brighter: mean luma 68.0 -> 75.4 and
     70.5 -> 74.8 in two pairs of sessions (vanilla's own frame differed by 4% between sessions). Its walls are at levels
     11-14, where the volume's sample half a block in front of a face can sit up to the one level of slack over vanilla's
-    smooth light; `METALMC_CLSLACK=0` would pin the brightness to vanilla's (not tried in game).
+    smooth light. With the slack at 0 (`-PclSlack=0`, which pins the brightness to vanilla's) the mineshaft is 73.1
+    against vanilla's 70.5 and the torch cave's two pictures 29.8 and 34.0 (slack 1: 30.2 and 34.3; vanilla's 30.7 and
+    32.6): the slack is about half of the mineshaft's difference, the rest within what vanilla's own frames vary, and
+    the pictures look the same; the default stays at 1 (light adds up where colors overlap).
   - The torch cave (`torch_cave`: ten torches and two lanterns its setup places on a cavern floor). The scene's own
     camera has a clear line to two of the twelve (checked against the fixture's blocks through the colored light's
     store) and its pictures are a dark rock face with or without colored light, so these are from a spot in the cavern
@@ -981,6 +984,10 @@ distance 12, 63 MB).
     where vanilla's is one warm white; the best picture of the set). Mean luma 30.7 -> 30.2, 30.0 -> 30.6, 32.6 -> 34.3.
     The world's own ticking (fluids settling, plants, leaves) sent the volume 15-140 block changes a second there; the
     fill ran in 16-41% of the frames, over 50-60 bricks.
+  - A trip to the Nether and back (`execute in minecraft:the_nether run tp`, then the overworld again: a new level each
+    way): the store started over (10,133 sections, then 5,885 sent again as the overworld's chunks came back) and the
+    village at midnight was colored as before (`pair-night_torches-before-after-nether.png`: before left, after right,
+    the latter at slack 0).
 - **The settings' route.** With no `METALMC_EXP` in the environment and `lighting`, `sky`, `bounceLight`,
   `waterReflections` and `experiments=rtshadows,coloredlight` in `config/metalmc.properties`, the game turned on
   "lit,nearchunks,sky,gi,water,rtshadows,coloredlight" and the colored light's Java side sent 8,560 sections. That
@@ -1016,9 +1023,10 @@ distance 12, 63 MB).
   a face at block light 15 next to a light that isn't opaque (the floor under a lantern, around lava) is a light source to
   the relight, full bright as before.
 - **Flicker** is one clock for all fires; torches don't flicker.
-- **Colors** are a first pass on the test gallery (`clBucketSpecs`, `ClClass.buckets`); `-PclGain`, `-PclFlicker` to tune.
+- **Colors** are a first pass on the test gallery (`clBucketSpecs`, `ClClass.buckets`); `-PclGain`, `-PclFlicker`,
+  `-PclSlack` to tune (the game logs them with the volume's size).
 - **Brightness against vanilla's:** the same within a few percent of mean luma in the gallery, the village and the torch
-  cave, 6-11% brighter in the mineshaft (the slack, above). Pinning it (`METALMC_CLSLACK=0`) trades the light adding
-  up where colors overlap for vanilla's brightness everywhere; worth a look in the lab.
+  cave, 6-11% brighter in the mineshaft (half of it the slack, above). `-PclSlack=0` pins it to vanilla's at the cost of
+  light adding up where colors overlap; in the lab the two look the same.
 - In the game: the gallery, two natural lava caves, the village at night, the mineshaft and the torch cave; not yet:
   the Nether (lit mode is overworld only), many lights flickering in motion, a long flight underground, multiplayer.

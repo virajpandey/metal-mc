@@ -678,7 +678,7 @@ final class ColoredLight: @unchecked Sendable {
             failed = true
             return false
         }
-        log("coloredlight: volume \(clSizeX) x \(clSizeY) x \(clSizeZ), \((cells * 18 + clBricks * 8) / 1_000_000) MB, \(clIterations) passes a frame")
+        log("coloredlight: volume \(clSizeX) x \(clSizeY) x \(clSizeZ), \((cells * 18 + clBricks * 8) / 1_000_000) MB, \(clIterations) passes a frame; gain \(clGain), slack \(clSlack) levels, flicker \(clFlicker)")
         return true
     }
 

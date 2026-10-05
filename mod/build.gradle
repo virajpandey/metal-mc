@@ -183,7 +183,11 @@ loom {
 			}
 			// Colored block light (-PmetalExp=lit,...,coloredlight; ColoredLight.swift; debug views -PlitView=11 the block
 			// light alone, 12 its check against vanilla's): -PclGain=<brightness, 1>, -PclFlicker=<fire's flicker, 0.12>,
-			// -PclIter=<flood-fill passes a frame, 4>, -PclBelow=<blocks of the volume below the camera, 64>.
+			// -PclIter=<flood-fill passes a frame, 4>, -PclBelow=<blocks of the volume below the camera, 64>,
+			// -PclSlack=<levels over vanilla's the colored light may reach, 1; 0 pins it to vanilla's brightness>.
+			if (project.hasProperty("clSlack")) {
+				environmentVariable "METALMC_CLSLACK", project.findProperty("clSlack").toString()
+			}
 			if (project.hasProperty("clGain")) {
 				environmentVariable "METALMC_CLGAIN", project.findProperty("clGain").toString()
 			}
