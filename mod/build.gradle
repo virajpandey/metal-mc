@@ -189,7 +189,7 @@ loom {
 			if (project.hasProperty("clShadow")) {
 				environmentVariable "METALMC_CLSHADOW", project.findProperty("clShadow").toString()
 			}
-			// -PclBounce=<gain of the block light bounced through the GI cache, 1; 0 none> (with gi; ColoredLightBounce.swift).
+			// -PclBounce=<gain of the block light bounced through the GI cache, default 0 (off); 1 to try it> (with gi; ColoredLightBounce.swift).
 			if (project.hasProperty("clBounce")) {
 				environmentVariable "METALMC_CLBOUNCE", project.findProperty("clBounce").toString()
 			}

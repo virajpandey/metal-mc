@@ -2,7 +2,8 @@ import Foundation
 import Metal
 import simd
 
-// Colored block light bounced through the GI cache (with coloredlight and gi; gain METALMC_CLBOUNCE, 1, 0 for none).
+// Colored block light bounced through the GI cache (with coloredlight and gi; gain METALMC_CLBOUNCE, default 0 = off
+// until a debug view shows the channel reaching the image; 1 to try it).
 // The cache's cells hold the sky's and the sun's light per unit of the frame's daylight, which block light doesn't
 // follow, so the block light has a channel of its own per cell (clBounce: half4 a slot, rgb in absolute light and the
 // cell's fingerprint in a, so a slot taken over by another cell reads as empty), filled by the same update: where a
@@ -11,8 +12,8 @@ import simd
 // light. The request resolves it beside the sky light into a half-resolution RG11B10Float texture (in the slot the
 // relight's giStandIn had kept free), and the relight adds it to the block light where vanilla's level isn't 0.
 
-/// The bounce's gain (METALMC_CLBOUNCE, 1; 0 adds none).
-let clBounceGain: Float = max(0, Float(ProcessInfo.processInfo.environment["METALMC_CLBOUNCE"] ?? "") ?? 1)
+/// The bounce's gain (METALMC_CLBOUNCE, default 0: off; 1 to try it).
+let clBounceGain: Float = max(0, Float(ProcessInfo.processInfo.environment["METALMC_CLBOUNCE"] ?? "") ?? 0)
 
 /// The cache kernels' part (spliced into Gi.swift's giKernelSource with clEnabled only).
 let giClBounceHeader = """
