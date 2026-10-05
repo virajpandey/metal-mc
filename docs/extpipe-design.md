@@ -6,7 +6,8 @@ our backend. Off by default; nothing changes without the variable. Run in game a
 OptiFine pack translated privately (its gbuffers programs for terrain, water, sky, entities, particles and weather, 29
 full-screen passes at half-resolution with exact ping-pong and flips, the shadow pass with its geometry shader as vertex
 expansion and an 8192^2 shadow and voxel atlas): its sky, clouds, sun shadows, water and path-traced GI from block
-lights show as the pack intends, at 11-20 fps. Such a pack needs safe math (`"mathMode": "safe"`): with fast math its
+lights show as the pack intends, at 11-20 fps; with a `lod` program our LOD's terrain to the horizon goes through the
+pack's G-buffer and is shaded by it too. Such a pack needs safe math (`"mathMode": "safe"`): with fast math its
 TAA history filled with NaNs and the frame went black. Code: `Sources/MetalMCNative/ExtPipe.swift` (with
 hooks marked "ExtPipe hook" in `Backend.swift`), `metalmc.backend.MetalExtPipe` (uniforms, bridge),
 `metalmc.extpipe.BlockIds` and the mixins in `metalmc.extpipe.mixin`; `tools/extpipe_check.swift` runs a description
@@ -59,6 +60,27 @@ voxel volume a pack builds from this pass, and with facing culling only the face
 `-PextPipeNoCull=1` (`METALMC_EXTPIPE_NOCULL=1`) turns vanilla's view-frustum culling off, so the main pass, and with it
 the shadow pass, has every section in range (at the cost of drawing the ones behind the camera).
 
+Translucent terrain (`translucentRoutes`, water) is drawn after the deferred passes, so the shadow pass draws the last
+frame's: when vanilla draws it, each section's indirect arguments and its section-stream entry (chunk position) are
+copied on the CPU, and the next frame's shadow pass draws its quads from the base vertex (vanilla's translucent index
+buffers are sorted, so a first index isn't a quad offset there) with that frame's camera (`Globals`).
+
+A pack's shadow pass that voxelizes geometry (SEUS PTGI: each triangle's corners moved into their face's voxel along
+the tangent and bitangent) depends on OptiFine's `at_tangent.w`: `cross(at_tangent.xyz, normal) * w` is the direction of
+increasing v. With the other sign the corners leave the face, faces land in the wrong voxel or none, and GI rays start
+inside solid voxels (black faces).
+
+## Our LOD in the G-buffer (`lod` in the description)
+
+`mmc_lod_draw` runs after vanilla's solid terrain, inside the G-buffer pass; with a `lod` entry it draws there: every LOD
+quad (water too, all opaque) with `program`, whose vertex function reads the buffers Lod.swift binds for its own `lod_vs`
+(quads 18, `LodUniforms` 19, xforms 20, material colors 21, AO offsets 22) plus the description's frame block, and
+whose fragment function writes the G-buffer attachments in order (`seamFragmentEntry`, from the same library: the
+variant for tiles that overlap vanilla's sections, with the seam bitmap at fragment buffer 21). Depth test less-equal
+(GL's convention). No far field there (its levels are drawn as quads), no occlusion boxes or fades. Every program gets
+the LOD's material ids as `MMC_MAT_<NAME>` macros (MetalMCCore's `Mat`). Run with the LOD on
+(`LAB_FAR=8192`, `-Plod=...`): vanilla's far plane is pushed past the LOD, so `gbufferProjection` covers it too.
+
 ## Full-screen passes
 
 Each pass draws OptiFine's quad ((0,0)-(1,1), the same numbers as texture coordinates; attributes named `quad`) with
@@ -81,7 +103,8 @@ history: they carry their latest copy into the next frame.
 | `programs` | name -> `{vertex, vertexEntry, fragment?, fragmentEntry?, outputs, attributes?, vanillaBuffers?, blend?, mathMode?}` |
 | `gbuffers` | `{attachments, depth, depthCopies: [{when: translucent\|end, target}], routes: [{pipeline, program?, alphaTest?, renderStage?, entityId?}], samplers?}` |
 | `passes` | `[{stage, program, mipsBefore?, flipAfter?, enabled?}]` in order |
-| `shadow` | `{program, colors, depth, depthCopy?, expand?, paramsBuffer?, routes, alphaTest?, renderStage?, enabled?}` (above) |
+| `shadow` | `{program, colors, depth, depthCopy?, expand?, paramsBuffer?, routes, translucentRoutes?, alphaTest?, renderStage?, enabled?}` (above) |
+| `lod` | `{program, seamFragmentEntry?}`: our LOD's quads in the G-buffer (above) |
 | `consts` | pack constants Java needs for the standard uniforms (`sunPathRotation`, `shadowDistance`, `shadowIntervalSize`, `wetnessHalflife`, `drynessHalflife`, `eyeBrightnessHalflife`) |
 
 Vertex attributes: `attributes` maps a vertex function's attribute location to a vanilla vertex element name
@@ -112,9 +135,10 @@ shadow camera (`shadowModelView`: 100 back along the sun or moon direction with 
 ## Running and debugging
 
 - `-PextPipe=<dir>` (needs the Metal backend; classic transparency; no `METALMC_EXP` look switches: near chunks would
-  take terrain out of vanilla's draws, lit mode and our anti-aliasing would work on the finished frame). Our LOD, far
-  field and section occlusion test skip the G-buffer pass (`-Plod=0` saves their work). In a lab session:
-  `LAB_EXP=none LAB_FAR=0 bash tools/bench/lab.sh <label> -PextPipe=<dir> -PocclusionCulling=0 -Ptaa=false`.
+  take terrain out of vanilla's draws, lit mode and our anti-aliasing would work on the finished frame). Without a
+  `lod` entry our LOD, far field and section occlusion test skip the G-buffer pass (`-Plod=0` saves their work). In a lab
+  session: `LAB_EXP=none LAB_FAR=0 bash tools/bench/lab.sh <label> -PextPipe=<dir> -PocclusionCulling=0 -Ptaa=false`
+  (`LAB_FAR=8192` with a `lod` entry).
 - `-PbenchTour=shader`: noon overview and ground view, afternoon, sunset, a pool of water built in the sky, a closed room
   lit by torches and glowstone, night; screenshots in `mod/run/screenshots/<label>-tour-*.png`.
 - `METALMC_EXTPIPE_VIEW=<target>[.a][@<pass>][:scale],...` (`-PextPipeView=`) shows targets in a grid over the screen
