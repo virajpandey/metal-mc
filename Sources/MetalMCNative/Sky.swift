@@ -736,7 +736,10 @@ final class Sky: @unchecked Sendable {
         if failed { return false }
         if library != nil { return true }
         do {
-            let lib = try ctx.device.makeLibrary(source: skyShaderSource, options: nil)
+            // Lab mode (ShaderLab.swift): after an edit, forget the pipelines and the tables; the next frame rebuilds them.
+            let lib = try ShaderLab.library("sky", skyShaderSource) { [self] _ in
+                library = nil; drawPipes = [:]; aerialDrawPipes = [:]; lowresView = nil; lutRain = -1; viewKey = SIMD4(repeating: .nan); failed = false
+            }
             func pipe(_ name: String) throws -> MTLComputePipelineState {
                 try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: name)!)
             }

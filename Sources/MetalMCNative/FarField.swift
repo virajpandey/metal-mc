@@ -1122,7 +1122,12 @@ final class FarField: @unchecked Sendable {
         compiling = true
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             do {
-                let lib = try ctx.device.makeLibrary(source: farFieldShaderSource, options: nil)
+                // Lab mode (ShaderLab.swift): after an edit, forget the pipelines (compiled again in the background, from the
+                // new library) and fill every ring again.
+                let lib = try ShaderLab.library("far_field", farFieldShaderSource) { [self] _ in
+                    lock.lock(); library = nil; clearPipe = nil; fillPipe = nil; mipPipe = nil; profilePipe = nil; drawPipes = [:]; compiling = false; lock.unlock()
+                    filled = filled.map { _ in false }
+                }
                 let c = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "ff_clear")!)
                 let f = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "ff_fill")!)
                 let m = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "ff_mip")!)

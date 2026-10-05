@@ -4,5 +4,7 @@ bench_out/
 *.gputrace
 .DS_Store
 fixtures/
+# a worktree's link to the main checkout's fixtures
+/fixtures
 .build-dev/
 .claude/worktrees/

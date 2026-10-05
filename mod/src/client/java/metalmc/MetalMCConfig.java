@@ -59,6 +59,20 @@ public final class MetalMCConfig {
         # to the LOD's far terrain. About 1 ms of GPU per frame at the panel's native resolution (enough to drop some
         # frames at a locked 120 Hz), so off by default.
         shadows=false
+
+        # The new look (Metal backend, work in progress; off by default, turn on what you like):
+        # Lighting computed by MetalMC: sun, sky and block light on all terrain, the nearby chunks in its own format.
+        lighting=false
+        # A physically based sky and haze over distance (with lighting).
+        sky=false
+        # Bounce light: sunlight and sky light reflected off surfaces, traced on the GPU (with lighting).
+        bounceLight=false
+        # Water that reflects the sky and the sun (with lighting and sky).
+        waterReflections=false
+        # HDR output: real highlights on screens that show them, such as the MacBook Pro's XDR display.
+        hdr=false
+        # Extra native switches, comma separated (developer use; METALMC_EXP in the environment wins).
+        experiments=
         """;
 
     private static final Properties FILE = load();
@@ -147,6 +161,26 @@ public final class MetalMCConfig {
 
     public static boolean lodMultiplayer() {
         return flag("lod.multiplayer", true);
+    }
+
+    /**
+     * The native switches the settings above turn on (Sources/MetalMCNative reads them from METALMC_EXP), comma
+     * separated; empty when none. NativeLibrary passes them on before any native code runs.
+     */
+    public static String nativeExperiments() {
+        java.util.LinkedHashSet<String> exp = new java.util.LinkedHashSet<>();
+        if (flag("lighting", false)) {
+            exp.add("lit");
+            exp.add("nearchunks");
+        }
+        if (flag("sky", false)) exp.add("sky");
+        if (flag("bounceLight", false)) exp.add("gi");
+        if (flag("waterReflections", false)) exp.add("water");
+        if (flag("hdr", false)) exp.add("hdr");
+        for (String e : get("experiments", "").split(",")) {
+            if (!e.isBlank()) exp.add(e.trim());
+        }
+        return String.join(",", exp);
     }
 
     public static int lodFar() {
