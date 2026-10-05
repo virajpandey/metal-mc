@@ -1,0 +1,18 @@
+{
+	"required": true,
+	"package": "metalmc.extpipe.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"BufferBuilderExtMixin",
+		"FrustumExtMixin",
+		"LevelRendererExtMixin",
+		"SectionCompilerExtMixin",
+		"SkyRendererExtMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
