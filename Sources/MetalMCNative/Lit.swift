@@ -154,13 +154,13 @@ private let litEmitterTerm = postEnabled ? """
     // lava, lanterns, fire, magma, sea lanterns) is theirs alone: smooth lighting averages four blocks, and next to a 15
     // they're 14 or less. LIT_EMIT times their light, in proportion to the texel's brightness: lava's glowing cracks more
     // than its crust, a lantern's flame more than its frame. Level 14 is a torch's, but also the face a lantern or a
-    // glowstone stands on (15, 14, 14 and 13 averaged): there only near-white texels count (a flame's yellow-white core;
-    // sand and stone under a lantern are darker).
+    // glowstone stands on (15, 14, 14 and 13 averaged): there only near-white texels count (a flame's yellow-white core,
+    // about 0.97; sand's brightest texels, about 0.88, speckled at 0.88-0.97).
 #ifndef LIT_EMIT
 #define LIT_EMIT 6.0
 #endif
     if (block >= 13.97) {
-        float emit = smoothstep(block >= 14.97 ? 0.35 : 0.88, block >= 14.97 ? 0.8 : 0.97, litLuma(albedo));
+        float emit = smoothstep(block >= 14.97 ? 0.35 : 0.93, block >= 14.97 ? 0.8 : 0.99, litLuma(albedo));
         if (emit > 0.0) E = max(E, float3(1.0)) * (1.0 + (LIT_EMIT - 1.0) * emit);
     }
 

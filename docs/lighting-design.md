@@ -1209,10 +1209,11 @@ Speed wasn't the goal tonight; these are the measurements to start from.
     blocks, and beside a 15 they're 14.
   - level 14: torches, but also the face a lantern or glowstone stands on (15, 14, 14 and 13 averaged is exactly 14). The
     first try counted every texel there: the sand under the cave's lantern went flat white
-    (`round2/compare-round1-round2-lantern-crop-falsepositive.png`). Now only near-white texels at 14 count
-    (`smoothstep(0.88, 0.97)`: a flame's yellow-white core; sand, about 0.81, and stone stay as they were). A white block
-    under a lantern (snow, quartz) would still glow; telling a torch from it for sure needs the writers to flag emitting
-    quads (the section compiler knows the block state), a G-buffer bit.
+    (`round2/compare-round1-round2-lantern-crop-falsepositive.png`); counting texels of luma 0.88 and up still speckled
+    it (sand's brightest texels are about 0.88). Now only texels of 0.93 and up count at 14 (`smoothstep(0.93, 0.99)`: a
+    flame's yellow-white core, about 0.97). A near-white block under a lantern (snow, quartz) would still glow; telling a
+    torch from it for sure needs the writers to flag emitting quads (the section compiler knows the block state), a
+    G-buffer bit.
   - They bloom on their own light now, so the bloom's extra weight for light sources went from 6 to 2. Lit mode without
     post keeps E = 1 for sources (its 8-bit frame would clip them to flat white).
 - **Clouds** (Sky.swift's `skyLevelColor`, the step that takes the level through the air, in scene-linear light with
@@ -1232,8 +1233,9 @@ Speed wasn't the goal tonight; these are the measurements to start from.
     glowing, the sand around it as before;
   - the deep lava lake from the colored light tour (`lava_lake.png`, -26.5 -51 -75.5): the glowing cracks near white,
     the crust orange, the cave walls lit warm by it;
-  - clouds (`compare-round1-round2-forest.png`): white with gray undersides instead of flat light gray; forest scene
-    mean luma 79.5 -> 83.0, the land unchanged;
+  - clouds (`compare-round1-round2-noon_overview.png`, `compare-round1-round2-forest.png`): white with gray undersides
+    instead of flat light gray; noon's mean luma 112.8 -> 116.2 and the forest's 79.5 -> 83.0, the land unchanged; the
+    lava pool on noon's left hotter; sunset unchanged (mean luma 121.5 -> 121.7, the gain is off below 3 degrees);
   - `night_torches.png` and `torch_cave.png` came from the first try (every texel at 14 boosted: the torches on the
     lamp post and the houses white-hot, which is the look the near-white test keeps for their flames).
 - **Cost**: offline, each stage alone at 3456 x 2234 (litflow, sunset, median of 40): the bloom 1.44 -> 1.31 ms with the
