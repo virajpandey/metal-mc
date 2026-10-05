@@ -781,7 +781,9 @@ default; without it every shader is the same text as before and nothing else run
 `Sources/MetalMCNative/ColoredLight.swift` (the volume, its kernels, the relight's part), `ColoredLightOffline.swift`
 (region files, the test scene, checks); on the Java side `metalmc.light.ColoredLight` (the blocks),
 `metalmc.light.mixin.ClientLevelLightMixin` (block changes), `metalmc.backend.MetalColoredLight` (the bindings) and a call
-in `GameRendererLodMixin`; the splices in Lit.swift and Taa.swift are marked "colored block light".
+in `GameRendererLodMixin`; the splices in Lit.swift and Taa.swift are marked "colored block light". In lab mode the
+volume's kernels are `colored_light.metal` and the relight's part is in `lit_relight_header.metal` (ShaderLab: an edit
+rebuilds the pipelines between two frames; the volume keeps its light).
 
 ### Design
 
@@ -878,10 +880,13 @@ the anti-aliasing's resolve, our sky; 1728 x 1117 pictures, means of 16 frames; 
   (the resolve's 16 and 32 pixel tiles with and without the sky and the relight; the relight's pass on RGBA8,
   RGBA16Float and RG11B10Float; with water and the GI cache), and the flood fill takes 512 threads a threadgroup.
 - **Nothing glows where vanilla is dark:** where vanilla's level is 0 the relight doesn't sample the volume, so those
-  pixels are vanilla's. In the debug view that does sample there, the check takes the light that's left to the curve at
-  one level (0.3% of full), and in the views below the volume had light where vanilla's reference didn't only around
-  the gallery's candles, amethyst and crying obsidian: the LOD, which stands in for vanilla offline, doesn't know them
-  as light sources (in the game vanilla does).
+  pixels are vanilla's: the colored frame against the vanilla one (the captures in the same place of the shadows' and
+  the sky's 64-frame cycle) differs at none of them from above; low over the gallery at 198-217 of 249,357, as many as
+  differ in the real-terrain view (108-274), where the volume touches nothing at all (far terrain that took a new shadow
+  between the two captures: the tile structures still build). In the debug view that does sample there, the check takes
+  the volume's light to the curve at one level (0.3% of full); the volume had light where vanilla's reference didn't
+  only around the gallery's candles, amethyst and crying obsidian: the LOD, which stands in for vanilla offline, doesn't
+  know them as light sources (in the game vanilla does).
 - **The look** (midnight, the gallery from above, `cl-above-midnight-pair.png`: vanilla's block light left, colored
   right; `cl-low-midnight-colored-taa.png` low over the mixing area through the anti-aliasing): every cell its own
   color, stopped by its walls and spilling faintly over them; the mixing area red, cyan-white and orange where the three
@@ -899,13 +904,13 @@ either way; medians of 60, alternating; other builders' work shared the GPU, so 
 
 | | GPU ms |
 |---|---|
-| from scratch (joining, a teleport): every section uploaded, light from nothing | 2.7-6.1, 2.9-3.4, 3.4, 2.6-2.8, 0.15 over the first 5 frames (5,800-8,500 bricks of 16,384), then idle |
-| still | 0.008 a frame (the listing over 16,384 bricks; nothing to fill) |
-| moving at the flight's 20 blocks/s (1/6 block a frame), 240 frames | median 0.007, mean 0.016-0.019, slowest 0.92-1.11 (the frame a slab of 128 sections enters) |
-| moving at 120 blocks/s | median 0.007, mean 0.07, slowest 1.24 |
-| a torch placed or broken | 0.033-0.042 for 4 frames (27, 36, 60, 81 bricks), then idle |
-| the relight's own pass | 1.10 -> 1.19 (+0.09) |
-| the anti-aliasing resolve with the relight in its load | 2.35-2.38 -> 2.47-2.48 (+0.10-0.11) |
+| from scratch (joining, a teleport): every section uploaded, light from nothing | 2.7-6.3, 2.9-5.3, 3.4, 2.5-2.8, 0.1-0.15 over the first 5 frames (5,800-8,500 bricks of 16,384), then idle |
+| still | 0.007-0.008 a frame (the listing over 16,384 bricks; nothing to fill) |
+| moving at the flight's 20 blocks/s (1/6 block a frame), 240 frames | median 0.007, mean 0.015-0.019, slowest 0.92-1.11 (the frame a slab of 128 sections enters) |
+| moving at 120 blocks/s | median 0.007, mean 0.07, slowest 1.24-1.27 |
+| a torch placed or broken | 0.025-0.042 for 4 frames (27, 36, 60, 81 bricks), then idle |
+| the relight's own pass | 1.10 -> 1.19-1.21 (+0.09-0.10) |
+| the anti-aliasing resolve with the relight in its load | 2.35-2.38 -> 2.47-2.51 (+0.10-0.14) |
 
 Memory: 151 MB on the GPU (light 33.5, codes 16.8, the two filtered textures 100.6), plus the store's copy of the blocks
 around the player on the CPU (8 KB per section that isn't one block throughout: 7,886 sections in the game at render
@@ -913,26 +918,39 @@ distance 12, 63 MB).
 
 ### In game (2026-10-05, native 3456 x 2234, TAA on)
 
-- **It runs.** `BENCH_FIXTURE=claudeworld-merged bash tools/bench/bench_lod.sh clTourOn 2048 -PbenchTour=coloredlight
-  -Ptaa=true -PmetalExp=lit,nearchunks,rtshadows,sky,coloredlight`, and `clTourOff` without `coloredlight` for the
-  pictures to compare: no errors; "coloredlight: volume 256 x 128 x 256, 151 MB"; the Java side had sent 7,886 sections
-  when the world loaded and the volume was full and lit within 7 frames; the gallery's 4,174 block changes (the tour
-  builds it with `fill` and `setblock`) and the later swaps reached it through the block-change path.
+- **It runs.** `BENCH_FIXTURE=claudeworld-merged bash tools/bench/bench_lod.sh clTourOn2 2048 -PbenchTour=coloredlight
+  -PbenchTrace=1 -Ptaa=true -PmetalExp=lit,nearchunks,rtshadows,sky,coloredlight`, and `clTourOff2` without
+  `coloredlight` for the pictures to compare: no errors; "coloredlight: volume 256 x 128 x 256, 151 MB, 4 passes a
+  frame"; the Java side had sent 7,886 sections when the world loaded and the volume was full and lit within 4 frames
+  (2,052 sections uploaded); the gallery's 4,174 block changes (the tour builds it with `fill` and `setblock`), the
+  roof's 3,763 and the later swaps reached it through the block-change path, and after the teleports to the two caves
+  below (2,304 and 1,957 sections entering the volume) the fill ran in 10 and 26 frames and was idle again.
 - **The tour** (`-PbenchTour=coloredlight`, `metalmc.bench.ColoredLightTour`): the gallery at midnight from above and
-  low over its mixing area, at noon, sealed in by a roof and outer walls (a cave: no sky light inside), and after its
-  three mixing-area lights are swapped and a lava pool is poured beside them. Pairs, vanilla's block light left and
-  colored right: `bench_out/agents/coloredlight/game/pair-tour-<step>.png`.
+  low over its mixing area, at noon, sealed in by a roof and outer walls (a cave: no sky light inside), after its three
+  mixing-area lights are swapped and a lava pool is poured beside them, and two natural caves of the fixture with lava
+  (found by litflow: open around, a line of sight to lava): one at y 20 under the gallery, one at y -51 over a lava lake.
+  Pairs, vanilla's block light left and colored right: `bench_out/agents/coloredlight/game/pair-tour-<step>.png`.
   - At night every cell has its own color, stopped by the cell's walls; the mixing area red, cyan and orange, white where
-    they overlap. (The fire bucket's flicker doesn't show in a still.)
-  - Sealed in, the room is dark but for the colored pools and their faint tint on the ceiling; vanilla's version is one
-    warm white.
+    they overlap. (The fire bucket's flicker doesn't show in a still.) At noon the colors show only in shade.
+  - Sealed in, the room is dark but for the colored pools and their tint on the ceiling; vanilla's version is one warm
+    white.
   - The swaps relight within a few frames, and the poured lava floods the floor and the ceiling around it with its
-    orange-red: a lava pool tints the walls around it (its direct light; see "Not done" for bouncing it).
-- **Cost** (per-pass times, `-PbenchTrace=1`, `tools/bench/passes.py`):
-  - Traced frames in the tour (3 at night low over the gallery, 3 in the sealed room, where nearly every pixel has block
-    light): the volume's pass 0.007 ms (nothing to fill: the scene is still); the anti-aliasing resolve 2.33 ms without
-    the volume, 2.86 with it: +0.53 ms, the two 3D samples on every block-lit pixel (offline, with a quarter of the
-    pixels block-lit, +0.10). The main pass unchanged (1.34 against 1.39).
+    orange-red, with the soul torch's cyan on the wall beside it (`09-cl-cave-edit-side`).
+  - The lava lake at y -51 (`11-cl-deep-lava`): the deepslate walls and ceiling around it orange-red where vanilla's are
+    a warm gray-white; the most convincing picture of the set. The cave at y 20 (`10-cl-lava-cave`): glow lichen's teal
+    on the wall in front, the lava's orange-red low on the left.
+- **Cost** (per-pass times, `-PbenchTrace=1`, `tools/bench/passes.py`; 3 traced frames per view, the same views without
+  the volume in `clTourOff2`):
+
+  | View | the volume's pass | the resolve (+ relight), without -> with |
+  |---|---|---|
+  | night, low over the gallery (about half the pixels block-lit) | 0.007-0.009 | 2.12 -> 2.68 (+0.56) |
+  | the sealed room (nearly every pixel block-lit) | 0.009-0.016 | 2.55 -> 3.17 (+0.62) |
+  | the lava lake at y -51 (every pixel) | 0.007-0.016 | 2.44 -> 3.10 (+0.66) |
+
+  The volume's pass is the listing alone (the scenes are still); the resolve pays for the two 3D samples on every
+  block-lit pixel, the flicker's noise and three evaluations of the curve (before the calibration, one curve fewer, the
+  sealed room cost +0.53). The G-buffer passes are unchanged (0.21 and 0.69 ms both ways).
   - The real-terrain flight (`bench_lod.sh clFly 32768 -PbenchY=150 -PbenchFly=20 -PbenchExtraWait=600 -PbenchHitches=1
     -PbenchTrace=1 -Ptaa=true -PmetalExp=lit,nearchunks,rtshadows,sky,coloredlight`, by day): 129.2 fps, p99 9.85 ms,
     1,481 frames over 8.33 ms; the volume's pass 0.007 ms (median of 21 traced frames) while it follows the flight
@@ -958,7 +976,7 @@ distance 12, 63 MB).
   recentering margin and the fade); past that vanilla's warm light. Flying high over terrain, the ground is often below
   it. A second level of 2-block cells (512 blocks across) would carry colors to villages seen from afar, or the LOD's
   light lists could carry a color class to its levels 0-4.
-- **Faster:** the resolve's two 3D samples a pixel cost 0.5 ms with the whole screen block-lit; one RGBA16Float sample
+- **Faster:** the relight's part costs 0.6-0.66 ms in the resolve with the whole screen block-lit; one RGBA16Float sample
   would do if the fire bucket's light and vanilla's equivalent shared a texel with the color (e.g. RGB9E5 color, the open
   share and vanilla's equivalent in a second half of one RGBA32 texel). From scratch (joining, a teleport) the fill runs
   3-6 ms a frame for 4 frames: several passes per memory pass (a brick with its halo in threadgroup memory) and spreading

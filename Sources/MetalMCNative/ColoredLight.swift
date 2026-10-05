@@ -615,25 +615,33 @@ final class ColoredLight: @unchecked Sendable {
 
     private func ensure() -> Bool {
         if failed { return false }
-        if library != nil { return true }
-        do {
-            let lib = try ctx.device.makeLibrary(source: clKernelSource, options: nil)
-            func pipe(_ name: String) throws -> MTLComputePipelineState {
-                try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: name)!)
+        if library != nil && blocks != nil { return true }
+        if library == nil {
+            do {
+                // Lab mode (ShaderLab.swift): after an edit of colored_light.metal the pipelines are built again from the new
+                // library on the next frame; the volume (its buffers and textures, and the light in them) stays.
+                let lib = try ShaderLab.library("colored_light", clKernelSource) { [self] _ in
+                    library = nil; uploadPipe = nil; editPipe = nil; listBeginPipe = nil; listPipe = nil; propagatePipe = nil
+                    resolvePipe = nil; clearPipe = nil; failed = false
+                }
+                func pipe(_ name: String) throws -> MTLComputePipelineState {
+                    try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: name)!)
+                }
+                uploadPipe = try pipe("cl_upload")
+                editPipe = try pipe("cl_edit")
+                listBeginPipe = try pipe("cl_list_begin")
+                listPipe = try pipe("cl_list")
+                propagatePipe = try pipe("cl_propagate")
+                resolvePipe = try pipe("cl_resolve")
+                clearPipe = try pipe("cl_clear")
+                library = lib
+            } catch {
+                log("coloredlight: shaders failed: \(error)")
+                failed = true
+                return false
             }
-            uploadPipe = try pipe("cl_upload")
-            editPipe = try pipe("cl_edit")
-            listBeginPipe = try pipe("cl_list_begin")
-            listPipe = try pipe("cl_list")
-            propagatePipe = try pipe("cl_propagate")
-            resolvePipe = try pipe("cl_resolve")
-            clearPipe = try pipe("cl_clear")
-            library = lib
-        } catch {
-            log("coloredlight: shaders failed: \(error)")
-            failed = true
-            return false
         }
+        if blocks != nil { return true }
         let cells = clSizeX * clSizeY * clSizeZ
         blocks = ctx.device.makeBuffer(length: cells * 2, options: .storageModePrivate)
         light = ctx.device.makeBuffer(length: cells * 4, options: .storageModePrivate)
