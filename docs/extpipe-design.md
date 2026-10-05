@@ -76,7 +76,9 @@ inside solid voxels (black faces).
 quad (water too, all opaque) with `program`, whose vertex function reads the buffers Lod.swift binds for its own `lod_vs`
 (quads 18, `LodUniforms` 19, xforms 20, material colors 21, AO offsets 22) plus the description's frame block, and
 whose fragment function writes the G-buffer attachments in order (`seamFragmentEntry`, from the same library: the
-variant for tiles that overlap vanilla's sections, with the seam bitmap at fragment buffer 21). Depth test less-equal
+variant for tiles that overlap vanilla's sections, with the seam bitmap at fragment buffer 21). The fragment stage also
+has what `lod_fs` uses: `LodUniforms` 19, the sprite table 20, the rim AO bits 22, the block atlas at texture 30 with
+sampler 15 (texture detail as `lodShade` does it). Depth test less-equal
 (GL's convention). No far field there (its levels are drawn as quads), no occlusion boxes or fades. Every program gets
 the LOD's material ids as `MMC_MAT_<NAME>` macros (MetalMCCore's `Mat`). Run with the LOD on
 (`LAB_FAR=8192`, `-Plod=...`): vanilla's far plane is pushed past the LOD, so `gbufferProjection` covers it too.
