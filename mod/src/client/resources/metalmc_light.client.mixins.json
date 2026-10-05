@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "metalmc.light.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"ClientLevelLightMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

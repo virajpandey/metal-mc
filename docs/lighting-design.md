@@ -769,3 +769,264 @@ third of the screen water puts it past 8.33 ms; something else has to give for 1
   night (dark water, no glint); a lake under an overhang (sky light under 15 dims its reflection) and a river in a
   canyon (the sky where the walls should be); the seams at the LOD's start (vanilla's water) and at 768 blocks (until the
   LOD writes the flag); `METALMC_WATERWAVES=0` (a mirror) and `2`.
+
+## Colored block light (prototype, `METALMC_EXP=lit,coloredlight`, 2026-10-05)
+
+Lit mode took block light from vanilla's lightmap: one warm white at vanilla's level. With `coloredlight` (and `lit`;
+meant with `nearchunks`, whose terrain is what's relit near the camera) block light has the color of what gives it off:
+torches and lanterns a candle-warm orange, fire and campfires a redder orange that flickers, soul fire cyan, redstone
+red, lava and magma orange-red, glowstone and redstone lamps warm, sea lanterns, end rods and beacons a cool white, the
+three froglights yellow, green and pink, amethyst, crying obsidian and portals a faint purple, glow lichen teal. Off by
+default; without it every shader is the same text as before and nothing else runs (checked below).
+`Sources/MetalMCNative/ColoredLight.swift` (the volume, its kernels, the relight's part), `ColoredLightOffline.swift`
+(region files, the test scene, checks); on the Java side `metalmc.light.ColoredLight` (the blocks),
+`metalmc.light.mixin.ClientLevelLightMixin` (block changes), `metalmc.backend.MetalColoredLight` (the bindings) and a call
+in `GameRendererLodMixin`; the splices in Lit.swift and Taa.swift are marked "colored block light". In lab mode the
+volume's kernels are `colored_light.metal` and the relight's part is in `lit_relight_header.metal` (ShaderLab: an edit
+rebuilds the pipelines between two frames; the volume keeps its light).
+
+### Design
+
+- **Eight colors, each spread exactly as vanilla spreads block light.** Every cell of a volume around the camera holds
+  eight light levels, one per color ("bucket": warm, fire, soul, red, lava, white, green, purple), 4 bits each in one
+  32-bit word. A light-emitting block puts its vanilla level (`getLightEmission`) in its color's bucket (some in a second
+  bucket a few levels lower, which tints them: glow lichen green plus soul, pink froglights purple plus red). Each bucket
+  then follows vanilla's rule: a cell's level is its own emission, or its brightest neighbor's less max(1, the cell's light
+  dampening); opaque cells hold only their own emission. So each color reaches exactly as far as vanilla's light does,
+  goes around corners the same way and is stopped by the same walls, and the brightest bucket of a cell is vanilla's own
+  level there. Where lights of different colors overlap, their light adds (a torch and a soul torch make white between
+  them); two lights of one color don't add, as in vanilla.
+- **Why buckets, not RGB.** A flood fill of RGB light by "brightest neighbor less a step" shifts hue with distance (blue
+  runs out first) and takes the brightest channel of each source where they meet (a torch and a soul torch make
+  magenta); a fill that sums and diffuses (light propagation volumes) loses light in narrow tunnels and doesn't reach as
+  far as vanilla's, so caves vanilla lights would go dark. Integer levels per color are exact (no drift, nothing to
+  converge numerically), compact (4 bytes a cell) and checkable against vanilla cell for cell.
+- **The volume:** 256 x 128 x 256 cells of one block around the camera (128 either side, 64 above and below; it moves a
+  whole section at a time when the camera is 12 blocks off its center, 8 vertically), addressed modulo its size, so
+  moving only replaces the sections that enter it. 33.5 MB of light, 16.8 MB of block codes (each cell's dampening,
+  emission and color class), and the filtered light the relight samples (100 MB, below): 151 MB.
+- **The flood fill, on the GPU, only where something changed.** Each frame: sections that entered the volume or changed
+  are uploaded (their light reset to their own emission), single block changes applied in place; then the 8 x 8 x 8
+  bricks that changed since the last frame, with their 26 neighbors, are listed, and the fill runs over them 4 times
+  (`METALMC_CLITER`), in place, a threadgroup a brick, a thread a cell (the eight levels as two sets of four bytes:
+  `max`, `subsat`). A brick whose cells changed is stamped, so the next frame lists it and its neighbors again. In a still
+  scene the list is empty and nothing runs; a light placed or broken settles over a few frames (light moves at least 4
+  blocks a frame: a torch's 14 in 4 frames).
+- **Resolve into filtered textures.** The bricks that changed are resolved into an RGBA16Float 3D texture (the linear
+  color of every bucket but fire, each bucket's color times vanilla's block light curve at its level, and whether the
+  cell is open: not opaque) and an RG16Float one (the fire bucket's light, and the curve at the brightest bucket's level:
+  vanilla's equivalent), all premultiplied by open.
+- **Sampling.** The relight samples both textures once (trilinear) half a block in front of the pixel's face (in the
+  cell the face looks into; plants in their own) and divides by the open share: light is averaged over the open cells
+  around the sample only, so solid cells don't darken it and the far side of a 1-block wall never reaches it (along the
+  face's normal the sample is at a cell's center; across it, the cells beside the face's own). Within 16 blocks of the
+  volume's edge it fades to vanilla's block light.
+- **Vanilla's level as the sanity reference.** The G-buffer has vanilla's block light at the pixel (smooth lighting's).
+  The volume's vanilla equivalent may not pass the curve at vanilla's level plus one level (`METALMC_CLSLACK`): above
+  it the colored light is scaled down to it, so nothing glows where vanilla is dark (a stale cell, a leak, light through
+  a slab that vanilla blocks). Where it falls short of the curve at vanilla's level less one level (outside the volume,
+  sections not uploaded yet, a light the volume doesn't know), vanilla's own block light makes up the share it misses, so
+  nothing is darker than vanilla either. Where vanilla's level is 0 the volume isn't sampled at all (most terrain by day).
+- **As bright as the game's own lightmap.** The curve is vanilla's lightmap formula at the default brightness; the
+  relight scales the colored light by the game's lightmap at the pixel's level (its luminance, less level 0's) over the
+  curve there (clamped to 0.5-2), so the brightness setting, night vision, the darkness effect and vanilla's own torch
+  flicker apply to it as to vanilla's block light. Offline, where the lightmap is that formula, the ratio is 1.
+- **Fire flickers:** the fire bucket's light times 1 + 0.12 x two octaves of smoothed noise in time (7 and 1.9 Hz;
+  `METALMC_CLFLICKER`), applied in the relight (the volume holds it apart), all fires together.
+- **Colors** (`clBucketSpecs`): a chroma shown at a luminance; the warm buckets about as bright as vanilla's torchlight
+  (whose luminance the curve is), the saturated ones less (they read brighter than their luminance).
+
+  | Bucket | Chroma (linear) | Luminance | Lights |
+  |---|---|---|---|
+  | warm | 1.00, 0.56, 0.25 | 0.95 | torches, lanterns, glowstone, jack o'lanterns, redstone lamps, copper bulbs; + green: glow berries, ochre froglights; + lava: shroomlights |
+  | fire | 1.00, 0.46, 0.15 | 0.95 | fire, campfires, candles, lit furnaces, trial spawners (flickers) |
+  | soul | 0.18, 0.76, 1.00 | 0.85 | soul torches, lanterns, fire and campfires, sculk; + white: conduits |
+  | red | 1.00, 0.07, 0.03 | 0.55 | redstone torches and ore |
+  | lava | 1.00, 0.30, 0.05 | 0.90 | lava, magma |
+  | white | 0.78, 0.90, 1.00 | 0.95 | end rods, beacons, light blocks; + soul: sea lanterns |
+  | green | 0.36, 1.00, 0.30 | 0.85 | verdant froglights, copper torches and lanterns; + soul: glow lichen, sea pickles |
+  | purple | 0.62, 0.28, 1.00 | 0.70 | amethyst, crying obsidian, portals, enchanting tables, respawn anchors; + red: pearlescent froglights |
+
+- **Where the blocks come from.** In the game, `metalmc.light.ColoredLight` sends every overworld chunk the client loads
+  (the client thread copies its sections, a worker thread converts them) as vanilla describes each block: its light
+  dampening (`getLightDampening`, 15 for `isSolidRender`), its emission (`getLightEmission`: lit furnaces, candles by
+  count, sea pickles, respawn anchors all as vanilla has them) and a color class from its name (`mmc_cl_classify`). Every
+  block change after that (`ClientLevel.sendBlockUpdated`, after the chunk holds it) is sent if it changes the block's
+  code; if a conversion of its chunk is still queued, the chunk is captured again instead. A new level starts over.
+  Offline the same codes come from the region files' block states (names and properties: vanilla's emission levels;
+  dampening 15 for full opaque blocks, 1 for water and leaves, 0 for the rest).
+
+### Verified offline (2026-10-05, no game)
+
+`tools/litflow.swift` with `LITFLOW_CL=1` (claudeworld-merged, the game's call sequence, the relight in its own pass and in
+the anti-aliasing's resolve, our sky; 1728 x 1117 pictures, means of 16 frames; `bench_out/agents/coloredlight/`):
+
+    LITFLOW_CL=1 LITFLOW_VIEW=0.5,227.6,2.5,0,47 .build/litflow .build/release/libMetalMCNative.dylib \
+      fixtures/claudeworld-merged <out> sky time
+
+- **The test gallery** (`mod/src/client/resources/metalmc/coloredlight_scene.txt`, vanilla commands, which the game's
+  tour runs too): a stone floor floating at y 199 with 18 cells walled 4 high (1-block walls), one light each: torch,
+  soul torch, redstone torch, lantern, soul lantern, campfire; glowstone, sea lantern, end rod, the three froglights;
+  shroomlight, jack o'lantern, crying obsidian, amethyst, glow lichen, a lava pool; and in front a torch, a soul torch
+  and a redstone torch 6 blocks apart, magma, candles. Offline the scene is applied to the light's store and to the LOD
+  (its chunks decoded from the region files with the scene on top and handed to the LOD as live chunks), whose level 0
+  stands in for vanilla's near terrain.
+- **The flood fill is vanilla's, exactly.** The GPU's light, read back, against a flood fill on the CPU over the same
+  codes (per color, vanilla's rule, the volume's edges dark): 0 of 8,388,608 cells differ, at each of three views and
+  after placing a soul torch and breaking it again; the GPU's codes are the store's in every cell.
+- **No change without the switch.** The anti-aliasing's resolve, lit mode's own pass, the far field and the GI cache's
+  shader sources under nine `METALMC_EXP` sets without `coloredlight` (none, lit, lit with shadows, the sky, the GI cache,
+  water, HDR, sky alone, sky with HDR) are the base build's byte for byte (36 sources). Every variant compiles with it on
+  (the resolve's 16 and 32 pixel tiles with and without the sky and the relight; the relight's pass on RGBA8,
+  RGBA16Float and RG11B10Float; with water and the GI cache), and the flood fill takes 512 threads a threadgroup.
+- **Nothing glows where vanilla is dark:** where vanilla's level is 0 the relight doesn't sample the volume, so those
+  pixels are vanilla's. Checked on the frame as drawn: the colored capture against vanilla's (both in the same place of
+  the shadows' and the sky's 64-frame cycle), with a second vanilla capture after it as the yardstick (far terrain whose
+  shadow structures still build changes a few hundred pixels between any two captures). Where vanilla is dark the
+  colored frame differs from vanilla's at 0 pixels from above (the two vanilla frames: 0), at 251 and 106 of 249,357
+  low over the gallery (vanilla's own: 393 and 347), and at 141 in the real-terrain view (vanilla's own: 152), where the
+  volume touches nothing at all; a glow would show at thousands (the volume has light under 60,474 of those pixels low
+  over the gallery). In the debug view that does sample there, the check takes
+  the volume's light to the curve at one level (0.3% of full); the volume had light where vanilla's reference didn't
+  only around the gallery's candles, amethyst and crying obsidian: the LOD, which stands in for vanilla offline, doesn't
+  know them as light sources (in the game vanilla does).
+- **The look** (midnight, the gallery from above, `cl-above-midnight-pair.png`: vanilla's block light left, colored
+  right; `cl-low-midnight-colored-taa.png` low over the mixing area through the anti-aliasing): every cell its own
+  color, stopped by its walls and spilling faintly over them; the mixing area red, cyan-white and orange where the three
+  lights overlap. Over the relit terrain with block light the mean luma is vanilla's (52.2 against 52.2 from above,
+  53.8 against 54.0 low): the colored light is as bright as vanilla's, its color and shape are what change. The check
+  (debug view 12, `-check.png`) applies the colored light to 99.4-100% of the pixels vanilla lights; it scales it down
+  to vanilla's level at 1.3-1.7% (the LOD's flat per-face light against the volume's trilinear one, and the sources the
+  LOD doesn't know). At noon the colors show only in shade (`cl-above-noon-pair.png`).
+
+### Costs (offline, M3 Pro)
+
+The volume's work alone, in a command buffer of its own per frame (`mmc_debug_cl_bench`; the gallery from above, 6,873
+sections in the store), and the relight at 3456 x 2234 with the volume on and off on one G-buffer (the code compiled in
+either way; medians of 60, alternating; other builders' work shared the GPU, so fastest-of figures are noise):
+
+| | GPU ms |
+|---|---|
+| from scratch (joining, a teleport): every section uploaded, light from nothing | 2.7-6.3, 2.9-5.3, 3.4, 2.5-2.8, 0.1-0.15 over the first 5 frames (5,800-8,500 bricks of 16,384), then idle |
+| still | 0.007-0.008 a frame (the listing over 16,384 bricks; nothing to fill) |
+| moving at the flight's 20 blocks/s (1/6 block a frame), 240 frames | median 0.007, mean 0.015-0.019, slowest 0.92-1.11 (the frame a slab of 128 sections enters) |
+| moving at 120 blocks/s | median 0.007, mean 0.07, slowest 1.24-1.27 |
+| a torch placed or broken | 0.025-0.042 for 4 frames (27, 36, 60, 81 bricks), then idle |
+| the relight's own pass | 1.10 -> 1.19-1.21 (+0.09-0.10) |
+| the anti-aliasing resolve with the relight in its load | 2.35-2.38 -> 2.47-2.51 (+0.10-0.14) |
+
+Memory: 151 MB on the GPU (light 33.5, codes 16.8, the two filtered textures 100.6), plus the store's copy of the blocks
+around the player on the CPU (8 KB per section that isn't one block throughout: 7,886 sections in the game at render
+distance 12, 63 MB).
+
+### In game (2026-10-05, native 3456 x 2234, TAA on)
+
+- **It runs.** `BENCH_FIXTURE=claudeworld-merged bash tools/bench/bench_lod.sh clTourOn2 2048 -PbenchTour=coloredlight
+  -PbenchTrace=1 -Ptaa=true -PmetalExp=lit,nearchunks,rtshadows,sky,coloredlight`, and `clTourOff2` without
+  `coloredlight` for the pictures to compare: no errors; "coloredlight: volume 256 x 128 x 256, 151 MB, 4 passes a
+  frame"; the Java side had sent 7,886 sections when the world loaded and the volume was full and lit within 4 frames
+  (2,052 sections uploaded); the gallery's 4,174 block changes (the tour builds it with `fill` and `setblock`), the
+  roof's 3,763 and the later swaps reached it through the block-change path, and after the teleports to the two caves
+  below (2,304 and 1,957 sections entering the volume) the fill ran in 10 and 26 frames and was idle again.
+- **The tour** (`-PbenchTour=coloredlight`, `metalmc.bench.ColoredLightTour`): the gallery at midnight from above and
+  low over its mixing area, at noon, sealed in by a roof and outer walls (a cave: no sky light inside), after its three
+  mixing-area lights are swapped and a lava pool is poured beside them, and two natural caves of the fixture with lava
+  (found by litflow: open around, a line of sight to lava): one at y 20 under the gallery, one at y -51 over a lava lake.
+  Pairs, vanilla's block light left and colored right: `bench_out/agents/coloredlight/game/pair-tour-<step>.png`.
+  - At night every cell has its own color, stopped by the cell's walls; the mixing area red, cyan and orange, white where
+    they overlap. (The fire bucket's flicker doesn't show in a still.) At noon the colors show only in shade.
+  - Sealed in, the room is dark but for the colored pools and their tint on the ceiling; vanilla's version is one warm
+    white.
+  - The swaps relight within a few frames, and the poured lava floods the floor and the ceiling around it with its
+    orange-red, with the soul torch's cyan on the wall beside it (`09-cl-cave-edit-side`).
+  - The lava lake at y -51 (`11-cl-deep-lava`): the deepslate walls and ceiling around it orange-red where vanilla's are
+    a warm gray-white; the most convincing picture of the set. The cave at y 20 (`10-cl-lava-cave`): glow lichen's teal
+    on the wall in front, the lava's orange-red low on the left.
+- **Cost** (per-pass times, `-PbenchTrace=1`, `tools/bench/passes.py`; 3 traced frames per view, the same views without
+  the volume in `clTourOff2`):
+
+  | View | the volume's pass | the resolve (+ relight), without -> with |
+  |---|---|---|
+  | night, low over the gallery (about half the pixels block-lit) | 0.007-0.009 | 2.12 -> 2.68 (+0.56) |
+  | the sealed room (nearly every pixel block-lit) | 0.009-0.016 | 2.55 -> 3.17 (+0.62) |
+  | the lava lake at y -51 (every pixel) | 0.007-0.016 | 2.44 -> 3.10 (+0.66) |
+
+  The volume's pass is the listing alone (the scenes are still); the resolve pays for the two 3D samples on every
+  block-lit pixel, the flicker's noise and three evaluations of the curve (before the calibration, one curve fewer, the
+  sealed room cost +0.53). The G-buffer passes are unchanged (0.21 and 0.69 ms both ways).
+  - The real-terrain flight (`bench_lod.sh clFly 32768 -PbenchY=150 -PbenchFly=20 -PbenchExtraWait=600 -PbenchHitches=1
+    -PbenchTrace=1 -Ptaa=true -PmetalExp=lit,nearchunks,rtshadows,sky,coloredlight`, by day): 129.2 fps, p99 9.85 ms,
+    1,481 frames over 8.33 ms; the volume's pass 0.007 ms (median of 21 traced frames) while it follows the flight
+    (1,400-1,540 sections uploaded every 1,200 frames as they stream in and the volume moves); the resolve 1.99 ms. Tonight's
+    lit flight without it (`v_lit`, the same settings, the main checkout's queue): 126.0 fps, p99 10.17, the resolve
+    1.89 ms. So by day about +0.1 ms in the resolve, the rest within run-to-run noise (not an A/B in one checkout).
+- **Lab mode's natural scenes** (`tools/bench/lab.sh`, the full look `lit,nearchunks,rtshadows,sky,gi,water` with and
+  without `coloredlight`, scenes of `tools/bench/scenes.json`; pairs, vanilla's block light left:
+  `bench_out/agents/coloredlight/lab/pair-<scene>.png`): no errors with the GI cache and water on. (The first session
+  with colored light took its switches from the settings, below; the rest from `METALMC_EXP`.)
+  - The plains village at midnight (`night_torches`, its 64 wall torches): the lit walls, paths and lamp posts a warmer
+    orange; mean luma 21.5 -> 21.6, mean chroma 16.3 -> 17.6 (its light was warm already, so the change is mild).
+  - The mineshaft corridor lit by its own wall torches (`mineshaft`): warmer, and brighter: mean luma 68.0 -> 75.4 and
+    70.5 -> 74.8 in two pairs of sessions (vanilla's own frame differed by 4% between sessions). Its walls are at levels
+    11-14, where the volume's sample half a block in front of a face can sit up to the one level of slack over vanilla's
+    smooth light. With the slack at 0 (`-PclSlack=0`, which pins the brightness to vanilla's) the mineshaft is 73.1
+    against vanilla's 70.5 and the torch cave's two pictures 29.8 and 34.0 (slack 1: 30.2 and 34.3; vanilla's 30.7 and
+    32.6): the slack is about half of the mineshaft's difference, the rest within what vanilla's own frames vary, and
+    the pictures look the same; the default stays at 1 (light adds up where colors overlap).
+  - The torch cave (`torch_cave`: ten torches and two lanterns its setup places on a cavern floor). The scene's own
+    camera has a clear line to two of the twelve (checked against the fixture's blocks through the colored light's
+    store) and its pictures are a dark rock face with or without colored light, so these are from a spot in the cavern
+    that sees all twelve, `tp 110.5 21.98 -58.5 286 40`: as placed (`torch_cave_warm`); with a soul lantern, a soul
+    torch, a redstone torch and a campfire in place of four of them (`torch_cave_mixed`: the soul lights whiten the
+    torches' orange where they overlap, the redstone torch a small red pool); and with a sea lantern and pearlescent and
+    verdant froglights in place of three more
+    (`torch_cave_showcase`: purple, green and cool white pools meeting the torches' orange across the cavern floor,
+    where vanilla's is one warm white; the best picture of the set). Mean luma 30.7 -> 30.2, 30.0 -> 30.6, 32.6 -> 34.3.
+    The world's own ticking (fluids settling, plants, leaves) sent the volume 15-140 block changes a second there; the
+    fill ran in 16-41% of the frames, over 50-60 bricks.
+  - A trip to the Nether and back (`execute in minecraft:the_nether run tp`, then the overworld again: a new level each
+    way): the store started over (10,133 sections, then 5,885 sent again as the overworld's chunks came back) and the
+    village at midnight was colored as before (`pair-night_torches-before-after-nether.png`: before left, after right,
+    the latter at slack 0).
+- **The settings' route.** With no `METALMC_EXP` in the environment and `lighting`, `sky`, `bounceLight`,
+  `waterReflections` and `experiments=rtshadows,coloredlight` in `config/metalmc.properties`, the game turned on
+  "lit,nearchunks,sky,gi,water,rtshadows,coloredlight" and the colored light's Java side sent 8,560 sections. That
+  needed a fix outside this feature: the settings reach the native side by `setenv`, which Java's `System.getenv` (a
+  copy taken at startup) never sees, so `MetalLit.ENABLED` and `MetalNearChunks.ENABLED` had stayed false (lit mode's
+  relight and the near chunks off on the Java side while the native side had them on); their `experiment()` now falls
+  back to `MetalMCConfig.nativeExperiments()`, as `MetalColoredLight`'s does.
+
+### Not done, and next
+
+- **Bounce through the GI cache.** Not done. The cache's cells hold the sky's and the sun's light per unit of the frame's
+  daylight, and block light doesn't follow daylight: folded into the same cells it would be divided by a daylight that
+  goes to 1e-4 at night and flash when day comes. It needs a channel of its own per cell (RGB halfs, 8 bytes a slot: 72
+  -> 88 MB at 2 M slots), filled by the update's bounce hits reading this volume at the hit's front cell (as the relight
+  samples it) times the hit's albedo, kept out of the daylight scale, and added by the relight (times AO) with the cell's
+  sky light. A lava pool's direct light already reaches the walls around it through the volume (14 blocks); what this
+  would add is the second bounce and the walls' own colors in it.
+- **Shadows from lights,** what Rethinking Voxels is known for: the fill blocks light with whole blocks, so there are no
+  sharp shadows of fences, slabs or mobs. One shadow ray a pixel (or a quarter of them, like the sun's) toward the
+  nearest bright lights of its brick (the volume knows its emitters) through RtShadows' structures.
+- **Partial blocks** (slabs, stairs, walls) let light through in the volume where vanilla stops it at their full faces;
+  vanilla's level caps what leaks (the check), so it shows as a tint, not a glow.
+- **The volume's reach:** colors within about 100 blocks of the camera horizontally and 40 vertically (its size less the
+  recentering margin and the fade); past that vanilla's warm light. Flying high over terrain, the ground is often below
+  it. A second level of 2-block cells (512 blocks across) would carry colors to villages seen from afar, or the LOD's
+  light lists could carry a color class to its levels 0-4.
+- **Faster:** the relight's part costs 0.6-0.66 ms in the resolve with the whole screen block-lit; one RGBA16Float sample
+  would do if the fire bucket's light and vanilla's equivalent shared a texel with the color (e.g. RGB9E5 color, the open
+  share and vanilla's equivalent in a second half of one RGBA32 texel). From scratch (joining, a teleport) the fill runs
+  3-6 ms a frame for 4 frames: several passes per memory pass (a brick with its halo in threadgroup memory) and spreading
+  the uploads would take that down.
+- **Not colored:** entities, the hand, particles, water and translucent blocks keep vanilla's light (they aren't relit);
+  a face at block light 15 next to a light that isn't opaque (the floor under a lantern, around lava) is a light source to
+  the relight, full bright as before.
+- **Flicker** is one clock for all fires; torches don't flicker.
+- **Colors** are a first pass on the test gallery (`clBucketSpecs`, `ClClass.buckets`); `-PclGain`, `-PclFlicker`,
+  `-PclSlack` to tune (the game logs them with the volume's size).
+- **Brightness against vanilla's:** the same within a few percent of mean luma in the gallery, the village and the torch
+  cave, 6-11% brighter in the mineshaft (half of it the slack, above). `-PclSlack=0` pins it to vanilla's at the cost of
+  light adding up where colors overlap; in the lab the two look the same.
+- In the game: the gallery, two natural lava caves, the village at night, the mineshaft and the torch cave; not yet:
+  the Nether (lit mode is overworld only), many lights flickering in motion, a long flight underground, multiplayer.

@@ -119,6 +119,15 @@ private let litGiRelightArgsDoc = litGi ? """
 // one there).
 """ : ""
 private let litGiRelightArgs = litGi ? ", texture2d<float> giStandIn, texture2d<uint> gi" : ""
+/// With colored block light (clEnabled only; ColoredLight.swift): litRelightPixel's extra arguments, the volume's two
+/// textures and frame, and its block light in place of the lightmap's.
+private let litClRelightArgs = clEnabled ? ", texture3d<float> clRGB, texture3d<float> clAux, constant ClFrame& clf" : ""
+private let litClBlockLight = clEnabled ? """
+
+        // Colored block light (ColoredLight.swift): the light volume in place of the lightmap, checked against vanilla's level.
+        blockLight = clBlockLight(blockLight, lm00, block, rel, fi, n, clf, clRGB, clAux, clDbg, view);
+        clBL = blockLight;
+""" : ""
 private let litGiTexel = litGi ? """
 
     // The GI cache's texel for the pixel (giUpsample's common case needs no other), read now: its address depends on
@@ -181,12 +190,12 @@ static float litFogValue(float d, float s, float e) {
     if (d >= e) return 1.0;
     return (d - s) / (e - s);
 }
-
+\(clEnabled ? clRelightHeader + "\n" : "")
 // The relight of pixel q, whose color is dst (as the target holds it), depth d and G-buffer texel g: the color it gets.
 // Pixels that aren't lit terrain keep theirs. env: the sun's light (0), the sky's on each face direction (1-6, the LOD's
 // face order) and on faces that aren't axis-aligned (7), linear, per unit of albedo.\(litGiRelightArgsDoc)
 static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<half, access::read> vis, texture2d<float> lightmap,
-                              constant LitFrame& f, constant float4* env\(litGiRelightArgs)) {
+                              constant LitFrame& f, constant float4* env\(litGiRelightArgs)\(litClRelightArgs)) {
     uint code = g.x >> 29;
     uint view = uint(f.misc.z);
     if (code == 0u) return view != 0u ? float3(0.0) : dst;
@@ -224,14 +233,14 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
 
     // The new light, linear, per unit of albedo.
     float3 E;
-    float vSunOut = 0.0;\(litGi ? "\n    bool giUsed = false;" : "")
+    float vSunOut = 0.0;\(litGi ? "\n    bool giUsed = false;" : "")\(clEnabled ? "\n    float4 clDbg = float4(0.0);\n    float3 clBL = float3(0.0);" : "")
     if (block >= 15.0) {
         // Light sources (vanilla gives emissive faces full block light): full bright, like vanilla.
         E = float3(1.0);
     } else {
         float3 lm00 = lm ? skyDecode(litLightmap(lightmap, 0.0, 0.0)) : float3(0.0);
         // Vanilla's block light, with the dimension's ambient, night vision and the darkness effect, as its lightmap has it.
-        float3 blockLight = lm ? skyDecode(litLightmap(lightmap, block, 0.0)) : float3(litBrightness(block) * litBrightness(block));
+        float3 blockLight = lm ? skyDecode(litLightmap(lightmap, block, 0.0)) : float3(litBrightness(block) * litBrightness(block));\(litClBlockLight)
         // Vanilla's sky light at full sky (its day and night curve, rain and thunder darkening), for the moon and, without
         // our sky, the daylight curve.
         float3 vanillaSky = lm ? max(skyDecode(litLightmap(lightmap, 0.0, 15.0)) - lm00, 0.0) : float3(1.0);
@@ -275,7 +284,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         else if (view == 4u) c = float3(ao);
         else if (view == 5u) c = skyEncode(skyDecode(float3(0.5)) * E);
         else if (view == 6u) c = float3(vSunOut);
-        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));\(litGi ? "\n        else if (view == 8u) c = giUsed ? float3(0.0, 0.8, 0.0) : (block >= 15.0 ? float3(0.0, 0.0, 0.9) : float3(0.9, 0.0, 0.0));" : "")
+        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));\(litGi ? "\n        else if (view == 8u) c = giUsed ? float3(0.0, 0.8, 0.0) : (block >= 15.0 ? float3(0.0, 0.0, 0.9) : float3(0.9, 0.0, 0.0));" : "")\(clEnabled ? "\n        else if (view == 11u) c = skyEncode(skyDecode(float3(0.5)) * clBL * f.misc.w);\n        else if (view == 12u) c = clDbg.rgb;" : "")
         return saturate(c);
     }
     return o;
@@ -437,10 +446,10 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
 
 /// lit_relight_fs's last line, and with water the lines in its place: the reflections after the relight (this frame's sky
 /// map and waves' tile are bound then, or stand-ins without our sky, when litWaterPixel leaves water alone).
-private let litRelightFsReturn = "    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")), dst.a);"
+private let litRelightFsReturn = "    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")\(clEnabled ? ", clRGB, clAux, clf" : "")), dst.a);"
 private let litRelightFsWater = """
     float d = depth.read(q);
-    float3 c = litRelightPixel(dst.rgb, q, d, g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : ""));
+    float3 c = litRelightPixel(dst.rgb, q, d, g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")\(clEnabled ? ", clRGB, clAux, clf" : ""));
     return float4(litWaterPixel(c, q, d, g, vis, f, env, waves, waterSky), dst.a);
 """
 
@@ -501,7 +510,7 @@ fragment float4 lit_relight_fs(LitVOut in [[stage_in]], float4 dst [[color(0)]],
                                texture2d<half, access::read> vis [[texture(2)]],
                                texture2d<float> lightmap [[texture(3)]],\(litGi ? "\n                               texture2d<float> giStandIn [[texture(4)]],\n                               texture2d<uint> gi [[texture(5)]]," : "")
                                constant LitFrame& f [[buffer(0)]],
-                               constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]]" : "")) {
+                               constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]]" : "")\(clEnabled ? ",\n                               texture3d<float> clRGB [[texture(8)]],\n                               texture3d<float> clAux [[texture(9)]],\n                               constant ClFrame& clf [[buffer(2)]]" : "")) {
     uint2 q = uint2(in.pos.xy);
     uint2 g = gbuf.read(q).rg;
     if ((g.x >> 29) == 0u && f.misc.z == 0.0\(litWater ? " && !litIsWater(g)" : "")) return dst;
@@ -787,6 +796,7 @@ final class Lit: @unchecked Sendable {
             enc.setTexture(waves ?? dummyLightmap, index: 13)
             enc.setTexture(waterSky ?? dummyLightmap, index: 14)
         }
+        if clEnabled { ColoredLight.shared.bindDeferred(enc) }   // colored block light: textures 15, 16, buffer 4
     }
 
     /// With the GI cache: the sun and sky light it made this frame from the atmosphere (lit_env on the same sky tables the
@@ -941,6 +951,7 @@ final class Lit: @unchecked Sendable {
             enc.setFragmentTexture(waterSky ?? dummyLightmap, index: 6)
             enc.setFragmentTexture(waves ?? dummyLightmap, index: 7)
         }
+        if clEnabled { ColoredLight.shared.bindRelight(enc) }   // colored block light: textures 8, 9, buffer 2
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         ctx.statPasses += 1
