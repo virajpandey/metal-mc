@@ -8,11 +8,13 @@ import simd
 //   up, seven levels: from a few pixels to about a sixth of the screen), mixed in as a share of the light (energy
 //   conserving: what the bloom adds around a bright thing it takes from the thing itself). Only very bright light shows
 //   it: the sun, the sky around it, glints on water; light sources (lit mode's G-buffer: block light 14 and 15) weigh more.
-// - Eye adaptation: a histogram of the frame's log luminance (a quarter of the resolution, the middle of the screen
-//   weighted 4 times its edges), its mean between two percentiles against the reference scene (noon outdoors), a share
-//   of the difference made up within limits, followed over time: faster into the light (the image overexposes for a
-//   moment and settles) than into the dark (it takes a couple of seconds to open up). In stops on top of the sky's own
-//   adaptation to the sun's height (Sky.swift), which stays: the units of docs/lighting-design.md are unchanged.
+// - Eye adaptation: a histogram of the frame's log luminance over the square root of lit terrain's albedo (halfway to
+//   metering light rather than color; a quarter of the resolution, a little below the screen's middle weighted 4 times
+//   its edges), its mean between two percentiles against the reference scene (noon outdoors); little of a darker scene's
+//   difference is made up within 2.5 stops (daylight's swings), most of it past that (night, caves), within limits;
+//   followed over time, faster into the light (the image overexposes for a moment and settles) than into the dark (it
+//   takes a couple of seconds to open up). In stops on top of the sky's own adaptation to the sun's height (Sky.swift),
+//   which stays: the units of docs/lighting-design.md are unchanged.
 // - Light shafts: the share of sky in each quarter-resolution texel, blurred radially toward the sun's position on the
 //   screen (two passes, the mean of 144 taps along the line), times the sky's own light in the texel's direction: the
 //   air in front of terrain and clouds lit where the sun gets through, the sky darkened where something between it and
@@ -78,7 +80,8 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // Eye adaptation: the histogram's range (log2), the percentiles its mean is taken between, the darkest albedo lit
 // terrain's light is worked out with and how far the meter goes from luminance (0) toward light (1, luminance over
 // albedo), the reference (the metered log2 value that gets 0 stops: noon outdoors), how much of a darker scene's
-// difference the exposure makes up within the knee and past it, and of a brighter one's, its limits in stops, and how fast it follows (seconds: up, into the dark; down, into the light).
+// difference the exposure makes up within the knee and past it, and of a brighter one's, its limits in stops, and how
+// fast it follows (seconds: up, into the dark; down, into the light).
 #define POST_BINS 128
 #define POST_LOG_MIN (-14.0)
 #define POST_LOG_MAX 10.0
@@ -107,7 +110,8 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_SHAFT_DECAY 0.994
 
 // The tone curves' exposure (each curve's own mid-tones: these keep noon's terrain about as bright as before post) and
-// AgX's look (ASC CDL power and saturation on its sigmoid's output, like its "punchy" look but gentler).
+// AgX's look (ASC CDL power and saturation on its sigmoid's output: its "punchy" look's saturation without its
+// contrast, which crushed dark scenes).
 #define POST_AGX_EXPOSURE 1.0
 #define POST_AGX_POWER 1.0
 #define POST_AGX_SAT 1.3
