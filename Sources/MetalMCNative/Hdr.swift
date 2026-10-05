@@ -100,7 +100,11 @@ final class Hdr: @unchecked Sendable {
         if let library { return library }
         if failed { return nil }
         do {
-            library = try ctx.device.makeLibrary(source: hdrShaderSource, options: nil)
+            // Lab mode (ShaderLab.swift): after an edit, forget it and the present's pipeline (built from it).
+            library = try ShaderLab.library("hdr", hdrShaderSource) { [self] _ in
+                library = nil; snapshotPipe = nil; failed = false
+                ctx.utilLock.lock(); ctx.blitPipeline = nil; ctx.utilLock.unlock()
+            }
         } catch {
             log("hdr: shaders failed: \(error)")
             failed = true

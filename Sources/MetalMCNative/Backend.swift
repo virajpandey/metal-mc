@@ -1248,7 +1248,12 @@ fragment float4 blit_noflip_fs(VOut in [[stage_in]], texture2d<float, access::re
 var utilLibrary: MTLLibrary?
 
 func utilFunction(_ name: String) -> MTLFunction {
-    if utilLibrary == nil { utilLibrary = try! ctx.device.makeLibrary(source: utilShaderSource, options: nil) }
+    // Lab mode (ShaderLab.swift): after an edit, forget it and the clear and present pipelines made from it.
+    if utilLibrary == nil {
+        utilLibrary = try! ShaderLab.library("util", utilShaderSource) { _ in
+            ctx.utilLock.lock(); utilLibrary = nil; ctx.clearPipelines = [:]; ctx.blitPipeline = nil; ctx.utilLock.unlock()
+        }
+    }
     return utilLibrary!.makeFunction(name: name)!
 }
 
@@ -1363,6 +1368,7 @@ public func mmc_submit(_ index: Int64) {
         }
         cb.commit()
         ctx.cb = nil
+        ShaderLab.frameBoundary()   // lab mode: shader files that changed swap their pipelines in here, between frames
         ctx.statSubmits += 1
         if passFolding && ctx.statSubmits % 2000 == 0 {
             log("pass folding: \(ctx.statClearsFolded) clears and \(ctx.statCopiesFolded) anti-aliasing copies folded into the next pass over the last 2000 submits")
