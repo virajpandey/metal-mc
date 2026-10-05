@@ -187,6 +187,14 @@ final class RtShadows: @unchecked Sendable {
         return (g.gi, g.env)
     }
 
+    /// This frame's instance structure, its tiles' structures and the camera's offset from its origin, for other rays after
+    /// the shadows' (colored block light's shadows, ColoredLightShadows.swift); taken once.
+    private var frameStructure: (tlas: MTLAccelerationStructure, accels: [MTLAccelerationStructure], camOffset: SIMD3<Float>)?
+    func takeStructure() -> (tlas: MTLAccelerationStructure, accels: [MTLAccelerationStructure], camOffset: SIMD3<Float>)? {
+        defer { frameStructure = nil }
+        return frameStructure
+    }
+
     func takeDeferred(width: Int, height: Int) -> (lit: MTLTexture, params: SIMD4<Float>)? {
         defer { deferred = nil }
         guard let d = deferred, d.width == width, d.height == height else { return nil }
@@ -497,6 +505,7 @@ final class RtShadows: @unchecked Sendable {
         enc.setTexture(lit, index: 1)
         enc.dispatchThreads(MTLSize(width: hw, height: hh, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
+        frameStructure = (tlas, tlasAccels, SIMD3<Float>(Float(cam.x - origin.x), Float(cam.y - origin.y), Float(cam.z - origin.z)))
         // Lit mode with the GI cache: its frame, on the same depth, projection, origin and instance structure.
         if litGi && giOn {
             encodeGi(cb: cb, depth: depth, invViewProj: params.invViewProj, cam: cam, sunAngle: sunAngle, cloudHeight: cloudHeight, tlas: tlas,

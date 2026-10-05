@@ -121,11 +121,11 @@ private let litGiRelightArgsDoc = litGi ? """
 private let litGiRelightArgs = litGi ? ", texture2d<float> giStandIn, texture2d<uint> gi" : ""
 /// With colored block light (clEnabled only; ColoredLight.swift): litRelightPixel's extra arguments, the volume's two
 /// textures and frame, and its block light in place of the lightmap's.
-private let litClRelightArgs = clEnabled ? ", texture3d<float> clRGB, texture3d<float> clAux, constant ClFrame& clf" : ""
+private let litClRelightArgs = clEnabled ? ", texture3d<float> clRGB, texture3d<float> clAux, constant ClFrame& clf, texture2d<half, access::read> clSh" : ""
 private let litClBlockLight = clEnabled ? """
 
         // Colored block light (ColoredLight.swift): the light volume in place of the lightmap, checked against vanilla's level.
-        blockLight = clBlockLight(blockLight, lm00, block, rel, fi, n, clf, clRGB, clAux, clDbg, view);
+        blockLight = clBlockLight(blockLight, lm00, block, rel, fi, n, clf, clRGB, clAux, clSh, q, clDbg, view);
         clBL = blockLight;
 """ : ""
 private let litGiTexel = litGi ? """
@@ -446,10 +446,10 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
 
 /// lit_relight_fs's last line, and with water the lines in its place: the reflections after the relight (this frame's sky
 /// map and waves' tile are bound then, or stand-ins without our sky, when litWaterPixel leaves water alone).
-private let litRelightFsReturn = "    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")\(clEnabled ? ", clRGB, clAux, clf" : "")), dst.a);"
+private let litRelightFsReturn = "    return float4(litRelightPixel(dst.rgb, q, depth.read(q), g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")\(clEnabled ? ", clRGB, clAux, clf, clSh" : "")), dst.a);"
 private let litRelightFsWater = """
     float d = depth.read(q);
-    float3 c = litRelightPixel(dst.rgb, q, d, g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")\(clEnabled ? ", clRGB, clAux, clf" : ""));
+    float3 c = litRelightPixel(dst.rgb, q, d, g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")\(clEnabled ? ", clRGB, clAux, clf, clSh" : ""));
     return float4(litWaterPixel(c, q, d, g, vis, f, env, waves, waterSky), dst.a);
 """
 
@@ -510,7 +510,7 @@ fragment float4 lit_relight_fs(LitVOut in [[stage_in]], float4 dst [[color(0)]],
                                texture2d<half, access::read> vis [[texture(2)]],
                                texture2d<float> lightmap [[texture(3)]],\(litGi ? "\n                               texture2d<float> giStandIn [[texture(4)]],\n                               texture2d<uint> gi [[texture(5)]]," : "")
                                constant LitFrame& f [[buffer(0)]],
-                               constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]]" : "")\(clEnabled ? ",\n                               texture3d<float> clRGB [[texture(8)]],\n                               texture3d<float> clAux [[texture(9)]],\n                               constant ClFrame& clf [[buffer(2)]]" : "")) {
+                               constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]]" : "")\(clEnabled ? ",\n                               texture3d<float> clRGB [[texture(8)]],\n                               texture3d<float> clAux [[texture(9)]],\n                               constant ClFrame& clf [[buffer(2)]],\n                               texture2d<half, access::read> clSh [[texture(10)]]" : "")) {
     uint2 q = uint2(in.pos.xy);
     uint2 g = gbuf.read(q).rg;
     if ((g.x >> 29) == 0u && f.misc.z == 0.0\(litWater ? " && !litIsWater(g)" : "")) return dst;
@@ -875,6 +875,8 @@ final class Lit: @unchecked Sendable {
         lastAtmosphere = atmosphere
         ctx.endBlit()
         let cb = ctx.ensureCB()
+        // Colored block light's shadows (ColoredLightShadows.swift): rays toward the lights, for the relight below.
+        if clEnabled { ClShadows.shared.trace(cb: cb, depth: depth, invViewProj: f.invViewProj, width: color.width, height: color.height) }
         var daylight: [SIMD4<Float>] = []
         var env = envBuffer
         if atmosphere, let giEnv = frameGiEnv {

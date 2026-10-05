@@ -309,6 +309,7 @@ struct ClFrameGPU {
     var tune = SIMD4<Float>.zero     // x: gain, y: flicker amplitude, z: sanity slack (levels), w: 1 to fill from vanilla
     var fire = SIMD4<Float>.zero     // rgb: the fire bucket's color
     var curve0 = SIMD4<Float>.zero, curve1 = SIMD4<Float>.zero, curve2 = SIMD4<Float>.zero, curve3 = SIMD4<Float>.zero
+    var shadow = SIMD4<Float>.zero   // the block lights' shadows (ColoredLightShadows.swift): x strength, y pixels per sample, z 1 if traced
 }
 
 /// The volume's kernels.
@@ -496,6 +497,7 @@ struct ClFrame {
     float4 tune;     // x: gain, y: flicker amplitude, z: sanity slack (levels), w: 1 to fill from vanilla
     float4 fire;     // rgb: the fire bucket's color
     float4 curve[4]; // vanilla's block light (linear luminance) at levels 0-15
+    float4 shadow;   // the block lights' shadows: x strength, y pixels per traced sample, z 1 if traced this frame
 };
 
 // The curve at a fractional level.
@@ -530,8 +532,12 @@ static float clNoise(float x) {
 // made up, yellow outside the volume, gray nothing open around. Where vanilla's level is 0 the check would leave at most
 // the curve at the slack (level 1: 0.3% of full light), so the volume isn't sampled there (most terrain by day), but in
 // the debug views (view: the relight's), which show what the check removed.
+// shTex, q: the block lights' shadows (ColoredLightShadows.swift: 1 where the light the pixel's light comes from is in
+// view, 0 where something is in the way, one sample per scale x scale pixels that the anti-aliasing accumulates) and the
+// pixel; the colored light (not vanilla's make-up) is scaled by 1 - strength where it's shadowed.
 static float3 clBlockLight(float3 vanilla, float3 ambient, float level, float3 rel, uint fi, float3 n, constant ClFrame& c,
-                           texture3d<float> rgbVol, texture3d<float> auxVol, thread float4& dbg, uint view) {
+                           texture3d<float> rgbVol, texture3d<float> auxVol, texture2d<half, access::read> shTex, uint2 q2,
+                           thread float4& dbg, uint view) {
     if (c.camTex.w <= 0.0 || (level < 0.01 && view == 0u)) return vanilla;
     float3 off = fi < 6u ? n * 0.5 : float3(0.0);
     float3 q = c.camVol.xyz + rel + off;
@@ -556,7 +562,12 @@ static float3 clBlockLight(float3 vanilla, float3 ambient, float level, float3 r
     float3 vb = max(vanilla - ambient, float3(0.0));
     float cv = clCurve(c, level);
     float r = cv > 1e-3 ? clamp(dot(vb, float3(0.2126, 0.7152, 0.0722)) / cv, 0.5, 2.0) : 1.0;
-    float3 colored = ambient + rgb * (k * c.tune.x * r) + vb * fill;
+    float sh = 1.0;
+    if (c.shadow.z > 0.5) {
+        uint ss = uint(c.shadow.y);
+        sh = 1.0 - c.shadow.x * (1.0 - float(shTex.read(min(q2 / ss, uint2(shTex.get_width() - 1, shTex.get_height() - 1))).r));
+    }
+    float3 colored = ambient + rgb * (k * c.tune.x * r * sh) + vb * fill;
     dbg = float4(k < 0.98 ? 0.9 : 0.0, m * k > 1e-4 ? 0.8 : 0.0, fill * 0.9, 1.0);
     return mix(vanilla, colored, w);
 }
@@ -940,8 +951,17 @@ final class ColoredLight: @unchecked Sendable {
         var f = frameParams
         if (debugTime < 0 && DispatchTime.now().uptimeNanoseconds - frameTime > 100_000_000) || !cleared { f.camTex.w = 0 }
         f.camTex.w = shadingOn ? f.camTex.w : 0
+        f.shadow = ClShadows.shared.frameShadow
         guard f.camTex.w > 0, let rgb, let aux else { f.camTex.w = 0; return (dummy3D, dummy3D, f) }
         return (rgb, aux, f)
+    }
+
+    /// For the block lights' shadows (ColoredLightShadows.swift): the light and this frame's parameters, if the volume is
+    /// valid this frame.
+    var shadowInputs: (light: MTLBuffer, frame: ClFrameGPU)? {
+        guard let light, cleared, frameParams.camTex.w > 0,
+              debugTime >= 0 || DispatchTime.now().uptimeNanoseconds - frameTime < 100_000_000 else { return nil }
+        return (light, frameParams)
     }
 
     /// Offline checks: the volume's min corner (world blocks), and a copy of its light and codes (the GPU's, by cell index
@@ -969,19 +989,21 @@ final class ColoredLight: @unchecked Sendable {
         (((z >> 3) * clBricksY + (y >> 3)) * clBricksX + (x >> 3)) * 512 + ((z & 7) * 8 + (y & 7)) * 8 + (x & 7)
     }
 
-    /// Lit hook (Lit.relight, its own pass): textures 8 and 9 and buffer 2 of lit_relight_fs.
+    /// Lit hook (Lit.relight, its own pass): textures 8-10 and buffer 2 of lit_relight_fs.
     func bindRelight(_ enc: MTLRenderCommandEncoder) {
         guard var c = current() else { return }
         enc.setFragmentTexture(c.rgb, index: 8)
         enc.setFragmentTexture(c.aux, index: 9)
+        enc.setFragmentTexture(ClShadows.shared.texture, index: 10)
         enc.setFragmentBytes(&c.frame, length: MemoryLayout<ClFrameGPU>.stride, index: 2)
     }
 
-    /// Lit hook (Lit.bindDeferred, the anti-aliasing's resolve): textures 15 and 16 and buffer 4 of taa_resolve.
+    /// Lit hook (Lit.bindDeferred, the anti-aliasing's resolve): textures 15-17 and buffer 4 of taa_resolve.
     func bindDeferred(_ enc: MTLComputeCommandEncoder) {
         guard var c = current() else { return }
         enc.setTexture(c.rgb, index: 15)
         enc.setTexture(c.aux, index: 16)
+        enc.setTexture(ClShadows.shared.texture, index: 17)
         enc.setBytes(&c.frame, length: MemoryLayout<ClFrameGPU>.stride, index: 4)
     }
 }
