@@ -1227,17 +1227,18 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - **The bloom's first pass reads the G-buffer and the depth once per 2 x 2 block** (its top-left pixel) into threadgroup
   memory, then the frame per pixel: 3 bytes a pixel of them instead of 12. The light source weight and the meter's albedo
   are blurred far wider than a block.
-- **In game** (a lab session, the same switches as the first round's plus nothing else; `bench_out/agents/post/round2/` in
-  the main checkout; round 1's final defaults over round 2 in `compare-round1-round2-*.png`):
-  - the cave's lantern (`compare-round1-round2-lantern-crop.png`, full resolution): its flame window brighter and
-    glowing, the sand around it as before;
+- **In game** (four short lab sessions, the first round's switches; `bench_out/agents/post/round2/` in the main checkout;
+  round 1's final defaults over round 2 in `compare-round1-round2-*.png`):
+  - the cave's lantern (`compare-round1-round2-lantern-crop.png`, full resolution, the final test): its flame window
+    brighter and glowing, the sand around it as before, the torches' flame tips white; `-falsepositive` and `-speckled`
+    are the two earlier tests;
   - the deep lava lake from the colored light tour (`lava_lake.png`, -26.5 -51 -75.5): the glowing cracks near white,
     the crust orange, the cave walls lit warm by it;
   - clouds (`compare-round1-round2-noon_overview.png`, `compare-round1-round2-forest.png`): white with gray undersides
     instead of flat light gray; noon's mean luma 112.8 -> 116.2 and the forest's 79.5 -> 83.0, the land unchanged; the
     lava pool on noon's left hotter; sunset unchanged (mean luma 121.5 -> 121.7, the gain is off below 3 degrees);
-  - `night_torches.png` and `torch_cave.png` came from the first try (every texel at 14 boosted: the torches on the
-    lamp post and the houses white-hot, which is the look the near-white test keeps for their flames).
+  - the village at midnight (`compare-round1-round2-lamppost-crop.png`): the wall torches' flames were near the top of
+    the curve already at night's exposure; their cores a little whiter, the rest as before (mean luma 35.3 -> 35.2).
 - **Cost**: offline, each stage alone at 3456 x 2234 (litflow, sunset, median of 40): the bloom 1.44 -> 1.31 ms with the
   G-buffer read per block; post's whole-frame cost +2.29 -> +2.03 ms. The emitter term and the cloud gain are a few
   instructions in passes that run anyway.
