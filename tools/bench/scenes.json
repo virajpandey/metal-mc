@@ -26,7 +26,7 @@
     },
     {
       "name": "torch_cave",
-      "pos": [136, 20, -46], "yaw": 105, "pitch": 22, "time": 6000, "weather": "clear",
+      "pos": [110.5, 21.98, -58.5], "yaw": 286, "pitch": 40, "time": 6000, "weather": "clear",
       "setup": [
         "setblock 130 12 -52 minecraft:torch", "setblock 126 9 -52 minecraft:torch", "setblock 122 6 -56 minecraft:torch",
         "setblock 120 9 -52 minecraft:torch", "setblock 116 13 -50 minecraft:torch", "setblock 118 7 -58 minecraft:torch",

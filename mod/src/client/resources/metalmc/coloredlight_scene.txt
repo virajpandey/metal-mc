@@ -1,0 +1,50 @@
+# Colored block light's test gallery (docs/lighting-design.md, "Colored block light"), as vanilla commands: the bench
+# tour runs them (-PbenchTour=coloredlight, metalmc.bench.ColoredLightTour), tools/litflow.swift applies them offline
+# (LITFLOW_CL=1, ColoredLightOffline.swift: fill and setblock only, absolute coordinates).
+#
+# A stone floor floating at y 199 (x -26..26, z 12..66). In front (z 14-38) a mixing area: a torch, a soul torch and a
+# redstone torch 6 blocks apart, magma, candles. Behind it 18 cells, 7 x 7 inside, walled 4 high with stone bricks (1-block
+# walls: light mustn't leak through them, only over the top), each with one light: the first row open toward the mixing
+# area.
+fill -26 199 12 26 199 66 minecraft:smooth_stone
+fill -26 200 12 26 206 66 minecraft:air
+fill -24 200 48 24 203 48 minecraft:stone_bricks
+fill -24 200 56 24 203 56 minecraft:stone_bricks
+fill -24 200 64 24 203 64 minecraft:stone_bricks
+fill -24 200 40 -24 203 64 minecraft:stone_bricks
+fill -16 200 40 -16 203 64 minecraft:stone_bricks
+fill -8 200 40 -8 203 64 minecraft:stone_bricks
+fill 0 200 40 0 203 64 minecraft:stone_bricks
+fill 8 200 40 8 203 64 minecraft:stone_bricks
+fill 16 200 40 16 203 64 minecraft:stone_bricks
+fill 24 200 40 24 203 64 minecraft:stone_bricks
+# Row 1 (z 44, open toward the mixing area): torch, soul torch, redstone torch, lantern, soul lantern, campfire.
+setblock -20 200 44 minecraft:torch
+setblock -12 200 44 minecraft:soul_torch
+setblock -4 200 44 minecraft:redstone_torch
+setblock 4 200 44 minecraft:lantern
+setblock 12 200 44 minecraft:soul_lantern
+setblock 20 200 44 minecraft:campfire[lit=true]
+# Row 2 (z 52): glowstone, sea lantern, end rod, the three froglights.
+setblock -20 200 52 minecraft:glowstone
+setblock -12 200 52 minecraft:sea_lantern
+setblock -4 200 52 minecraft:end_rod
+setblock 4 200 52 minecraft:ochre_froglight
+setblock 12 200 52 minecraft:verdant_froglight
+setblock 20 200 52 minecraft:pearlescent_froglight
+# Row 3 (z 60): shroomlight, jack o'lantern, crying obsidian, an amethyst cluster, glow lichen, a lava pool (on a floor of
+# its own: the platform floats).
+setblock -20 200 60 minecraft:shroomlight
+setblock -12 200 60 minecraft:jack_o_lantern[facing=north]
+setblock -4 200 60 minecraft:crying_obsidian
+setblock 4 200 60 minecraft:amethyst_cluster[facing=up]
+setblock 12 200 60 minecraft:glow_lichen[down=true]
+fill 19 198 59 21 198 61 minecraft:smooth_stone
+fill 19 199 59 21 199 61 minecraft:lava
+# The mixing area.
+setblock -6 200 26 minecraft:torch
+setblock 0 200 26 minecraft:soul_torch
+setblock 6 200 26 minecraft:redstone_torch
+fill -21 198 21 -17 198 25 minecraft:smooth_stone
+fill -20 199 22 -18 199 24 minecraft:magma_block
+setblock 18 200 24 minecraft:candle[candles=4,lit=true]

@@ -48,7 +48,8 @@ public final class Bench {
 
     /** Rendering coverage tour instead of the timed orbit (see Tour). */
     static final boolean TOUR = "1".equals(System.getProperty("metalmc.tour")) || "lod".equals(System.getProperty("metalmc.tour"))
-        || Tour.MP_TOUR || Tour.FIDELITY_TOUR || Tour.END_TOUR || Tour.WALK_TOUR || Tour.ZOOM_TOUR || Tour.TAA_TOUR || Tour.SHADER_TOUR;
+        || Tour.MP_TOUR || Tour.FIDELITY_TOUR || Tour.END_TOUR || Tour.WALK_TOUR || Tour.ZOOM_TOUR || Tour.TAA_TOUR || Tour.SHADER_TOUR
+        || ColoredLightTour.ENABLED;
 
     private enum State { WAITING, WARMUP, RUNNING, TOUR, PREGEN, LAB, DONE }
     private static int lodWaitTicks;

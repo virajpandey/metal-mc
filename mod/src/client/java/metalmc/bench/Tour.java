@@ -287,6 +287,7 @@ final class Tour {
     );
 
     static List<Step> steps() {
+        if (ColoredLightTour.ENABLED) return ColoredLightTour.STEPS;
         if (SHADER_TOUR) return SHADER_STEPS;
         if (TAA_TOUR) return TAA_STEPS;
         if (FIDELITY_TOUR) return FIDELITY_STEPS;

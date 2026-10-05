@@ -31,7 +31,9 @@ public final class MetalPost {
 
     private static boolean experiment(String name) {
         String v = System.getenv("METALMC_EXP");
-        if (v == null) return false;
+        // As MetalLit: the settings' switches (config/metalmc.properties) reach the native side by a setenv Java's copy of
+        // the environment never sees, so the same rule here (METALMC_EXP in the environment first).
+        if (v == null) v = metalmc.MetalMCConfig.nativeExperiments();
         for (String s : v.split(",")) {
             if (s.trim().equals(name)) return true;
         }
