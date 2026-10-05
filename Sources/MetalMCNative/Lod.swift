@@ -1121,7 +1121,13 @@ final class LodRenderer: @unchecked Sendable {
                     .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
                     .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")
                     .replacingOccurrences(of: "TRANSPARENT_SHADE", with: "\(lodTransparentShade)f")
-                library = try ctx.device.makeLibrary(source: src, options: nil)
+                // Lab mode (ShaderLab.swift): after an edit, forget the library and every pipeline; the next frame compiles
+                // them again in the background from the new library.
+                library = try ShaderLab.library("lod", src) { [self] _ in
+                    libraryLock.lock(); library = nil; libraryLock.unlock()
+                    pipelineLock.lock(); pipelines = [:]; compiled = []; compiling = []; pipelineLock.unlock()
+                    LodQuadCull.shared.lock.lock(); LodQuadCull.shared.pipe = nil; LodQuadCull.shared.lock.unlock()
+                }
             }
             if mesh {
                 let d = MTLMeshRenderPipelineDescriptor()

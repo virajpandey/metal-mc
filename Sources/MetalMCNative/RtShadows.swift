@@ -214,12 +214,13 @@ final class RtShadows: @unchecked Sendable {
 
     private func ensurePipelines(format: MTLPixelFormat) -> Bool {
         if library == nil {
-            do { library = try ctx.device.makeLibrary(source: rtShadowSource, options: nil) } catch {
+            // Lab mode (ShaderLab.swift): after an edit, forget the kernel and the pipelines; the next frame rebuilds them.
+            do { library = try ShaderLab.library("rt_shadows", rtShadowSource) { [self] _ in library = nil; kernel = nil; applyPipes = [:] } } catch {
                 log("rt shadows: library failed: \(error)")
                 return false
             }
             if let f = library?.makeFunction(name: "rt_shadow") { kernel = try? ctx.device.makeComputePipelineState(function: f) }
-            buildQueue = ctx.device.makeCommandQueue()
+            if buildQueue == nil { buildQueue = ctx.device.makeCommandQueue() }
         }
         if applyPipes[format.rawValue] == nil, let lib = library {
             let d = MTLRenderPipelineDescriptor()
