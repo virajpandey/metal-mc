@@ -1078,13 +1078,15 @@ frame), folded into the hand's pass like the copy it replaces (pass folding, Bac
    and the sky around it, glints on water, torches at night and in caves.
 2. **Eye adaptation** (`post_histogram`, `post_exposure`): a 128-bin histogram of log2 light (2^-14 to 2^10, scene
    units) over the bloom's second level (a quarter of the resolution), each texel weighing 1 at the screen's edges up
-   to 4 a little below its middle (leaning away from the sky). It meters light, not color: in lit mode a texel's
-   luminance over its mean albedo luminance (alpha), so a dark forest and bright sand under the same sun read alike
-   (an incident-light meter) and only shade, night and caves read as less light; sky and water meter their luminance.
-   The weighted mean of log2 light between the 30th and 85th percentiles (a black corner, the sun and the light
-   sources don't count); against the reference (noon outdoors, the metered value that gets 0 stops) the exposure makes up
-   45% of a darker scene's difference and 30% of a brighter one's, within -2 and +2 stops (partial adaptation: night and
-   caves come out readable but still darker than day). Followed on the GPU with no readback: toward a darker exposure
+   to 4 a little below its middle (leaning away from the sky). In lit mode it meters halfway between luminance and
+   light: a texel's luminance over the square root of its mean albedo luminance (alpha; sky and water count as 1), so a
+   dark forest canopy reads much closer to the plains under the same sun, while a sunset's bright sky still counts
+   (In game, below, for luminance alone and light alone). The weighted mean of the log2 values between the 30th and
+   85th percentiles (a black corner, the sun and the light sources don't count); against the reference (noon outdoors,
+   the metered value that gets 0 stops) the exposure makes up 20% of a darker scene's difference within 2.5 stops of it
+   and 70% past that, and 30% of a brighter one's, within -2 and +2 stops: daylight's own swings (dusk, shade, a
+   forest), which the sky's adaptation to the sun's height already covers, barely move it; night, caves and interiors
+   open up (partial adaptation: readable, still darker than day). Followed on the GPU with no readback: toward a darker exposure
    (into the light) with a time constant of 0.45 s, toward a brighter one (into the dark) with 2.2 s, so stepping out of
    a cave overexposes and blooms for a moment, then settles, and walking into one opens up over a couple of seconds.
    A camera jump (16 blocks in a frame: a teleport, a respawn, a lab `scene`) snaps it. In stops on top of the sky's own
@@ -1102,8 +1104,8 @@ frame), folded into the hand's pass like the copy it replaces (pass folding, Bac
    ways, from the sky's own colors and brightness. Faded out as the sun leaves the screen (fully gone a screen's width
    past its edge), below the horizon, behind the camera, in rain.
 4. **The tone curve** (`post_composite`, `METALMC_TONEMAP`): AgX by default (Sobotka's, as in Blender 4; the polynomial
-   fit and Rec.709 matrices of Wrensch's minimal version), with a look (power 1.15, saturation 1.3 on its sigmoid's
-   output, like its "punchy" look but milder): bright saturated light runs to white without the hue skews a
+   fit and Rec.709 matrices of Wrensch's minimal version), with a look (saturation 1.3 on its sigmoid's output, power
+   1: its "punchy" look's saturation without its contrast, which crushed dark scenes): bright saturated light runs to white without the hue skews a
    per-channel curve on the original primaries gives (a sunset's orange stays orange as it brightens). `aces` is
    Hill's fit of the RRT and ODT (more contrast, more saturated, exposure 1.6 to keep the mid-tones), `gt` Uchimura's,
    `legacy` the sky's shoulder (the look before post: with `legacy` and the effects off, post draws the frame as before).
@@ -1154,8 +1156,11 @@ curve). The log says every 1200 frames: "post: N frames; exposure +x stops (targ
     (session 2): noon read -0.95 against its reference of -1.0, the forest matched the plains, caves and night came up
     without crushing; but a sunset's land is lit dimly under a bright sky, so sunset_water got +1 stop (the sky washed
     pale, mean luma 141) and so did dusk offline. The default is halfway (luminance over the square root of albedo,
-    `POST_METER_LIGHT` 0.5), with the reference recalibrated to the midpoint (-1.9); see the offline numbers below. Not
-    yet seen in game.
+    `POST_METER_LIGHT` 0.5), with the reference at the midpoint (-1.9). Offline that still read the default view's dusk and
+    sunset 2.4-2.7 stops under noon, as the light meter did: at 60% partial adaptation they got +1.4 and +1.6 stops
+    (mean luma 158 and 148 against 87 and 82). Dusk is that much darker (a top under a sun 8 degrees up gets 14% of
+    noon's light) and the sky's own adaptation already gives some back, so the dark side now has two slopes: 20% within
+    2.5 stops of the reference, 70% past it (night, caves).
   - ACES (`METALMC_TONEMAP=aces`) tried live at sunset, noon and forest: more contrast, but it takes the sky around the
     setting sun to flat white where AgX keeps its gradient and color. AgX stays the default.
 
@@ -1179,7 +1184,7 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - The tone curves (`mmc_debug_post_curve`, litflow): at headroom 2, 4 and 8 every curve is the SDR one below the knee to
   the 4th decimal and reaches the headroom (AgX: 4 -> 0.84 in SDR, 1.24 at headroom 2, 2.04 at 4); AgX's outset matrix
   takes saturated highlights a little past 1 (the check flagged it), now clamped to the headroom.
-OFFLINE_METER
+FINAL_CHECK
 
 ### Not done, and next
 

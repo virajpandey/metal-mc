@@ -77,8 +77,8 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 
 // Eye adaptation: the histogram's range (log2), the percentiles its mean is taken between, the darkest albedo lit
 // terrain's light is worked out with and how far the meter goes from luminance (0) toward light (1, luminance over
-// albedo), the reference (the metered log2 value that gets 0 stops: noon outdoors), how much of a darker or brighter scene's difference the exposure makes up,
-// its limits in stops, and how fast it follows (seconds: up, into the dark; down, into the light).
+// albedo), the reference (the metered log2 value that gets 0 stops: noon outdoors), how much of a darker scene's
+// difference the exposure makes up within the knee and past it, and of a brighter one's, its limits in stops, and how fast it follows (seconds: up, into the dark; down, into the light).
 #define POST_BINS 128
 #define POST_LOG_MIN (-14.0)
 #define POST_LOG_MAX 10.0
@@ -87,7 +87,9 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_METER_ALBEDO 0.04
 #define POST_METER_LIGHT 0.5
 #define POST_ADAPT_REF (\(litEnabled ? "-1.9" : "-2.1"))
-#define POST_ADAPT_DARK 0.6
+#define POST_ADAPT_KNEE 2.5
+#define POST_ADAPT_DARK_NEAR 0.2
+#define POST_ADAPT_DARK 0.7
 #define POST_ADAPT_BRIGHT 0.3
 #define POST_EV_MIN (-2.0)
 #define POST_EV_MAX 2.0
@@ -295,7 +297,11 @@ kernel void post_exposure(device atomic_uint* hist [[buffer(0)]], device float4*
     }
     float metered = wsum > 0.0 ? sum / wsum : POST_ADAPT_REF;
     float d = POST_ADAPT_REF - metered;   // > 0: darker than the reference
-    float target = f.adapt.z > 0.5 ? clamp(d * (d > 0.0 ? POST_ADAPT_DARK : POST_ADAPT_BRIGHT), POST_EV_MIN, POST_EV_MAX) : 0.0;
+    // Darker: little within POST_ADAPT_KNEE stops of the reference (daylight's own swings, which the sky's adaptation to
+    // the sun's height already covers: dusk, shade, a forest), more past it (night, caves, interiors).
+    float response = d > 0.0 ? POST_ADAPT_DARK_NEAR * min(d, POST_ADAPT_KNEE) + POST_ADAPT_DARK * max(d - POST_ADAPT_KNEE, 0.0)
+                             : POST_ADAPT_BRIGHT * d;
+    float target = f.adapt.z > 0.5 ? clamp(response, POST_EV_MIN, POST_EV_MAX) : 0.0;
     float4 e = expo[0];
     float ev = target;
     if (f.adapt.y < 0.5 && e.w > 0.5 && isfinite(e.x)) {
