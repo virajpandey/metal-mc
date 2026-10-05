@@ -123,7 +123,7 @@ def record(label, log_path, fixture, start, far, args):
         "screenshots": shots,
         "window": window,
         "exit": int(exit_m[-1]) if exit_m else None,
-        "errors": len(re.findall(r"Exception|GPU error", log)),
+        "errors": sum(1 for line in log.splitlines() if re.search(r"Exception|GPU error", line) and not re.search(r"Realms|SignedJWT", line)),
         "log": log_path,
     }
     entry.update(flags)

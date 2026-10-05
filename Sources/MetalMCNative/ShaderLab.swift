@@ -198,7 +198,7 @@ private final class ShaderLabFiles: @unchecked Sendable {
                 }
                 return lib
             } catch {
-                if !known { report(name, error) }
+                if !known { report([name], (error as NSError).localizedDescription) }
                 lock.lock(); v.badText = text; lock.unlock()
                 if let last { return last }
                 note("\(name): the built-in source until \(name).metal compiles")
@@ -244,7 +244,8 @@ private final class ShaderLabFiles: @unchecked Sendable {
     }
 
     /// The watcher (its queue): recompiles the libraries whose files changed (all of them with `force`) and queues their
-    /// reloads. Returns how many compiled and which failed.
+    /// reloads, all of one poll's together (an edit to a header reloads every library that has it in the same frame, and
+    /// none of them is left for the render thread to compile). Returns how many compiled and which failed.
     @discardableResult
     private func poll(force: Bool) -> (ok: Int, failed: [String]) {
         lock.lock()
@@ -252,6 +253,16 @@ private final class ShaderLabFiles: @unchecked Sendable {
         lock.unlock()
         var ok = 0
         var failed: [String] = []
+        var batch: [(Variant, MTLLibrary)] = []
+        var errors: [(text: String, names: [String])] = []   // an error once, with every library it broke
+        defer {
+            for e in errors { report(e.names, e.text) }
+            if !batch.isEmpty {
+                lock.lock(); pending.append(contentsOf: batch); lock.unlock()
+                note("reloading " + batch.map { $0.0.name }.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+                    .joined(separator: ", ") + " next frame")
+            }
+        }
         var stampCache: [String: Stamp] = [:]
         for v in all {
             lock.lock()
@@ -281,11 +292,19 @@ private final class ShaderLabFiles: @unchecked Sendable {
                         continue
                     }
                 }
-                lock.lock(); v.lib = lib; v.text = text; v.badText = ""; pending.append((v, lib)); lock.unlock()
+                lock.lock(); v.lib = lib; v.text = text; v.badText = ""; lock.unlock()
+                batch.append((v, lib))
                 ok += 1
-                note("\(v.name).metal compiled in \((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) ms; reloading next frame")
+                note("\(v.name).metal compiled in \((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) ms")
             } catch {
-                if force || text != bad0 { report(v.name, error) }
+                if force || text != bad0 {
+                    let message = (error as NSError).localizedDescription
+                    if let i = errors.firstIndex(where: { $0.text == message }) {
+                        if !errors[i].names.contains(v.name) { errors[i].names.append(v.name) }
+                    } else {
+                        errors.append((message, [v.name]))
+                    }
+                }
                 lock.lock(); v.badText = text; lock.unlock()
                 failed.append(v.name)
             }
@@ -294,12 +313,12 @@ private final class ShaderLabFiles: @unchecked Sendable {
     }
 
     /// A compile error, with the file and line of each error (from the #line directives).
-    private func report(_ name: String, _ error: Error) {
-        let lines = (error as NSError).localizedDescription.split(separator: "\n").map(String.init)
+    private func report(_ names: [String], _ message: String) {
+        let lines = message.split(separator: "\n").map(String.init)
         let errors = lines.filter { $0.contains("error:") }
         let shown = (errors.isEmpty ? lines : errors).prefix(12).map { "  " + $0 }
-        note("\(name).metal failed to compile; the old pipelines keep running:\n" + shown.joined(separator: "\n")
-             + (errors.count > 12 ? "\n  (\(errors.count - 12) more errors)" : ""))
+        note(names.map { $0 + ".metal" }.joined(separator: ", ") + " failed to compile; the old pipelines keep running:\n"
+             + shown.joined(separator: "\n") + (errors.count > 12 ? "\n  (\(errors.count - 12) more errors)" : ""))
     }
 
     private static func stamp(_ path: String) -> Stamp {

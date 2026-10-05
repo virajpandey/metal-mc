@@ -4,8 +4,8 @@
   "scenes": [
     {
       "name": "noon_overview",
-      "pos": [8, 190, 8], "yaw": 281.5, "pitch": 12, "time": 6000, "weather": "clear",
-      "note": "120 blocks over the plains at the world's center (ground 65-98), looking east-northeast at the frozen peaks 1.1 km away (1108 184 232, the highest terrain in the fixture); the LOD and the far field fill the rest."
+      "pos": [8, 165, 8], "yaw": 281.5, "pitch": 12, "time": 6000, "weather": "clear",
+      "note": "95 blocks over the plains at the world's center (ground 65-98; below the clouds at 192, which a camera at 190 sees as a white slab), looking east-northeast over the river plains at the frozen peaks 1.1 km away (1108 184 232, the highest terrain in the fixture); the LOD and the far field fill the rest."
     },
     {
       "name": "night_torches",
@@ -15,18 +15,18 @@
     },
     {
       "name": "rain",
-      "pos": [60, 66, 150], "yaw": 116.5, "pitch": 6, "time": 6000, "weather": "rain",
+      "pos": [20, 70, 178], "yaw": 160, "pitch": 12, "time": 6000, "weather": "rain",
       "settle": 160,
-      "note": "Noon rain in the same village, from street height east of the bell, looking west-northwest at the houses. Rain takes about 5 s to fade in, hence the longer settle."
+      "note": "Noon rain over the same village from its southwest edge, 8 blocks up, looking north-northwest past an animal pen at the houses and the river behind them. Rain takes about 5 s to fade in, hence the longer settle."
     },
     {
       "name": "forest",
-      "pos": [-30, 77, 350], "yaw": 146, "pitch": 5, "time": 3000, "weather": "clear",
-      "note": "Standing on the floor of the oak and birch forest 350 blocks south of spawn (ground 76 here; canopy 86-90 with leaf litter under it), mid-morning sun from the east, looking northwest into the trees."
+      "pos": [-12, 92, 372], "yaw": 125, "pitch": 18, "time": 3000, "weather": "clear",
+      "note": "Just over the canopy of the oak and birch forest 370 blocks south of spawn (ground 63-85, canopy 75-96), looking west-northwest across it and up the wooded hills, mid-morning sun from behind. At ground level here the view is a wall of leaves and dirt a few blocks off."
     },
     {
       "name": "torch_cave",
-      "pos": [134, 17, -52], "yaw": 90, "pitch": 14, "time": 6000, "weather": "clear",
+      "pos": [134, 17, -52], "yaw": 90, "pitch": 5, "time": 6000, "weather": "clear",
       "setup": [
         "setblock 130 12 -52 minecraft:torch", "setblock 126 9 -52 minecraft:torch", "setblock 122 6 -56 minecraft:torch",
         "setblock 120 9 -52 minecraft:torch", "setblock 116 13 -50 minecraft:torch", "setblock 118 7 -58 minecraft:torch",
@@ -54,8 +54,8 @@
     },
     {
       "name": "mountain_view",
-      "pos": [1108, 192, 232], "yaw": 90, "pitch": 6, "time": 7000, "weather": "clear",
-      "note": "8 blocks over the summit of the frozen peaks 1.1 km east of spawn (the fixture's highest point, 184), looking west across the whole fixture toward the horizon: a long view for the LOD, the far field and the aerial perspective."
+      "pos": [1108, 188, 232], "yaw": 90, "pitch": 6, "time": 7000, "weather": "clear",
+      "note": "4 blocks over the summit of the frozen peaks 1.1 km east of spawn (the fixture's highest point, 184; the clouds start at 192), looking west across the whole fixture toward the horizon: a long view for the LOD, the far field and the aerial perspective."
     }
   ]
 }

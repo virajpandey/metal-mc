@@ -24,8 +24,9 @@ import java.util.Map;
 
 /**
  * Lab mode (-PbenchLab=1, tools/bench/lab.sh; docs/lab-mode.md): once the world has loaded the game stays up and runs the
- * commands appended to run/metalmc-control.txt, one at a time, taking each line off the file as it starts it. Results go
- * to run/metalmc-control.log and the game log ([metalmc-lab]). Lines starting with # are skipped.
+ * commands appended to run/metalmc-control.txt, one at a time. Each tick it takes the file's lines into its queue (the
+ * file empties; run/metalmc-control.pending lists what hasn't started). Results go to run/metalmc-control.log and the game
+ * log ([metalmc-lab]). Lines starting with # are skipped.
  * <pre>
  *   scene NAME        go to a scene of tools/bench/scenes.json (pose, time of day, weather, setup commands) and wait until
  *                     the terrain around it has loaded and the LOD has settled
@@ -45,15 +46,18 @@ final class Lab {
     private static final Path SCENES = Path.of(System.getProperty("metalmc.lab.scenes", "../../tools/bench/scenes.json"));
     private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
-    private static Path file, log;
+    private static Path file, log, pendingFile;
     /** Commands made by other commands (tour), run before the file's. */
     private static final ArrayDeque<String> front = new ArrayDeque<>();
+    /** Lines taken from the control file and not run yet (listed in run/metalmc-control.pending). */
+    private static final ArrayDeque<String> inbox = new ArrayDeque<>();
+    /** The control file as it was taken (renamed away whole), read a tick later. */
+    private static Path taken;
     /** The command in progress (one that takes ticks), its number and text. */
     private static Running current;
     private static int count;
     /** The pose held every tick (scene, tp), until `free`. */
     private static double[] hold;
-    private static byte[] partial;
     private static boolean quit;
 
     /** A command that takes ticks: tick() returns its result once done, null until then. */
@@ -69,6 +73,7 @@ final class Lab {
         Path dir = mc.gameDirectory.toPath();
         file = dir.resolve("metalmc-control.txt");
         log = dir.resolve("metalmc-control.log");
+        pendingFile = dir.resolve("metalmc-control.pending");
         server(mc, "gamerule advance_time false", "gamerule advance_weather false", "gamerule spawn_mobs false");
         if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();   // F1: no HUD, no hand in the pictures
         String shaders = System.getenv("METALMC_SHADERDIR");
@@ -81,6 +86,7 @@ final class Lab {
     static boolean onTick(Minecraft mc, LocalPlayer player) {
         if (hold != null) place(player, hold);
         if (quit) return true;
+        take();
         for (int i = 0; i < 32; i++) {   // commands that finish at once run back to back
             if (current != null) {
                 String result;
@@ -132,6 +138,7 @@ final class Lab {
                     lines.add("shot " + prefix + "-" + name);
                 }
                 for (int i = lines.size() - 1; i >= 0; i--) front.addFirst(lines.get(i));
+                pending();
                 return "ok: " + scenes.size() + " scenes queued";
             }
             case "time": server(mc, "time set " + Integer.parseInt(arg)); return "ok";
@@ -168,8 +175,11 @@ final class Lab {
         JsonObject s = scenes.get(name);
         if (s == null) return "error: no scene " + name + " (" + String.join(" ", scenes.keySet()) + ")";
         JsonArray pos = s.getAsJsonArray("pos");
+        double fromX = mc.player == null ? 0 : mc.player.getX(), fromZ = mc.player == null ? 0 : mc.player.getZ();
         hold = new double[]{pos.get(0).getAsDouble(), pos.get(1).getAsDouble(), pos.get(2).getAsDouble(),
             s.has("yaw") ? s.get("yaw").getAsDouble() : 0, s.has("pitch") ? s.get("pitch").getAsDouble() : 0};
+        // A jump past a LOD node or two: the LOD's update passes (every 2 s) have to move it before it counts as settled.
+        boolean far = Math.hypot(hold[0] - fromX, hold[2] - fromZ) > 256;
         int time = s.has("time") ? s.get("time").getAsInt() : 6000;
         String weather = s.has("weather") ? s.get("weather").getAsString() : "clear";
         var cmds = new java.util.ArrayList<String>();
@@ -180,12 +190,13 @@ final class Lab {
         server(mc, cmds.toArray(new String[0]));
         if (s.has("fov")) mc.options.fov().set(s.get("fov").getAsInt());
         // Settled: at least `settle` ticks (rain takes about 5 s to fade in; the GI cache and the anti-aliasing's history a
-        // few seconds to converge), the LOD's quad count steady for 2 s, and vanilla's sections around the camera compiled
-        // (or 5 s more: with our near chunks vanilla's count may never say so). At most a minute.
+        // few seconds to converge); the LOD built and its quad count steady for 3 s (after a far jump, only once it has
+        // changed: it can hold still for the 2 s before its first update pass; or after 20 s); and vanilla's sections
+        // around the camera compiled (or 5 s more: with our near chunks vanilla's count may never say so). At most a minute.
         int min = s.has("settle") ? s.get("settle").getAsInt() : 100, max = Math.max(min, 1200);
         String what = String.format(Locale.ROOT, "%.1f %.1f %.1f yaw %.1f pitch %.1f, time %d, %s", hold[0], hold[1], hold[2],
             hold[3], hold[4], time, weather);
-        int[] t = {0, 0};
+        int[] t = {0, 0, 0};   // ticks, ticks the quad count held, times it changed
         long[] lastQuads = {-1};
         current = m -> {
             t[0]++;
@@ -193,9 +204,14 @@ final class Lab {
             boolean lod = true;
             if (metalmc.lod.Lod.ENABLED && metalmc.backend.MetalLod.available()) {
                 long q = metalmc.backend.MetalLod.status()[2];
-                t[1] = q == lastQuads[0] ? t[1] + 1 : 0;
+                if (lastQuads[0] >= 0 && q != lastQuads[0]) {
+                    t[1] = 0;
+                    t[2]++;
+                } else {
+                    t[1]++;
+                }
                 lastQuads[0] = q;
-                lod = metalmc.lod.Lod.built() && t[1] >= 40;
+                lod = metalmc.lod.Lod.built() && t[1] >= 60 && (!far || t[2] > 0 || t[0] >= 400);
             }
             if (t[0] >= min && lod && (terrain || t[0] >= min + 100)) {
                 return "ok: " + what + "; settled in " + t[0] + " ticks" + (terrain ? "" : " (vanilla's sections still compiling)");
@@ -269,41 +285,50 @@ final class Lab {
         });
     }
 
-    /** The next command: one made by another command, or the control file's first line (taken off the file). */
+    /** The next command: one made by another command, or the control file's next line. */
     private static String next() {
-        if (!front.isEmpty()) return front.pollFirst();
+        String s = !front.isEmpty() ? front.pollFirst() : inbox.pollFirst();
+        if (s != null) pending();
+        return s;
+    }
+
+    /**
+     * Every tick: takes the control file's lines into the queue without ever rewriting the file. The file is renamed away
+     * whole and read a tick later: an `echo ... >>` that opened it before the rename writes into the renamed file, and
+     * those writes have landed by then; one that opens it after creates a new file, taken next time. (Rewriting the file
+     * to drop the line just run lost lines appended at the same moment: three of seventeen, appended in a loop.)
+     */
+    private static void take() {
         try {
-            while (true) {
-                if (!Files.exists(file) || Files.size(file) == 0) return null;
-                byte[] b = Files.readAllBytes(file);
-                int nl = indexOf(b, (byte) '\n');
-                if (nl < 0) {
-                    // A last line without its newline: a writer may be in the middle of it; take it once it stays a tick.
-                    if (!Arrays.equals(b, partial)) {
-                        partial = b;
-                        return null;
-                    }
-                    nl = b.length;
+            if (taken != null) {
+                for (String l : Files.readAllLines(taken, StandardCharsets.UTF_8)) {
+                    String s = l.strip();
+                    if (!s.isEmpty() && !s.startsWith("#")) inbox.add(s);
                 }
-                partial = null;
-                String line = new String(b, 0, nl, StandardCharsets.UTF_8).strip();
-                // The rest, with whatever was appended since the read, replaces the file.
-                byte[] now = Files.readAllBytes(file);
-                if (now.length < b.length || !Arrays.equals(Arrays.copyOf(now, b.length), b)) return null;   // rewritten: next tick
-                Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-                Files.write(tmp, Arrays.copyOfRange(now, Math.min(now.length, nl + 1), now.length));
-                Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                if (!line.isEmpty() && !line.startsWith("#")) return line;
+                Files.deleteIfExists(taken);
+                taken = null;
+                pending();
+            }
+            if (Files.exists(file) && Files.size(file) > 0) {
+                Path t = file.resolveSibling(file.getFileName() + ".taken");
+                Files.move(file, t, StandardCopyOption.ATOMIC_MOVE);
+                taken = t;
             }
         } catch (IOException e) {
             say("control file " + file + ": " + e);
-            return null;
         }
     }
 
-    private static int indexOf(byte[] b, byte v) {
-        for (int i = 0; i < b.length; i++) if (b[i] == v) return i;
-        return -1;
+    /** run/metalmc-control.pending: the commands queued and not started yet, in order. */
+    private static void pending() {
+        StringBuilder b = new StringBuilder();
+        for (String s : front) b.append(s).append('\n');
+        for (String s : inbox) b.append(s).append('\n');
+        try {
+            Files.writeString(pendingFile, b.toString(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            say("can't write " + pendingFile + ": " + e);
+        }
     }
 
     private static void done(Command c, String result) {
