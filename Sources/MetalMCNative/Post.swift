@@ -73,7 +73,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_BLOOM_SHAPE 1.0
 #define POST_BLOOM_LIGHTS 6.0
 #define POST_LIGHT_LEVEL 222u
-#define POST_FIREFLY 64.0
+#define POST_FIREFLY 256.0
 
 // Eye adaptation: the histogram's range (log2 of scene luminance), the percentiles its mean is taken between, the
 // reference (the metered log2 luminance that gets 0 stops: noon outdoors), how much of a darker or brighter scene's
@@ -93,10 +93,12 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_TAU_DOWN 0.45
 #define POST_EV \(postFloat(postEvDefault))
 
-// Light shafts: strength over terrain and clouds, how much the sky darkens in their shadows, taps per pass, the decay
-// per tap along the line (of the 144 the two passes take).
+// Light shafts: strength over terrain and clouds, how much the sky darkens in their shadows, the distance (blocks) over
+// which the air in front of a surface builds up to the shafts' full haze, taps per pass, the decay per tap along the
+// line (of the 144 the two passes take).
 #define POST_SHAFTS \(postFloat(postShaftsDefault))
 #define POST_SHAFT_SHADOW 0.35
+#define POST_SHAFT_DEPTH 192.0
 #define POST_SHAFT_TAPS 12
 #define POST_SHAFT_DECAY 0.994
 
@@ -292,10 +294,12 @@ kernel void post_exposure(device atomic_uint* hist [[buffer(0)]], device float4*
 
 // --------------------------------------------------------------------------------------------------------- light shafts
 
-// The share of each quarter-resolution texel's 4 x 4 pixels that are sky (reverse-Z: depth 0). Vanilla's clouds write
-// depth, so they shadow the air like terrain does.
+// Each quarter-resolution texel's 4 x 4 pixels: r the share that is sky (reverse-Z: depth 0; vanilla's clouds write
+// depth, so they shadow the air like terrain does), g how much air there is in front of the rest (1 - exp(-distance /
+// POST_SHAFT_DEPTH) at their mean depth: the haze the shafts light builds up with distance, so a tree nearby gets
+// little of it and a ridge a few hundred blocks off nearly all).
 kernel void post_shaft_mask(depth2d<float> depth [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
-                            uint2 gid [[thread_position_in_grid]]) {
+                            constant PostFrame& f [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
     float2 inv = 1.0 / float2(depth.get_width(), depth.get_height());
@@ -303,7 +307,15 @@ kernel void post_shaft_mask(depth2d<float> depth [[texture(0)]], texture2d<float
     float4 a = depth.gather(s, (c + float2(-1.0, -1.0)) * inv), b = depth.gather(s, (c + float2(1.0, -1.0)) * inv);
     float4 d = depth.gather(s, (c + float2(-1.0, 1.0)) * inv), e = depth.gather(s, (c + float2(1.0, 1.0)) * inv);
     float4 sky = float4(a <= 0.0) + float4(b <= 0.0) + float4(d <= 0.0) + float4(e <= 0.0);
-    dst.write(float4(dot(sky, float4(1.0)) / 16.0), gid);
+    float n = dot(sky, float4(1.0));
+    float solid = 16.0 - n;
+    float air = 1.0;
+    if (solid > 0.5) {
+        float mean = dot(a + b + d + e, float4(1.0)) / solid;   // the sky's depths are 0
+        float4 h = f.invViewProj * float4(c * inv * 2.0 - 1.0, mean, 1.0);
+        air = 1.0 - exp(-length(h.xyz / h.w) / POST_SHAFT_DEPTH);
+    }
+    dst.write(float4(n / 16.0, air, 0.0, 0.0), gid);
 }
 
 // One pass of the radial blur toward the sun (after Mitchell, "Volumetric Light Scattering as a Post-Process", GPU Gems
@@ -340,8 +352,9 @@ kernel void post_shaft_color(texture2d<float, access::read> blurred [[texture(0)
     float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());
     float4 h = f.invViewProj * float4(uv * 2.0 - 1.0, 1.0, 1.0);
     float3 dir = normalize(h.xyz / h.w);
-    float open = blurred.read(gid).r, self = mask.read(gid).r;
-    float share = POST_SHAFTS * open * (1.0 - self) - POST_SHAFT_SHADOW * (1.0 - open) * self;
+    float open = blurred.read(gid).r;
+    float2 m = mask.read(gid).rg;   // the sky's share, the air in front of the rest
+    float share = POST_SHAFTS * open * m.y * (1.0 - m.x) - POST_SHAFT_SHADOW * (1.0 - open) * m.x;
     dst.write(float4(skyLuminance(sky, dir, skyView) * (share * f.sun.w), 1.0), gid);
 }
 
@@ -607,7 +620,7 @@ final class Post: @unchecked Sendable {
             }
         }
         let qw = (width + 3) / 4, qh = (height + 3) / 4
-        guard let m = tex(.r16Float, qw, qh, "MetalMC post shaft mask"), let t = tex(.r16Float, qw, qh, "MetalMC post shaft blur 1"),
+        guard let m = tex(.rg16Float, qw, qh, "MetalMC post shaft mask"), let t = tex(.r16Float, qw, qh, "MetalMC post shaft blur 1"),
               let b = tex(.r16Float, qw, qh, "MetalMC post shaft blur 2"), let c = tex(.rgba16Float, qw, qh, "MetalMC post shafts"),
               let o = tex(.rgba16Float, width, height, "MetalMC post output") else { return false }
         down = downs; up = ups
@@ -750,9 +763,9 @@ final class Post: @unchecked Sendable {
             enc.setComputePipelineState(maskPipe)
             enc.setTexture(depth, index: 0)
             enc.setTexture(shaftMask, index: 1)
+            enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 0)
             enc.dispatchThreads(grid(shaftMask), threadsPerThreadgroup: tg)
             enc.setComputePipelineState(blurPipe)
-            enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 0)
             var p1 = SIMD4<Float>(0, 0, 0, 0), p2 = SIMD4<Float>(1, 0, 0, 0)
             enc.setTexture(shaftMask, index: 0)
             enc.setTexture(shaftTemp, index: 1)

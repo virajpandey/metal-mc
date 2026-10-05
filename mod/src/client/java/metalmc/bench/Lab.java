@@ -36,7 +36,8 @@ import java.util.Map;
  *   tour [PREFIX]     scene + shot for every scene: PREFIX-NAME.png (PREFIX: tour)
  *   quit              stop the game
  *   time TICKS, weather clear|rain|thunder, tp X Y Z [YAW PITCH], free (stop holding the pose), cmd COMMAND (any server
- *   command), hud on|off, fov DEGREES, status, scenes, echo TEXT
+ *   command), hud on|off, fov DEGREES, status, scenes, echo TEXT, trace [N] (per-pass GPU times of the next N frames into
+ *   the game log: tools/bench/passes.py)
  * </pre>
  */
 final class Lab {
@@ -164,8 +165,10 @@ final class Lab {
                 return scenes == null ? "error: no scenes file at " + SCENES : String.join(" ", scenes.keySet());
             }
             case "status": return status(mc, player);
+            // Per-pass GPU timestamps of the next N frames (3) into the game log, for tools/bench/passes.py.
+            case "trace": metalmc.backend.MetalStats.traceFrames(arg.isEmpty() ? 3 : Integer.parseInt(arg)); return "ok";
             case "quit": quit = true; mc.stop(); return "ok";
-            default: return "error: unknown command (scene, shot, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo)";
+            default: return "error: unknown command (scene, shot, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo, trace)";
         }
     }
 
