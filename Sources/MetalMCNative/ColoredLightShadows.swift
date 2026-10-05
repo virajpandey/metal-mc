@@ -121,10 +121,11 @@ kernel void cl_shadow(instance_acceleration_structure accel [[buffer(0)]],
         ls = bl;
     }
     // The ray, from just off the surface toward a point in the middle of the light's cell, stopped where it enters the cell.
-    float3 o = pos + n * (0.03 + length(pos) * 0.0008);
+    // (Farther off the surface than the sun's rays: these often run along the wall they start from, toward a light on it.)
+    float3 o = pos + n * (0.1 + length(pos) * 0.001);
     float3 lo = float3(s) - p.camVol.xyz;
     float3 jitter = float3(clsRand(fp, p.sample.w, 1u), clsRand(fp, p.sample.w, 2u), clsRand(fp, p.sample.w, 3u)) - 0.5;
-    float3 dir = lo + 0.5 + jitter * 0.5 - o;
+    float3 dir = lo + 0.5 + jitter * 0.3 - o;
     float dist = length(dir);
     if (dist < 1e-3) { out.write(half4(1.0h), gid); return; }
     dir /= dist;

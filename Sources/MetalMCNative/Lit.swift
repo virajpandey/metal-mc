@@ -121,7 +121,7 @@ private let litGiRelightArgsDoc = litGi ? """
 private let litGiRelightArgs = litGi ? ", texture2d<float> giStandIn, texture2d<uint> gi" : ""
 /// With colored block light (clEnabled only; ColoredLight.swift): litRelightPixel's extra arguments, the volume's two
 /// textures and frame, and its block light in place of the lightmap's.
-private let litClRelightArgs = clEnabled ? ", texture3d<float> clRGB, texture3d<float> clAux, constant ClFrame& clf, texture2d<half, access::read> clSh" : ""
+private let litClRelightArgs = clEnabled ? ", texture3d<float> clRGB, texture3d<float> clAux, constant ClFrame& clf, texture2d<half> clSh" : ""
 private let litClBlockLight = clEnabled ? """
 
         // Colored block light (ColoredLight.swift): the light volume in place of the lightmap, checked against vanilla's level.
@@ -510,7 +510,7 @@ fragment float4 lit_relight_fs(LitVOut in [[stage_in]], float4 dst [[color(0)]],
                                texture2d<half, access::read> vis [[texture(2)]],
                                texture2d<float> lightmap [[texture(3)]],\(litGi ? "\n                               texture2d<float> giStandIn [[texture(4)]],\n                               texture2d<uint> gi [[texture(5)]]," : "")
                                constant LitFrame& f [[buffer(0)]],
-                               constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]]" : "")\(clEnabled ? ",\n                               texture3d<float> clRGB [[texture(8)]],\n                               texture3d<float> clAux [[texture(9)]],\n                               constant ClFrame& clf [[buffer(2)]],\n                               texture2d<half, access::read> clSh [[texture(10)]]" : "")) {
+                               constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]]" : "")\(clEnabled ? ",\n                               texture3d<float> clRGB [[texture(8)]],\n                               texture3d<float> clAux [[texture(9)]],\n                               constant ClFrame& clf [[buffer(2)]],\n                               texture2d<half> clSh [[texture(10)]]" : "")) {
     uint2 q = uint2(in.pos.xy);
     uint2 g = gbuf.read(q).rg;
     if ((g.x >> 29) == 0u && f.misc.z == 0.0\(litWater ? " && !litIsWater(g)" : "")) return dst;

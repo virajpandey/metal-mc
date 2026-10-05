@@ -536,7 +536,7 @@ static float clNoise(float x) {
 // view, 0 where something is in the way, one sample per scale x scale pixels that the anti-aliasing accumulates) and the
 // pixel; the colored light (not vanilla's make-up) is scaled by 1 - strength where it's shadowed.
 static float3 clBlockLight(float3 vanilla, float3 ambient, float level, float3 rel, uint fi, float3 n, constant ClFrame& c,
-                           texture3d<float> rgbVol, texture3d<float> auxVol, texture2d<half, access::read> shTex, uint2 q2,
+                           texture3d<float> rgbVol, texture3d<float> auxVol, texture2d<half> shTex, uint2 q2,
                            thread float4& dbg, uint view) {
     if (c.camTex.w <= 0.0 || (level < 0.01 && view == 0u)) return vanilla;
     float3 off = fi < 6u ? n * 0.5 : float3(0.0);
@@ -564,8 +564,10 @@ static float3 clBlockLight(float3 vanilla, float3 ambient, float level, float3 r
     float r = cv > 1e-3 ? clamp(dot(vb, float3(0.2126, 0.7152, 0.0722)) / cv, 0.5, 2.0) : 1.0;
     float sh = 1.0;
     if (c.shadow.z > 0.5) {
-        uint ss = uint(c.shadow.y);
-        sh = 1.0 - c.shadow.x * (1.0 - float(shTex.read(min(q2 / ss, uint2(shTex.get_width() - 1, shTex.get_height() - 1))).r));
+        // Bilinear between the traced samples (one per scale x scale pixels), so their blocks don't show.
+        constexpr sampler ls(filter::linear, address::clamp_to_edge);
+        float2 uv = (float2(q2) + 0.5) / (c.shadow.y * float2(shTex.get_width(), shTex.get_height()));
+        sh = 1.0 - c.shadow.x * (1.0 - float(shTex.sample(ls, uv, level(0.0)).r));
     }
     float3 colored = ambient + rgb * (k * c.tune.x * r * sh) + vb * fill;
     dbg = float4(k < 0.98 ? 0.9 : 0.0, m * k > 1e-4 ? 0.8 : 0.0, fill * 0.9, 1.0);
