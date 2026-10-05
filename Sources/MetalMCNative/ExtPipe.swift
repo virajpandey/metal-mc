@@ -151,6 +151,9 @@ struct ExtDesc: Decodable {
         let depth: String
         let depthCopies: [DepthCopy]?
         let routes: [Route]
+        /// The first-person hand into the G-buffer (Java's ExtHand submits it with the level's features, so it's drawn before
+        /// the deferred passes and its draws go through `routes`; vanilla's own hand pass is skipped).
+        let hand: Bool?
         let samplers: [String: Sampler]?    // game texture name -> the sampler the routed programs get instead of vanilla's
     }
     struct Pass: Decodable {
@@ -1834,6 +1837,13 @@ public func mmc_ext_translucent() -> Int32 {
 public func mmc_ext_debug_view(_ name: UnsafePointer<CChar>, _ scale: Float) {
     let n = String(cString: name)
     ExtPipe.view = n.isEmpty ? nil : (n, scale)
+}
+
+/// 1 if the description wants the first-person hand in its G-buffer this frame (`gbuffers.hand`).
+@_cdecl("mmc_ext_hand")
+public func mmc_ext_hand() -> Int32 {
+    guard let p = ExtPipe.shared else { return 0 }
+    return p.frameActive && (p.desc.gbuffers.hand ?? false) ? 1 : 0
 }
 
 /// The level is done (safety net for frames whose main pass never came).

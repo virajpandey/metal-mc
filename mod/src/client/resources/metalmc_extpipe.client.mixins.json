@@ -5,6 +5,7 @@
 	"client": [
 		"BufferBuilderExtMixin",
 		"FrustumExtMixin",
+		"GameRendererExtMixin",
 		"LevelRendererExtMixin",
 		"SectionCompilerExtMixin",
 		"SkyRendererExtMixin"

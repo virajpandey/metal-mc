@@ -41,7 +41,7 @@ offline. No pack's code, shaders or constants live here: a description and its M
    geometry; Java re-applies the pass's pipeline and uniforms. (With improved transparency there's no such point: the
    deferred passes run at the end of the main pass, after the translucent geometry.)
 4. **Composite and final** (the main pass ends): the `composite` passes, then `final`, whose `screen` output is vanilla's
-   main color target. Vanilla's later passes (outlines, the hand, the GUI) draw over it as usual.
+   main color target. Vanilla's later passes (outlines, the hand unless `hand` took it, the GUI) draw over it as usual.
 
 ## The shadow pass (`shadow` in the description)
 
@@ -69,6 +69,16 @@ A pack's shadow pass that voxelizes geometry (e.g. by moving each triangle's cor
 the tangent and bitangent) depends on OptiFine's `at_tangent.w`: `cross(at_tangent.xyz, normal) * w` is the direction of
 increasing v. With the other sign the corners leave the face, faces land in the wrong voxel or none, and GI rays start
 inside solid voxels (black faces).
+
+## The first-person hand (`gbuffers.hand`)
+
+OptiFine-style packs draw the hand in their G-buffer before the deferred passes (gbuffers_hand); vanilla draws it in a
+pass of its own after the level, which here is after the final pass. With `"hand": true` in `gbuffers`, Java
+(`metalmc.extpipe.ExtHand`) submits the hands and held items with the level's own features, just before the level
+prepares them, so they're drawn in the G-buffer pass before the deferred passes, and skips vanilla's own hand pass that
+frame. (The level's feature frame is in use for the whole main pass: the hand can't have a frame of its own inside it.)
+Its draws go through `routes` like other entities and items, with the level's projection and view bobbing rather than
+the hand's own field of view. Nothing changes without the flag, with the HUD hidden, or in third person.
 
 ## Our LOD in the G-buffer (`lod` in the description)
 
@@ -103,7 +113,7 @@ history: they carry their latest copy into the next frame.
 | `customTextures` | `{stage, name, file?\|game?}` (PNG relative to the description, or `minecraft:textures/atlas/blocks.png`) |
 | `constantTextures` | `{name, value: [r,g,b,a]}` (1x1, e.g. default normal and specular maps) |
 | `programs` | name -> `{vertex, vertexEntry, fragment?, fragmentEntry?, outputs, attributes?, vanillaBuffers?, blend?, mathMode?}` |
-| `gbuffers` | `{attachments, depth, depthCopies: [{when: translucent\|end, target}], routes: [{pipeline, program?, alphaTest?, renderStage?, entityId?}], samplers?}` |
+| `gbuffers` | `{attachments, depth, depthCopies: [{when: translucent\|end, target}], routes: [{pipeline, program?, alphaTest?, renderStage?, entityId?}], hand?, samplers?}` |
 | `passes` | `[{stage, program, mipsBefore?, flipAfter?, enabled?}]` in order |
 | `shadow` | `{program, colors, depth, depthCopy?, expand?, paramsBuffer?, routes, translucentRoutes?, alphaTest?, renderStage?, enabled?}` (above) |
 | `lod` | `{program, seamFragmentEntry?}`: our LOD's quads in the G-buffer (above) |

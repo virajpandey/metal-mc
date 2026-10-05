@@ -4,9 +4,11 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import metalmc.backend.MetalExtPipe;
+import metalmc.extpipe.ExtHand;
 import metalmc.lod.Lod;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.SubmitNodeStorage;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlas;
@@ -23,7 +25,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * The external pipeline (METALMC_EXTPIPE, metalmc.backend.MetalExtPipe) in the level: its frame starts with the level
  * (the standard uniforms), the main pass ("Main" in LevelRenderer.addMainPass) draws into its G-buffer, its deferred passes
  * run between that pass's opaque and translucent geometry (classic transparency; with improved transparency they run at
- * the end of the pass), and its composite and final passes when the main pass ends. Does nothing without the variable.
+ * the end of the pass), and its composite and final passes when the main pass ends; the first-person hand goes in with
+ * the level's features when the description asks for it (ExtHand). Does nothing without the variable.
  */
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererExtMixin {
@@ -38,6 +41,10 @@ abstract class LevelRendererExtMixin {
     @Shadow
     @Final
     private TextureManager textureManager;
+
+    @Shadow
+    @Final
+    private SubmitNodeStorage submitNodeStorage;
 
     @Inject(method = "render", at = @At("HEAD"))
     private void metalmc$extBegin(GraphicsResourceAllocator resourceAllocator, boolean renderOutline, CameraRenderState cameraState,
@@ -63,5 +70,12 @@ abstract class LevelRendererExtMixin {
     @Inject(method = "executeClassicTransparency", at = @At("HEAD"))
     private void metalmc$extTranslucent(CallbackInfo ci) {
         if (MetalExtPipe.ENABLED) MetalExtPipe.translucent();
+    }
+
+    /** The first-person hand with the level's features (ExtHand), before the level prepares them. */
+    @Inject(method = "render", at = @At(value = "INVOKE",
+        target = "Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher;prepareFrame(Lnet/minecraft/client/renderer/SubmitNodeStorage;)Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher$PreparedFrame;"))
+    private void metalmc$extHand(CallbackInfo ci) {
+        if (MetalExtPipe.ENABLED) ExtHand.submit(gameRenderer, submitNodeStorage);
     }
 }
