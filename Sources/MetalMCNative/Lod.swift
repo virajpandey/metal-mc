@@ -1482,7 +1482,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     }
     let r = LodRenderer.shared
     // ExtPipe hook: an external pipeline's G-buffer pass has its own targets and GL's depth convention: the LOD goes there
-    // only through its description's LOD program (opaque quads; no water, far field or occlusion boxes).
+    // only through its description's LOD program (every quad opaque, water too; no far field or occlusion boxes).
     let ext = extPassActive ? extLodPipelines() : nil
     guard let enc = ctx.pass, !ctx.scissorEmpty, !extPassActive || ext?.plain != nil else { return 0 }
     r.lock.lock(); let w = r.world; r.lock.unlock()
@@ -1898,7 +1898,6 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     }
     var state = (seam: false, water: false, fade: false)
     for (di, d) in ordered.enumerated() {
-        if ext != nil && d.water { continue }
         if d.water && !boxesDone {
             if !farDone { drawFar() }
             runBoxes()
@@ -1915,7 +1914,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             if d.water && !state.water {
                 // Water writes depth only for the ray-traced shadows (its surface, not the floor under it, receives them)
                 // and in lit mode (the relight leaves the floor under it alone: its depth no longer matches).
-                enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: lodRtShadows || litEnabled))
+                enc.setDepthStencilState(ext != nil ? ctx.depthState(compare: .lessEqual, write: true)   // ExtPipe: opaque there
+                                         : ctx.depthState(compare: .greaterEqual, write: lodRtShadows || litEnabled))
                 u.alpha = lodOpaqueWater ? 1 : lodWaterAlpha
                 enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
             }

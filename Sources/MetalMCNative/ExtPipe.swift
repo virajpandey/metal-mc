@@ -184,7 +184,8 @@ struct ExtDesc: Decodable {
     /// binds for its own (lod_vs: quads 18, LodUniforms 19, xforms 20, material colors 21, AO offsets 22; frame block too),
     /// its fragment function writes the G-buffer attachments in order; `seamFragmentEntry` (same library) the variant for
     /// tiles that overlap vanilla's terrain (the seam bitmap at fragment buffer 21). The LOD material ids are the
-    /// MMC_MAT_<NAME> macros in every program. No water, far field or fades there.
+    /// MMC_MAT_<NAME> macros in every program. Water quads are drawn opaque like the rest (the program sees their
+    /// materials); no far field (its levels are drawn as quads) or fades there.
     struct Lod: Decodable {
         let program: String
         let seamFragmentEntry: String?
