@@ -214,6 +214,19 @@ loom {
 			if (project.hasProperty("giHistory")) {
 				environmentVariable "METALMC_GIHISTORY", project.findProperty("giHistory").toString()
 			}
+			// External pipeline (-PextPipe=<dir>, Sources/MetalMCNative/ExtPipe.swift, docs/extpipe-design.md): the level
+			// drawn through the pipeline described in <dir>/pipeline.json.
+			if (project.hasProperty("extPipe")) {
+				environmentVariable "METALMC_EXTPIPE", project.findProperty("extPipe").toString()
+			}
+			// -PextPipeView=<target>[@<pass>][:scale]: that target on the screen instead of the frame (a debug view).
+			if (project.hasProperty("extPipeView")) {
+				environmentVariable "METALMC_EXTPIPE_VIEW", project.findProperty("extPipeView").toString()
+			}
+			// -PextPipeNoCull=1: no view-frustum culling (the shadow pass then has the terrain behind the camera too).
+			if (project.hasProperty("extPipeNoCull")) {
+				environmentVariable "METALMC_EXTPIPE_NOCULL", project.findProperty("extPipeNoCull").toString()
+			}
 			if (project.hasProperty("metalValidation")) {
 				environmentVariable "MTL_DEBUG_LAYER", "1"
 				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"
