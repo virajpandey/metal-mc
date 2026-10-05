@@ -402,12 +402,12 @@ kernel void cl_list(device const uint* changed [[buffer(4)]], constant ClParams&
 // changed is stamped.
 kernel void cl_propagate(device const ushort* blocks [[buffer(2)]], device uint* light [[buffer(3)]], device uint* changed [[buffer(4)]],
                          constant ClParams& p [[buffer(5)]], constant uint* table [[buffer(6)]], device const uint* list [[buffer(7)]],
-                         uint tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]],
+                         uint3 tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]],
                          uint li [[thread_index_in_threadgroup]]) {
     threadgroup atomic_uint tgChanged;
     if (li == 0u) atomic_store_explicit(&tgChanged, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint b = list[tg];
+    uint b = list[tg.x];
     uint3 u = clBrickCoord(b) * 8u + lid;
     uint i = clIndex(u);
     uint code = uint(blocks[i]);
@@ -446,8 +446,8 @@ kernel void cl_resolve(device const ushort* blocks [[buffer(2)]], device const u
                        device const uint* changed [[buffer(4)]], constant ClParams& p [[buffer(5)]],
                        device const uint* list [[buffer(7)]], constant float4* color [[buffer(9)]], constant float* curve [[buffer(10)]],
                        texture3d<half, access::write> rgbOut [[texture(0)]], texture3d<half, access::write> auxOut [[texture(1)]],
-                       uint tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {
-    uint b = list[tg];
+                       uint3 tg [[threadgroup_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {
+    uint b = list[tg.x];
     if (changed[b] < p.stamp.z) return;
     uint3 u = clBrickCoord(b) * 8u + lid;
     uint i = clIndex(u);

@@ -202,6 +202,8 @@ let litWaterTime = lit ? dlsym(lib, "mmc_debug_lit_water_time").map {
 if waterOn { print(litWaterSwitch.map { $0(1, 100) == 1 ? "ok    water is on (lit,water)" : "FAIL  water isn't on" } ?? "      no water in this library: its pictures are the reflections off") }
 var reflectWater = true
 var framesDrawn = 0
+/// The colored light's debug views are read without the sky's aerial perspective (by day its haze is over every pixel).
+var skipAerial = false
 
 // The world's LOD around the camera.
 let viewSpec = (ProcessInfo.processInfo.environment["LITFLOW_VIEW"] ?? "8,150,8,100,22").split(separator: ",").map { Double($0)! }
@@ -376,7 +378,7 @@ func frame(_ t: Targets, sunAngle: Float, relight: Bool, extras: Bool = true, ta
         var lp = mats + [sunAngle, 0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, sky ? 1 : 0]
         ran = litRelight(t.color, t.depth, &lp, lightmap, taa ? 1 : 0) == 1
     }
-    if sky { _ = skyAerial(t.color, t.depth, &mats, taa ? 1 : 0) }
+    if sky && !skipAerial { _ = skyAerial(t.color, t.depth, &mats, taa ? 1 : 0) }
     if taa { var c2 = [cam.x, cam.y, cam.z]; _ = taaApply(t.color, t.depth, &mats, &c2, 0, 0, 0) }
     readback?(t.color)
     submit(submitIndex)
@@ -803,13 +805,15 @@ if clOn {
             }
             writePNG(pair, 2 * Int(W), Int(H), "cl-\(v.name)-\(t)-pair.png")
             writePNG(onT.color, Int(W), Int(H), "cl-\(v.name)-\(t)-colored-taa.png")
+            skipAerial = true
             let lightView = capture(half, sunAngle: angle, relight: true, view: 11, extras: false, frames: 1)
             let checkView = capture(half, sunAngle: angle, relight: true, view: 12, extras: false, frames: 1)
+            skipAerial = false
             writePNG(lightView.color, Int(W), Int(H), "cl-\(v.name)-\(t)-light.png")
             writePNG(checkView.color, Int(W), Int(H), "cl-\(v.name)-\(t)-check.png")
             // Relit terrain (not light sources) by vanilla's block light level at the pixel, and what the check did there:
             // red the volume scaled down to vanilla's level, green colored light, blue a share of vanilla's light made up.
-            var lit = 0, dark = 0, applied = 0, clamped = 0, filled = 0, outside = 0, darkLit = 0, darkClamped = 0
+            var lit = 0, dark = 0, applied = 0, clamped = 0, filled = 0, outside = 0, darkLit = 0, darkClamped = 0, darkChanged = 0
             var fillSum = 0.0, lumOff = 0.0, lumOn = 0.0, rgbOff = SIMD3<Double>.zero, rgbOn = SIMD3<Double>.zero
             for i in 0..<n {
                 let gx = on.gbuf[2 * i], gy = on.gbuf[2 * i + 1]
@@ -832,6 +836,10 @@ if clOn {
                     dark += 1
                     if isClamped { darkClamped += 1 }
                     if lumOf(lightView.color, 4 * i) > 3 { darkLit += 1 }
+                    // The frame as drawn: where vanilla has no block light the colored frame is the vanilla one.
+                    if on.color[4 * i] != off.color[4 * i] || on.color[4 * i + 1] != off.color[4 * i + 1] || on.color[4 * i + 2] != off.color[4 * i + 2] {
+                        darkChanged += 1
+                    }
                 }
             }
             let l = Double(max(lit, 1))
@@ -839,8 +847,8 @@ if clOn {
                          v.name, t, lit, dark, 100 * Double(applied) / l, 100 * Double(clamped) / l, 100 * Double(filled) / l,
                          filled > 0 ? fillSum / Double(filled) : 0, 100 * Double(outside) / l, lumOff / l, lumOn / l,
                          rgbOff.x / l, rgbOff.y / l, rgbOff.z / l, rgbOn.x / l, rgbOn.y / l, rgbOn.z / l))
-            print("      \(v.name) \(t): where vanilla has no block light, \(darkClamped) pixels had volume light the check removed, \(darkLit) show block light")
-            print((darkLit == 0 ? "ok    " : "FAIL  ") + "nothing glows where vanilla's block light is 0 (\(v.name), \(t))")
+            print("      \(v.name) \(t): where vanilla has no block light (\(dark) pixels), the volume had light at \(darkClamped), which the check took down to the curve at its slack (\(darkLit) of them over 3 levels of luma in the light view, which samples there); the frame as drawn differs from vanilla's at \(darkChanged)")
+            print((darkChanged == 0 ? "ok    " : "FAIL  ") + "nothing glows where vanilla's block light is 0: the colored frame is vanilla's there (\(v.name), \(t))")
         }
     }
     // A block change: a soul torch placed in the mixing area, then broken (as the Java side sends them), the frames each
