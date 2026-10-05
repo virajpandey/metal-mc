@@ -50,6 +50,7 @@ commands would run at once).
 | `reload` | recompile every shader file now, changed or not, and rebuild their pipelines (normally the watcher does it on save) |
 | `wait TICKS` | 20 ticks a second |
 | `tour [PREFIX]` | `scene` + `shot PREFIX-NAME` for every scene (PREFIX: tour) |
+| `trace [N]` | per-pass GPU timestamps of the next N frames (3) into the game log: `python3 tools/bench/passes.py bench_out/run_LABEL.log` |
 | `quit` | stop the game |
 | `time T`, `weather clear\|rain\|thunder`, `tp X Y Z [YAW PITCH]`, `free`, `cmd COMMAND`, `hud on\|off`, `fov D`, `status`, `scenes`, `echo TEXT` | `free` lets go of the held pose; `cmd` runs any server command; `status` prints the pose, time, rain, fps and the LOD's state |
 

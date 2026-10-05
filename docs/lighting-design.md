@@ -1127,21 +1127,22 @@ curve). The log says every 1200 frames: "post: N frames; exposure +x stops (targ
   anti-aliasing's history; two sessions, the nine scenes of the lab tour each time, no errors; post.metal edited and
   reloaded live (0.4-0.8 s to compile). Screenshots go through the SDR copy (identity on post's SDR frame).
 - **Before and after**, in the main checkout's `bench_out/agents/post/`: `before/<scene>.png` is lab3 (the same code and
-  switches without post, commit cbb4db8); `session1-final/` post metering luminance (AgX power 1.15); `session2-final/`
-  post metering light (power 1.0); `compare-<scene>.png` in each stacks before over after at 1100 px; `session1-first/`
-  the first pass before any tuning. Mean 8-bit luma (the share of pixels under 8):
+  switches without post, commit cbb4db8); `final-defaults/` the committed defaults (session 3); `session1-final/` post
+  metering luminance (AgX power 1.15); `session2-final/` metering light (power 1.0); `compare-<scene>.png` in each stacks
+  before over after at 1100 px; `session1-first/` the first pass before any tuning. Mean 8-bit luma (the share of pixels
+  under 8):
 
-  | Scene | Before | Session 1 (luminance meter) | Session 2 (light meter) |
-  |---|---|---|---|
-  | noon_overview | 114.2 (0.0%) | 111.9 (0.0%) | 112.8 (0.0%) |
-  | sunset_water | 115.1 (0.5%) | 119.2 (0.8%) | 141.3 (0.0%) |
-  | torch_cave | 31.6 (4.6%) | 48.8 (18.4%) | 57.1 (4.3%) |
-  | night_torches | 21.7 (9.9%) | 37.2 (8.9%) | 45.4 (3.4%) |
-  | forest | 78.5 (6.6%) | 93.1 (9.1%) | 78.2 (14.8%) |
-  | mineshaft | 67.6 | 88.1 | 86.2 |
-  | rain | 72.8 | 88.7 | 94.2 |
-  | water_closeup | 101.9 | 111.5 | 147.3 |
-  | mountain_view | 103.7 (2.3%) | 103.0 (13.0%) | 103.9 (9.0%) |
+  | Scene | Before | Session 1 (luminance meter) | Session 2 (light meter) | Final defaults (session 3) |
+  |---|---|---|---|---|
+  | noon_overview | 114.2 (0.0%) | 111.9 (0.0%) | 112.8 (0.0%) | (the LOD hadn't loaded: no comparison) |
+  | sunset_water | 115.1 (0.5%) | 119.2 (0.8%) | 141.3 (0.0%) | 121.5 (0.3%) |
+  | torch_cave | 31.6 (4.6%) | 48.8 (18.4%) | 57.1 (4.3%) | 37.4 (the scene's camera moved in main) |
+  | night_torches | 21.7 (9.9%) | 37.2 (8.9%) | 45.4 (3.4%) | 35.3 (8.4%) |
+  | forest | 78.5 (6.6%) | 93.1 (9.1%) | 78.2 (14.8%) | 79.5 (14.1%) |
+  | mineshaft | 67.6 | 88.1 | 86.2 | 80.0 |
+  | rain | 72.8 | 88.7 | 94.2 | 83.1 |
+  | water_closeup | 101.9 | 111.5 | 147.3 | 115.8 |
+  | mountain_view | 103.7 (2.3%) | 103.0 (13.0%) | 103.9 (9.0%) | 99.9 (12.5%) |
 
   - Sunset: crepuscular rays fan out from the sun through the gaps in the clouds and darken the sky in their shadows, the
     sun blooms warm over the water with its reflection, the far shore sits in lit haze. The first pass (shafts 0.35) had
@@ -1160,7 +1161,10 @@ curve). The log says every 1200 frames: "post: N frames; exposure +x stops (targ
     sunset 2.4-2.7 stops under noon, as the light meter did: at 60% partial adaptation they got +1.4 and +1.6 stops
     (mean luma 158 and 148 against 87 and 82). Dusk is that much darker (a top under a sun 8 degrees up gets 14% of
     noon's light) and the sky's own adaptation already gives some back, so the dark side now has two slopes: 20% within
-    2.5 stops of the reference, 70% past it (night, caves).
+    2.5 stops of the reference, 70% past it (night, caves). Session 3 ran those defaults from the built-in source: the
+    sunset keeps its rays, its blue sky and the sun's warm bloom at about its old brightness (121.5), the forest and the
+    mountain are where they were, night and the mineshaft come up, the torch-lit cave (main moved its camera to see all
+    twelve lights) is bright where the torches are and keeps its black rock in front.
   - ACES (`METALMC_TONEMAP=aces`) tried live at sunset, noon and forest: more contrast, but it takes the sky around the
     setting sun to flat white where AgX keeps its gradient and color. AgX stays the default.
 
@@ -1173,9 +1177,10 @@ Speed wasn't the goal tonight; these are the measurements to start from.
   0.40 (the anti-aliasing's own copy cost about that; post's replaces it). Whole frames (sky, main pass, shadows, the
   relight and aerial perspective in the resolve) with and without post, alternating: 8.50 against 6.14 ms, +2.36.
 - **In game, traced** (`trace 5` in the lab, `passes.py` on the game log; compute passes' totals overlap their
-  neighbors, so they don't add up): session 2 over sunset_water and noon_overview: bloom 1.37 ms, exposure 0.04, shafts
-  0.80, composite 0.64, the copy 0.40 of fragment work (0.61 in session 1, before the composite's output went from
-  RGBA16Float to RGB10A2). sunset_water held 119 fps at 120 Hz with the whole look and post.
+  neighbors, so they don't add up): session 3 at sunset_water, the final defaults: bloom 1.38 ms, exposure 0.04, shafts
+  0.20, composite 0.66, the copy 0.39 of fragment work (0.61 in session 1, before the composite's output went from
+  RGBA16Float to RGB10A2; session 1's shafts read 1.42 there, overlapping the bloom). In session 1 sunset_water held
+  119 fps at 120 Hz with the whole look and post.
 - Where the bloom's 1.46 ms goes: its first pass reads the frame (4 bytes a pixel), the G-buffer (8) and the depth (4) at
   every pixel, 124 MB at the panel's resolution; the rest of the chain is small. Reading the G-buffer and depth once per
   2 x 2 block would take most of it away (below).
@@ -1184,7 +1189,11 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - The tone curves (`mmc_debug_post_curve`, litflow): at headroom 2, 4 and 8 every curve is the SDR one below the knee to
   the 4th decimal and reaches the headroom (AgX: 4 -> 0.84 in SDR, 1.24 at headroom 2, 2.04 at 4); AgX's outset matrix
   takes saturated highlights a little past 1 (the check flagged it), now clamped to the headroom.
-FINAL_CHECK
+- The final defaults' exposure in game (session 3's log, one line every 1200 frames, matched to the scenes by time):
+  rain +0.30 stops (metered log2 -3.42), forest +0.70 (-4.69), the torch-lit cave +0.20 (-2.88: with all twelve
+  lights in view it's well lit), mineshaft +0.24, sunset_water +0.24 (-3.09), water_closeup +0.16, mountain_view
+  +0.24, midnight in the village +1.35 to +1.54 (-5.6 to -5.9). Daylight stays within a stop of noon; night opens up
+  by about a stop and a half.
 
 ### Not done, and next
 
@@ -1198,12 +1207,16 @@ FINAL_CHECK
   down.
 - Light sources only weigh more in the bloom; the image itself keeps them at lit mode's full bright (1). A torch flame
   that is 4-8 times brighter in the image too (and so goes white-hot through the curve) needs lit mode's relight to give
-  emitters more than 1 (Lit.swift, where the colored block light work is going on now).
+  emitters more than 1 (Lit.swift; with colored block light, its volume's emitters).
 - Clouds and water keep vanilla's light: under the filmic curve vanilla's white clouds come out a light gray.
 - Cheaper: the bloom's first pass reads the G-buffer and the depth at every pixel (93 MB at the panel's resolution, for
-  the light sources and the meter's albedo); one read per 2 x 2 block would do for both. The shafts' first blur pass
-  scatters its taps along the whole line to the sun; an eighth of the resolution would likely look the same.
+  the light sources and the meter's albedo); one read per 2 x 2 block would do for both and should take the bloom from
+  1.46 ms to under 1. The composite and the copy could be one pass if the sharpening read its neighbors' tone-mapped
+  values from threadgroup memory (a compute pass can't write the frame today: it has no shader-write usage).
 - Lit mode's G-buffer layout is read in `post_bloom_first` (face code in x's top bits, block light in y's top byte, the
-  depth key): a change to it (the colored block light work) has to follow there.
+  depth key; colored block light left it as it was): a change to it has to follow there.
 - No Purkinje shift (night desaturating toward blue) in the eye adaptation; lit mode's moonlight is already bluer.
-- HDR output: checked offline (the curves at headroom 2-8, below), not yet seen on the panel.
+- HDR output: checked offline (the curves at headroom 2-8, above), not yet seen on the panel.
+- Not seen in game with the final defaults: noon_overview (the first scene of session 3 caught the LOD still loading);
+  sessions 1 and 2 put noon within 2% of before with each meter, and the defaults sit between them.
+- With the external pipeline (`METALMC_EXTPIPE`): not tried together.
