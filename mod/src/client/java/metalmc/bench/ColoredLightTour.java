@@ -25,6 +25,10 @@ final class ColoredLightTour {
     private static final Tour.Pose LOW = new Tour.Pose(0.5, 205.5, 15.5, 0f, 24f);
     private static final Tour.Pose CAVE = new Tour.Pose(0.5, 200.0, 14.5, 0f, 4f);
     private static final Tour.Pose CAVE_SIDE = new Tour.Pose(-22.5, 200.0, 30.5, 280f, 6f);
+    /** Natural caves over lava in claudeworld-merged (found by tools/litflow.swift's LITFLOW_CL section: open around, an
+     *  open line of sight to lava with air above it). */
+    private static final Tour.Pose LAVA_CAVE = new Tour.Pose(24.5, 19.88, 57.5, 180f, 18f);
+    private static final Tour.Pose DEEP_LAVA = new Tour.Pose(-26.5, -51.12, -75.5, 90f, 18f);
 
     private static void cmd(Minecraft mc, List<String> commands) {
         MinecraftServer server = mc.getSingleplayerServer();
@@ -84,6 +88,10 @@ final class ColoredLightTour {
         new Tour.Step("cl-cave-edit", CAVE, 60, mc -> cmd(mc, "setblock -6 200 26 minecraft:soul_torch",
             "setblock 0 200 26 minecraft:redstone_torch", "setblock 6 200 26 minecraft:torch",
             "fill -12 199 30 -10 199 32 minecraft:lava", "fill -12 198 30 -10 198 32 minecraft:smooth_stone")),
-        new Tour.Step("cl-cave-edit-side", CAVE_SIDE, 40, mc -> {})
+        new Tour.Step("cl-cave-edit-side", CAVE_SIDE, 40, mc -> {}),
+        // Natural lava caves underground (no sky light): the volume follows the camera there and fills in a few frames.
+        new Tour.Step("cl-lava-cave", LAVA_CAVE, 120, mc -> {}),
+        new Tour.Step("cl-deep-lava", DEEP_LAVA, 120, mc -> {}),
+        new Tour.Step("cl-deep-lava-traced", DEEP_LAVA, 20, mc -> metalmc.backend.MetalStats.traceFrames(3))
     );
 }

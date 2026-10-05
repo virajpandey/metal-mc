@@ -67,12 +67,12 @@ private let clSlack = max(0, clEnvFloat("METALMC_CLSLACK", 1))
 private let clBucketSpecs: [(name: String, chroma: SIMD3<Float>, luminance: Float)] = [
     ("warm", SIMD3(1.00, 0.56, 0.25), 0.95),     // torches, lanterns, glowstone, jack o'lanterns: a candle-warm 1900 K
     ("fire", SIMD3(1.00, 0.46, 0.15), 0.95),     // fire, campfires, candles, lit furnaces: redder, and it flickers
-    ("soul", SIMD3(0.18, 0.76, 1.00), 0.70),     // soul fire, soul torches and lanterns: cyan
-    ("red", SIMD3(1.00, 0.07, 0.03), 0.40),      // redstone torches and ore
-    ("lava", SIMD3(1.00, 0.30, 0.05), 0.80),     // lava, magma: orange-red
+    ("soul", SIMD3(0.18, 0.76, 1.00), 0.85),     // soul fire, soul torches and lanterns: cyan
+    ("red", SIMD3(1.00, 0.07, 0.03), 0.55),      // redstone torches and ore
+    ("lava", SIMD3(1.00, 0.30, 0.05), 0.90),     // lava, magma: orange-red
     ("white", SIMD3(0.78, 0.90, 1.00), 0.95),    // sea lanterns, end rods, beacons, light blocks: cool white
-    ("green", SIMD3(0.36, 1.00, 0.30), 0.75),    // verdant froglights, glow lichen, sea pickles, copper torches
-    ("purple", SIMD3(0.62, 0.28, 1.00), 0.55),   // amethyst, crying obsidian, portals, pearlescent froglights
+    ("green", SIMD3(0.36, 1.00, 0.30), 0.85),    // verdant froglights, glow lichen, sea pickles, copper torches
+    ("purple", SIMD3(0.62, 0.28, 1.00), 0.70),   // amethyst, crying obsidian, portals, pearlescent froglights
 ]
 let clFireBucket = 1
 
@@ -217,6 +217,10 @@ final class ClStore: @unchecked Sendable {
     private(set) var stamp: UInt64 = 0
     /// Block changes since the last frame: (x, y, z, code).
     var edits: [(Int, Int, Int, UInt16)] = []
+    /// Chunk columns (cx, cz) whose sections were replaced since the volume last looked, and whether everything was
+    /// (a reset): the volume rechecks only their slots.
+    var dirtyColumns: [(Int, Int)] = []
+    var dirtyAll = false
     var generation: Int32 = 0
 
     /// Section y range of the world (the overworld's -64..319).
@@ -227,6 +231,8 @@ final class ClStore: @unchecked Sendable {
         sections.removeAll()
         columns.removeAll()
         edits.removeAll()
+        dirtyColumns.removeAll()
+        dirtyAll = true
         generation = g
         stamp &+= 1
     }
@@ -248,6 +254,7 @@ final class ClStore: @unchecked Sendable {
         }
         // Sections that were there and aren't now become air: a new version for them too (a missing section is version 0).
         columns[ck] = ys
+        if dirtyColumns.count < 4096 { dirtyColumns.append((cx, cz)) } else { dirtyAll = true }
         stamp &+= 1
     }
 
@@ -374,7 +381,10 @@ kernel void cl_edit(device const uint4* edits [[buffer(0)]], device ushort* bloc
     changed[clBrickIndex(e.xyz >> 3)] = p.stamp.x;
 }
 
-kernel void cl_list_begin(device uint* args [[buffer(8)]]) {
+// The listing's arguments reset; the last listing's count kept first in a ring of 8 (stamp.w: this frame's slot) for the
+// CPU's stats, which it reads a few frames later.
+kernel void cl_list_begin(device uint* args [[buffer(8)]], device uint* stats [[buffer(11)]], constant ClParams& p [[buffer(5)]]) {
+    stats[p.stamp.w & 7u] = args[0];
     args[0] = 0u; args[1] = 1u; args[2] = 1u;
 }
 
@@ -540,7 +550,13 @@ static float3 clBlockLight(float3 vanilla, float3 ambient, float level, float3 r
     float hi = clCurve(c, level + c.tune.z), lo = clCurve(c, level - c.tune.z);
     float k = m > hi ? hi / max(m, 1e-6) : 1.0;
     float fill = c.tune.w > 0.0 && lo > 1e-5 ? saturate(1.0 - m * k / lo) : 0.0;
-    float3 colored = ambient + rgb * (k * c.tune.x) + max(vanilla - ambient, float3(0.0)) * fill;
+    // The game's own lightmap at the pixel's level against the curve (vanilla's formula at the default brightness): the
+    // colored light is as bright as vanilla's block light there whatever the brightness setting, night vision or the
+    // darkness effect make of it (1 offline, where the lightmap is that formula).
+    float3 vb = max(vanilla - ambient, float3(0.0));
+    float cv = clCurve(c, level);
+    float r = cv > 1e-3 ? clamp(dot(vb, float3(0.2126, 0.7152, 0.0722)) / cv, 0.5, 2.0) : 1.0;
+    float3 colored = ambient + rgb * (k * c.tune.x * r) + vb * fill;
     dbg = float4(k < 0.98 ? 0.9 : 0.0, m * k > 1e-4 ? 0.8 : 0.0, fill * 0.9, 1.0);
     return mix(vanilla, colored, w);
 }
@@ -567,6 +583,8 @@ final class ColoredLight: @unchecked Sendable {
     private var args: MTLBuffer?
     private var colorBuffer: MTLBuffer?
     private var curveBuffer: MTLBuffer?
+    /// The listing's counts, a ring of 8 frames (cl_list_begin), for the stats.
+    private var statsBuffer: MTLBuffer?
     private(set) var rgb: MTLTexture?
     private(set) var aux: MTLTexture?
     private var dummy3D: MTLTexture?
@@ -621,8 +639,9 @@ final class ColoredLight: @unchecked Sendable {
         light = ctx.device.makeBuffer(length: cells * 4, options: .storageModePrivate)
         changed = ctx.device.makeBuffer(length: clBricks * 4, options: .storageModePrivate)
         list = ctx.device.makeBuffer(length: clBricks * 4, options: .storageModePrivate)
-        // Shared: the CPU reads the last listing's count for the stats (a frame or two late).
+        // Shared: offline the CPU reads the listing's count once its frame is done (debugListed).
         args = ctx.device.makeBuffer(length: 16, options: .storageModeShared)
+        statsBuffer = ctx.device.makeBuffer(length: 32, options: .storageModeShared)
         var colors = clBucketColors.map { SIMD4<Float>($0, 0) }
         colorBuffer = ctx.device.makeBuffer(bytes: &colors, length: colors.count * 16, options: .storageModeShared)
         var curve = clCurve
@@ -692,24 +711,33 @@ final class ColoredLight: @unchecked Sendable {
             store.lock.lock()
             let s0 = SIMD3(floorDiv(org.x, 16), floorDiv(org.y, 16), floorDiv(org.z, 16))
             let cs = SIMD3(floorDiv(cam.x, 16), floorDiv(cam.y, 16), floorDiv(cam.z, 16))
-            for k in 0..<clSlotsZ {
-                for j in 0..<clSlotsY {
-                    for i in 0..<clSlotsX {
-                        // The section of the volume in slot (i, j, k): the one in range whose coordinates are i, j, k modulo
-                        // the slots.
-                        let sx = s0.x + ((i - s0.x) % clSlotsX + clSlotsX) % clSlotsX
-                        let sy = s0.y + ((j - s0.y) % clSlotsY + clSlotsY) % clSlotsY
-                        let sz = s0.z + ((k - s0.z) % clSlotsZ + clSlotsZ) % clSlotsZ
-                        let slot = (k * clSlotsY + j) * clSlotsX + i
-                        let key = clSectionKey(sx, sy, sz)
-                        let sec = store.section(sx, sy, sz)
-                        if slotKey[slot] == key && slotVersion[slot] == sec.version { continue }
-                        let d = (sx - cs.x) * (sx - cs.x) + (sy - cs.y) * (sy - cs.y) + (sz - cs.z) * (sz - cs.z)
-                        ups.append(Up(slot: slot, sx: sx, sy: sy, sz: sz, d: d))
-                        codesOf[slot] = sec
-                    }
+            /// Slot (i, j, k) holds the section of the volume whose coordinates are i, j, k modulo the slots: queued for upload
+            /// if that isn't what it holds.
+            func check(_ i: Int, _ j: Int, _ k: Int) {
+                let sx = s0.x + ((i - s0.x) % clSlotsX + clSlotsX) % clSlotsX
+                let sy = s0.y + ((j - s0.y) % clSlotsY + clSlotsY) % clSlotsY
+                let sz = s0.z + ((k - s0.z) % clSlotsZ + clSlotsZ) % clSlotsZ
+                let slot = (k * clSlotsY + j) * clSlotsX + i
+                let key = clSectionKey(sx, sy, sz)
+                let sec = store.section(sx, sy, sz)
+                if (slotKey[slot] == key && slotVersion[slot] == sec.version) || codesOf[slot] != nil { return }
+                let d = (sx - cs.x) * (sx - cs.x) + (sy - cs.y) * (sy - cs.y) + (sz - cs.z) * (sz - cs.z)
+                ups.append(Up(slot: slot, sx: sx, sy: sy, sz: sz, d: d))
+                codesOf[slot] = sec
+            }
+            if moved || pendingSlots || store.dirtyAll {
+                // Every slot (the volume moved, a reset, or uploads left over).
+                for k in 0..<clSlotsZ { for j in 0..<clSlotsY { for i in 0..<clSlotsX { check(i, j, k) } } }
+            } else {
+                // Only the columns of chunks that arrived (most frames while chunks stream in: a few columns of 8 slots).
+                for (cx, cz) in store.dirtyColumns {
+                    guard cx >= s0.x, cx < s0.x + clSlotsX, cz >= s0.z, cz < s0.z + clSlotsZ else { continue }
+                    let i = ((cx % clSlotsX) + clSlotsX) % clSlotsX, k = ((cz % clSlotsZ) + clSlotsZ) % clSlotsZ
+                    for j in 0..<clSlotsY { check(i, j, k) }
                 }
             }
+            store.dirtyColumns.removeAll()
+            store.dirtyAll = false
             let pendingEdits = store.edits
             store.edits.removeAll()
             store.lock.unlock()
@@ -857,13 +885,17 @@ final class ColoredLight: @unchecked Sendable {
             enc.dispatchThreads(MTLSize(width: edits.count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(64, edits.count), height: 1, depth: 1))
             stats.edits += edits.count
         }
-        // The last listing's count (a frame or two old: the stats only).
-        let listed = Int(args.contents().load(as: UInt32.self))
-        lastListed = listed
-        if listed > 0 { stats.framesWithWork += 1; stats.bricks += listed }
+        // The listing's count 5 frames ago (the ring cl_list_begin fills; done by now): the stats only.
+        if frames > 8, let statsBuffer {
+            let listed = Int(statsBuffer.contents().load(fromByteOffset: ((frames - 4) & 7) * 4, as: UInt32.self))
+            lastListed = listed
+            if listed > 0 { stats.framesWithWork += 1; stats.bricks += listed }
+        }
         // The bricks to run over: changed since the previous frame's first pass (its passes, and this frame's uploads).
-        p.stamp = SIMD4(first, lastFrameFirst &+ 1, first, 0)
+        p.stamp = SIMD4(first, lastFrameFirst &+ 1, first, UInt32(frames & 7))
         enc.setComputePipelineState(pipes.2)
+        enc.setBytes(&p, length: MemoryLayout<ClParamsGPU>.stride, index: 5)
+        if let statsBuffer { enc.setBuffer(statsBuffer, offset: 0, index: 11) }
         enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
         enc.setComputePipelineState(pipes.3)
         enc.setBytes(&p, length: MemoryLayout<ClParamsGPU>.stride, index: 5)

@@ -389,6 +389,51 @@ public func mmc_debug_cl_verify(_ out: UnsafeMutablePointer<Int64>) -> Int32 {
     return 1
 }
 
+/// Offline: the store's light sources in the box (x0, y0, z0)-(x1, y1, z1) (world blocks, inclusive), up to `max`, as
+/// (x, y, z, code) in `out`; and per source, in out2, how many of its 6 neighbors are open (dampening under 15). Returns
+/// how many there are in all.
+@_cdecl("mmc_debug_cl_emitters")
+public func mmc_debug_cl_emitters(_ x0: Int32, _ y0: Int32, _ z0: Int32, _ x1: Int32, _ y1: Int32, _ z1: Int32,
+                                  _ out: UnsafeMutablePointer<Int32>, _ out2: UnsafeMutablePointer<Int32>, _ max: Int32) -> Int32 {
+    let store = ColoredLight.shared.store
+    store.lock.lock(); defer { store.lock.unlock() }
+    func code(_ x: Int, _ y: Int, _ z: Int) -> UInt16 {
+        let s = store.section(floorDiv(x, 16), floorDiv(y, 16), floorDiv(z, 16))
+        return s.codes?[((y & 15) * 16 + (z & 15)) * 16 + (x & 15)] ?? s.uniform
+    }
+    var n: Int32 = 0
+    for sy in floorDiv(Int(y0), 16)...floorDiv(Int(y1), 16) {
+        for sz in floorDiv(Int(z0), 16)...floorDiv(Int(z1), 16) {
+            for sx in floorDiv(Int(x0), 16)...floorDiv(Int(x1), 16) {
+                let s = store.section(sx, sy, sz)
+                guard let codes = s.codes else { continue }
+                for i in 0..<4096 where (codes[i] >> 4) & 15 != 0 {
+                    let x = sx * 16 + (i & 15), z = sz * 16 + ((i >> 4) & 15), y = sy * 16 + (i >> 8)
+                    guard x >= Int(x0), x <= Int(x1), y >= Int(y0), y <= Int(y1), z >= Int(z0), z <= Int(z1) else { continue }
+                    if n < max {
+                        out[4 * Int(n)] = Int32(x); out[4 * Int(n) + 1] = Int32(y); out[4 * Int(n) + 2] = Int32(z); out[4 * Int(n) + 3] = Int32(codes[i])
+                        var open: Int32 = 0
+                        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] where code(x + dx, y + dy, z + dz) & 15 < 15 { open += 1 }
+                        out2[Int(n)] = open
+                    }
+                    n += 1
+                }
+            }
+        }
+    }
+    return n
+}
+
+/// Offline: whether block (x, y, z) is open (dampening under 15) in the store: 1, else 0.
+@_cdecl("mmc_debug_cl_open")
+public func mmc_debug_cl_open(_ x: Int32, _ y: Int32, _ z: Int32) -> Int32 {
+    let store = ColoredLight.shared.store
+    store.lock.lock(); defer { store.lock.unlock() }
+    let s = store.section(floorDiv(Int(x), 16), floorDiv(Int(y), 16), floorDiv(Int(z), 16))
+    let c = s.codes?[((Int(y) & 15) * 16 + (Int(z) & 15)) * 16 + (Int(x) & 15)] ?? s.uniform
+    return c & 15 < 15 ? 1 : 0
+}
+
 /// Debug: the volume's kernels' source, for an offline compile check. Returns its length.
 @_cdecl("mmc_debug_cl_shader_source")
 public func mmc_debug_cl_shader_source(_ out: UnsafeMutablePointer<CChar>, _ len: Int32) -> Int32 {

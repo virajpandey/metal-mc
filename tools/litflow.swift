@@ -777,6 +777,82 @@ if clOn {
         // Reported, not fatal: the pictures still come.
         print((out[1] == 0 && out[2] == 0 ? "ok    " : "FAIL  ") + "the volume's light is vanilla's flood fill per color, exactly (\(what))")
     }
+    // Natural scenes in the loaded area: light sources next to open cells, by 32 x 32 column cell and kind (warm and fire
+    // lights: villages; lava; others), the top few of each with their mean height, to point a view or the tour at.
+    if let emittersC = dlsym(lib, "mmc_debug_cl_emitters").map({ unsafeBitCast($0, to: (@convention(c) (Int32, Int32, Int32, Int32, Int32, Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, Int32) -> Int32).self) }) {
+        let maxN: Int32 = 400_000
+        var e = [Int32](repeating: 0, count: 4 * Int(maxN)), o = [Int32](repeating: 0, count: Int(maxN))
+        let cx = Int32(cam.x), cz = Int32(cam.z)
+        let total = Int(emittersC(cx - 160, -64, cz - 160, cx + 400, 319, cz + 160, &e, &o, maxN))
+        var cells: [Int64: (warm: Int, lava: Int, other: Int, ySum: Int, n: Int)] = [:]
+        for k in 0..<min(total, Int(maxN)) where o[k] > 0 {
+            let x = Int(e[4 * k]), y = Int(e[4 * k + 1]), z = Int(e[4 * k + 2]), code = Int(e[4 * k + 3])
+            if y > 0 && y < 200 && abs(x) < 26 && z >= 12 && z <= 66 { continue }   // (the scene, if it's there)
+            if y >= 190 { continue }
+            let cls = (code >> 8) & 63
+            let key = Int64((x >> 5) + 100_000) << 32 | Int64((z >> 5) + 100_000)
+            var c = cells[key] ?? (0, 0, 0, 0, 0)
+            if [2, 3, 4, 5, 6, 7, 12, 29].contains(cls) { c.warm += 1 } else if cls == 10 || cls == 11 { c.lava += 1 } else { c.other += 1 }
+            c.ySum += y; c.n += 1
+            cells[key] = c
+        }
+        func show(_ name: String, _ score: ((warm: Int, lava: Int, other: Int, ySum: Int, n: Int)) -> Int) {
+            let top = cells.sorted { score($0.value) > score($1.value) }.prefix(5).filter { score($0.value) > 0 }
+            print("      natural light sources, most \(name) (32 x 32 column cells: x, z, mean y, warm/lava/other): "
+                  + top.map { "(\((Int($0.key >> 32) - 100_000) * 32 + 16), \((Int($0.key & 0xFFFF_FFFF) - 100_000) * 32 + 16), y \($0.value.ySum / max($0.value.n, 1)): \($0.value.warm)/\($0.value.lava)/\($0.value.other))" }.joined(separator: " "))
+        }
+        print("      \(total) light sources in the loaded area")
+        show("warm (villages)", { $0.warm })
+        show("lava", { $0.lava })
+        show("other", { $0.other })
+        // A camera in a cave over lava: lava with air above it, grouped by 32 x 32 column cell; from the biggest groups'
+        // centers, an open spot 3-8 blocks above the lava and 6-14 away, mostly open around, with an open line of sight to
+        // the lava. Printed as a pose (feet position for the tour: eye minus 1.62).
+        if let openC = dlsym(lib, "mmc_debug_cl_open").map({ unsafeBitCast($0, to: (@convention(c) (Int32, Int32, Int32) -> Int32).self) }) {
+            func open(_ x: Int, _ y: Int, _ z: Int) -> Bool { openC(Int32(x), Int32(y), Int32(z)) == 1 }
+            var groups: [Int64: [SIMD3<Int>]] = [:]
+            for k in 0..<min(total, Int(maxN)) where ((Int(e[4 * k + 3]) >> 8) & 63) == 10 {
+                let x = Int(e[4 * k]), y = Int(e[4 * k + 1]), z = Int(e[4 * k + 2])
+                guard y < 180, open(x, y + 1, z) else { continue }
+                groups[Int64((x >> 5) + 100_000) << 32 | Int64((z >> 5) + 100_000), default: []].append(SIMD3(x, y, z))
+            }
+            var found = 0
+            for (_, cells) in groups.sorted(by: { $0.value.count > $1.value.count }).prefix(8) where found < 3 {
+                let c = cells.reduce(SIMD3<Int>.zero, &+) / SIMD3(repeating: cells.count)
+                let surface = cells.map { $0.y }.max() ?? c.y
+                let target = SIMD3<Double>(Double(c.x) + 0.5, Double(surface) + 1.0, Double(c.z) + 0.5)
+                var best: (SIMD3<Double>, Int)? = nil
+                for dist in stride(from: 14, through: 6, by: -2) {
+                    for dy in [5, 4, 6, 3, 7, 8] {
+                        for a in 0..<16 {
+                            let ang = Double(a) * .pi / 8
+                            let p = SIMD3<Int>(c.x + Int((Double(dist) * cos(ang)).rounded()), surface + dy, c.z + Int((Double(dist) * sin(ang)).rounded()))
+                            guard open(p.x, p.y, p.z), open(p.x, p.y - 1, p.z) else { continue }
+                            var around = 0
+                            for ox in -1...1 { for oy in -1...1 { for oz in -1...1 where open(p.x + ox, p.y + oy, p.z + oz) { around += 1 } } }
+                            guard around >= 22 else { continue }
+                            let eye = SIMD3<Double>(Double(p.x) + 0.5, Double(p.y) + 0.5, Double(p.z) + 0.5)
+                            let steps = Int(simd_length(target - eye) * 2)
+                            var clear = true
+                            for s in 1..<max(steps, 2) {
+                                let q = eye + (target - eye) * (Double(s) / Double(max(steps, 2)))
+                                if !open(Int(q.x.rounded(.down)), Int(q.y.rounded(.down)), Int(q.z.rounded(.down))) { clear = false; break }
+                            }
+                            if clear && around > (best?.1 ?? 0) { best = (eye, around) }
+                        }
+                    }
+                    if best != nil { break }
+                }
+                guard let b = best else { continue }
+                let eye = b.0
+                let d = target - eye
+                let yawDeg = atan2(-d.x, d.z) * 180 / .pi, pitchDeg = -atan2(d.y, (d.x * d.x + d.z * d.z).squareRoot()) * 180 / .pi
+                print(String(format: "      cave over lava (%d cells with air above, around %d %d %d): eye %.1f,%.1f,%.1f yaw %.0f pitch %.0f (tour feet y %.2f)",
+                             cells.count, c.x, surface, c.z, eye.x, eye.y, eye.z, yawDeg, pitchDeg, eye.y - 1.62))
+                found += 1
+            }
+        }
+    }
     for v in views {
         use(v)
         print("      view \(v.name): (\(v.pos.x), \(v.pos.y), \(v.pos.z)) yaw \(v.yaw) pitch \(v.pitch)")
@@ -788,6 +864,9 @@ if clOn {
             for _ in 0..<16 { frame(small, sunAngle: angle, relight: true, extras: false) }
             _ = clSwitch(0, 100)
             let off = capture(half, sunAngle: angle, relight: true, extras: false)
+            // 48 frames more, so the "on" frames have the same places in every 64-frame cycle (the shadows' disk samples,
+            // the sky's dither) as the "off" ones: then only block light may differ between the two.
+            for _ in 0..<48 { frame(small, sunAngle: angle, relight: true, extras: false) }
             _ = clSwitch(1, 100)
             let on = capture(half, sunAngle: angle, relight: true, extras: false)
             let onT = capture(half, sunAngle: angle, relight: true, extras: false, frames: 24, taa: true)
