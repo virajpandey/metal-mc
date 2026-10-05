@@ -1481,7 +1481,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         ctx.hitchLodNanos += dt
     }
     let r = LodRenderer.shared
-    guard let enc = ctx.pass, !ctx.scissorEmpty else { return 0 }
+    // ExtPipe hook: an external pipeline's G-buffer pass has its own targets and GL's depth convention: no LOD there.
+    guard let enc = ctx.pass, !ctx.scissorEmpty, !extPassActive else { return 0 }
     r.lock.lock(); let w = r.world; r.lock.unlock()
     guard let w else { return 0 }
     let snap = w.snapshot()

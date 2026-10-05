@@ -35,6 +35,21 @@ final class MetalRenderPass implements RenderPassBackend {
         if (pipeline != null) Mtl.rpSetPipeline(pipeline.handle);
     }
 
+    /** The native side reopened this pass's encoder (MetalExtPipe.translucent): set the pipeline and every uniform again. */
+    void rebindAll() {
+        MetalRenderPipeline p = pipeline;
+        if (p == null) return;
+        if (Mtl.rpSetPipeline(p.handle) != 1) {
+            pipeline = null;
+            return;
+        }
+        int bits = 0;
+        for (int i = 0; i < p.uniformKinds.length; i++) {
+            if (uniforms[i] != null) bits |= 1 << i;
+        }
+        dirty = bits;
+    }
+
     /**
      * Near chunks (MetalNearChunks): the value last set for the current pipeline's uniform {@code name} (a buffer slice or
      * a texture and sampler), or null. Their draw reads vanilla's terrain uniforms.

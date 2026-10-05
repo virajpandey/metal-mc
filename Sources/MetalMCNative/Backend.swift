@@ -461,6 +461,8 @@ final class PipelineBox {
     let name: String
     /// Built with supportIndirectCommandBuffers (pipelines with per-instance vertex data: chunk terrain).
     let icbCapable: Bool
+    /// ExtPipe hook (ExtPipe.swift, METALMC_EXTPIPE): uniform and vertex input names, for routing this pipeline's draws.
+    var ext: ExtPipelineInfo?
     private var variants: [UInt64: MTLRenderPipelineState] = [:]
     private let lock = NSLock()
 
@@ -675,6 +677,8 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
                            _ depth: Int64, _ depthClear: Int32, _ depthValue: Float,
                            _ ax: Int32, _ ay: Int32, _ aw: Int32, _ ah: Int32) -> Int32 {
     autoreleasepool { () -> Int32 in
+        // ExtPipe hook (ExtPipe.swift): the level pass Java marked draws into the external pipeline's G-buffer instead.
+        if extPipeDir != nil, let r = extPassBegin(colors, count) { return r }
         ctx.endBlit()
         let d = MTLRenderPassDescriptor()
         var w = 0, h = 0
@@ -787,6 +791,7 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
 
 @_cdecl("mmc_pass_end")
 public func mmc_pass_end() {
+    if extPassActive { extPassEnd(); return }   // ExtPipe hook
     if ctx.traceFrames > 0 { log("trace pass end draws=\(ctx.statDraws - ctx.traceDraws)") }
     ctx.pass?.endEncoding()
     ctx.pass = nil
@@ -819,6 +824,7 @@ public func mmc_rp_set_pipeline(_ h: Int64) -> Int32 {
     guard let enc = ctx.pass else { return 0 }
     let p: PipelineBox = from(h)
     if ctx.pipe === p { return 1 }
+    if extPassActive { return extSetPipeline(p) }   // ExtPipe hook: vanilla's pipeline routed to a program, or skipped
     // HDR hook (Hdr.swift): matched to the pass's color formats (the main target is RGBA16Float). Lit hook (Lit.swift):
     // the same, for the G-buffer target of the level's main pass.
     guard let st = floatMainTarget || litEnabled ? p.state(depthFormat: ctx.passDepthFormat, colorFormats: ctx.passColorFormats)
@@ -843,6 +849,7 @@ public func mmc_rp_set_pipeline(_ h: Int64) -> Int32 {
 
 @_cdecl("mmc_rp_bind_buffer")
 public func mmc_rp_bind_buffer(_ index: Int32, _ h: Int64, _ offset: Int64) {
+    if extPassActive { extBindBuffer(index, h, offset); return }   // ExtPipe hook
     guard let enc = ctx.pass, let p = ctx.pipe else { return }
     let b = (from(h) as BufferBox).buffer
     let bit = UInt32(1) << UInt32(index)
@@ -852,6 +859,7 @@ public func mmc_rp_bind_buffer(_ index: Int32, _ h: Int64, _ offset: Int64) {
 
 @_cdecl("mmc_rp_bind_texture")
 public func mmc_rp_bind_texture(_ index: Int32, _ tex: Int64, _ smp: Int64) {
+    if extPassActive { extBindTexture(index, tex, smp); return }   // ExtPipe hook
     guard let enc = ctx.pass, let p = ctx.pipe else { return }
     let t = (from(tex) as TextureBox).texture
     let s = (from(smp) as SamplerBox).state
@@ -889,6 +897,7 @@ func texelTexture(_ box: BufferBox, _ offset: Int, _ length: Int, _ format: MTLP
 
 @_cdecl("mmc_rp_bind_texel_buffer")
 public func mmc_rp_bind_texel_buffer(_ index: Int32, _ h: Int64, _ offset: Int64, _ length: Int64, _ format: Int32, _ bpp: Int32) {
+    if extPassActive { return }   // ExtPipe hook: routed programs don't read vanilla's texel buffers
     guard let enc = ctx.pass, let p = ctx.pipe, let pf = MTLPixelFormat(rawValue: UInt(format)) else { return }
     guard let t = texelTexture(from(h), Int(offset), Int(length), pf, Int(bpp)) else {
         log("texel buffer view failed (format \(format), offset \(offset), length \(length))")
@@ -911,6 +920,7 @@ public func mmc_rp_push_constants(_ ptr: UnsafeRawPointer, _ len: Int32) {
 @_cdecl("mmc_rp_set_vertex_buffer")
 public func mmc_rp_set_vertex_buffer(_ slot: Int32, _ h: Int64, _ offset: Int64) {
     guard let enc = ctx.pass else { return }
+    if extPassActive { extVertexBuffer(slot, h, offset) }   // ExtPipe hook: kept for the shadow pass
     ctx.bindBuffer(enc, 0, (from(h) as BufferBox).buffer, Int(offset), vertexBufferIndex(Int(slot)))
 }
 
@@ -924,6 +934,7 @@ public func mmc_rp_set_index_buffer(_ h: Int64, _ type: Int32) {
 
 @inline(__always) func drawReady() -> (MTLRenderCommandEncoder, PipelineBox)? {
     guard let enc = ctx.pass, let p = ctx.pipe, !ctx.scissorEmpty else { return nil }
+    if extPassActive { extBeforeDraw(enc) }   // ExtPipe hook: the routed draw's per-draw uniforms
     return (enc, p)
 }
 
@@ -1002,6 +1013,7 @@ public func mmc_rp_draw_indexed_indirect(_ h: Int64, _ offset: Int64, _ drawCoun
     guard let r = drawReady(), let ib = ctx.indexBuffer else { return }
     let (enc, p) = r
     let buf = (from(h) as BufferBox).buffer
+    if extPassActive { extRecordIndirect(buf, Int(offset), Int(drawCount)) }   // ExtPipe hook: the shadow pass replays it
     let prim = p.fan ? MTLPrimitiveType.triangle : p.prim
     let n = Int(drawCount)
     ctx.statDraws += n
