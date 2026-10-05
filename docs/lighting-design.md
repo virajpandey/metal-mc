@@ -769,3 +769,161 @@ third of the screen water puts it past 8.33 ms; something else has to give for 1
   night (dark water, no glint); a lake under an overhang (sky light under 15 dims its reflection) and a river in a
   canyon (the sky where the walls should be); the seams at the LOD's start (vanilla's water) and at 768 blocks (until the
   LOD writes the flag); `METALMC_WATERWAVES=0` (a mirror) and `2`.
+
+## Post-processing (prototype, `METALMC_EXP=post`, 2026-10-05)
+
+`Sources/MetalMCNative/Post.swift`, `metalmc.backend.MetalPost` and a call in `GameRendererLodMixin` (after the
+anti-aliasing, before the hand); hooks marked "Post hook" in Sky.swift and Hdr.swift. Off by default; meant for
+`-PmetalExp=lit,nearchunks,rtshadows,sky,post` (with `gi`, `water`, `hdr` as wanted). It needs our sky to have drawn the
+frame (`Sky.frameActive`): elsewhere (the Nether, the End, under water) the frame is vanilla's and post doesn't run.
+
+### The frame in scene-linear light
+
+Until now the level became display light as it was drawn: the sky pass and the aerial perspective step (in the
+anti-aliasing's resolve) applied the tone curve, and the history held display light. Bloom and eye adaptation need the
+light before that, so with `post`:
+
+- **The main target is float even on an SDR display** (`floatMainTarget` in Hdr.swift: RG11B10Float as with HDR, or
+  RGBA16Float with `METALMC_HDRFORMAT=rgba16f`; `mmc_hdr_enabled` reports it, so MainTargetMixin and the rest of the
+  Java side treat it like HDR's). The layer and the present stay 8-bit SDR unless `hdr` is on. RG11B10Float is 32 bits
+  like RGBA8: the bandwidth of every pass is unchanged.
+- **The sky pass and the aerial perspective step leave the tone curve out** (Sky.swift: the knee pushed to 65504, so
+  `skyToneMap` is the identity): the frame holds scene-linear light, sRGB-encoded (extended past 1: the sun's disk at
+  about 35,000 encodes to about 82). The relight doesn't clamp on a float target. The anti-aliasing resolves this into its
+  float history as before (its neighborhood clip in YCoCg of the encoded values, which compresses highlights the way a
+  tone-mapped resolve would; nothing in Taa.swift changed).
+- **One tone curve.** Post's composite is the only place light becomes display light; with `hdr` it maps into the
+  display's headroom instead of compressing into SDR (below). Nothing is mapped twice.
+
+### The chain (after the anti-aliasing's resolve, in the same command buffer)
+
+Post reads the anti-aliasing's new history (without anti-aliasing, the frame itself), then takes the anti-aliasing's
+waiting copy into the frame and leaves its own in its place: the composite's display light, with the same contrast-
+adaptive sharpening (on the values over the display's largest, so it's the same in HDR) and dither (relative on the packed
+frame), folded into the hand's pass like the copy it replaces (pass folding, Backend.swift).
+
+1. **Bloom** (`post_bloom_first`, `post_bloom_down`, `post_bloom_up`): seven levels below the frame, from half
+   resolution down to 1/128 (27 x 17 at the panel's resolution). Down: Jimenez's 13-tap filter (five overlapping 2 x 2
+   boxes of bilinear taps). The first level reads the frame once per 16 x 16 threadgroup into threadgroup memory in
+   linear light (a bilinear tap of the sRGB-encoded frame would average wrongly) and weighs each box down by how far past
+   a firefly limit it is (256 times the exposure's mid-gray): a softened Karis average, so a glint's few pixels can't make
+   the bloom flicker while a large bright area (the sun's disk, lava) keeps its weight. Light sources weigh 6 times their
+   light (lit terrain whose G-buffer texel has block light 14 or more and whose depth key matches: torches, lanterns,
+   glowstone, lava). The same pass puts lit terrain's albedo luminance in alpha (1 for anything else) for the light
+   meter. Up: each level's own light times its share plus the level below through a 3 x 3 tent; the shares
+   are equal (`POST_BLOOM_SHAPE` 1) and sum to 1, so the bloom is a normalized blur with a long tail (a sum of
+   doubling-width Gaussians of equal energy falls off like 1/r^2). Composite: `mix(scene, bloom, 0.05)`: energy
+   conserving, what the glow gets the source loses. Only light much brighter than its surroundings shows it: the sun
+   and the sky around it, glints on water, torches at night and in caves.
+2. **Eye adaptation** (`post_histogram`, `post_exposure`): a 128-bin histogram of log2 light (2^-14 to 2^10, scene
+   units) over the bloom's second level (a quarter of the resolution), each texel weighing 1 at the screen's edges up
+   to 4 a little below its middle (leaning away from the sky). It meters light, not color: in lit mode a texel's
+   luminance over its mean albedo luminance (alpha), so a dark forest and bright sand under the same sun read alike
+   (an incident-light meter) and only shade, night and caves read as less light; sky and water meter their luminance.
+   The weighted mean of log2 light between the 30th and 85th percentiles (a black corner, the sun and the light
+   sources don't count); against the reference (noon outdoors, the metered value that gets 0 stops) the exposure makes up
+   45% of a darker scene's difference and 30% of a brighter one's, within -2 and +2 stops (partial adaptation: night and
+   caves come out readable but still darker than day). Followed on the GPU with no readback: toward a darker exposure
+   (into the light) with a time constant of 0.45 s, toward a brighter one (into the dark) with 2.2 s, so stepping out of
+   a cave overexposes and blooms for a moment, then settles, and walking into one opens up over a couple of seconds.
+   A camera jump (16 blocks in a frame: a teleport, a respawn, a lab `scene`) snaps it. In stops on top of the sky's own
+   adaptation to the sun's height (Sky.prepare, up to 3.5 stops at night), which stays, so the units above (sun 12,
+   vanilla's white 1) are unchanged and post's exposure is 0 at the reference.
+3. **Light shafts** (`post_shaft_mask`, `post_shaft_blur`, `post_shaft_color`), at a quarter of the resolution: the
+   share of each texel's 4 x 4 pixels that are sky (depth 0; vanilla's clouds write depth, so they cast shafts too),
+   blurred radially toward the sun's position on the screen (after Mitchell, GPU Gems 3; two passes of 12 taps, the
+   second spanning one tap of the first: the weighted mean of 144 taps along the line), times the sky's own light in the
+   texel's direction (`skyLuminance`: its glow around the sun; below the horizon, the horizon's). Over terrain and
+   clouds that adds the air in front lit where the sun gets through (22% of the sky's light, times how much of the way to
+   the sun is open, times how much air there is in front: `1 - exp(-distance / 192 blocks)` at the texel's mean depth, so
+   a tree nearby gets little and a ridge a few hundred blocks off nearly all); over the sky it darkens it where something
+   between it and the sun shadows the air (30% of the sky's light, times how much is blocked): crepuscular rays both
+   ways, from the sky's own colors and brightness. Faded out as the sun leaves the screen (fully gone a screen's width
+   past its edge), below the horizon, behind the camera, in rain.
+4. **The tone curve** (`post_composite`, `METALMC_TONEMAP`): AgX by default (Sobotka's, as in Blender 4; the polynomial
+   fit and Rec.709 matrices of Wrensch's minimal version), with a look (power 1.15, saturation 1.3 on its sigmoid's
+   output, like its "punchy" look but milder): bright saturated light runs to white without the hue skews a
+   per-channel curve on the original primaries gives (a sunset's orange stays orange as it brightens). `aces` is
+   Hill's fit of the RRT and ODT (more contrast, more saturated, exposure 1.6 to keep the mid-tones), `gt` Uchimura's,
+   `legacy` the sky's shoulder (the look before post: with `legacy` and the effects off, post draws the frame as before).
+   **HDR output** (`hdr`): the same curve below a knee, and above it (luminance 0.8, exposed) the highlights carried on
+   toward the display's headroom, `d * (1 + (H - 1) * (1 - exp(-t^2)))` with `t` the luminance past the knee over 4:
+   zero slope where it starts, the curve's hue kept, the identity at H = 1. So SDR white stays where SDR puts it and the
+   sun, its glow and glints go past it to the panel's peak. The screenshot copy (Hdr.swift) then rolls that into SDR as
+   before; on an SDR display post's frame is SDR already and the copy only clamps it.
+
+Every constant of the look is a `#define` at the top of `post.metal` (lab mode: edit and save, the chain recompiles in
+about a second). Environment switches set their defaults: `METALMC_TONEMAP` (agx, aces, gt, legacy), `METALMC_BLOOM`
+(0.05), `METALMC_SHAFTS` (0.22), `METALMC_POSTEV` (exposure compensation, stops), `METALMC_ADAPT=0` (no eye
+adaptation), `METALMC_POSTVIEW` (1 the bloom alone, 2 the shafts alone, 3 the exposure meter in false color, 4 no tone
+curve). The log says every 1200 frames: "post: N frames; exposure +x stops (target, metered log2 light)".
+
+### In game (2026-10-05, lab mode: 3456 x 2234 fullscreen, TAA, vsync, LOD 8192, `lit,nearchunks,rtshadows,sky,gi,water,post`)
+
+- **It runs.** "post: 3456x2234, bloom 7 levels down to 27x18, light shafts at 864x559, tone curve agx", reading the
+  anti-aliasing's history; the nine scenes of the lab tour, no errors; post.metal edited and reloaded live (0.4 s to
+  compile). Screenshots go through the SDR copy (identity on post's SDR frame).
+- **Before and after** (`bench_out/agents/post/` in the main checkout: `before/<scene>.png` is lab3, the same code and
+  switches without post at commit cbb4db8; `session1-final/<scene>.png` is post after session 1's tuning;
+  `compare-<scene>.png` stacks the two at 1100 px; `session1-first/` the first pass before tuning). Mean 8-bit luma
+  (and the share of pixels under 8):
+
+  | Scene | Before | After |
+  |---|---|---|
+  | noon_overview | 114.2 (0.00%) | 111.9 (0.03%) |
+  | sunset_water | 115.1 (0.47%) | 119.2 (0.76%) |
+  | torch_cave | 31.6 (4.6%) | 48.8 (18.4%) |
+  | night_torches | 21.7 (9.9%) | 37.2 (8.9%) |
+  | forest | 78.5 (6.6%) | 93.1 (9.1%) |
+  | mineshaft | 67.6 | 88.1 |
+  | rain | 72.8 | 88.7 |
+  | water_closeup | 101.9 | 111.5 |
+  | mountain_view | 103.7 (2.3%) | 103.0 (13.0%) |
+
+  - Sunset: crepuscular rays fan out from the sun through the gaps in the clouds and darken the sky in their shadows, the
+    sun blooms warm over the water with its reflection, the far shore sits in lit haze. The first pass (shafts 0.35) had
+    them strong enough to wash the clouds and the far silhouettes; 0.22 keeps them.
+  - Noon: about as bright as before (the reference calibrated on it), the lava pool on the left glows, the sky a softer
+    blue (AgX takes bright saturated light toward white), the clouds a light gray rather than white.
+  - Cave and night: readable. The cave's walls come up from near black, the lantern and torches glow, the foreground
+    keeps its blacks (AgX's toe: more pixels under 8 than before, in the parts that were nearly black anyway). The village
+    at midnight shows its fields, river and houses, the torches and windows glow, the sky stays a night sky.
+  - What it showed about metering luminance: under the same sun the forest's dark canopy read two stops darker than the
+    plains (log2 -4.9 against -2.9) and mountain_view, half sky and haze with the far LOD still loading on a cold cache,
+    read two stops brighter, so the forest's sky washed out and the mountain's forest went black. Session 1 limited it
+    (60% -> 45% of a darker scene's difference, 70% -> 30% of a brighter one's, metering weighted below the middle);
+    the fix is to meter light, not color (lit terrain's luminance over its albedo, below).
+  - ACES (`METALMC_TONEMAP=aces`) tried live at sunset, noon and forest: more contrast, but it takes the sky around the
+    setting sun to flat white where AgX keeps its gradient and color. AgX stays the default.
+
+### Costs
+
+Speed wasn't the goal tonight; these are the measurements to start from.
+
+- **In game, traced** (`trace 5` in the lab at sunset_water, the full look with post, `passes.py` on the game log; the
+  compute passes' totals overlap the passes around them, so they don't add up): post bloom 1.27 ms, exposure 0.05,
+  light shafts 1.42, composite 0.92; the copy into the frame 0.61 ms of fragment work (it was the anti-aliasing's copy's
+  0.38). The frame's command buffer 7.28 ms; the game held 119 fps at 120 Hz there.
+OFFLINE_COSTS
+
+### Not done, and next
+
+- **Volumetric light from the traced shadows.** The shafts are screen-space: they need the sun on or near the screen, and
+  they can't show beams in the air when the sun is behind the camera (under a canopy, looking away from the sun). The
+  better version marches each quarter-resolution pixel's view ray through a thin fog (8 steps, jittered per frame and
+  accumulated like the shadows' rays), tests each step's visibility toward the sun with one ray into RtShadows'
+  instance structure (it has `tlas`, `tlasAccels` and `origin`; an accessor and `useResources` are all it needs), and
+  adds `sigma x phase(theta) x sun x visibility x transmittance` in the composite. At the shadows' measured rate (about
+  0.3 ms per half-million rays) that's 1-2 ms at 4-8 rays per quarter-resolution pixel; temporal reuse would bring it
+  down.
+- Light sources only weigh more in the bloom; the image itself keeps them at lit mode's full bright (1). A torch flame
+  that is 4-8 times brighter in the image too (and so goes white-hot through the curve) needs lit mode's relight to give
+  emitters more than 1 (Lit.swift, where the colored block light work is going on now).
+- Clouds and water keep vanilla's light: under the filmic curve vanilla's white clouds come out a light gray.
+- Cheaper: the bloom's first pass reads the G-buffer and the depth at every pixel (93 MB at the panel's resolution, for
+  the light sources and the meter's albedo); one read per 2 x 2 block would do for both. The shafts' first blur pass
+  scatters its taps along the whole line to the sun; an eighth of the resolution would likely look the same.
+- Lit mode's G-buffer layout is read in `post_bloom_first` (face code in x's top bits, block light in y's top byte, the
+  depth key): a change to it (the colored block light work) has to follow there.
+- No Purkinje shift (night desaturating toward blue) in the eye adaptation; lit mode's moonlight is already bluer.
+- HDR output: checked offline (the curves at headroom 2-8, below), not yet seen on the panel.

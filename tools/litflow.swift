@@ -736,6 +736,39 @@ if postOn {
     let name = ProcessInfo.processInfo.environment["LITFLOW_NAME"] ?? "view"
     let suns: [String: (Float, Float)] = ["noon": (noon, 1), "morning": (morning, 1), "dusk": (dusk, 0.55), "sunset": (1.53, 0.4),
                                           "low": (-1.45, 0.6), "midnight": (midnight, 0.2)]
+    // The tone curves (mmc_debug_post_curve): gray from 2^-10 to 2^14 in sixteenths of a stop, and a saturated orange, at
+    // headroom 1 (SDR), 2, 4, 8: monotonic, never past the headroom, and with headroom the SDR curve below its knee.
+    if let curveF = dlsym(lib, "mmc_debug_post_curve").map({ unsafeBitCast($0, to: (@convention(c) (UnsafePointer<Float>, UnsafeMutablePointer<Float>, Int32, Float, Int32) -> Int32).self) }) {
+        let steps = 24 * 16 + 1
+        var input = [Float](repeating: 0, count: steps * 4 * 2)
+        for k in 0..<steps {
+            let x = powf(2, -10 + Float(k) / 16)
+            input[4 * k] = x; input[4 * k + 1] = x; input[4 * k + 2] = x
+            input[4 * (steps + k)] = x; input[4 * (steps + k) + 1] = 0.35 * x; input[4 * (steps + k) + 2] = 0.06 * x
+        }
+        for curve in Int32(0)...3 {
+            var sdr = [Float](repeating: 0, count: input.count)
+            var line: [String] = []
+            for h: Float in [1, 2, 4, 8] {
+                var out = [Float](repeating: 0, count: input.count)
+                guard curveF(input, &out, Int32(steps * 2), h, curve) == 1 else { print("FAIL  curve check"); break }
+                if h == 1 { sdr = out }
+                var mono = true, under = true, belowKnee = 0.0
+                for k in 0..<(steps * 2) {
+                    let y = max(out[4 * k], max(out[4 * k + 1], out[4 * k + 2]))
+                    if y > h * 1.0005 { under = false }
+                    if k % steps > 0 && out[4 * k + 1] < out[4 * (k - 1) + 1] - 1e-5 { mono = false }
+                    let x = input[4 * k + 1]
+                    if h > 1 && x < 0.5 { belowKnee = max(belowKnee, Double(abs(out[4 * k + 1] - sdr[4 * k + 1]))) }
+                }
+                func at(_ x: Float) -> Float { out[4 * Int(((log2(x) + 10) * 16).rounded()) + 1] }
+                line.append(String(format: "H %.0f: 0.18 -> %.3f, 1 -> %.3f, 4 -> %.3f, 64 -> %.3f, 4096 -> %.2f%@%@%@", h, at(0.18), at(1), at(4), at(64), at(4096),
+                                   mono ? "" : " NOT MONOTONIC", under ? "" : " PAST THE HEADROOM",
+                                   h > 1 ? String(format: " (below 0.5 within %.4f of SDR)", belowKnee) : ""))
+            }
+            print("      tone curve \(["legacy", "agx", "aces", "gt"][Int(curve)]): " + line.joined(separator: "; "))
+        }
+    }
     let list = (ProcessInfo.processInfo.environment["LITFLOW_POSTTIMES"] ?? "noon,dusk,sunset,midnight").split(separator: ",").map(String.init)
     if ProcessInfo.processInfo.environment["LITFLOW_TIMEONLY"] != "1" {
         for t in list {

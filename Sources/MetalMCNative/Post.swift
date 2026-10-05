@@ -47,7 +47,7 @@ private let postToneDefault = postToneCurves.firstIndex(of: postEnv["METALMC_TON
 /// METALMC_BLOOM: the bloom's share of the light (0.05: 5% of it spread over the chain's levels).
 private let postBloomDefault = max(0, postSetting("METALMC_BLOOM", 0.05))
 /// METALMC_SHAFTS: the light shafts' strength (0: none).
-private let postShaftsDefault = max(0, postSetting("METALMC_SHAFTS", 0.35))
+private let postShaftsDefault = max(0, postSetting("METALMC_SHAFTS", 0.22))
 /// METALMC_POSTEV: exposure compensation in stops, on top of the eye adaptation.
 private let postEvDefault = postSetting("METALMC_POSTEV", 0)
 /// METALMC_ADAPT=0: no eye adaptation (the exposure stays at the reference scene's).
@@ -75,18 +75,19 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_LIGHT_LEVEL 222u
 #define POST_FIREFLY 256.0
 
-// Eye adaptation: the histogram's range (log2 of scene luminance), the percentiles its mean is taken between, the
-// reference (the metered log2 luminance that gets 0 stops: noon outdoors), how much of a darker or brighter scene's
-// difference the exposure makes up, its limits in stops, and how fast it follows (seconds: up, into the dark; down, into
-// the light).
+// Eye adaptation: the histogram's range (log2 of scene light), the percentiles its mean is taken between, the darkest
+// albedo lit terrain's light is worked out with (lit mode meters light, not color), the reference (the metered log2
+// light that gets 0 stops: noon outdoors), how much of a darker or brighter scene's difference the exposure makes up,
+// its limits in stops, and how fast it follows (seconds: up, into the dark; down, into the light).
 #define POST_BINS 128
 #define POST_LOG_MIN (-14.0)
 #define POST_LOG_MAX 10.0
 #define POST_METER_LOW 0.30
-#define POST_METER_HIGH 0.92
-#define POST_ADAPT_REF (-1.3)
-#define POST_ADAPT_DARK 0.6
-#define POST_ADAPT_BRIGHT 0.7
+#define POST_METER_HIGH 0.85
+#define POST_METER_ALBEDO 0.04
+#define POST_ADAPT_REF (\(litEnabled ? "-1.0" : "-2.1"))
+#define POST_ADAPT_DARK 0.45
+#define POST_ADAPT_BRIGHT 0.3
 #define POST_EV_MIN (-2.0)
 #define POST_EV_MAX 2.0
 #define POST_TAU_UP 2.2
@@ -97,7 +98,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // which the air in front of a surface builds up to the shafts' full haze, taps per pass, the decay per tap along the
 // line (of the 144 the two passes take).
 #define POST_SHAFTS \(postFloat(postShaftsDefault))
-#define POST_SHAFT_SHADOW 0.35
+#define POST_SHAFT_SHADOW 0.3
 #define POST_SHAFT_DEPTH 192.0
 #define POST_SHAFT_TAPS 12
 #define POST_SHAFT_DECAY 0.994
@@ -105,8 +106,8 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // The tone curves' exposure (each curve's own mid-tones: these keep noon's terrain about as bright as before post) and
 // AgX's look (ASC CDL power and saturation on its sigmoid's output, like its "punchy" look but gentler).
 #define POST_AGX_EXPOSURE 1.0
-#define POST_AGX_POWER 1.12
-#define POST_AGX_SAT 1.12
+#define POST_AGX_POWER 1.15
+#define POST_AGX_SAT 1.3
 #define POST_ACES_EXPOSURE 1.6
 #define POST_GT_EXPOSURE 1.0
 // HDR output: above this luminance (exposed) the highlights are carried on toward the headroom, over this span.
@@ -136,10 +137,11 @@ static float postLuma(float3 c) { return dot(c, kPostLuma); }
 // an eighth each. The threadgroup's 36 x 36 pixels are read once, in linear light (the frame holds it sRGB-encoded,
 // which a bilinear tap would average wrongly), light sources weighted up. A box brighter than the firefly limit is
 // weighted down by how far past it it is: a glint's few pixels can't make the bloom flicker, a large bright area (the
-// sun's disk, a lava lake) keeps its weight against boxes like it.
+// sun's disk, a lava lake) keeps its weight against boxes like it. Alpha carries what the light meter divides by (lit
+// mode): lit terrain's albedo luminance, 1 for everything else, averaged down the chain like the light.
 #define PB_T 16
 #define PB_A (2 * PB_T + 4)
-#define PB_PX(PX, PY) float3(tile[(o.y + (PY)) * PB_A + o.x + (PX)])
+#define PB_PX(PX, PY) float4(tile[(o.y + (PY)) * PB_A + o.x + (PX)])
 #define PB_BOX(BX, BY) ((PB_PX(BX, BY) + PB_PX((BX) + 1, BY) + PB_PX(BX, (BY) + 1) + PB_PX((BX) + 1, (BY) + 1)) * 0.25)
 
 static float postBoxWeight(float3 c, float limit) {
@@ -154,20 +156,25 @@ kernel void post_bloom_first(texture2d<float, access::read> src [[texture(0)]],
                              device const float4* expo [[buffer(1)]],
                              uint2 lid [[thread_position_in_threadgroup]],
                              uint2 tgid [[threadgroup_position_in_grid]]) {
-    threadgroup half3 tile[PB_A * PB_A];
+    threadgroup half4 tile[PB_A * PB_A];
     int2 size = int2(src.get_width(), src.get_height());
     int2 base = int2(tgid) * (2 * PB_T) - 2;
     bool lights = f.effects.z > 0.5;
     for (uint i = lid.y * PB_T + lid.x; i < PB_A * PB_A; i += PB_T * PB_T) {
         uint2 q = uint2(clamp(base + int2(i % PB_A, i / PB_A), int2(0), size - 1));
         float3 c = max(skyDecode(src.read(q).rgb), 0.0);
+        float albedo = 1.0;
 #if LIT_MODE
         if (lights) {
             uint2 g = gbuf.read(q).rg;
-            if ((g.x >> 29) != 0u && (g.y >> 24) >= POST_LIGHT_LEVEL && litDepthMatches(depth.read(q), g.y & 0xFFFFu)) c *= POST_BLOOM_LIGHTS;
+            if ((g.x >> 29) != 0u && litDepthMatches(depth.read(q), g.y & 0xFFFFu)) {
+                float3 al = skyDecode(float3(float(g.x & 255u), float((g.x >> 8) & 255u), float((g.x >> 16) & 255u)) / 255.0);
+                albedo = max(postLuma(al), POST_METER_ALBEDO);
+                if ((g.y >> 24) >= POST_LIGHT_LEVEL) c *= POST_BLOOM_LIGHTS;
+            }
         }
 #endif
-        tile[i] = half3(min(c, float3(60000.0)));
+        tile[i] = half4(half3(min(c, float3(60000.0))), half(albedo));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint2 gid = tgid * PB_T + lid;
@@ -175,34 +182,34 @@ kernel void post_bloom_first(texture2d<float, access::read> src [[texture(0)]],
     // This texel's footprint: tile pixels 2 lid .. 2 lid + 5 on each axis. PB_BOX(x, y): the bilinear tap at offset
     // (x - 2, y - 2) from its center, a 2 x 2 box.
     uint2 o = lid * 2u;
-    float3 a = PB_BOX(0, 0), b = PB_BOX(2, 0), c = PB_BOX(4, 0);
-    float3 d = PB_BOX(1, 1), e = PB_BOX(3, 1);
-    float3 l0 = PB_BOX(0, 2), g = PB_BOX(2, 2), h = PB_BOX(4, 2);
-    float3 i0 = PB_BOX(1, 3), j = PB_BOX(3, 3);
-    float3 k = PB_BOX(0, 4), l = PB_BOX(2, 4), m = PB_BOX(4, 4);
-    float3 inner = (d + e + i0 + j) * 0.25;
-    float3 c0 = (a + b + l0 + g) * 0.25, c1 = (b + c + g + h) * 0.25, c2 = (l0 + g + k + l) * 0.25, c3 = (g + h + l + m) * 0.25;
+    float4 a = PB_BOX(0, 0), b = PB_BOX(2, 0), c = PB_BOX(4, 0);
+    float4 d = PB_BOX(1, 1), e = PB_BOX(3, 1);
+    float4 l0 = PB_BOX(0, 2), g = PB_BOX(2, 2), h = PB_BOX(4, 2);
+    float4 i0 = PB_BOX(1, 3), j = PB_BOX(3, 3);
+    float4 k = PB_BOX(0, 4), l = PB_BOX(2, 4), m = PB_BOX(4, 4);
+    float4 inner = (d + e + i0 + j) * 0.25;
+    float4 c0 = (a + b + l0 + g) * 0.25, c1 = (b + c + g + h) * 0.25, c2 = (l0 + g + k + l) * 0.25, c3 = (g + h + l + m) * 0.25;
     float limit = POST_FIREFLY * 0.18 * exp2(-expo[0].x);
-    float wi = 0.5 * postBoxWeight(inner, limit);
-    float w0 = 0.125 * postBoxWeight(c0, limit), w1 = 0.125 * postBoxWeight(c1, limit);
-    float w2 = 0.125 * postBoxWeight(c2, limit), w3 = 0.125 * postBoxWeight(c3, limit);
-    float3 r = (inner * wi + c0 * w0 + c1 * w1 + c2 * w2 + c3 * w3) / (wi + w0 + w1 + w2 + w3);
-    dst.write(float4(r, 1.0), gid);
+    float wi = 0.5 * postBoxWeight(inner.rgb, limit);
+    float w0 = 0.125 * postBoxWeight(c0.rgb, limit), w1 = 0.125 * postBoxWeight(c1.rgb, limit);
+    float w2 = 0.125 * postBoxWeight(c2.rgb, limit), w3 = 0.125 * postBoxWeight(c3.rgb, limit);
+    dst.write((inner * wi + c0 * w0 + c1 * w1 + c2 * w2 + c3 * w3) / (wi + w0 + w1 + w2 + w3), gid);
 }
 
-// Down the chain: the same 13 taps from the level above (linear light already), plain weights.
-#define PB_S(SX, SY) src.sample(s, uv + t * float2(SX, SY), level(0.0)).rgb
+// Down the chain: the same 13 taps from the level above (linear light already), plain weights; alpha (the light meter's
+// albedo) along with it.
+#define PB_S(SX, SY) src.sample(s, uv + t * float2(SX, SY), level(0.0))
 kernel void post_bloom_down(texture2d<float> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
                             uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float2 t = 1.0 / float2(src.get_width(), src.get_height());
     float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());
-    float3 r = (PB_S(-1, -1) + PB_S(1, -1) + PB_S(-1, 1) + PB_S(1, 1)) * 0.125
+    float4 r = (PB_S(-1, -1) + PB_S(1, -1) + PB_S(-1, 1) + PB_S(1, 1)) * 0.125
              + (PB_S(-2, -2) + PB_S(2, -2) + PB_S(-2, 2) + PB_S(2, 2)) * 0.03125
              + (PB_S(0, -2) + PB_S(-2, 0) + PB_S(2, 0) + PB_S(0, 2)) * 0.0625
              + PB_S(0, 0) * 0.125;
-    dst.write(float4(r, 1.0), gid);
+    dst.write(r, gid);
 }
 
 // A level's share of the bloom: POST_BLOOM_SHAPE times the share of the level above it, the shares summing to 1.
@@ -236,7 +243,10 @@ static float postBinLog(float bin) {
 }
 
 // The histogram of a bloom level (quarter resolution, linear light), each texel's weight 1 at the screen's edges up to 4
-// in its middle (center-weighted metering). Threadgroups of 16 x 16 count into threadgroup memory first.
+// a little below its middle (center-weighted metering that leans away from the sky). In lit mode it meters light rather
+// than color: the texel's luminance over its mean albedo luminance (alpha, from the G-buffer in the bloom's first pass;
+// 1 for sky, water and the rest): an incident-light meter, so a dark forest and bright sand under the same sun read
+// alike, and night, shade and caves read as less light. Threadgroups of 16 x 16 count into threadgroup memory first.
 kernel void post_histogram(texture2d<float, access::read> src [[texture(0)]], device atomic_uint* hist [[buffer(0)]],
                            uint2 gid [[thread_position_in_grid]], uint li [[thread_index_in_threadgroup]]) {
     threadgroup atomic_uint local[POST_BINS];
@@ -244,11 +254,12 @@ kernel void post_histogram(texture2d<float, access::read> src [[texture(0)]], de
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint w = src.get_width(), h = src.get_height();
     if (gid.x < w && gid.y < h) {
-        float l = postLuma(src.read(gid).rgb);
+        float4 v = src.read(gid);
+        float l = postLuma(v.rgb) / clamp(v.a, POST_METER_ALBEDO, 1.0);
         float x = (log2(max(l, 1e-30)) - POST_LOG_MIN) / (POST_LOG_MAX - POST_LOG_MIN);
         uint bin = x < 0.0 ? 0u : uint(clamp(1.0 + x * float(POST_BINS - 1), 1.0, float(POST_BINS - 1)));
         float2 p = (float2(gid) + 0.5) / float2(w, h) * 2.0 - 1.0;
-        uint weight = 1u + uint(round(3.0 * saturate(1.0 - length(p * float2(0.9, 1.0)))));
+        uint weight = 1u + uint(round(3.0 * saturate(1.0 - length((p - float2(0.0, -0.3)) * float2(0.9, 1.0)))));
         atomic_fetch_add_explicit(&local[bin], weight, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -414,6 +425,12 @@ static float3 postToneMap(float3 x, float4 tone) {
     if (H <= 1.0) return d;
     float t = max(postLuma(x) - POST_EDR_KNEE, 0.0) / POST_EDR_SPAN;
     return d * (1.0 + (H - 1.0) * (1.0 - exp(-t * t)));
+}
+
+// Offline check (mmc_debug_post_curve): scene-linear inputs (exposed) through a tone curve at a headroom.
+kernel void post_debug_curve(device const float4* in [[buffer(0)]], device float4* out [[buffer(1)]],
+                             constant float4& tone [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    out[i] = float4(postToneMap(in[i].rgb, tone), 0.0);
 }
 
 // ------------------------------------------------------------------------------------------------------------ composite
@@ -620,9 +637,11 @@ final class Post: @unchecked Sendable {
             }
         }
         let qw = (width + 3) / 4, qh = (height + 3) / 4
+        // The composite's display light: on an SDR display it's within [0, 1], which RGB10A2 holds finer than the 8-bit
+        // present (half RGBA16Float's bandwidth for the composite's write and the copy's reads); past 1 with HDR output.
         guard let m = tex(.rg16Float, qw, qh, "MetalMC post shaft mask"), let t = tex(.r16Float, qw, qh, "MetalMC post shaft blur 1"),
               let b = tex(.r16Float, qw, qh, "MetalMC post shaft blur 2"), let c = tex(.rgba16Float, qw, qh, "MetalMC post shafts"),
-              let o = tex(.rgba16Float, width, height, "MetalMC post output") else { return false }
+              let o = tex(hdrOutput ? .rgba16Float : .rgb10a2Unorm, width, height, "MetalMC post output") else { return false }
         down = downs; up = ups
         shaftMask = m; shaftTemp = t; shaftBlur = b; shaftColor = c
         output = o
@@ -708,8 +727,8 @@ final class Post: @unchecked Sendable {
         var f = frame
         func grid(_ t: MTLTexture) -> MTLSize { MTLSize(width: t.width, height: t.height, depth: 1) }
         let tg = MTLSize(width: 16, height: 16, depth: 1)
-        // Bloom (and the histogram's source, its second level).
-        if stages.contains(.bloom) || stages.contains(.exposure) {
+        // Bloom (and the histogram's source, its second level; the offline timing's exposure stage alone reuses the last).
+        if stages.contains(.bloom) {
             guard let enc = cb.makeComputeCommandEncoder(descriptor: profComputePass("post bloom (13-tap down x\(postBloomLevels), tent up)")) else { return false }
             enc.label = "MetalMC post bloom"
             enc.setComputePipelineState(firstPipe)
@@ -844,10 +863,30 @@ final class Post: @unchecked Sendable {
         frames += 1
         if frames % 1200 == 1, let e = exposure {
             let v = e.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2)
-            log(String(format: "post: %d frames; exposure %+.2f stops (target %+.2f, metered log2 luminance %.2f), from %@, tone curve %@%@",
+            log(String(format: "post: %d frames; exposure %+.2f stops (target %+.2f, metered log2 light %.2f), from %@, tone curve %@%@",
                        frames, v[0].x, v[0].y, v[0].z, input === color ? "the frame" : "the anti-aliasing's history",
                        postToneCurves[toneCurve], headroom > 1 ? String(format: ", headroom %.2f", headroom) : ""))
         }
+        return true
+    }
+
+    /// Offline check: tone curve `curve` (0-3) at `headroom` for n scene-linear RGB inputs (4 floats each) into out.
+    func debugCurve(_ input: UnsafePointer<Float>, _ out: UnsafeMutablePointer<Float>, _ n: Int, headroom: Float, curve: Int) -> Bool {
+        guard ensureLibrary(), let lib = library, let f = lib.makeFunction(name: "post_debug_curve"),
+              let pipe = try? ctx.device.makeComputePipelineState(function: f),
+              let ib = ctx.device.makeBuffer(bytes: input, length: n * 16, options: .storageModeShared),
+              let ob = ctx.device.makeBuffer(length: n * 16, options: .storageModeShared),
+              let cb = ctx.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return false }
+        var tone = SIMD4<Float>(max(headroom, 1), skyKnee(headroom), 0, Float(curve))
+        enc.setComputePipelineState(pipe)
+        enc.setBuffer(ib, offset: 0, index: 0)
+        enc.setBuffer(ob, offset: 0, index: 1)
+        enc.setBytes(&tone, length: 16, index: 2)
+        enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(n, 64), height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        memcpy(out, ob.contents(), n * 16)
         return true
     }
 
@@ -948,6 +987,14 @@ public func mmc_debug_post_exposure(_ out: UnsafeMutablePointer<Float>) -> Int32
     guard v.count == 8 else { return 0 }
     for i in 0..<8 { out[i] = v[i] }
     return 1
+}
+
+/// Offline check (tools, no game): tone curve `curve` (0 legacy, 1 AgX, 2 ACES, 3 GT) at `headroom` for n inputs of 4
+/// floats (rgb, unused), exposed scene-linear light, into out (display-linear).
+@_cdecl("mmc_debug_post_curve")
+public func mmc_debug_post_curve(_ input: UnsafePointer<Float>, _ out: UnsafeMutablePointer<Float>, _ n: Int32, _ headroom: Float, _ curve: Int32) -> Int32 {
+    guard postEnabled else { return 0 }
+    return Post.shared.debugCurve(input, out, Int(n), headroom: headroom, curve: Int(curve)) ? 1 : 0
 }
 
 /// Offline timing (see Post.debugTime): out gets 10 doubles.
