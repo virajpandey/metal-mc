@@ -1201,24 +1201,44 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 ### Light sources, clouds, a cheaper first pass (2026-10-05, second round)
 
 - **Light sources brighter than white** (Lit.swift, `litEmitterTerm`, spliced into the relight only with `post`, so lit
-  mode's text and frame without it are as before). Emitting blocks are flat-lit at their own level: 15 for glowstone,
-  lava, lanterns, fire, magma, 14 for torches and end rods; faces lit by them stay under 14, since smooth lighting
-  averages four blocks of which at most one is the source. Where the G-buffer's block light is 13.9 or more the relight's
-  light becomes `max(E, 1) x (1 + (LIT_EMIT - 1) x smoothstep(0.35, 0.8, luma(albedo)))`, `LIT_EMIT` 6: the bright
-  texels of a source (a flame, lava's glowing cracks, glowstone's crystals) up to 6 times white, its dark ones (a torch's
-  stick, lava's crust) about as before. They then bloom on their own light, so the bloom's extra weight for light sources
-  went from 6 to 2. Lit mode without post keeps E = 1 for sources (its 8-bit frame would clip them to flat white).
+  mode's text and frame without it are as before). Emitting blocks are flat-lit at their own level, and the relight's
+  light there becomes `max(E, 1) x (1 + (LIT_EMIT - 1) x w)`, `LIT_EMIT` 6, `w` from the texel's (sRGB) luma:
+  - level 15 (glowstone, lava, lanterns, fire, magma, sea lanterns): `smoothstep(0.35, 0.8)`, so a source's bright
+    texels (lava's glowing cracks, a lantern's flame, glowstone's crystals) go up to 6 times white and its dark ones
+    (lava's crust, a lantern's frame) stay about as they were. Only sources reach 15: smooth lighting averages four
+    blocks, and beside a 15 they're 14.
+  - level 14: torches, but also the face a lantern or glowstone stands on (15, 14, 14 and 13 averaged is exactly 14). The
+    first try counted every texel there: the sand under the cave's lantern went flat white
+    (`round2/compare-round1-round2-lantern-crop-falsepositive.png`). Now only near-white texels at 14 count
+    (`smoothstep(0.88, 0.97)`: a flame's yellow-white core; sand, about 0.81, and stone stay as they were). A white block
+    under a lantern (snow, quartz) would still glow; telling a torch from it for sure needs the writers to flag emitting
+    quads (the section compiler knows the block state), a G-buffer bit.
+  - They bloom on their own light now, so the bloom's extra weight for light sources went from 6 to 2. Lit mode without
+    post keeps E = 1 for sources (its 8-bit frame would clip them to flat white).
 - **Clouds** (Sky.swift's `skyLevelColor`, the step that takes the level through the air, in scene-linear light with
   post): vanilla draws its clouds in its own white, which the filmic curve takes to a light gray against a darker sky.
   With post the 4-block slab at the cloud height (`Lod.CLOUD_HEIGHT`, camera-relative, given to the native side ahead of
-  that step by `mmc_post_clouds`) gets `SKY_CLOUD_GAIN` (2.6) times its color by day, fading with the sun's height to
-  none at night and in rain (the frame's `horizon.w` and `fade.w`, unused until now and 0 without post): sunlit cloud
+  that step by `mmc_post_clouds`) gets `SKY_CLOUD_GAIN` (2.6) times its color by day, from none with the sun 3 degrees
+  up to all of it at 20 (a sunset's clouds keep vanilla's gray, which reads as backlit against the glow; the first try
+  faded in from the horizon and washed the sunset's clouds into the haze), none at night and in rain (the frame's `horizon.w` and `fade.w`, unused until now and 0 without post): sunlit cloud
   is about as bright as sunlit snow, a stop above white terrain. Anything else inside the slab (a peak above y 192, a
   phantom) would get it too, as it gets no shadow in RtShadows.
 - **The bloom's first pass reads the G-buffer and the depth once per 2 x 2 block** (its top-left pixel) into threadgroup
   memory, then the frame per pixel: 3 bytes a pixel of them instead of 12. The light source weight and the meter's albedo
   are blurred far wider than a block.
-ROUND2_RESULTS
+- **In game** (a lab session, the same switches as the first round's plus nothing else; `bench_out/agents/post/round2/` in
+  the main checkout; round 1's final defaults over round 2 in `compare-round1-round2-*.png`):
+  - the cave's lantern (`compare-round1-round2-lantern-crop.png`, full resolution): its flame window brighter and
+    glowing, the sand around it as before;
+  - the deep lava lake from the colored light tour (`lava_lake.png`, -26.5 -51 -75.5): the glowing cracks near white,
+    the crust orange, the cave walls lit warm by it;
+  - clouds (`compare-round1-round2-forest.png`): white with gray undersides instead of flat light gray; forest scene
+    mean luma 79.5 -> 83.0, the land unchanged;
+  - `night_torches.png` and `torch_cave.png` came from the first try (every texel at 14 boosted: the torches on the
+    lamp post and the houses white-hot, which is the look the near-white test keeps for their flames).
+- **Cost**: offline, each stage alone at 3456 x 2234 (litflow, sunset, median of 40): the bloom 1.44 -> 1.31 ms with the
+  G-buffer read per block; post's whole-frame cost +2.29 -> +2.03 ms. The emitter term and the cloud gain are a few
+  instructions in passes that run anyway.
 
 ### Not done, and next
 

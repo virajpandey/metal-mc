@@ -150,14 +150,19 @@ private let litGiSkyTerm = litGi ? """
 /// With the post chain (postEnabled only, Post.swift; empty otherwise, so lit mode's text is unchanged without it): light
 /// sources brighter than vanilla's white, so they bloom and run white-hot through the tone curve.
 private let litEmitterTerm = postEnabled ? """
-    // Light sources (Post.swift, METALMC_EXP=post): their faces are flat-lit at the source's own level, 15 (glowstone,
-    // lava, lanterns, fire, magma) or 14 (torches, end rods); lit faces near them stay under 14 (smooth lighting averages
-    // four blocks, at most one of them the source). LIT_EMIT times their light, in proportion to the texel's brightness:
-    // the flame more than the stick, lava's glowing cracks more than its crust.
+    // Light sources (Post.swift, METALMC_EXP=post): their faces are flat-lit at the source's own level. Level 15 (glowstone,
+    // lava, lanterns, fire, magma, sea lanterns) is theirs alone: smooth lighting averages four blocks, and next to a 15
+    // they're 14 or less. LIT_EMIT times their light, in proportion to the texel's brightness: lava's glowing cracks more
+    // than its crust, a lantern's flame more than its frame. Level 14 is a torch's, but also the face a lantern or a
+    // glowstone stands on (15, 14, 14 and 13 averaged): there only near-white texels count (a flame's yellow-white core;
+    // sand and stone under a lantern are darker).
 #ifndef LIT_EMIT
 #define LIT_EMIT 6.0
 #endif
-    if (block >= 13.9) E = max(E, float3(1.0)) * (1.0 + (LIT_EMIT - 1.0) * smoothstep(0.35, 0.8, litLuma(albedo)));
+    if (block >= 13.97) {
+        float emit = smoothstep(block >= 14.97 ? 0.35 : 0.88, block >= 14.97 ? 0.8 : 0.97, litLuma(albedo));
+        if (emit > 0.0) E = max(E, float3(1.0)) * (1.0 + (LIT_EMIT - 1.0) * emit);
+    }
 
 """ : ""
 

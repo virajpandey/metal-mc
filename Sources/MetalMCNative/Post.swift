@@ -1003,7 +1003,8 @@ public func mmc_post_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsa
 public func mmc_post_clouds(_ bottomRel: Float) {
     guard postEnabled, Sky.shared.ready else { return }
     let f = Sky.shared.frame
-    let day = postSmoothstep(-0.05, 0.25, f.sun.y) * (1 - f.aerial.z)
+    // From a sun 3 degrees up (sunset's clouds keep vanilla's gray, which reads as backlit against the glow) to full at 20.
+    let day = postSmoothstep(0.05, 0.35, f.sun.y) * (1 - f.aerial.z)
     Sky.shared.frame.horizon.w = bottomRel.isFinite ? bottomRel : 0
     Sky.shared.frame.fade.w = bottomRel.isFinite ? day : 0
 }
