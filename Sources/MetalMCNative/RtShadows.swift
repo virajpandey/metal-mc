@@ -174,6 +174,8 @@ final class RtShadows: @unchecked Sendable {
     /// With the GI cache: its half-resolution light and code words this frame (one RG32Uint texel each, gi_resolve), and
     /// the sun and sky light it took from the atmosphere (GiCache.envThisFrame), for the relight (takeLitGi).
     private var giOut: MTLTexture?
+    /// Colored block light bounced through the cache (ColoredLightBounce.swift): its half-resolution light this frame.
+    private(set) var giBlockOut: MTLTexture?
     private var litGiOut: (gi: MTLTexture, env: MTLBuffer?, width: Int, height: Int)?
     private var giRuns = 0
     /// Offline timing (mmc_debug_gi_frame): 0 skips the cache's frame.
@@ -557,6 +559,17 @@ final class RtShadows: @unchecked Sendable {
         }
         guard let out = giOut else { return }
         cache.tiles = gi
+        if clEnabled {
+            // Colored block light bounced (ColoredLightBounce.swift): its half-resolution channel beside the cache's light.
+            if giBlockOut == nil || giBlockOut!.width != hw || giBlockOut!.height != hh {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg11b10Float, width: hw, height: hh, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]
+                d.storageMode = .private
+                giBlockOut = ctx.device.makeTexture(descriptor: d)
+                giBlockOut?.label = "MetalMC GI cache block light"
+            }
+            cache.clBlockOut = giBlockOut
+        }
         let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
         let daylight = litDaylightEnv(sunAngle: sunAngle)
         let light: GiLightSource = Lit.shared.lastAtmosphere ? .atmosphere(fallback: daylight) : .daylight(daylight)

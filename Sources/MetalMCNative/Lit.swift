@@ -144,7 +144,7 @@ private let litGiSkyTerm = litGi ? """
         if (gi.get_width() > 1u) {
             float4 cl = giUpsample(gi, giOwn, q, fi < 6u ? fi : 2u, rel);
             if (cl.w > 0.0) { skyAmb = cl.rgb * ao; giUsed = true; }
-        }
+        }\(clEnabled ? "\n        // Colored block light bounced through the cache (ColoredLightBounce.swift), where vanilla's level isn't 0.\n        if (giStandIn.get_width() > 1u) blockLight += float3(giStandIn.read(giOwn).rgb) * saturate(block);" : "")
 """ : ""
 
 /// The relight's per-pixel work (litRelightPixel), shared by its own pass and by the anti-aliasing's resolve (Taa.swift),
@@ -813,6 +813,8 @@ final class Lit: @unchecked Sendable {
         lastGi = (dummyGi.irr, g.gi)
         guard useGi else { return dummyGi }
         giFrames += 1
+        // Colored block light bounced through the cache (ColoredLightBounce.swift) in the slot giStandIn kept free.
+        if clEnabled, let b = RtShadows.shared.giBlockOut, b.width == g.gi.width, b.height == g.gi.height { return (b, g.gi) }
         return (dummyGi.irr, g.gi)
     }
 

@@ -956,6 +956,15 @@ final class ColoredLight: @unchecked Sendable {
         return (rgb, aux, f)
     }
 
+    /// For the GI cache's bounce (ColoredLightBounce.swift): the filtered textures, the volume's min corner and its
+    /// toroidal offset, if the volume is valid (as its last update left it).
+    var bounceInputs: (rgb: MTLTexture, aux: MTLTexture, org: SIMD3<Int>, orgMod: SIMD3<Int>)? {
+        guard let rgb, let aux, cleared, frameParams.camTex.w > 0,
+              debugTime >= 0 || DispatchTime.now().uptimeNanoseconds - frameTime < 100_000_000 else { return nil }
+        let om = SIMD3<Int>(((org.x % clSizeX) + clSizeX) % clSizeX, ((org.y % clSizeY) + clSizeY) % clSizeY, ((org.z % clSizeZ) + clSizeZ) % clSizeZ)
+        return (rgb, aux, org, om)
+    }
+
     /// For the block lights' shadows (ColoredLightShadows.swift): the light and this frame's parameters, if the volume is
     /// valid this frame.
     var shadowInputs: (light: MTLBuffer, frame: ClFrameGPU)? {
