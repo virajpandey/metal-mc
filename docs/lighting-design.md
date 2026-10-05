@@ -1184,8 +1184,8 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - Where the bloom's 1.46 ms goes: its first pass reads the frame (4 bytes a pixel), the G-buffer (8) and the depth (4) at
   every pixel, 124 MB at the panel's resolution; the rest of the chain is small. Reading the G-buffer and depth once per
   2 x 2 block would take most of it away (below).
-- Eye adaptation with the final defaults, offline (litflow's default view; `bench_out/post/post-default-<time>-<label>.png`
-  in this worktree): noon +0.05 stops (mean luma 114.5 against 110.4 before), dusk +0.48 (132.2 against 86.6; the rest
+- Eye adaptation with the final defaults, offline (litflow's default view; `post-default-<time>-<label>.png`
+  and `bench_out/agents/post/offline/` in the main checkout): noon +0.05 stops (mean luma 114.5 against 110.4 before), dusk +0.48 (132.2 against 86.6; the rest
   is the sun's bloom and shafts in a view that looks toward it), sunset +0.63 (122.1 against 82.2), midnight +1.35 (39.5
   against 22.8). In time, at 120 Hz steps: noon -> midnight at once, +0.57 stops after 1 s, +0.89 after 2 s, +1.36
   after 6 s; midnight -> noon, +1.34 -> +0.24 after 1 s, +0.12 after 2 s.
