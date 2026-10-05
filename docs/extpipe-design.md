@@ -111,8 +111,10 @@ shadow camera (`shadowModelView`: 100 back along the sun or moon direction with 
 
 ## Running and debugging
 
-- `-PextPipe=<dir>` (needs the Metal backend; meant with `-Plod=0 -PocclusionCulling=0`, no `METALMC_EXP`, classic
-  transparency). Our LOD, near chunks and far field don't draw into the G-buffer.
+- `-PextPipe=<dir>` (needs the Metal backend; classic transparency; no `METALMC_EXP` look switches: near chunks would
+  take terrain out of vanilla's draws, lit mode and our anti-aliasing would work on the finished frame). Our LOD, far
+  field and section occlusion test skip the G-buffer pass (`-Plod=0` saves their work). In a lab session:
+  `LAB_EXP=none LAB_FAR=0 bash tools/bench/lab.sh <label> -PextPipe=<dir> -PocclusionCulling=0 -Ptaa=false`.
 - `-PbenchTour=shader`: noon overview and ground view, afternoon, sunset, a pool of water built in the sky, a closed room
   lit by torches and glowstone, night; screenshots in `mod/run/screenshots/<label>-tour-*.png`.
 - `METALMC_EXTPIPE_VIEW=<target>[.a][@<pass>][:scale],...` (`-PextPipeView=`) shows targets in a grid over the screen
