@@ -972,6 +972,7 @@ final class ExtPipe {
         if Date().timeIntervalSince(lastReloadCheck) > 0.5 {
             lastReloadCheck = Date()
             reloadChanged()
+            pollViewFile()
         }
         if frameActive { endFrame() }   // the last frame never closed its main pass
         let n = min(count, extStdCount)
@@ -1285,6 +1286,21 @@ final class ExtPipe {
     var viewPSO: [Bool: MTLRenderPipelineState] = [:]
     var viewCaptures: [String: MTLTexture] = [:]
     var frameCopy: MTLTexture?
+    var viewFileMtime: Date?
+
+    /// `<dir>/view.txt` (polled with the programs): its first line replaces the debug view while the game runs (an empty
+    /// line or no file: the frame), so a session can look at targets without restarting.
+    func pollViewFile() {
+        let path = dir.appendingPathComponent("view.txt").path
+        let m = extMtime(path)
+        guard m != viewFileMtime else { return }
+        viewFileMtime = m
+        let line = m == nil ? "" : ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "")
+            .split(separator: "\n").first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        ExtPipe.view = line.isEmpty ? nil : (line, 1)
+        viewCaptures = [:]
+        log("extpipe: debug view \(line.isEmpty ? "off" : line)")
+    }
 
     struct ViewSpec { let spec: String; let name: String; let alpha: Bool; let pass: String?; let scale: Float }
 

@@ -113,6 +113,7 @@ shadow camera (`shadowModelView`: 100 back along the sun or moon direction with 
 - `METALMC_EXTPIPE_VIEW=<target>[.a][@<pass>][:scale],...` (`-PextPipeView=`) shows targets in a grid over the screen
   instead of the frame: each as it was after that pass (`@gbuffers`: when the G-buffer was done; none: at the end of the
   frame), its alpha with `.a`, absolute values times the scale; NaN magenta, infinity cyan, depth as (1 - depth)^(1/4);
-  `frame` is a cell with the frame itself.
+  `frame` is a cell with the frame itself. While the game runs, the first line of `<dir>/view.txt` replaces it (polled
+  with the programs; empty or no file: the frame).
 - `tools/extpipe_check.swift`: loads and compiles a description and runs frames with an empty G-buffer offline
   (`EXTCHECK_VIEWS=` for the same views).
