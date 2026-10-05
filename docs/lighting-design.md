@@ -1184,8 +1184,11 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - Where the bloom's 1.46 ms goes: its first pass reads the frame (4 bytes a pixel), the G-buffer (8) and the depth (4) at
   every pixel, 124 MB at the panel's resolution; the rest of the chain is small. Reading the G-buffer and depth once per
   2 x 2 block would take most of it away (below).
-- Eye adaptation, measured offline at 120 Hz steps: noon -> midnight at once, +0.07 stops after 0.01 s, +0.69 after 1 s,
-  +1.08 after 2 s, +1.65 after 6 s; midnight -> noon, +1.62 -> +0.32 after 1 s, +0.16 after 2 s.
+- Eye adaptation with the final defaults, offline (litflow's default view; `bench_out/post/post-default-<time>-<label>.png`
+  in this worktree): noon +0.05 stops (mean luma 114.5 against 110.4 before), dusk +0.48 (132.2 against 86.6; the rest
+  is the sun's bloom and shafts in a view that looks toward it), sunset +0.63 (122.1 against 82.2), midnight +1.35 (39.5
+  against 22.8). In time, at 120 Hz steps: noon -> midnight at once, +0.57 stops after 1 s, +0.89 after 2 s, +1.36
+  after 6 s; midnight -> noon, +1.34 -> +0.24 after 1 s, +0.12 after 2 s.
 - The tone curves (`mmc_debug_post_curve`, litflow): at headroom 2, 4 and 8 every curve is the SDR one below the knee to
   the 4th decimal and reaches the headroom (AgX: 4 -> 0.84 in SDR, 1.24 at headroom 2, 2.04 at 4); AgX's outset matrix
   takes saturated highlights a little past 1 (the check flagged it), now clamped to the headroom.
