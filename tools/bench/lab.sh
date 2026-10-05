@@ -9,6 +9,7 @@
 #   bash tools/bench/lab.sh look1 &
 #   echo "scene sunset_water" >> mod/run/metalmc-control.txt
 #   echo "shot sunset-a" >> mod/run/metalmc-control.txt      -> mod/run/screenshots/sunset-a.png
+#   (or tools/bench/labctl.sh "scene sunset_water" "shot sunset-a": appends and waits for the results)
 # Env: LAB_EXP (lit,nearchunks,rtshadows,sky,gi,water), LAB_FAR (LOD reach, 8192), LAB_FIXTURE (claudeworld-merged),
 #      LAB_MINUTES (90), LAB_SHADERS, LAB_SCRIPT (a file of commands to queue at the start), LAB_VSYNC (true: 120 Hz).
 LABEL=${1:-lab}; shift

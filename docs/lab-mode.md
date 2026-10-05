@@ -19,6 +19,9 @@ echo "shot sunset-b"      >> mod/run/metalmc-control.txt
 echo "quit"               >> mod/run/metalmc-control.txt
 ```
 
+`tools/bench/labctl.sh` does the appending and waits for the results: `bash tools/bench/labctl.sh "scene forest" "shot
+forest-a"` prints the two result lines once the shot is written (`-n 19 "tour x"` for a tour's 19 results).
+
 Measured (2026-10-05, M3 Pro): the world is ready about 50 s after the session gets the GPU lock (the first LOD build
 from a cold cache takes a minute or two more); a save to rebuilt pipelines is about a second (lit and taa compile in
 about 0.5 s each); `tour` visits all nine scenes and writes nine screenshots in 74 s once the LOD is built.
@@ -84,7 +87,8 @@ keep running. The next save that compiles is picked up the same way.
 to port back into the Swift string it came from (mind `\(...)` interpolations: the file holds what they expanded to
 with this session's switches). A file you haven't edited follows the built-in source when that changes (someone's merge).
 An edited one is kept, with a warning and the new built-in source in `.orig/<file>.new` to merge; delete the file to
-start over from the built-in source.
+start over from the built-in source at the next start (while the game runs, a deleted file leaves the shaders as they
+are).
 
 A new library joins by compiling through `ShaderLab.library("name", source) { _ in ... }` instead of
 `device.makeLibrary(source:options:)`; the closure (lab mode only, render thread, between frames) forgets the library

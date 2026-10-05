@@ -26,7 +26,7 @@
     },
     {
       "name": "torch_cave",
-      "pos": [134, 17, -52], "yaw": 90, "pitch": 5, "time": 6000, "weather": "clear",
+      "pos": [136, 20, -46], "yaw": 105, "pitch": 22, "time": 6000, "weather": "clear",
       "setup": [
         "setblock 130 12 -52 minecraft:torch", "setblock 126 9 -52 minecraft:torch", "setblock 122 6 -56 minecraft:torch",
         "setblock 120 9 -52 minecraft:torch", "setblock 116 13 -50 minecraft:torch", "setblock 118 7 -58 minecraft:torch",
@@ -34,7 +34,7 @@
         "setblock 128 3 -64 minecraft:torch", "setblock 120 8 -54 minecraft:lantern", "setblock 132 8 -56 minecraft:lantern"
       ],
       "settle": 140,
-      "note": "The biggest cave near spawn (a cavern 25 blocks across under the plains 120 blocks east-northeast; floor 1-14, ceiling 34-52, surface 63), lit by ten torches and two lanterns the setup places on its floor (floor heights read from the fixture). Looking west from its east end, down into the deepest part."
+      "note": "The biggest cave near spawn (a cavern 25 blocks across under the plains 120 blocks east-northeast; floor 1-14, ceiling 34-52, surface 63), lit by ten torches and two lanterns the setup places on its floor (floor heights read from the fixture; the setup runs 2 s after arrival, once the chunks are loaded). From high in its northeast end, looking west-southwest down into the deepest part."
     },
     {
       "name": "mineshaft",
@@ -54,8 +54,8 @@
     },
     {
       "name": "mountain_view",
-      "pos": [1108, 188, 232], "yaw": 90, "pitch": 6, "time": 7000, "weather": "clear",
-      "note": "4 blocks over the summit of the frozen peaks 1.1 km east of spawn (the fixture's highest point, 184; the clouds start at 192), looking west across the whole fixture toward the horizon: a long view for the LOD, the far field and the aerial perspective."
+      "pos": [1064, 172, 230], "yaw": 90, "pitch": 6, "time": 7000, "weather": "clear",
+      "note": "On the west shoulder of the frozen peaks 1.1 km east of spawn (ground 165 here, the summit 184 at 1108 232), looking west across the whole fixture toward the horizon: a long view for the LOD, the far field and the aerial perspective. Higher up the cloud layer (192-196) fills the top of the frame as a ceiling."
     }
   ]
 }

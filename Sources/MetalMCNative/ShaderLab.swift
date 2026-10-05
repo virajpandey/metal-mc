@@ -119,18 +119,22 @@ private final class ShaderLabFiles: @unchecked Sendable {
             rebuilds the pipelines made from it. A compile error goes to shaderlab.log (and the game log) with the file and
             line, and the old shaders keep running. *_header.metal files are shared: #include "x.metal" lines pull them in.
             .orig/ holds the built-in source each file was written from: `diff -u .orig/lit.metal lit.metal` shows your edits
-            (to port back into the Swift string they came from). Delete a file to get the built-in source again.
+            (to port back into the Swift string they came from). Delete a file to get the built-in source back at the next
+            start (while the game runs, a deleted file leaves the shaders as they are).
 
             """.write(toFile: readme, atomically: true, encoding: .utf8)
         }
         note("shaders from \(dir): written there from the built-in sources where missing, recompiled when saved")
     }
 
-    /// Logs to the game log and to <dir>/shaderlab.log.
+    /// Logs to the game log and to <dir>/shaderlab.log (one writer at a time: the watcher and the render thread both note,
+    /// and two seek-to-end-and-write appends at once land on the same offset).
+    private let noteLock = NSLock()
     private func note(_ s: String) {
         log("shaderlab: " + s)
         let line = ShaderLabFiles.clock.string(from: Date()) + " " + s + "\n"
         let path = dir + "/shaderlab.log"
+        noteLock.lock(); defer { noteLock.unlock() }
         if let h = FileHandle(forWritingAtPath: path) {
             h.seekToEndOfFile()
             h.write(line.data(using: .utf8)!)

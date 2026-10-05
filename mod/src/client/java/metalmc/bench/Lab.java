@@ -182,24 +182,25 @@ final class Lab {
         boolean far = Math.hypot(hold[0] - fromX, hold[2] - fromZ) > 256;
         int time = s.has("time") ? s.get("time").getAsInt() : 6000;
         String weather = s.has("weather") ? s.get("weather").getAsString() : "clear";
-        var cmds = new java.util.ArrayList<String>();
-        cmds.add(String.format(Locale.ROOT, "tp @a %.3f %.3f %.3f %.2f %.2f", hold[0], hold[1], hold[2], hold[3], hold[4]));
-        cmds.add("time set " + time);
-        cmds.add("weather " + weather);
-        if (s.has("setup")) for (JsonElement e : s.getAsJsonArray("setup")) cmds.add(e.getAsString());
-        server(mc, cmds.toArray(new String[0]));
+        server(mc, String.format(Locale.ROOT, "tp @a %.3f %.3f %.3f %.2f %.2f", hold[0], hold[1], hold[2], hold[3], hold[4]),
+            "time set " + time, "weather " + weather);
+        // The setup's commands run once the server has loaded the chunks there: 2 s after the jump, and again at 5 s for a
+        // slow load (a setblock in a chunk that isn't loaded does nothing; in the same tick as the jump none are).
+        var setup = new java.util.ArrayList<String>();
+        if (s.has("setup")) for (JsonElement e : s.getAsJsonArray("setup")) setup.add(e.getAsString());
         if (s.has("fov")) mc.options.fov().set(s.get("fov").getAsInt());
         // Settled: at least `settle` ticks (rain takes about 5 s to fade in; the GI cache and the anti-aliasing's history a
         // few seconds to converge); the LOD built and its quad count steady for 3 s (after a far jump, only once it has
         // changed: it can hold still for the 2 s before its first update pass; or after 20 s); and vanilla's sections
         // around the camera compiled (or 5 s more: with our near chunks vanilla's count may never say so). At most a minute.
-        int min = s.has("settle") ? s.get("settle").getAsInt() : 100, max = Math.max(min, 1200);
+        int min = Math.max(s.has("settle") ? s.get("settle").getAsInt() : 100, setup.isEmpty() ? 0 : 160), max = Math.max(min, 1200);
         String what = String.format(Locale.ROOT, "%.1f %.1f %.1f yaw %.1f pitch %.1f, time %d, %s", hold[0], hold[1], hold[2],
             hold[3], hold[4], time, weather);
         int[] t = {0, 0, 0};   // ticks, ticks the quad count held, times it changed
         long[] lastQuads = {-1};
         current = m -> {
             t[0]++;
+            if (!setup.isEmpty() && (t[0] == 40 || t[0] == 100)) server(m, setup.toArray(new String[0]));
             boolean terrain = m.levelRenderer.hasRenderedAllSections() && m.levelRenderer.sectionRenderDispatcher().isQueueEmpty();
             boolean lod = true;
             if (metalmc.lod.Lod.ENABLED && metalmc.backend.MetalLod.available()) {
