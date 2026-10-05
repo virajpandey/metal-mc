@@ -3,7 +3,7 @@ import Metal
 import simd
 
 // Shadows from block lights (part of colored block light, METALMC_EXP=lit,coloredlight with rtshadows; strength
-// METALMC_CLSHADOW, 0.75, 0 for none). The light volume (ColoredLight.swift) spreads each color as vanilla spreads block
+// METALMC_CLSHADOW, off by default: -PclShadow=0.75 to try them). The light volume (ColoredLight.swift) spreads each color as vanilla spreads block
 // light, so its light goes around a pillar and fills the space behind it; a torch casts no shadow. Here, after the sun's
 // shadow rays and before the relight, one ray per 4 x 4 pixels (a different pixel of the block each frame, like the sun's)
 // goes from the surface toward the light its light comes from, through the sun shadows' acceleration structures
@@ -15,8 +15,9 @@ import simd
 // most 15 steps). The ray ends where it enters the light's cell (an opaque light, glowstone, is in the structure), aimed at
 // a point in the middle of the cell that moves every frame (soft edges); a face turned away from the light is in shadow.
 
-/// The shadows' strength (METALMC_CLSHADOW, 0.75): the share of the colored light a shadowed pixel loses; 0 traces none.
-let clShadowStrength: Float = max(0, min(1, Float(ProcessInfo.processInfo.environment["METALMC_CLSHADOW"] ?? "") ?? 0.75))
+/// The shadows' strength (METALMC_CLSHADOW, 0: none; 0.75 is a good start): the share of the colored light a shadowed
+/// pixel loses. Off by default until their noise next to their lights is gone (docs/lighting-design.md).
+let clShadowStrength: Float = max(0, min(1, Float(ProcessInfo.processInfo.environment["METALMC_CLSHADOW"] ?? "") ?? 0))
 
 private let clShadowSource = """
 #include <metal_stdlib>
