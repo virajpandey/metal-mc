@@ -567,7 +567,7 @@ static float3 clBlockLight(float3 vanilla, float3 ambient, float level, float3 r
         // Bilinear between the traced samples (one per scale x scale pixels), so their blocks don't show.
         constexpr sampler ls(filter::linear, address::clamp_to_edge);
         float2 uv = (float2(q2) + 0.5) / (c.shadow.y * float2(shTex.get_width(), shTex.get_height()));
-        sh = 1.0 - c.shadow.x * (1.0 - float(shTex.sample(ls, uv, level(0.0)).r));
+        sh = 1.0 - c.shadow.x * (1.0 - float(shTex.sample(ls, uv, metal::level(0.0)).r));   // (level: vanilla's, above)
     }
     float3 colored = ambient + rgb * (k * c.tune.x * r * sh) + vb * fill;
     dbg = float4(k < 0.98 ? 0.9 : 0.0, m * k > 1e-4 ? 0.8 : 0.0, fill * 0.9, 1.0);
