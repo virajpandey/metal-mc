@@ -40,6 +40,7 @@ for TRY in 1 2 3; do
   fi
   gpu_lock "$LOCK" "game run $(basename "$LOG")" 2>> "$OUT/dialog_waits.log"
   [ -d run/saves/claudeworld ] && mv run/saves/claudeworld "$OUT/old_worlds/claudeworld-$(date +%s)"
+  mkdir -p run/saves   # a fresh worktree has no run directory yet
   cp -Rp "../fixtures/$FIX" run/saves/claudeworld   # -p keeps mtimes, so the LOD's region cache still matches
   # Let Spotlight and the security scanners finish with the fresh copy before timing anything.
   sleep ${SETTLE:-30}

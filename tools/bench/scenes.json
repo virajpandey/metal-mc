@@ -1,0 +1,61 @@
+{
+  "fixture": "claudeworld-merged",
+  "about": "Showcase scenes for lab mode (docs/lab-mode.md): `scene NAME` in mod/run/metalmc-control.txt. pos is the player's feet (world x y z; the eye is 1.62 higher), yaw/pitch are Minecraft's (yaw 0 faces +z/south, 90 -x/west, 180 north, 270 east; pitch > 0 looks down), time is the day time in ticks (6000 noon, 12500 sunset, 18000 midnight), weather clear|rain|thunder, setup is server commands run on arrival (the fixture is a fresh copy every session, so placed blocks don't stay), settle the fewest ticks to wait before the scene counts as ready (it also waits for the terrain and the LOD). Spots were found by reading the fixture's region files (heightmaps, block palettes, structure starts) and checked in game; the notes say how.",
+  "scenes": [
+    {
+      "name": "noon_overview",
+      "pos": [8, 190, 8], "yaw": 281.5, "pitch": 12, "time": 6000, "weather": "clear",
+      "note": "120 blocks over the plains at the world's center (ground 65-98), looking east-northeast at the frozen peaks 1.1 km away (1108 184 232, the highest terrain in the fixture); the LOD and the far field fill the rest."
+    },
+    {
+      "name": "night_torches",
+      "pos": [64, 74, 168], "yaw": 134, "pitch": 14, "time": 18000, "weather": "clear",
+      "settle": 140,
+      "note": "Midnight over the plains village southeast of spawn (bell at 42 65 139; its houses carry 64 wall torches and 12 torches of their own), from 12 blocks up at its southeast corner, looking northwest across it."
+    },
+    {
+      "name": "rain",
+      "pos": [60, 66, 150], "yaw": 116.5, "pitch": 6, "time": 6000, "weather": "rain",
+      "settle": 160,
+      "note": "Noon rain in the same village, from street height east of the bell, looking west-northwest at the houses. Rain takes about 5 s to fade in, hence the longer settle."
+    },
+    {
+      "name": "forest",
+      "pos": [-30, 77, 350], "yaw": 146, "pitch": 5, "time": 3000, "weather": "clear",
+      "note": "Standing on the floor of the oak and birch forest 350 blocks south of spawn (ground 76 here; canopy 86-90 with leaf litter under it), mid-morning sun from the east, looking northwest into the trees."
+    },
+    {
+      "name": "torch_cave",
+      "pos": [134, 17, -52], "yaw": 90, "pitch": 14, "time": 6000, "weather": "clear",
+      "setup": [
+        "setblock 130 12 -52 minecraft:torch", "setblock 126 9 -52 minecraft:torch", "setblock 122 6 -56 minecraft:torch",
+        "setblock 120 9 -52 minecraft:torch", "setblock 116 13 -50 minecraft:torch", "setblock 118 7 -58 minecraft:torch",
+        "setblock 126 2 -60 minecraft:torch", "setblock 130 6 -58 minecraft:torch", "setblock 124 12 -48 minecraft:torch",
+        "setblock 128 3 -64 minecraft:torch", "setblock 120 8 -54 minecraft:lantern", "setblock 132 8 -56 minecraft:lantern"
+      ],
+      "settle": 140,
+      "note": "The biggest cave near spawn (a cavern 25 blocks across under the plains 120 blocks east-northeast; floor 1-14, ceiling 34-52, surface 63), lit by ten torches and two lanterns the setup places on its floor (floor heights read from the fixture). Looking west from its east end, down into the deepest part."
+    },
+    {
+      "name": "mineshaft",
+      "pos": [-137, 6, -25], "yaw": 90, "pitch": 4, "time": 6000, "weather": "clear",
+      "settle": 120,
+      "note": "Inside a mineshaft corridor 60 blocks under the plains west of spawn (floor y 5, two blocks high, oak supports), looking west along it at the corridor's own wall torches (-142 7 -25, -144 7 -25, -149 7 -25): torchlight only, no sky."
+    },
+    {
+      "name": "sunset_water",
+      "pos": [-640, 78, 4], "yaw": 90, "pitch": 3, "time": 12500, "weather": "clear",
+      "note": "On the coastal hill at the western shore 640 blocks west of spawn (ground 72; the land ends at x -652 and the ocean runs on past the fixture's edge), looking due west at the setting sun over open water."
+    },
+    {
+      "name": "water_closeup",
+      "pos": [-664, 64, 4], "yaw": 100, "pitch": 30, "time": 10000, "weather": "clear",
+      "note": "2.6 blocks over the sea just off the same shore (water 12 deep here), looking down at it toward the late-afternoon sun in the west: the sky's reflection and the sun's glint, waves, the shore's edge at the right."
+    },
+    {
+      "name": "mountain_view",
+      "pos": [1108, 192, 232], "yaw": 90, "pitch": 6, "time": 7000, "weather": "clear",
+      "note": "8 blocks over the summit of the frozen peaks 1.1 km east of spawn (the fixture's highest point, 184), looking west across the whole fixture toward the horizon: a long view for the LOD, the far field and the aerial perspective."
+    }
+  ]
+}
