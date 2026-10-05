@@ -69,6 +69,8 @@ public final class MetalMCConfig {
         bounceLight=false
         # Water that reflects the sky and the sun (with lighting and sky).
         waterReflections=false
+        # Colored block light: torches orange, soul lights cyan, redstone red, lava orange-red (with lighting).
+        coloredLight=false
         # HDR output: real highlights on screens that show them, such as the MacBook Pro's XDR display.
         hdr=false
         # Extra native switches, comma separated (developer use; METALMC_EXP in the environment wins).
@@ -176,6 +178,7 @@ public final class MetalMCConfig {
         if (flag("sky", false)) exp.add("sky");
         if (flag("bounceLight", false)) exp.add("gi");
         if (flag("waterReflections", false)) exp.add("water");
+        if (flag("coloredLight", false)) exp.add("coloredlight");
         if (flag("hdr", false)) exp.add("hdr");
         for (String e : get("experiments", "").split(",")) {
             if (!e.isBlank()) exp.add(e.trim());
