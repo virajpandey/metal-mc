@@ -28,7 +28,8 @@ public final class MetalColoredLight {
 
     private static boolean experiment(String name) {
         String v = System.getenv("METALMC_EXP");
-        if (v == null) return false;
+        // As MetalLit: the settings' switches (experiments=coloredlight) when the environment has none.
+        if (v == null) v = metalmc.MetalMCConfig.nativeExperiments();
         for (String s : v.split(",")) {
             if (s.trim().equals(name)) return true;
         }
