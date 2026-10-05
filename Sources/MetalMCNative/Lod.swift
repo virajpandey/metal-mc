@@ -1481,8 +1481,10 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         ctx.hitchLodNanos += dt
     }
     let r = LodRenderer.shared
-    // ExtPipe hook: an external pipeline's G-buffer pass has its own targets and GL's depth convention: no LOD there.
-    guard let enc = ctx.pass, !ctx.scissorEmpty, !extPassActive else { return 0 }
+    // ExtPipe hook: an external pipeline's G-buffer pass has its own targets and GL's depth convention: the LOD goes there
+    // only through its description's LOD program (every quad opaque, water too; no far field or occlusion boxes).
+    let ext = extPassActive ? extLodPipelines() : nil
+    guard let enc = ctx.pass, !ctx.scissorEmpty, !extPassActive || ext?.plain != nil else { return 0 }
     r.lock.lock(); let w = r.world; r.lock.unlock()
     guard let w else { return 0 }
     let snap = w.snapshot()
@@ -1749,7 +1751,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                          inView: visible)
         : [:]
     // Far field: its levels are ray-marched instead of drawn as quads, once its rings are filled.
-    let farOn = lodFarFieldLevel > 0 && !w.floating
+    let farOn = ext == nil && lodFarFieldLevel > 0 && !w.floating
         && FarField.shared.prepare(meshes: snap.meshes, generation: snap.generation, chosen: chosen, maxLevel: w.maxLevel, cx: cx, cz: cz)
     var farNearest = Double.infinity   // horizontal distance to the nearest tile the far field draws
     if farOn {
@@ -1793,8 +1795,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     let testBoxes = vis.map { !$0.slots.isEmpty } ?? false
     guard !draws.isEmpty || testBoxes || farOn else { return 0 }
 
-    enc.setRenderPipelineState(pipe)
-    enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: true))
+    enc.setRenderPipelineState(ext?.plain ?? pipe)
+    enc.setDepthStencilState(ctx.depthState(compare: ext != nil ? .lessEqual : .greaterEqual, write: true))
     enc.setCullMode(.back)
     enc.setTriangleFillMode(.fill)
     enc.setDepthBias(0, slopeScale: 0, clamp: 0)
@@ -1890,6 +1892,10 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
                                  cy: cy, nearest: farNearest)
         }
     }
+    if ext != nil {
+        boxesDone = true
+        vis?.slots.removeAll(keepingCapacity: true)
+    }
     var state = (seam: false, water: false, fade: false)
     for (di, d) in ordered.enumerated() {
         if d.water && !boxesDone {
@@ -1902,12 +1908,14 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         }
         let fading = d.fade > 0
         if d.seam != state.seam || d.water != state.water || fading != state.fade {
-            let p = fading ? (d.water ? fadeWaterPipe : fadePipe) : (d.water ? (d.seam ? seamWaterPipe : waterPipe) : (d.seam ? seamPipe : pipe))
+            let p = ext.map { d.seam ? $0.seam : $0.plain }
+                ?? (fading ? (d.water ? fadeWaterPipe : fadePipe) : (d.water ? (d.seam ? seamWaterPipe : waterPipe) : (d.seam ? seamPipe : pipe)))
             guard let p else { continue }   // a pipeline that failed to build: skip its draws, not everything after them
             if d.water && !state.water {
                 // Water writes depth only for the ray-traced shadows (its surface, not the floor under it, receives them)
                 // and in lit mode (the relight leaves the floor under it alone: its depth no longer matches).
-                enc.setDepthStencilState(ctx.depthState(compare: .greaterEqual, write: lodRtShadows || litEnabled))
+                enc.setDepthStencilState(ext != nil ? ctx.depthState(compare: .lessEqual, write: true)   // ExtPipe: opaque there
+                                         : ctx.depthState(compare: .greaterEqual, write: lodRtShadows || litEnabled))
                 u.alpha = lodOpaqueWater ? 1 : lodWaterAlpha
                 enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
             }

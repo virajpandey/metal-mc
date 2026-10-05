@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import ImageIO
 import Metal
+import MetalMCCore
 import simd
 
 // MARK: - External pipeline (METALMC_EXTPIPE=<dir>, off by default)
@@ -164,6 +165,8 @@ struct ExtDesc: Decodable {
     /// shader emulated by vertex expansion) each input triangle becomes that many vertices of a non-indexed draw, and the
     /// program gets {triangles, index mode 2 (quads), first index, base vertex, base instance, render stage} at buffer
     /// `paramsBuffer`; it pulls the vertices itself (buffers 30 and 29 as vanilla bound them, its vanillaBuffers).
+    /// `translucentRoutes`: translucent terrain (water) draws, which come after the deferred passes: the shadow pass draws
+    /// the last frame's (quads in vertex order, their sections' positions as they were, the current camera).
     struct Shadow: Decodable {
         let program: String
         let colors: [String]
@@ -172,10 +175,22 @@ struct ExtDesc: Decodable {
         let expand: Int?
         let paramsBuffer: Int?
         let routes: [String]
+        let translucentRoutes: [String]?
         let alphaTest: Double?
         let renderStage: Int?
         let enabled: Bool?
     }
+    /// Our LOD's opaque quads in the G-buffer pass (Lod.swift's hook): `program`'s vertex function reads the buffers Lod.swift
+    /// binds for its own (lod_vs: quads 18, LodUniforms 19, xforms 20, material colors 21, AO offsets 22; frame block too),
+    /// its fragment function writes the G-buffer attachments in order; `seamFragmentEntry` (same library) the variant for
+    /// tiles that overlap vanilla's terrain (the seam bitmap at fragment buffer 21). The LOD material ids are the
+    /// MMC_MAT_<NAME> macros in every program. Water quads are drawn opaque like the rest (the program sees their
+    /// materials); no far field (its levels are drawn as quads) or fades there.
+    struct Lod: Decodable {
+        let program: String
+        let seamFragmentEntry: String?
+    }
+    let lod: Lod?
     let name: String?
     let mslVersion: String?
     let mathMode: String?
@@ -258,6 +273,7 @@ final class ExtProgram {
     var vfn: MTLFunction?
     var ffn: MTLFunction?        // as written: color(i) is output i (full-screen passes)
     var ffnG: MTLFunction?       // color(i) moved to output i's G-buffer attachment (routed draws)
+    var flib: MTLLibrary?        // the fragment library (other entry points of it)
     var written: Set<Int> = []   // the fragment outputs the source declares
     var mtimes: [String: Date] = [:]
     var passPSO: [String: MTLRenderPipelineState] = [:]          // by the attachments' formats
@@ -335,6 +351,19 @@ final class ExtPipe {
         let renderStage: Int
     }
     var shadowRecords: [ShadowRecord] = []
+    /// A translucent section draw kept for the next frame's shadow pass: its vertices, first vertex and triangles, and
+    /// its entry of the section stream (chunk position + visibility, 16 bytes) copied.
+    struct TranslucentDraw {
+        let vertices: (MTLBuffer, Int)
+        let start: Int32
+        let tris: UInt32
+        let chunk: SIMD4<Int32>
+        let renderStage: Int
+    }
+    var translucentDraws: [TranslucentDraw] = []
+    var lastTranslucent: [TranslucentDraw] = []
+    var translucentSeen = false
+    var translucentChunks: [MTLBuffer?] = [nil, nil, nil]
     var shadowMode = false
     var shadowPSO: MTLRenderPipelineState?
     var shadowPSOFor: MTLFunction?
@@ -428,8 +457,16 @@ final class ExtPipe {
         } else {
             o.fastMathEnabled = mode != "safe"
         }
+        o.preprocessorMacros = ExtPipe.materialMacros
         return o
     }
+
+    /// The LOD's material ids (MetalMCCore's Mat) as MMC_MAT_<NAME> macros, for programs that read our LOD's quads.
+    static let materialMacros: [String: NSObject] = {
+        var m: [String: NSObject] = [:]
+        for c in Mat.allCases { m["MMC_MAT_\(String(describing: c).uppercased())"] = NSNumber(value: c.rawValue) }
+        return m
+    }()
 
     static let colorAttr = try! NSRegularExpression(pattern: "\\[\\[color\\((\\d+)\\)\\]\\]")
 
@@ -469,7 +506,7 @@ final class ExtPipe {
         guard let vf = vlib.makeFunction(name: p.desc.vertexEntry) else {
             throw NSError(domain: "extpipe", code: 1, userInfo: [NSLocalizedDescriptionKey: "\(p.name): no vertex entry \(p.desc.vertexEntry)"])
         }
-        var ff: MTLFunction?, ffG: MTLFunction?
+        var ff: MTLFunction?, ffG: MTLFunction?, fl: MTLLibrary?
         var written: Set<Int> = []
         if let fpath0 = p.desc.fragment, let fentry = p.desc.fragmentEntry {
             let fpath = dir.appendingPathComponent(fpath0).path
@@ -477,6 +514,7 @@ final class ExtPipe {
             mt[fpath] = extMtime(fpath) ?? Date()
             written = ExtPipe.colorOutputs(fsrc)
             let flib = try dev.makeLibrary(source: fsrc, options: opts)
+            fl = flib
             ff = flib.makeFunction(name: fentry)
             if ff == nil {
                 throw NSError(domain: "extpipe", code: 1, userInfo: [NSLocalizedDescriptionKey: "\(p.name): no fragment entry \(fentry)"])
@@ -496,6 +534,7 @@ final class ExtPipe {
         p.vfn = vf
         p.ffn = ff
         p.ffnG = ffG
+        p.flib = fl
         p.written = written
         p.mtimes = mt
         p.passPSO = [:]
@@ -990,6 +1029,9 @@ final class ExtPipe {
         stage = "gbuffers"
         writtenInStage = []
         shadowRecords.removeAll(keepingCapacity: true)
+        if translucentSeen { swap(&lastTranslucent, &translucentDraws) }
+        translucentDraws.removeAll(keepingCapacity: true)
+        translucentSeen = false
         stats.frames += 1
         if stats.frames % 600 == 1 {
             log("extpipe: frame \(stats.frames): routed draws \(stats.routed), skipped pipelines: \(unrouted.sorted().joined(separator: " "))")
@@ -1084,6 +1126,7 @@ final class ExtPipe {
         closeEncoder()
         runDeferred()
         phase = 3
+        translucentSeen = true
         stage = "gbuffers"
         return openGbufferEncoder()
     }
@@ -1101,13 +1144,46 @@ final class ExtPipe {
 
     /// From mmc_rp_draw_indexed_indirect in the opaque G-buffer pass: a terrain draw the shadow pass replays.
     func recordIndirect(_ buf: MTLBuffer, _ offset: Int, _ count: Int) {
-        guard let sh = desc.shadow, sh.enabled ?? true, phase == 2, let v = vanilla, sh.routes.contains(v.name) else { return }
-        shadowRecords.append(ShadowRecord(vertices: vertexBuffers[0], instances: vertexBuffers[1], globals: vanillaBuffers["Globals"],
-                                          args: buf, argsOffset: offset, count: count, renderStage: route?.renderStage ?? 0))
+        guard let sh = desc.shadow, sh.enabled ?? true, let v = vanilla else { return }
+        if phase == 2, sh.routes.contains(v.name) {
+            shadowRecords.append(ShadowRecord(vertices: vertexBuffers[0], instances: vertexBuffers[1], globals: vanillaBuffers["Globals"],
+                                              args: buf, argsOffset: offset, count: count, renderStage: route?.renderStage ?? 0))
+        } else if phase == 3, sh.translucentRoutes?.contains(v.name) ?? false {
+            recordTranslucent(buf, offset, count)
+        }
+    }
+
+    /// Copies what the next frame's shadow pass needs of a translucent multi-draw (the arguments and section stream are
+    /// rewritten every frame; the sections' vertex buffers stay).
+    func recordTranslucent(_ buf: MTLBuffer, _ offset: Int, _ count: Int) {
+        guard let vb = vertexBuffers[0], let (sb, so) = vertexBuffers[1], offset + count * 20 <= buf.length else { return }
+        let args = (buf.contents() + offset).assumingMemoryBound(to: UInt32.self)
+        // Quads are 4 vertices each from the first vertex; with the shared sequential index buffer a first index is a quad
+        // offset, with a sorted one (vanilla sorts translucent quads by index) the section's quads start at its base vertex.
+        var sequential: (Int) -> Bool = { _ in false }
+        if let ib = ctx.indexBuffer {
+            let n = ib.length / ctx.indexSize
+            if ctx.indexType == .uint16 {
+                let p = ib.contents().assumingMemoryBound(to: UInt16.self)
+                sequential = { f in f + 6 <= n && Int(p[f]) == f / 6 * 4 && Int(p[f + 1]) == f / 6 * 4 + 1 && Int(p[f + 4]) == f / 6 * 4 + 3 }
+            } else {
+                let p = ib.contents().assumingMemoryBound(to: UInt32.self)
+                sequential = { f in f + 6 <= n && Int(p[f]) == f / 6 * 4 && Int(p[f + 1]) == f / 6 * 4 + 1 && Int(p[f + 4]) == f / 6 * 4 + 3 }
+            }
+        }
+        let stage = route?.renderStage ?? 0
+        for i in 0..<count {
+            let a = args + 5 * i
+            let indexCount = a[0], instances = a[1], firstIndex = Int(a[2]), baseVertex = Int32(bitPattern: a[3]), baseInstance = Int(a[4])
+            guard indexCount >= 6, instances > 0, so + (baseInstance + 1) * 16 <= sb.length else { continue }
+            let chunk = (sb.contents() + so + baseInstance * 16).loadUnaligned(as: SIMD4<Int32>.self)
+            let start = baseVertex + (firstIndex % 6 == 0 && sequential(firstIndex) ? Int32(firstIndex / 6 * 4) : 0)
+            translucentDraws.append(TranslucentDraw(vertices: vb, start: start, tris: indexCount / 3, chunk: chunk, renderStage: stage))
+        }
     }
 
     func runShadow() {
-        guard let sh = desc.shadow, sh.enabled ?? true, !shadowRecords.isEmpty, let prog = programs[sh.program],
+        guard let sh = desc.shadow, sh.enabled ?? true, !(shadowRecords.isEmpty && lastTranslucent.isEmpty), let prog = programs[sh.program],
               let vf = prog.vfn, let ff = prog.ffn, let depth = targets[sh.depth], !depth.tex.isEmpty else { return }
         let colors = sh.colors.compactMap { targets[$0] }.filter { !$0.tex.isEmpty }
         if shadowPSO == nil || shadowPSOFor !== vf {
@@ -1192,9 +1268,33 @@ final class ExtPipe {
                 draws += 1
             }
         }
+        // The last frame's translucent sections, with this frame's camera (Globals) and their copied stream entries.
+        var waterDraws = 0
+        if !lastTranslucent.isEmpty, let globals = shadowRecords.last?.globals {
+            let need = lastTranslucent.count * 16
+            if (translucentChunks[ring]?.length ?? 0) < need {
+                translucentChunks[ring] = ctx.device.makeBuffer(length: max(need * 2, 4096), options: [.storageModeShared])
+            }
+            if let chunks = translucentChunks[ring] {
+                let p = chunks.contents().assumingMemoryBound(to: SIMD4<Int32>.self)
+                for (k, t) in lastTranslucent.enumerated() { p[k] = t.chunk }
+                enc.setVertexBuffer(chunks, offset: 0, index: 29)
+                if let slot = globalsSlot { enc.setVertexBuffer(globals.0, offset: globals.1, index: slot) }
+                for (k, t) in lastTranslucent.enumerated() {
+                    enc.setVertexBuffer(t.vertices.0, offset: t.vertices.1, index: 30)
+                    var params: (UInt32, UInt32, UInt32, Int32, UInt32, UInt32, UInt32, UInt32) =
+                        (t.tris, 2, 0, t.start, UInt32(k), UInt32(t.renderStage), 0, 0)
+                    enc.setVertexBytes(&params, length: 32, index: paramsIndex)
+                    if expand > 0 { enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: Int(t.tris) * expand) }
+                    waterDraws += 1
+                }
+            }
+        }
         enc.endEncoding()
         ctx.statPasses += 1
-        if stats.frames % 600 == 1 { log("extpipe: shadow pass: \(shadowRecords.count) terrain draws, \(draws) sections") }
+        if stats.frames % 600 == 1 {
+            log("extpipe: shadow pass: \(shadowRecords.count) terrain draws, \(draws) sections, \(waterDraws) translucent sections (last frame's)")
+        }
         if let c = sh.depthCopy, let t = targets[c], !t.tex.isEmpty, t.format == depth.format,
            t.current.width == depth.current.width, t.current.height == depth.current.height, let blit = cb.makeBlitCommandEncoder() {
             blit.copy(from: depth.current, sourceSlice: 0, sourceLevel: 0, to: t.current, destinationSlice: 0, destinationLevel: 0, sliceCount: 1, levelCount: 1)
@@ -1608,6 +1708,35 @@ final class ExtPipe {
         stats.routed += 1
     }
 
+    // MARK: Our LOD (Lod.swift's hook in mmc_lod_draw)
+
+    var lodPSOs: (key: String, vfn: MTLFunction, ffn: MTLFunction, plain: MTLRenderPipelineState?, seam: MTLRenderPipelineState?)?
+
+    /// The description's LOD program for the opaque G-buffer pass now open (nil: the LOD stays out of it).
+    func lodPipelines() -> (plain: MTLRenderPipelineState?, seam: MTLRenderPipelineState?)? {
+        guard phase == 2, extPassActive, let l = desc.lod, let prog = programs[l.program], !prog.failed,
+              let vf = prog.vfn, let ff = prog.ffn else { return nil }
+        let key = ctx.passColorFormats.map { "\($0.rawValue)" }.joined(separator: ",") + "/\(ctx.passDepthFormat.rawValue)"
+        if let c = lodPSOs, c.key == key, c.vfn === vf, c.ffn === ff { return (c.plain, c.seam) }
+        func make(_ f: MTLFunction?) -> MTLRenderPipelineState? {
+            guard let f else { return nil }
+            let d = MTLRenderPipelineDescriptor()
+            d.label = "extpipe lod"
+            d.vertexFunction = vf
+            d.fragmentFunction = f
+            for (i, fmt) in ctx.passColorFormats.enumerated() where fmt != .invalid { d.colorAttachments[i].pixelFormat = fmt }
+            d.depthAttachmentPixelFormat = ctx.passDepthFormat
+            do { return try ctx.device.makeRenderPipelineState(descriptor: d) } catch {
+                log("extpipe: lod program \(l.program): \(error)")
+                return nil
+            }
+        }
+        let plain = make(ff)
+        let seam = make(l.seamFragmentEntry.flatMap { prog.flib?.makeFunction(name: $0) })
+        lodPSOs = (key, vf, ff, plain, seam)
+        return (plain, seam)
+    }
+
     // MARK: Loading
 
     /// The pipeline for this frame: loads it the first time, and again when pipeline.json changes (a failed reload keeps
@@ -1749,4 +1878,11 @@ func extVertexBuffer(_ slot: Int32, _ h: Int64, _ offset: Int64) {
 
 func extRecordIndirect(_ buf: MTLBuffer, _ offset: Int, _ count: Int) {
     ExtPipe.shared?.recordIndirect(buf, offset, count)
+}
+
+// MARK: - Lod.swift hooks
+
+/// mmc_lod_draw inside the G-buffer pass: the description's LOD pipelines (plain, seam), or nil to draw nothing there.
+func extLodPipelines() -> (plain: MTLRenderPipelineState?, seam: MTLRenderPipelineState?)? {
+    ExtPipe.shared?.lodPipelines()
 }
