@@ -198,6 +198,7 @@ final class MetalRenderPipeline implements BackendRenderPipeline {
             LOGGER.error("Couldn't compile Metal pipeline {}: {}", info.name(), error);
             return BackendRenderPipeline.Pending.NULL;
         }
+        if (MetalExtPipe.ENABLED) MetalExtPipe.pipelineInfo(handle, info);   // the external pipeline routes by these names
         MetalRenderPipeline pipeline = new MetalRenderPipeline(device, handle, info.uniforms());
         return () -> pipeline;
     }

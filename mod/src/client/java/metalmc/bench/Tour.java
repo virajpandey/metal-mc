@@ -255,7 +255,39 @@ final class Tour {
         new Step("taa-turn", ground(180f), 30, mc -> mc.options.setCameraType(net.minecraft.client.CameraType.FIRST_PERSON))
     );
 
+    /**
+     * Shader pipeline showcase (-PbenchTour=shader, for the external pipeline, METALMC_EXTPIPE): a noon overview and a
+     * ground view, the sunset, a pool of water built in the sky (open sky to reflect), a closed room lit by torches and
+     * glowstone (no sky light), and the night. No HUD; each pose holds a few seconds so temporal filters settle.
+     */
+    static final boolean SHADER_TOUR = "shader".equals(System.getProperty("metalmc.tour"));
+    private static final int WX0 = 30, WX1 = 78, WY = 196, WZ0 = -40, WZ1 = 8;      // the pool
+    private static final int RX0 = -32, RX1 = -22, RY = 200, RZ0 = 28, RZ1 = 38;    // the room
+    static final List<Step> SHADER_STEPS = List.of(
+        new Step("noon-overview", at(190, 180f, 30f), 600, mc -> {
+            cmd(mc, "time set 6000", "weather clear", "gamerule advance_time false", "gamerule advance_weather false",
+                "gamerule spawn_mobs false");
+            if (!mc.gui.hud.isHidden()) mc.gui.hud.toggle();
+        }),
+        new Step("noon-ground", ground(180f), 160, mc -> {}),
+        new Step("afternoon-ground", ground(90f), 160, mc -> cmd(mc, "time set 9000")),
+        new Step("sunset", ground(90f), 160, mc -> cmd(mc, "time set 12300")),
+        new Step("water", new Pose(WX0 + 1.5, WY + 3.6, WZ1 - 1.5, 225f, 14f), 200, mc -> cmd(mc, "time set 7000",
+            fill(WX0, WY, WZ0, WX1, WY + 2, WZ1, "minecraft:stone"),
+            fill(WX0 + 1, WY + 1, WZ0 + 1, WX1 - 1, WY + 2, WZ1 - 1, "minecraft:water"))),
+        new Step("interior", new Pose(RX0 + 2.5, RY + 0.2, RZ0 + 2.5, 315f, 10f), 200, mc -> cmd(mc, "time set 6000",
+            fill(RX0, RY - 1, RZ0, RX1, RY + 5, RZ1, "minecraft:stone_bricks"),
+            fill(RX0 + 1, RY, RZ0 + 1, RX1 - 1, RY + 4, RZ1 - 1, "minecraft:air"),
+            "setblock " + (RX1 - 2) + " " + RY + " " + (RZ1 - 2) + " minecraft:glowstone",
+            "setblock " + (RX1 - 1) + " " + (RY + 2) + " " + (RZ0 + 4) + " minecraft:wall_torch[facing=west]",
+            "setblock " + (RX0 + 4) + " " + (RY + 2) + " " + (RZ1 - 1) + " minecraft:wall_torch[facing=north]",
+            "setblock " + (RX0 + 6) + " " + RY + " " + (RZ0 + 6) + " minecraft:oak_planks",
+            "setblock " + (RX0 + 5) + " " + RY + " " + (RZ0 + 6) + " minecraft:lantern")),
+        new Step("night", at(190, 180f, 30f), 200, mc -> cmd(mc, "time set 18000"))
+    );
+
     static List<Step> steps() {
+        if (SHADER_TOUR) return SHADER_STEPS;
         if (TAA_TOUR) return TAA_STEPS;
         if (FIDELITY_TOUR) return FIDELITY_STEPS;
         if (ZOOM_TOUR) return ZOOM_STEPS;

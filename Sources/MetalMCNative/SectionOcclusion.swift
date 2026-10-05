@@ -81,7 +81,8 @@ public func mmc_occ_hidden(_ camera: UnsafePointer<Double>, _ out: UnsafeMutable
 /// Minecraft's pipeline state.
 @_cdecl("mmc_occ_test")
 public func mmc_occ_test(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>, _ keys: UnsafePointer<Int64>, _ count: Int32) {
-    guard count > 0, let enc = ctx.pass, !ctx.scissorEmpty, let cb = ctx.cb else { return }
+    // ExtPipe hook: not against an external pipeline's G-buffer depth (GL's convention, half resolution).
+    guard count > 0, let enc = ctx.pass, !ctx.scissorEmpty, let cb = ctx.cb, !extPassActive else { return }
     let o = SectionOcclusion.shared
     guard let set = o.harvestAndAcquire(),
           let pipe = LodRenderer.shared.pipeline(colorFormats: ctx.passColorFormats, depth: ctx.passDepthFormat, box: true) else { return }
