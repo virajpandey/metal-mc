@@ -13,6 +13,7 @@ import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
+import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -52,6 +53,20 @@ public final class MetalPost {
         }
 
         static final MethodHandle APPLY = h("mmc_post_apply", JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
+        static final MethodHandle CLOUDS = h("mmc_post_clouds", null, JAVA_FLOAT);
+    }
+
+    /**
+     * Before the sky's aerial perspective: where vanilla's clouds are this frame ({@code bottomRelative}: the bottom of
+     * their 4-block slab, camera-relative), so the step that takes the level through the air lights them by day.
+     */
+    public static void clouds(float bottomRelative) {
+        if (!ENABLED || MetalDevice.current == null) return;
+        try {
+            Native.CLOUDS.invokeExact(bottomRelative);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
     }
 
     private static RuntimeException rethrow(Throwable t) {

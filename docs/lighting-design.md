@@ -1198,6 +1198,28 @@ Speed wasn't the goal tonight; these are the measurements to start from.
   +0.24, midnight in the village +1.35 to +1.54 (-5.6 to -5.9). Daylight stays within a stop of noon; night opens up
   by about a stop and a half.
 
+### Light sources, clouds, a cheaper first pass (2026-10-05, second round)
+
+- **Light sources brighter than white** (Lit.swift, `litEmitterTerm`, spliced into the relight only with `post`, so lit
+  mode's text and frame without it are as before). Emitting blocks are flat-lit at their own level: 15 for glowstone,
+  lava, lanterns, fire, magma, 14 for torches and end rods; faces lit by them stay under 14, since smooth lighting
+  averages four blocks of which at most one is the source. Where the G-buffer's block light is 13.9 or more the relight's
+  light becomes `max(E, 1) x (1 + (LIT_EMIT - 1) x smoothstep(0.35, 0.8, luma(albedo)))`, `LIT_EMIT` 6: the bright
+  texels of a source (a flame, lava's glowing cracks, glowstone's crystals) up to 6 times white, its dark ones (a torch's
+  stick, lava's crust) about as before. They then bloom on their own light, so the bloom's extra weight for light sources
+  went from 6 to 2. Lit mode without post keeps E = 1 for sources (its 8-bit frame would clip them to flat white).
+- **Clouds** (Sky.swift's `skyLevelColor`, the step that takes the level through the air, in scene-linear light with
+  post): vanilla draws its clouds in its own white, which the filmic curve takes to a light gray against a darker sky.
+  With post the 4-block slab at the cloud height (`Lod.CLOUD_HEIGHT`, camera-relative, given to the native side ahead of
+  that step by `mmc_post_clouds`) gets `SKY_CLOUD_GAIN` (2.6) times its color by day, fading with the sun's height to
+  none at night and in rain (the frame's `horizon.w` and `fade.w`, unused until now and 0 without post): sunlit cloud
+  is about as bright as sunlit snow, a stop above white terrain. Anything else inside the slab (a peak above y 192, a
+  phantom) would get it too, as it gets no shadow in RtShadows.
+- **The bloom's first pass reads the G-buffer and the depth once per 2 x 2 block** (its top-left pixel) into threadgroup
+  memory, then the frame per pixel: 3 bytes a pixel of them instead of 12. The light source weight and the meter's albedo
+  are blurred far wider than a block.
+ROUND2_RESULTS
+
 ### Not done, and next
 
 - **Volumetric light from the traced shadows.** The shafts are screen-space: they need the sun on or near the screen, and
@@ -1208,14 +1230,10 @@ Speed wasn't the goal tonight; these are the measurements to start from.
   adds `sigma x phase(theta) x sun x visibility x transmittance` in the composite. At the shadows' measured rate (about
   0.3 ms per half-million rays) that's 1-2 ms at 4-8 rays per quarter-resolution pixel; temporal reuse would bring it
   down.
-- Light sources only weigh more in the bloom; the image itself keeps them at lit mode's full bright (1). A torch flame
-  that is 4-8 times brighter in the image too (and so goes white-hot through the curve) needs lit mode's relight to give
-  emitters more than 1 (Lit.swift; with colored block light, its volume's emitters).
-- Clouds and water keep vanilla's light: under the filmic curve vanilla's white clouds come out a light gray.
-- Cheaper: the bloom's first pass reads the G-buffer and the depth at every pixel (93 MB at the panel's resolution, for
-  the light sources and the meter's albedo); one read per 2 x 2 block would do for both and should take the bloom from
-  1.46 ms to under 1. The composite and the copy could be one pass if the sharpening read its neighbors' tone-mapped
-  values from threadgroup memory (a compute pass can't write the frame today: it has no shader-write usage).
+- Water keeps vanilla's light; clouds get a gain, not lighting (their undersides and the sunset's color on them would
+  need the sun's direction and color in `skyLevelColor`).
+- Cheaper: the composite and the copy could be one pass if the sharpening read its neighbors' tone-mapped values from
+  threadgroup memory (a compute pass can't write the frame today: it has no shader-write usage).
 - Lit mode's G-buffer layout is read in `post_bloom_first` (face code in x's top bits, block light in y's top byte, the
   depth key; colored block light left it as it was): a change to it has to follow there.
 - No Purkinje shift (night desaturating toward blue) in the eye adaptation; lit mode's moonlight is already bluer.

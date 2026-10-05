@@ -147,6 +147,20 @@ private let litGiSkyTerm = litGi ? """
         }
 """ : ""
 
+/// With the post chain (postEnabled only, Post.swift; empty otherwise, so lit mode's text is unchanged without it): light
+/// sources brighter than vanilla's white, so they bloom and run white-hot through the tone curve.
+private let litEmitterTerm = postEnabled ? """
+    // Light sources (Post.swift, METALMC_EXP=post): their faces are flat-lit at the source's own level, 15 (glowstone,
+    // lava, lanterns, fire, magma) or 14 (torches, end rods); lit faces near them stay under 14 (smooth lighting averages
+    // four blocks, at most one of them the source). LIT_EMIT times their light, in proportion to the texel's brightness:
+    // the flame more than the stick, lava's glowing cracks more than its crust.
+#ifndef LIT_EMIT
+#define LIT_EMIT 6.0
+#endif
+    if (block >= 13.9) E = max(E, float3(1.0)) * (1.0 + (LIT_EMIT - 1.0) * smoothstep(0.35, 0.8, litLuma(albedo)));
+
+""" : ""
+
 /// The relight's per-pixel work (litRelightPixel), shared by its own pass and by the anti-aliasing's resolve (Taa.swift),
 /// which applies it as it loads each pixel when anti-aliasing is on. Needs skyShaderHeader, then LIT_MODE 1 and
 /// litShaderHeader (and with litGi, giUpsampleHeader), before it.
@@ -268,7 +282,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         float3 moon = moonLum * kLitMoonTint * (0.6 * ndlMoon / max(f.moonDir.y, 0.5) * vMoon + 0.4 * kLitHemi[fi] * skyFall * ao);
         E = ((sun + skyAmb) * dayScale + moon + blockLight * ao) * f.misc.w;
     }
-    float3 lin = skyDecode(refl) * E;
+\(litEmitterTerm)    float3 lin = skyDecode(refl) * E;
     float3 o = skyEncode(lin);
     if (overlayBright) o = c0 + (o - fwd);
     if (f.size.w <= 1.0) o = saturate(o);

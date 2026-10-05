@@ -74,6 +74,8 @@ abstract class GameRendererLodMixin {
         // Sky hook (METALMC_EXP=sky, metalmc.sky.Sky): the level through the air (aerial perspective, the render distance's
         // fade into the sky, the tone curve), after the shadows; with anti-aliasing, as it loads the color.
         if (metalmc.sky.Sky.frameActive) {
+            // Post hook (METALMC_EXP=post): where vanilla's clouds are, so this step lights them by day.
+            if (metalmc.backend.MetalPost.ENABLED) metalmc.backend.MetalPost.clouds(Lod.CLOUD_HEIGHT - (float) cameraState.pos.y);
             metalmc.backend.MetalSky.aerial(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, TemporalAA.ENABLED);
         }

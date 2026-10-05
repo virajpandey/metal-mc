@@ -73,8 +73,8 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // in the first downsample (a softened Karis average).
 #define POST_BLOOM \(postFloat(postBloomDefault))
 #define POST_BLOOM_SHAPE 1.0
-#define POST_BLOOM_LIGHTS 6.0
-#define POST_LIGHT_LEVEL 222u
+#define POST_BLOOM_LIGHTS 2.0
+#define POST_LIGHT_LEVEL 223u
 #define POST_FIREFLY 256.0
 
 // Eye adaptation: the histogram's range (log2), the percentiles its mean is taken between, the darkest albedo lit
@@ -165,20 +165,37 @@ kernel void post_bloom_first(texture2d<float, access::read> src [[texture(0)]],
                              uint2 tgid [[threadgroup_position_in_grid]]) {
     threadgroup half4 tile[PB_A * PB_A];
     int2 size = int2(src.get_width(), src.get_height());
-    int2 base = int2(tgid) * (2 * PB_T) - 2;
+    int2 base = int2(tgid) * (2 * PB_T) - 2;   // even: the tile's 2 x 2 blocks are the frame's
     bool lights = f.effects.z > 0.5;
+#if LIT_MODE
+    // Lit terrain's albedo luminance (for the meter; 1: not lit terrain) and the light source weight, once per 2 x 2 block
+    // from its top-left pixel's G-buffer and depth: a quarter of the reads (12 bytes a pixel were most of this pass's
+    // cost), for blurs and a meter that are far wider than a block.
+    threadgroup half2 blocks[(PB_A / 2) * (PB_A / 2)];
+    if (lights) {
+        for (uint i = lid.y * PB_T + lid.x; i < (PB_A / 2) * (PB_A / 2); i += PB_T * PB_T) {
+            uint2 q = uint2(clamp(base + 2 * int2(i % (PB_A / 2), i / (PB_A / 2)), int2(0), size - 1));
+            uint2 g = gbuf.read(q).rg;
+            half2 v = half2(1.0h);
+            if ((g.x >> 29) != 0u && litDepthMatches(depth.read(q), g.y & 0xFFFFu)) {
+                float3 al = skyDecode(float3(float(g.x & 255u), float((g.x >> 8) & 255u), float((g.x >> 16) & 255u)) / 255.0);
+                v.x = half(max(postLuma(al), POST_METER_ALBEDO));
+                if ((g.y >> 24) >= POST_LIGHT_LEVEL) v.y = half(POST_BLOOM_LIGHTS);
+            }
+            blocks[i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#endif
     for (uint i = lid.y * PB_T + lid.x; i < PB_A * PB_A; i += PB_T * PB_T) {
         uint2 q = uint2(clamp(base + int2(i % PB_A, i / PB_A), int2(0), size - 1));
         float3 c = max(skyDecode(src.read(q).rgb), 0.0);
         float albedo = 1.0;
 #if LIT_MODE
         if (lights) {
-            uint2 g = gbuf.read(q).rg;
-            if ((g.x >> 29) != 0u && litDepthMatches(depth.read(q), g.y & 0xFFFFu)) {
-                float3 al = skyDecode(float3(float(g.x & 255u), float((g.x >> 8) & 255u), float((g.x >> 16) & 255u)) / 255.0);
-                albedo = max(postLuma(al), POST_METER_ALBEDO);
-                if ((g.y >> 24) >= POST_LIGHT_LEVEL) c *= POST_BLOOM_LIGHTS;
-            }
+            half2 v = blocks[((i / PB_A) / 2) * (PB_A / 2) + (i % PB_A) / 2];
+            albedo = float(v.x);
+            c *= float(v.y);
         }
 #endif
         tile[i] = half4(half3(min(c, float3(60000.0))), half(albedo));
@@ -976,6 +993,19 @@ public func mmc_post_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsa
     guard postEnabled else { return 0 }
     let color = (from(colorHandle) as TextureBox).texture, depth = (from(depthHandle) as TextureBox).texture
     return Post.shared.apply(color: color, depth: depth, p: p, cam: SIMD3(cam[0], cam[1], cam[2]), taa: taa != 0) ? 1 : 0
+}
+
+/// Before the level goes through the air (GameRendererLodMixin, ahead of the sky's aerial perspective): the bottom of
+/// vanilla's cloud slab, camera-relative (blocks), so skyLevelColor brightens the clouds by day (Sky.swift's
+/// SKY_CLOUD_GAIN, times how much it's day: the sun above the horizon, less in rain). Without it they keep vanilla's
+/// color, which the filmic curve takes to a light gray.
+@_cdecl("mmc_post_clouds")
+public func mmc_post_clouds(_ bottomRel: Float) {
+    guard postEnabled, Sky.shared.ready else { return }
+    let f = Sky.shared.frame
+    let day = postSmoothstep(-0.05, 0.25, f.sun.y) * (1 - f.aerial.z)
+    Sky.shared.frame.horizon.w = bottomRel.isFinite ? bottomRel : 0
+    Sky.shared.frame.fade.w = bottomRel.isFinite ? day : 0
 }
 
 /// Offline (tools/litflow.swift): effects (bit 0 bloom, 1 light shafts, 2 eye adaptation; -1 leaves them), the tone curve
