@@ -2,7 +2,12 @@
 
 **Status (2026-10-05):** a generic plug-in point for a shader pipeline described outside this repository: OptiFine/Iris
 style programs (translated to MSL elsewhere), their render targets and passes, drawn from vanilla's own level draws on
-our backend. Off by default; nothing changes without the variable. Code: `Sources/MetalMCNative/ExtPipe.swift` (with
+our backend. Off by default; nothing changes without the variable. Run in game at 3456 x 2234 with a large path-traced
+OptiFine pack translated privately (its gbuffers programs for terrain, water, sky, entities, particles and weather, 29
+full-screen passes at half-resolution with exact ping-pong and flips, the shadow pass with its geometry shader as vertex
+expansion and an 8192^2 shadow and voxel atlas): its sky, clouds, sun shadows, water and path-traced GI from block
+lights show as the pack intends, at 11-20 fps. Such a pack needs safe math (`"mathMode": "safe"`): with fast math its
+TAA history filled with NaNs and the frame went black. Code: `Sources/MetalMCNative/ExtPipe.swift` (with
 hooks marked "ExtPipe hook" in `Backend.swift`), `metalmc.backend.MetalExtPipe` (uniforms, bridge),
 `metalmc.extpipe.BlockIds` and the mixins in `metalmc.extpipe.mixin`; `tools/extpipe_check.swift` runs a description
 offline. No pack's code, shaders or constants live here: a description and its MSL stay wherever their license allows.
