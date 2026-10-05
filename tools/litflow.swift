@@ -870,6 +870,13 @@ if clOn {
             _ = clSwitch(1, 100)
             let on = capture(half, sunAngle: angle, relight: true, extras: false)
             let onT = capture(half, sunAngle: angle, relight: true, extras: false, frames: 24, taa: true)
+            // Vanilla's again, at the same place in the cycle (16 + 24 frames since the colored capture began, 24 more):
+            // far terrain whose shadow structures are still building changes a few hundred pixels between any two
+            // captures, which is the yardstick for the check below.
+            for _ in 0..<24 { frame(small, sunAngle: angle, relight: true, extras: false) }
+            _ = clSwitch(0, 100)
+            let off2 = capture(half, sunAngle: angle, relight: true, extras: false)
+            _ = clSwitch(1, 100)
             writePNG(off.color, Int(W), Int(H), "cl-\(v.name)-\(t)-vanilla.png")
             writePNG(on.color, Int(W), Int(H), "cl-\(v.name)-\(t)-colored.png")
             // Side by side, vanilla's block light left and the colored light right.
@@ -893,6 +900,7 @@ if clOn {
             // Relit terrain (not light sources) by vanilla's block light level at the pixel, and what the check did there:
             // red the volume scaled down to vanilla's level, green colored light, blue a share of vanilla's light made up.
             var lit = 0, dark = 0, applied = 0, clamped = 0, filled = 0, outside = 0, darkLit = 0, darkClamped = 0, darkChanged = 0
+            var darkDrift = 0
             var fillSum = 0.0, lumOff = 0.0, lumOn = 0.0, rgbOff = SIMD3<Double>.zero, rgbOn = SIMD3<Double>.zero
             for i in 0..<n {
                 let gx = on.gbuf[2 * i], gy = on.gbuf[2 * i + 1]
@@ -915,10 +923,15 @@ if clOn {
                     dark += 1
                     if isClamped { darkClamped += 1 }
                     if lumOf(lightView.color, 4 * i) > 3 { darkLit += 1 }
-                    // The frame as drawn: where vanilla has no block light the colored frame is the vanilla one.
-                    if on.color[4 * i] != off.color[4 * i] || on.color[4 * i + 1] != off.color[4 * i + 1] || on.color[4 * i + 2] != off.color[4 * i + 2] {
-                        darkChanged += 1
+                    // The frame as drawn: where vanilla has no block light the colored frame is the vanilla one (the
+                    // relight returns vanilla's light there), so it may differ from vanilla's no more than two vanilla
+                    // frames differ from each other; a glow would show at thousands of pixels (the volume has light at
+                    // tens of thousands of them, darkClamped).
+                    func differs(_ a: [UInt8], _ b: [UInt8]) -> Bool {
+                        a[4 * i] != b[4 * i] || a[4 * i + 1] != b[4 * i + 1] || a[4 * i + 2] != b[4 * i + 2]
                     }
+                    if differs(on.color, off.color) { darkChanged += 1 }
+                    if differs(off.color, off2.color) { darkDrift += 1 }
                 }
             }
             let l = Double(max(lit, 1))
@@ -926,8 +939,8 @@ if clOn {
                          v.name, t, lit, dark, 100 * Double(applied) / l, 100 * Double(clamped) / l, 100 * Double(filled) / l,
                          filled > 0 ? fillSum / Double(filled) : 0, 100 * Double(outside) / l, lumOff / l, lumOn / l,
                          rgbOff.x / l, rgbOff.y / l, rgbOff.z / l, rgbOn.x / l, rgbOn.y / l, rgbOn.z / l))
-            print("      \(v.name) \(t): where vanilla has no block light (\(dark) pixels), the volume had light at \(darkClamped), which the check took down to the curve at its slack (\(darkLit) of them over 3 levels of luma in the light view, which samples there); the frame as drawn differs from vanilla's at \(darkChanged)")
-            print((darkChanged == 0 ? "ok    " : "FAIL  ") + "nothing glows where vanilla's block light is 0: the colored frame is vanilla's there (\(v.name), \(t))")
+            print("      \(v.name) \(t): where vanilla has no block light (\(dark) pixels), the volume had light at \(darkClamped), which the check took down to the curve at its slack (\(darkLit) of them over 3 levels of luma in the light view, which samples there); the frame as drawn differs from vanilla's at \(darkChanged); vanilla's frames before and after it differ from each other at \(darkDrift)")
+            print((darkChanged <= darkDrift ? "ok    " : "FAIL  ") + "nothing glows where vanilla's block light is 0: the colored frame differs from vanilla's there no more than vanilla's own frames do (\(v.name), \(t))")
         }
     }
     // A block change: a soul torch placed in the mixing area, then broken (as the Java side sends them), the frames each
