@@ -59,6 +59,10 @@ using namespace metal;
 #define SKY_AP_D 32
 
 constant float SKY_PI = 3.14159265358979;
+// Post hook (Post.swift): vanilla's clouds by day, in skyLevelColor.
+#ifndef SKY_CLOUD_GAIN
+#define SKY_CLOUD_GAIN 2.6
+#endif
 
 // Distances in the atmosphere are kilometres; world positions (blocks) are metres.
 struct SkyAtmosphere {
@@ -358,7 +362,12 @@ static float3 skyLevelColor(float3 c, uint2 q, float d, constant SkyFrame& f, te
     float2 ndc = (float2(q) + 0.5) / f.view.zw * 2.0 - 1.0;
     float4 h = f.invViewProj * float4(ndc, d, 1.0);
     float3 rel = h.xyz / h.w;
-    float3 lin = skyApplyAerial(skyDecode(c), rel, f, apScatter, apTrans, haze);
+    float3 surf = skyDecode(c);
+    // Post hook (Post.swift, METALMC_EXP=post): vanilla's clouds (the 4-block slab whose bottom is horizon.w, camera-
+    // relative) as bright as sunlit cloud is against the terrain, SKY_CLOUD_GAIN times vanilla's color by day (fade.w:
+    // how much it's day; 0 without post), so the filmic curve doesn't gray them.
+    if (f.fade.w > 0.0 && rel.y > f.horizon.w - 0.1 && rel.y < f.horizon.w + 4.1) surf *= 1.0 + (SKY_CLOUD_GAIN - 1.0) * f.fade.w;
+    float3 lin = skyApplyAerial(surf, rel, f, apScatter, apTrans, haze);
     float fade = skyFadeAmount(rel, f);
     if (fade > 0.0) lin = mix(lin, skyLuminance(f, rel / length(rel), skyView), fade);
     haze = max(haze, fade);

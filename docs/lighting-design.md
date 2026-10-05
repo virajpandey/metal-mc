@@ -1260,6 +1260,51 @@ Speed wasn't the goal tonight; these are the measurements to start from.
   +0.24, midnight in the village +1.35 to +1.54 (-5.6 to -5.9). Daylight stays within a stop of noon; night opens up
   by about a stop and a half.
 
+### Light sources, clouds, a cheaper first pass (2026-10-05, second round)
+
+- **Light sources brighter than white** (Lit.swift, `litEmitterTerm`, spliced into the relight only with `post`, so lit
+  mode's text and frame without it are as before). Emitting blocks are flat-lit at their own level, and the relight's
+  light there becomes `max(E, 1) x (1 + (LIT_EMIT - 1) x w)`, `LIT_EMIT` 6, `w` from the texel's (sRGB) luma:
+  - level 15 (glowstone, lava, lanterns, fire, magma, sea lanterns): `smoothstep(0.35, 0.8)`, so a source's bright
+    texels (lava's glowing cracks, a lantern's flame, glowstone's crystals) go up to 6 times white and its dark ones
+    (lava's crust, a lantern's frame) stay about as they were. Only sources reach 15: smooth lighting averages four
+    blocks, and beside a 15 they're 14.
+  - level 14: torches, but also the face a lantern or glowstone stands on (15, 14, 14 and 13 averaged is exactly 14). The
+    first try counted every texel there: the sand under the cave's lantern went flat white
+    (`round2/compare-round1-round2-lantern-crop-falsepositive.png`); counting texels of luma 0.88 and up still speckled
+    it (sand's brightest texels are about 0.88). Now only texels of 0.93 and up count at 14 (`smoothstep(0.93, 0.99)`: a
+    flame's yellow-white core, about 0.97). A near-white block under a lantern (snow, quartz) would still glow; telling a
+    torch from it for sure needs the writers to flag emitting quads (the section compiler knows the block state), a
+    G-buffer bit.
+  - They bloom on their own light now, so the bloom's extra weight for light sources went from 6 to 2. Lit mode without
+    post keeps E = 1 for sources (its 8-bit frame would clip them to flat white).
+- **Clouds** (Sky.swift's `skyLevelColor`, the step that takes the level through the air, in scene-linear light with
+  post): vanilla draws its clouds in its own white, which the filmic curve takes to a light gray against a darker sky.
+  With post the 4-block slab at the cloud height (`Lod.CLOUD_HEIGHT`, camera-relative, given to the native side ahead of
+  that step by `mmc_post_clouds`) gets `SKY_CLOUD_GAIN` (2.6) times its color by day, from none with the sun 3 degrees
+  up to all of it at 20 (a sunset's clouds keep vanilla's gray, which reads as backlit against the glow; the first try
+  faded in from the horizon and washed the sunset's clouds into the haze), none at night and in rain (the frame's `horizon.w` and `fade.w`, unused until now and 0 without post): sunlit cloud
+  is about as bright as sunlit snow, a stop above white terrain. Anything else inside the slab (a peak above y 192, a
+  phantom) would get it too, as it gets no shadow in RtShadows.
+- **The bloom's first pass reads the G-buffer and the depth once per 2 x 2 block** (its top-left pixel) into threadgroup
+  memory, then the frame per pixel: 3 bytes a pixel of them instead of 12. The light source weight and the meter's albedo
+  are blurred far wider than a block.
+- **In game** (four short lab sessions, the first round's switches; `bench_out/agents/post/round2/` in the main checkout;
+  round 1's final defaults over round 2 in `compare-round1-round2-*.png`):
+  - the cave's lantern (`compare-round1-round2-lantern-crop.png`, full resolution, the final test): its flame window
+    brighter and glowing, the sand around it as before, the torches' flame tips white; `-falsepositive` and `-speckled`
+    are the two earlier tests;
+  - the deep lava lake from the colored light tour (`lava_lake.png`, -26.5 -51 -75.5): the glowing cracks near white,
+    the crust orange, the cave walls lit warm by it;
+  - clouds (`compare-round1-round2-noon_overview.png`, `compare-round1-round2-forest.png`): white with gray undersides
+    instead of flat light gray; noon's mean luma 112.8 -> 116.2 and the forest's 79.5 -> 83.0, the land unchanged; the
+    lava pool on noon's left hotter; sunset unchanged (mean luma 121.5 -> 121.7, the gain is off below 3 degrees);
+  - the village at midnight (`compare-round1-round2-lamppost-crop.png`): the wall torches' flames were near the top of
+    the curve already at night's exposure; their cores a little whiter, the rest as before (mean luma 35.3 -> 35.2).
+- **Cost**: offline, each stage alone at 3456 x 2234 (litflow, sunset, median of 40): the bloom 1.44 -> 1.31 ms with the
+  G-buffer read per block; post's whole-frame cost +2.29 -> +2.03 ms. The emitter term and the cloud gain are a few
+  instructions in passes that run anyway.
+
 ### Not done, and next
 
 - **Volumetric light from the traced shadows.** The shafts are screen-space: they need the sun on or near the screen, and
@@ -1270,14 +1315,10 @@ Speed wasn't the goal tonight; these are the measurements to start from.
   adds `sigma x phase(theta) x sun x visibility x transmittance` in the composite. At the shadows' measured rate (about
   0.3 ms per half-million rays) that's 1-2 ms at 4-8 rays per quarter-resolution pixel; temporal reuse would bring it
   down.
-- Light sources only weigh more in the bloom; the image itself keeps them at lit mode's full bright (1). A torch flame
-  that is 4-8 times brighter in the image too (and so goes white-hot through the curve) needs lit mode's relight to give
-  emitters more than 1 (Lit.swift; with colored block light, its volume's emitters).
-- Clouds and water keep vanilla's light: under the filmic curve vanilla's white clouds come out a light gray.
-- Cheaper: the bloom's first pass reads the G-buffer and the depth at every pixel (93 MB at the panel's resolution, for
-  the light sources and the meter's albedo); one read per 2 x 2 block would do for both and should take the bloom from
-  1.46 ms to under 1. The composite and the copy could be one pass if the sharpening read its neighbors' tone-mapped
-  values from threadgroup memory (a compute pass can't write the frame today: it has no shader-write usage).
+- Water keeps vanilla's light; clouds get a gain, not lighting (their undersides and the sunset's color on them would
+  need the sun's direction and color in `skyLevelColor`).
+- Cheaper: the composite and the copy could be one pass if the sharpening read its neighbors' tone-mapped values from
+  threadgroup memory (a compute pass can't write the frame today: it has no shader-write usage).
 - Lit mode's G-buffer layout is read in `post_bloom_first` (face code in x's top bits, block light in y's top byte, the
   depth key; colored block light left it as it was): a change to it has to follow there.
 - No Purkinje shift (night desaturating toward blue) in the eye adaptation; lit mode's moonlight is already bluer.
