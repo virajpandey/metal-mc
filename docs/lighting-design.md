@@ -996,18 +996,80 @@ distance 12, 63 MB).
   relight and the near chunks off on the Java side while the native side had them on); their `experiment()` now falls
   back to `MetalMCConfig.nativeExperiments()`, as `MetalColoredLight`'s does.
 
+### Shadows from block lights, and block light bounced through the GI cache
+
+Both part of `coloredlight`: the shadows with `rtshadows`, off by default (`-PclShadow=<strength>`: 0.75 to try them),
+the bounce with `gi`, on (`-PclBounce=<gain>`, 1; 0 none). Without `coloredlight` the cache's kernels, the relight and the resolve are
+main's text (the 36-source check).
+
+- **Shadows** (`ColoredLightShadows.swift`). The volume spreads light as vanilla does, around a pillar and into the space
+  behind it, so a torch casts no shadow. After the sun's shadow rays and before the relight, one ray per 4 x 4 pixels (a
+  different pixel of the block each frame, which the anti-aliasing accumulates, as the sun's) goes from the surface
+  toward the light its light comes from, through the sun shadows' acceleration structures (`RtShadows.takeStructure`:
+  the LOD's blocks, near terrain included; no entities, and partial blocks as the LOD has them). The light is found in
+  the volume, with no list of lights: in the cell the face looks into a bucket is picked by its share of the cell's
+  light (a different pick each frame where colors mix), then that bucket's light is climbed, each step to the brightest
+  of the six neighbors, until none is brighter. Vanilla's rule makes light fall at least a level a cell away from a
+  light, so that cell is the light (at most 15 steps, 6 reads each). The ray is aimed at a point in the middle of the
+  light's cell that moves every frame (soft edges) and stops where it enters that cell (an opaque light, glowstone, is
+  in the structure); a face turned away from the light is in shadow. The relight takes the colored light (not vanilla's
+  make-up) down by the strength where the ray was blocked. Light that reached a pixel around a corner, which vanilla's
+  rule and the volume give at nearly full strength, is shadowed too: only bounced light (below) reaches there.
+- **Bounce** (`ColoredLightBounce.swift`, splices in `Gi.swift`). The cache's cells hold the sky's and the sun's light
+  per unit of the frame's daylight, which block light doesn't follow, so block light has a channel of its own: a half4
+  per slot (16 MB at 2 M slots), rgb in absolute light and the cell's fingerprint in a, so a slot another cell took
+  over reads as empty and no initialization path changes. The cache's update fills it where its bounce rays hit: the
+  volume's colored light half a block in front of the hit (as the relight samples it) plus the hit cell's own bounced
+  block light (so it bounces on), times the hit's color, averaged with the same weights as the sky light. The request
+  resolves it beside the sky light (the same 2 x 2 cells, bilinear) into a half-resolution RG11B10Float texture, bound
+  in the relight's `giStandIn` slot that had been kept free, and the relight adds it to the block light where vanilla's
+  level isn't 0 (so caves vanilla leaves dark stay dark). The cache runs before the volume's update each frame, so it
+  reads the volume as the last frame left it.
+
+In game (lab sessions with the full look, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight`, at the torch cave as
+placed and with the showcase swaps, the mineshaft and the village at midnight; pairs in
+`bench_out/agents/coloredlight/lab2/`: `shadows-<spot>.png` without | with the shadows (0.75, no bounce),
+`both-<spot>.png` neither | the bounce alone; the tour's with both in `gameG/`):
+
+- **The first shadows were noisy.** Rays from a wall toward a light on that wall run along it, and from 0.03 block off
+  the surface (the sun's offset) they hit it again: salt-and-pepper shadow on the walls beside the lights, and the
+  scenes 14-17% darker in mean luma (torch cave 34.3 -> 29.6, mineshaft 74.7 -> 61.8, village 21.6 -> 19.5). Now the
+  rays start 0.1 block off, aim within 0.15 of the light's middle, and the relight samples the traced texture
+  bilinearly. With those (`shadows-<spot>.png`): the rock steps of the torch cave are dark on their sides away from
+  the lights, and the lava lake's foreground rocks cast real shadows across the cave (tour step `11-cl-deep-lava` in
+  `gameG/`: without | with both), the look this is for; the open gallery barely changes (every floor cell sees its
+  torch). Mean luma -13% in the torch cave (30.4 -> 26.4 as placed, 34.3 -> 29.4 with the showcase lights), -16% in the
+  mineshaft (74.7 -> 62.4), -8% in the village (21.6 -> 19.8): light that went around corners now gets there only as
+  bounce. Still grainy on walls right next to their light (the mineshaft's beam and the wall beside it), which the
+  anti-aliasing doesn't settle: so they're off by default (`-PclShadow=0.75` to try them).
+- **The bounce shows no effect yet** (`both-<spot>.png`: neither | the bounce alone, the shadows being off by default by
+  then): mean luma 30.4 -> 30.3 and 34.3 -> 34.5 in the torch cave, 74.7 -> 73.6 in the mineshaft, 21.6 -> 21.6 in the
+  village, and the pictures look the same. It runs without errors (the kernels compile with it, the cache logs as
+  before), but whether its channel reaches the image (a plumbing fault: the volume's inputs at the cache's update,
+  the block channel's resolve, its binding in the `giStandIn` slot) or is just weak (a floor lit by a torch bounces a few
+  percent of its light back) isn't established. Next: a debug view of the channel (`giStandIn` alone), then its
+  plumbing or its gain (`-PclBounce`).
+- **Costs** (traced coloredlight tour with the GI cache, `-PbenchTrace=1`, 3 frames each low over the gallery at night,
+  in the sealed room and over the lava lake; `clTourG0` without the two, `-PclShadow=0 -PclBounce=0`, and `clTourG1`
+  with both, shadows at 0.75): the shadows' own pass 0.80-0.89 ms where most pixels have block light (0.35 at the lava
+  lake); the cache's request and resolve 0.89 -> 1.13 ms (the block channel's resolve with data in it; G0 already has
+  the channel's storage and resolve, at gain 0), its update unchanged (0.35 -> 0.31); the anti-aliasing resolve 3.53 ->
+  3.55 median (in the sealed room 3.65-3.85 -> 3.92-4.50: the bilinear shadow sample on every block-lit pixel). The
+  sun's shadow pass read 0.22 -> 0.74 ms in the same frames: the block lights' pass runs right after it with nothing
+  to wait for, so the GPU overlaps them and the sun's timestamps take in part of it. Memory: the channel 16 MB (2 M
+  slots x 8 bytes), the half-resolution block light 11 MB, the shadows' quarter-resolution texture 0.5 MB.
+
 ### Not done, and next
 
-- **Bounce through the GI cache.** Not done. The cache's cells hold the sky's and the sun's light per unit of the frame's
-  daylight, and block light doesn't follow daylight: folded into the same cells it would be divided by a daylight that
-  goes to 1e-4 at night and flash when day comes. It needs a channel of its own per cell (RGB halfs, 8 bytes a slot: 72
-  -> 88 MB at 2 M slots), filled by the update's bounce hits reading this volume at the hit's front cell (as the relight
-  samples it) times the hit's albedo, kept out of the daylight scale, and added by the relight (times AO) with the cell's
-  sky light. A lava pool's direct light already reaches the walls around it through the volume (14 blocks); what this
-  would add is the second bounce and the walls' own colors in it.
-- **Shadows from lights,** what Rethinking Voxels is known for: the fill blocks light with whole blocks, so there are no
-  sharp shadows of fences, slabs or mobs. One shadow ray a pixel (or a quarter of them, like the sun's) toward the
-  nearest bright lights of its brick (the volume knows its emitters) through RtShadows' structures.
+- **Bounce through the GI cache:** built (above) but with no visible effect in the lab scenes yet: find out whether it
+  reaches the image (a debug view of its channel) before tuning it. Then: it doesn't follow the fire's flicker, a
+  cell's block channel changes only as fast as the cache updates it, and far cells (past the volume) get none.
+- **Shadows from lights:** built (above), off by default for their grain on walls next to their lights: a few frames of
+  history of their own (the sun's visibility gets by on the anti-aliasing's), or two rays a sample. Entities, fences
+  and slabs cast none (not in the structures, or as the LOD has them); one light per ray (the anti-aliasing mixes the
+  picks where colors overlap). With them on, scenes are 8-16% darker: light that went around corners comes only as
+  bounce, so they want the bounce working.
+- **One sample in the resolve** (the +0.6 ms): not started.
 - **Partial blocks** (slabs, stairs, walls) let light through in the volume where vanilla stops it at their full faces;
   vanilla's level caps what leaks (the check), so it shows as a tint, not a glow.
 - **The volume's reach:** colors within about 100 blocks of the camera horizontally and 40 vertically (its size less the

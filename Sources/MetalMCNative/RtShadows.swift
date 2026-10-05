@@ -174,6 +174,8 @@ final class RtShadows: @unchecked Sendable {
     /// With the GI cache: its half-resolution light and code words this frame (one RG32Uint texel each, gi_resolve), and
     /// the sun and sky light it took from the atmosphere (GiCache.envThisFrame), for the relight (takeLitGi).
     private var giOut: MTLTexture?
+    /// Colored block light bounced through the cache (ColoredLightBounce.swift): its half-resolution light this frame.
+    private(set) var giBlockOut: MTLTexture?
     private var litGiOut: (gi: MTLTexture, env: MTLBuffer?, width: Int, height: Int)?
     private var giRuns = 0
     /// Offline timing (mmc_debug_gi_frame): 0 skips the cache's frame.
@@ -185,6 +187,14 @@ final class RtShadows: @unchecked Sendable {
         defer { litGiOut = nil }
         guard let g = litGiOut, g.width == width, g.height == height else { return nil }
         return (g.gi, g.env)
+    }
+
+    /// This frame's instance structure, its tiles' structures and the camera's offset from its origin, for other rays after
+    /// the shadows' (colored block light's shadows, ColoredLightShadows.swift); taken once.
+    private var frameStructure: (tlas: MTLAccelerationStructure, accels: [MTLAccelerationStructure], camOffset: SIMD3<Float>)?
+    func takeStructure() -> (tlas: MTLAccelerationStructure, accels: [MTLAccelerationStructure], camOffset: SIMD3<Float>)? {
+        defer { frameStructure = nil }
+        return frameStructure
     }
 
     func takeDeferred(width: Int, height: Int) -> (lit: MTLTexture, params: SIMD4<Float>)? {
@@ -497,6 +507,7 @@ final class RtShadows: @unchecked Sendable {
         enc.setTexture(lit, index: 1)
         enc.dispatchThreads(MTLSize(width: hw, height: hh, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
+        frameStructure = (tlas, tlasAccels, SIMD3<Float>(Float(cam.x - origin.x), Float(cam.y - origin.y), Float(cam.z - origin.z)))
         // Lit mode with the GI cache: its frame, on the same depth, projection, origin and instance structure.
         if litGi && giOn {
             encodeGi(cb: cb, depth: depth, invViewProj: params.invViewProj, cam: cam, sunAngle: sunAngle, cloudHeight: cloudHeight, tlas: tlas,
@@ -548,6 +559,17 @@ final class RtShadows: @unchecked Sendable {
         }
         guard let out = giOut else { return }
         cache.tiles = gi
+        if clEnabled {
+            // Colored block light bounced (ColoredLightBounce.swift): its half-resolution channel beside the cache's light.
+            if giBlockOut == nil || giBlockOut!.width != hw || giBlockOut!.height != hh {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg11b10Float, width: hw, height: hh, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]
+                d.storageMode = .private
+                giBlockOut = ctx.device.makeTexture(descriptor: d)
+                giBlockOut?.label = "MetalMC GI cache block light"
+            }
+            cache.clBlockOut = giBlockOut
+        }
         let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
         let daylight = litDaylightEnv(sunAngle: sunAngle)
         let light: GiLightSource = Lit.shared.lastAtmosphere ? .atmosphere(fallback: daylight) : .daylight(daylight)

@@ -457,7 +457,7 @@ static uint giRequestCell(constant GiParams& p, device atomic_uint* check, devic
 }
 
 static uint4 giResolveSample(constant GiParams& p, const device uint* check, const device half4* value, constant GiLight& L,
-                             depth2d<float, access::read> depth, uint2 hs);
+                             depth2d<float, access::read> depth, uint2 hs);\(clEnabled ? "\nstatic float3 giResolveBlock(constant GiParams& p, const device uint* check, const device half4* value, const device half4* bv, depth2d<float, access::read> depth, uint2 hs);" : "")
 
 // Per sample x sample block of pixels (4 x 4), the request and the resolve, in one pass over the depth buffer:
 // - the request: one pixel of the block (a different one each frame) finds or creates its surface's cell, marks it seen
@@ -477,7 +477,7 @@ kernel void gi_request(constant GiParams& p [[buffer(1)]],
                        device atomic_uint* counters [[buffer(8)]],
                        constant GiLight& L [[buffer(15)]],
                        depth2d<float, access::read> depth [[texture(0)]],
-                       texture2d<uint, access::write> out [[texture(1)]],
+                       texture2d<uint, access::write> out [[texture(1)]],\(clEnabled ? "\n                       const device half4* clBounce [[buffer(19)]], texture2d<float, access::write> outB [[texture(5)]]," : "")
                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(p.sizes.z) || gid.y >= uint(p.sizes.w)) return;
     uint2 full = uint2(p.sizes.xy);
@@ -514,7 +514,7 @@ kernel void gi_request(constant GiParams& p [[buffer(1)]],
     uint2 hsize = uint2(out.get_width(), out.get_height());
     for (uint j = 0; j < 4u; j++) {
         uint2 hs = gid * 2u + uint2(j & 1u, j >> 1);
-        if (hs.x < hsize.x && hs.y < hsize.y) out.write(giResolveSample(p, (const device uint*)check, value, L, depth, hs), hs);
+        if (hs.x < hsize.x && hs.y < hsize.y) out.write(giResolveSample(p, (const device uint*)check, value, L, depth, hs), hs);\(clEnabled ? "\n        if (hs.x < outB.get_width() && hs.y < outB.get_height()) outB.write(float4(giResolveBlock(p, (const device uint*)check, value, clBounce, depth, hs), 1.0), hs);" : "")
     }
 }
 
@@ -574,7 +574,7 @@ kernel void gi_args(constant GiParams& p [[buffer(1)]], device atomic_uint* coun
 // Per triangle (primitive data): material | face << 8 | block light << 11 | water depth or sky cover << 15.
 static uint giPrim(const device void* d) { return *(const device uint*)d; }
 
-kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
+\(clEnabled ? giClBounceHeader : "")kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
                       constant GiParams& p [[buffer(1)]],
                       device atomic_uint* check [[buffer(2)]],
                       device uint4* keys [[buffer(3)]],
@@ -586,7 +586,7 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
                       constant float4* mats [[buffer(9)]],
                       constant GiLight& L [[buffer(15)]],
                       constant SkyFrame& sf [[buffer(16)]],
-                      texture2d<float> skyView [[texture(6)]]
+                      texture2d<float> skyView [[texture(6)]]\(clEnabled ? ",\n                      device half4* clBounce [[buffer(19)]], texture3d<float> clRGB [[texture(7)]], texture3d<float> clAux [[texture(8)]], constant GiCl& gcl [[buffer(20)]]" : "")
                       GI_TILES_ARG,
                       uint tid [[thread_position_in_grid]],
                       ushort simdLane [[thread_index_in_simdgroup]]) {
@@ -631,7 +631,7 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
     intersector<instancing> shadow;
     shadow.accept_any_intersection(true);
     shadow.assume_geometry_type(geometry_type::triangle);
-    float3 sumE = 0.0;
+    float3 sumE = 0.0;\(clEnabled ? "\n    float3 sumB = 0.0;" : "")
     float sumSun = 0.0;
     uint valid = 0, sunSamples = 0, rays = 0, cached = 0, uncached = 0, spawned = 0, repUsed = 0;
     for (uint i = lane; i < p.sample.w; i += lanes) {
@@ -731,12 +731,12 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
             uncached++;
         }
         eh += giBlockLight(p, hbl);
-        sumE += mats[hm * 4u + giFaceClass(hf)].rgb * eh + mats[hm * 4u + 3u].rgb * p.look.y;
+        sumE += mats[hm * 4u + giFaceClass(hf)].rgb * eh + mats[hm * 4u + 3u].rgb * p.look.y;\(clEnabled ? "\n        // Colored block light (ColoredLightBounce.swift): the volume's at the hit, and the light it bounced there.\n        sumB += mats[hm * 4u + giFaceClass(hf)].rgb * (giClBlock(gcl, clRGB, clAux, hp, hf) + (he >= 0 && giClOwn(clBounce[he], hk) ? float3(clBounce[he].rgb) : float3(0.0)));" : "")
     }
     // The cell's lanes sum what they found (every lane of the cell gets here: they return early or not together).
     for (uint d = 1u; d < lanes; d <<= 1) {
         ushort x = ushort(d);
-        sumE += simd_shuffle_xor(sumE, x);
+        sumE += simd_shuffle_xor(sumE, x);\(clEnabled ? "\n        sumB += simd_shuffle_xor(sumB, x);" : "")
         sumSun += simd_shuffle_xor(sumSun, x);
         valid += simd_shuffle_xor(valid, x);
         sunSamples += simd_shuffle_xor(sunSamples, x);
@@ -796,7 +796,7 @@ kernel void gi_update(instance_acceleration_structure accel [[buffer(0)]],
     // if it never had one).
     float oldVis = giSampled(old) ? float(old.a) - 1.0 : 0.0;
     float vis = sunSamples > 0u ? mix(oldVis, sumSun / float(sunSamples), alpha) : oldVis;
-    value[e] = half4(half3(rgb), half(1.0 + vis));
+    value[e] = half4(half3(rgb), half(1.0 + vis));\(clEnabled ? "\n    // The block channel, averaged alike (a slot that held another cell starts over).\n    {\n        uint2 ek = keys[e].xy;\n        half4 ob = clBounce[e];\n        bool own = giClOwn(ob, ek);\n        float3 nb = mix(own ? float3(ob.rgb) : float3(0.0), sumB / float(valid), own ? alpha : 1.0);\n        clBounce[e] = half4(half3(nb), half(float(giPrint(ek) & 1023u)));\n    }" : "")
     meta[e] = min(cnt + 1u, cap) | (((seq + p.sample.w) & 0xFFFFu) << 16);
 }
 
@@ -885,7 +885,7 @@ static uint4 giResolveSample(constant GiParams& p, const device uint* check, con
     return uint4(e.w > 0.0 ? giPackIrradiance(e.rgb * L.scale.rgb) : 0u, pc | (e.w > 0.0 ? GI_CODE_DATA : GI_CODE_EMPTY), 0u, 0u);
 }
 
-// The resolve alone, on the cells as they stand (the debug views and tests; a frame's comes with its request, gi_request).
+\(clEnabled ? giClResolveSource : "")// The resolve alone, on the cells as they stand (the debug views and tests; a frame's comes with its request, gi_request).
 kernel void gi_resolve(constant GiParams& p [[buffer(1)]],
                        const device uint* check [[buffer(2)]],
                        const device half4* value [[buffer(5)]],
@@ -1394,6 +1394,7 @@ final class GiCache: @unchecked Sendable {
               let t = dev.makeBuffer(bytes: table, length: table.count * 16, options: .storageModeShared),
               let li = buf(12 * 16, .storageModeShared), let env = buf(9 * 16), let dsv = dev.makeTexture(descriptor: sv) else { return nil }
         check = c; keys = k; stamp = s; value = v; meta = m; list = l; counters = n; mats = t; light = li; envBuffer = env; dummySkyView = dsv
+        if clEnabled { clBounce = buf(slots * 8) }   // colored block light bounced (ColoredLightBounce.swift)
         do {
             // Lab mode (ShaderLab.swift): after an edit, the kernels are swapped and the table kept (as debugReload does).
             let lib = try ShaderLab.library(zeroCopy ? "gi" : "gi_copied", giShaderSource(zeroCopy: zeroCopy), device: dev) { [weak self] new in
@@ -1428,10 +1429,16 @@ final class GiCache: @unchecked Sendable {
 
     func pipe(_ name: String) -> MTLComputePipelineState { pipes[name]! }
 
+    /// Colored block light bounced (ColoredLightBounce.swift): the cells' block channel, the request's output for it
+    /// (half resolution, RG11B10Float; set by RtShadows.encodeGi), and the frame's origin for the update's hits.
+    var clBounce: MTLBuffer?
+    var clBlockOut: MTLTexture?
+    var clOrigin = SIMD3<Double>.zero
+
     /// Empties the table.
     func clear(_ cb: MTLCommandBuffer) {
         guard let b = cb.makeBlitCommandEncoder() else { return }
-        for x in [check, keys, stamp, value, meta] { b.fill(buffer: x, range: 0..<x.length, value: 0) }
+        for x in [check, keys, stamp, value, meta] + (clBounce.map { [$0] } ?? []) { b.fill(buffer: x, range: 0..<x.length, value: 0) }
         b.endEncoding()
     }
 
@@ -1504,6 +1511,7 @@ final class GiCache: @unchecked Sendable {
         enc.setBuffer(counters, offset: 0, index: 8)
         enc.setBuffer(mats, offset: 0, index: 9)
         enc.setBuffer(light, offset: 0, index: 15)
+        if let clBounce { enc.setBuffer(clBounce, offset: 0, index: 19) }   // colored block light bounced
     }
 
     /// What the kernels that trace rays need beside the table: the hit quads' buffers (zero copy, buffer 17) and the sky
@@ -1516,6 +1524,7 @@ final class GiCache: @unchecked Sendable {
         var f = skyFrame
         enc.setBytes(&f, length: MemoryLayout<SkyFrameGPU>.stride, index: 16)
         enc.setTexture(skyView ?? dummySkyView, index: 6)
+        if clEnabled { giClBind(enc, origin: clOrigin) }   // colored block light at the hits: textures 7, 8, buffer 20
     }
 
     private func dispatch1D(_ enc: MTLComputeCommandEncoder, _ name: String, _ n: Int) {
@@ -1588,6 +1597,7 @@ final class GiCache: @unchecked Sendable {
         enc.setComputePipelineState(pipe("gi_request"))
         enc.setTexture(depth, index: 0)
         enc.setTexture(out, index: 1)
+        if clEnabled { giClBindOut(enc, clBlockOut) }   // colored block light bounced: texture 5
         enc.dispatchThreads(MTLSize(width: Int(p.sizes.z), height: Int(p.sizes.w), depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     }
 
@@ -1636,6 +1646,7 @@ final class GiCache: @unchecked Sendable {
                      sunUp: Float, cloudHeight: Float, light: GiLightSource, fence: MTLFence? = nil,
                      pass: (String) -> MTLComputePassDescriptor = profComputePass) -> Bool {
         if zeroCopy && tiles == nil { return false }
+        clOrigin = origin
         var p = params(invViewProj: invViewProj, cam: cam, origin: origin, sunDir: sunDir, sunUp: sunUp, width: depth.width, height: depth.height)
         p.blockLight = SIMD4(0, 0, 0, evictFrames)
         p.rays.w = cloudHeight - Float(cam.y)
