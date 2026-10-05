@@ -65,7 +65,7 @@ frame's: when vanilla draws it, each section's indirect arguments and its sectio
 copied on the CPU, and the next frame's shadow pass draws its quads from the base vertex (vanilla's translucent index
 buffers are sorted, so a first index isn't a quad offset there) with that frame's camera (`Globals`).
 
-A pack's shadow pass that voxelizes geometry (SEUS PTGI: each triangle's corners moved into their face's voxel along
+A pack's shadow pass that voxelizes geometry (e.g. by moving each triangle's corners into their face's voxel along
 the tangent and bitangent) depends on OptiFine's `at_tangent.w`: `cross(at_tangent.xyz, normal) * w` is the direction of
 increasing v. With the other sign the corners leave the face, faces land in the wrong voxel or none, and GI rays start
 inside solid voxels (black faces).
