@@ -880,10 +880,13 @@ the anti-aliasing's resolve, our sky; 1728 x 1117 pictures, means of 16 frames; 
   (the resolve's 16 and 32 pixel tiles with and without the sky and the relight; the relight's pass on RGBA8,
   RGBA16Float and RG11B10Float; with water and the GI cache), and the flood fill takes 512 threads a threadgroup.
 - **Nothing glows where vanilla is dark:** where vanilla's level is 0 the relight doesn't sample the volume, so those
-  pixels are vanilla's: the colored frame against the vanilla one (the captures in the same place of the shadows' and
-  the sky's 64-frame cycle) differs at none of them from above; low over the gallery at 198-217 of 249,357, as many as
-  differ in the real-terrain view (108-274), where the volume touches nothing at all (far terrain that took a new shadow
-  between the two captures: the tile structures still build). In the debug view that does sample there, the check takes
+  pixels are vanilla's. Checked on the frame as drawn: the colored capture against vanilla's (both in the same place of
+  the shadows' and the sky's 64-frame cycle), with a second vanilla capture after it as the yardstick (far terrain whose
+  shadow structures still build changes a few hundred pixels between any two captures). Where vanilla is dark the
+  colored frame differs from vanilla's at 0 pixels from above (the two vanilla frames: 0), at 251 and 106 of 249,357
+  low over the gallery (vanilla's own: 393 and 347), and at 141 in the real-terrain view (vanilla's own: 152), where the
+  volume touches nothing at all; a glow would show at thousands (the volume has light under 60,474 of those pixels low
+  over the gallery). In the debug view that does sample there, the check takes
   the volume's light to the curve at one level (0.3% of full); the volume had light where vanilla's reference didn't
   only around the gallery's candles, amethyst and crying obsidian: the LOD, which stands in for vanilla offline, doesn't
   know them as light sources (in the game vanilla does).
@@ -957,6 +960,34 @@ distance 12, 63 MB).
     (1,400-1,540 sections uploaded every 1,200 frames as they stream in and the volume moves); the resolve 1.99 ms. Tonight's
     lit flight without it (`v_lit`, the same settings, the main checkout's queue): 126.0 fps, p99 10.17, the resolve
     1.89 ms. So by day about +0.1 ms in the resolve, the rest within run-to-run noise (not an A/B in one checkout).
+- **Lab mode's natural scenes** (`tools/bench/lab.sh`, the full look `lit,nearchunks,rtshadows,sky,gi,water` with and
+  without `coloredlight`, scenes of `tools/bench/scenes.json`; pairs, vanilla's block light left:
+  `bench_out/agents/coloredlight/lab/pair-<scene>.png`): no errors with the GI cache and water on. (The first session
+  with colored light took its switches from the settings, below; the rest from `METALMC_EXP`.)
+  - The plains village at midnight (`night_torches`, its 64 wall torches): the lit walls, paths and lamp posts a warmer
+    orange; mean luma 21.5 -> 21.6, mean chroma 16.3 -> 17.6 (its light was warm already, so the change is mild).
+  - The mineshaft corridor lit by its own wall torches (`mineshaft`): warmer, and brighter: mean luma 68.0 -> 75.4 and
+    70.5 -> 74.8 in two pairs of sessions (vanilla's own frame differed by 4% between sessions). Its walls are at levels
+    11-14, where the volume's sample half a block in front of a face can sit up to the one level of slack over vanilla's
+    smooth light; `METALMC_CLSLACK=0` would pin the brightness to vanilla's (not tried in game).
+  - The torch cave (`torch_cave`: ten torches and two lanterns its setup places on a cavern floor). The scene's own
+    camera has a clear line to two of the twelve (checked against the fixture's blocks through the colored light's
+    store) and its pictures are a dark rock face with or without colored light, so these are from a spot in the cavern
+    that sees all twelve, `tp 110.5 21.98 -58.5 286 40`: as placed (`torch_cave_warm`); with a soul lantern, a soul
+    torch, a redstone torch and a campfire in place of four of them (`torch_cave_mixed`: the soul lights whiten the
+    torches' orange where they overlap, the redstone torch a small red pool); and with a sea lantern and pearlescent and
+    verdant froglights in place of three more
+    (`torch_cave_showcase`: purple, green and cool white pools meeting the torches' orange across the cavern floor,
+    where vanilla's is one warm white; the best picture of the set). Mean luma 30.7 -> 30.2, 30.0 -> 30.6, 32.6 -> 34.3.
+    The world's own ticking (fluids settling, plants, leaves) sent the volume 15-140 block changes a second there; the
+    fill ran in 16-41% of the frames, over 50-60 bricks.
+- **The settings' route.** With no `METALMC_EXP` in the environment and `lighting`, `sky`, `bounceLight`,
+  `waterReflections` and `experiments=rtshadows,coloredlight` in `config/metalmc.properties`, the game turned on
+  "lit,nearchunks,sky,gi,water,rtshadows,coloredlight" and the colored light's Java side sent 8,560 sections. That
+  needed a fix outside this feature: the settings reach the native side by `setenv`, which Java's `System.getenv` (a
+  copy taken at startup) never sees, so `MetalLit.ENABLED` and `MetalNearChunks.ENABLED` had stayed false (lit mode's
+  relight and the near chunks off on the Java side while the native side had them on); their `experiment()` now falls
+  back to `MetalMCConfig.nativeExperiments()`, as `MetalColoredLight`'s does.
 
 ### Not done, and next
 
@@ -986,5 +1017,8 @@ distance 12, 63 MB).
   the relight, full bright as before.
 - **Flicker** is one clock for all fires; torches don't flicker.
 - **Colors** are a first pass on the test gallery (`clBucketSpecs`, `ClClass.buckets`); `-PclGain`, `-PclFlicker` to tune.
-- In the game: the gallery and a cave with natural lava; not yet: a village at night, the Nether (lit mode is
-  overworld only), many lights flickering, a long flight underground.
+- **Brightness against vanilla's:** the same within a few percent of mean luma in the gallery, the village and the torch
+  cave, 6-11% brighter in the mineshaft (the slack, above). Pinning it (`METALMC_CLSLACK=0`) trades the light adding
+  up where colors overlap for vanilla's brightness everywhere; worth a look in the lab.
+- In the game: the gallery, two natural lava caves, the village at night, the mineshaft and the torch cave; not yet:
+  the Nether (lit mode is overworld only), many lights flickering in motion, a long flight underground, multiplayer.
