@@ -938,6 +938,8 @@ final class Sky: @unchecked Sendable {
         f.tone.x = h
         f.tone.y = skyKnee(h)
         f.tone.z = isFloat ? (target == .rg11b10Float ? -1 : 0) : 1.0 / 255
+        // Post hook (Post.swift, METALMC_EXP=post): scene-linear light, the knee out of reach; its tone curve is the only one.
+        if postEnabled && isFloat { f.tone.x = 65504; f.tone.y = 65504 }
         enc.setRenderPipelineState(pipe)
         enc.setDepthStencilState(ctx.depthState(compare: .always, write: false))
         enc.setCullMode(.none)
@@ -1024,6 +1026,8 @@ final class Sky: @unchecked Sendable {
         f.tone.x = h
         f.tone.y = skyKnee(h)
         f.tone.z = isFloat ? (color.pixelFormat == .rg11b10Float ? -1 : 0) : 1.0 / 255
+        // Post hook (Post.swift, METALMC_EXP=post): scene-linear light, the knee out of reach; its tone curve is the only one.
+        if postEnabled && isFloat { f.tone.x = 65504; f.tone.y = 65504 }
         return f
     }
 

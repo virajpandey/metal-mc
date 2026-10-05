@@ -32,11 +32,14 @@ import QuartzCore
 
 /// METALMC_EXP=hdr: float main target, EDR drawable, tone curve into the display's headroom.
 let hdrOutput = experiments.contains("hdr")
+/// The main target is float: with HDR, and with the post chain (METALMC_EXP=post, Post.swift), which needs the level's
+/// scene-linear light until its own tone curve (on an SDR display: the layer and the present stay 8-bit).
+let floatMainTarget = hdrOutput || postEnabled
 /// The float main target (and the anti-aliasing's history) as RG11B10Float by default, 32 bits a pixel instead of
 /// RGBA16Float's 64: half the bandwidth in every pass that loads or stores it (the real-terrain flight with sky and HDR:
 /// 124.7 → 136.3 fps), for 6-bit mantissas (5 in blue) and no alpha, so the sky and the anti-aliasing dither relative
 /// to the value. METALMC_HDRFORMAT=rgba16f: RGBA16Float as before. The drawable stays RGBA16Float.
-let hdrPacked = hdrOutput && ProcessInfo.processInfo.environment["METALMC_HDRFORMAT"] != "rgba16f"
+let hdrPacked = floatMainTarget && ProcessInfo.processInfo.environment["METALMC_HDRFORMAT"] != "rgba16f"
 /// The main target's format with HDR.
 let hdrTargetFormat: MTLPixelFormat = hdrPacked ? .rg11b10Float : .rgba16Float
 /// Whether a color target holds HDR's float frame.
@@ -68,10 +71,12 @@ fragment float4 hdr_present_fs(HdrVOut in [[stage_in]], texture2d<float, access:
     return float4(max(skyDecode(src.read(uint2(p.x, size.y - 1 - p.y)).rgb), 0.0), 1.0);
 }
 
-// Screenshots: the frame rolled into SDR the way an SDR display would show it (the tone curve at headroom 1).
-fragment float4 hdr_snapshot_fs(HdrVOut in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {
+// Screenshots: the frame rolled into SDR the way an SDR display would show it (the tone curve at headroom 1; tone.y, the
+// knee, is 1 when the frame is SDR display light already: post on an SDR display, which then only clamps).
+fragment float4 hdr_snapshot_fs(HdrVOut in [[stage_in]], texture2d<float, access::read> src [[texture(0)]],
+                                constant float4& tone [[buffer(0)]]) {
     float3 c = max(skyDecode(src.read(uint2(in.pos.xy)).rgb), 0.0);
-    return float4(skyEncode(skyToneMap(c, float4(1.0, 0.9, 0.0, 0.0))), 1.0);
+    return float4(skyEncode(skyToneMap(c, tone)), 1.0);
 }
 
 // Offline check of the tone curve (mmc_debug_hdr_curve): scene-linear inputs to display-linear outputs.
@@ -174,6 +179,9 @@ final class Hdr: @unchecked Sendable {
         guard let enc = ctx.ensureCB().makeRenderCommandEncoder(descriptor: d) else { return false }
         enc.setRenderPipelineState(pipe)
         enc.setFragmentTexture(src, index: 0)
+        // Post hook (Post.swift): on an SDR display its frame is SDR display light already (knee 1: only clamped).
+        var tone = SIMD4<Float>(1, postEnabled && !hdrOutput ? 1 : 0.9, 0, 0)
+        enc.setFragmentBytes(&tone, length: 16, index: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         ctx.statPasses += 1
@@ -201,9 +209,9 @@ final class Hdr: @unchecked Sendable {
     }
 }
 
-/// 1 with METALMC_EXP=hdr (Java makes the main target RGBA16Float then).
+/// 1 or 2 with METALMC_EXP=hdr or post (Java makes the main target RGBA16Float, or RG11B10Float for 2, then).
 @_cdecl("mmc_hdr_enabled")
-public func mmc_hdr_enabled() -> Int32 { hdrOutput ? (hdrPacked ? 2 : 1) : 0 }
+public func mmc_hdr_enabled() -> Int32 { floatMainTarget ? (hdrPacked ? 2 : 1) : 0 }
 
 /// The headroom the tone curve uses this frame (1 without HDR).
 @_cdecl("mmc_hdr_headroom")

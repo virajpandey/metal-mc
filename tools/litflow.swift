@@ -43,9 +43,12 @@ let timing = args.count >= 6 && args[5] == "time"
 let cullRun = args.count >= 6 && args[5] == "cull"
 let giOn = ProcessInfo.processInfo.environment["LITFLOW_GI"] == "1" && mode != "off"
 let waterOn = ProcessInfo.processInfo.environment["LITFLOW_WATER"] == "1" && mode != "off"
+// LITFLOW_POST=1 (with sky or hdr): the post chain (METALMC_EXP=...,post, Post.swift) after the anti-aliasing; runs only the
+// post section (pictures of each effect at several times of day, the exposure's numbers; with "time" each stage's cost).
+let postOn = ProcessInfo.processInfo.environment["LITFLOW_POST"] == "1" && (mode == "sky" || mode == "hdr")
 let exp = mode == "compile" ? (ProcessInfo.processInfo.environment["LITFLOW_EXP"] ?? "lit,rtshadows,sky,water")
     : (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
-        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "")
+        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "") + (postOn ? ",post" : "")
 setenv("METALMC_EXP", exp, 1)
 let lit = mode != "off", sky = mode == "sky" || mode == "hdr", hdr = mode == "hdr"
 guard let lib = dlopen(args[1], RTLD_NOW) else { print("dlopen failed"); exit(1) }
@@ -152,6 +155,24 @@ if mode == "compile" {
                 }
             }
         } else { print("      (no lit mode source in this library: an older build)") }
+    }
+    // The post chain (METALMC_EXP=...,post): its kernels and its copy into the frame for the float frames.
+    if exp.split(separator: ",").contains("post"), let src = source("mmc_debug_post_shader_source") {
+        attempt("post chain: kernels, copy into RG11B10Float and RGBA16Float frames") {
+            let l = try device.makeLibrary(source: src, options: nil)
+            for k in ["post_bloom_first", "post_bloom_down", "post_bloom_up", "post_histogram", "post_exposure", "post_shaft_mask",
+                      "post_shaft_blur", "post_shaft_color", "post_composite"] {
+                _ = try device.makeComputePipelineState(function: l.makeFunction(name: k)!)
+            }
+            for format in [MTLPixelFormat.rg11b10Float, .rgba16Float] {
+                let d = MTLRenderPipelineDescriptor()
+                d.vertexFunction = l.makeFunction(name: "post_copy_vs")
+                d.fragmentFunction = l.makeFunction(name: "post_copy_fs")
+                d.colorAttachments[0].pixelFormat = format
+                d.depthAttachmentPixelFormat = .depth32Float
+                _ = try device.makeRenderPipelineState(descriptor: d)
+            }
+        }
     }
     print(failures == 0 ? "done: every variant compiles" : "FAIL  \(failures) failed")
     exit(failures == 0 ? 0 : 1)
@@ -283,8 +304,12 @@ func matrices(width: Int32, height: Int32) -> [Float] {
 
 struct Targets { let color: Int64, depth: Int64, w: Int32, h: Int32 }
 func targets(_ w: Int32, _ h: Int32) -> Targets {
-    Targets(color: textureCreate(hdr ? 115 : 70, w, h, 1, 1, 1), depth: textureCreate(252, w, h, 1, 1, 1), w: w, h: h)
+    // With post the game's main target is RG11B10Float (92), as with HDR's packed default.
+    Targets(color: textureCreate(hdr ? 115 : (postOn ? 92 : 70), w, h, 1, 1, 1), depth: textureCreate(252, w, h, 1, 1, 1), w: w, h: h)
 }
+// The post chain's entry points (LITFLOW_POST=1).
+let postApply = postOn ? fn("mmc_post_apply", (@convention(c) (Int64, Int64, UnsafePointer<Float>, UnsafePointer<Double>, Int32) -> Int32).self) : nil
+var postRan = false, postSkip = false
 
 /// One frame as the game draws it. sunAngle: vanilla's (0 noon, pi midnight, -pi/2 sunrise in the east). Returns whether
 /// the shadows traced and the relight ran.
@@ -322,6 +347,7 @@ func frame(_ t: Targets, sunAngle: Float, relight: Bool, extras: Bool = true, ta
     }
     if sky { _ = skyAerial(t.color, t.depth, &mats, taa ? 1 : 0) }
     if taa { var c2 = [cam.x, cam.y, cam.z]; _ = taaApply(t.color, t.depth, &mats, &c2, 0, 0, 0) }
+    if let postApply, !postSkip { var pp = mats + [sunAngle]; var c3 = [cam.x, cam.y, cam.z]; postRan = postApply(t.color, t.depth, &pp, &c3, taa ? 1 : 0) == 1 }
     readback?(t.color)
     submit(submitIndex)
     if waitSubmit(submitIndex, 10_000_000_000) != 1 { check(false, "frame \(submitIndex) done") }
@@ -336,14 +362,15 @@ struct Readback { var color: [UInt8] = []; var depth: [Float] = []; var gbuf: [U
 func capture(_ t: Targets, sunAngle: Float, relight: Bool, view: Int32 = 0, extras: Bool = true, frames: Int = 16, taa: Bool = false) -> Readback {
     let n = Int(t.w) * Int(t.h)
     let cbuf = bufferCreate(Int64(n * 4)), dbuf = bufferCreate(Int64(n * 4)), gbuf = bufferCreate(Int64(n * 8))
-    let snap = hdr ? textureCreate(70, t.w, t.h, 1, 1, 1) : 0
+    let floatTarget = hdr || postOn
+    let snap = floatTarget ? textureCreate(70, t.w, t.h, 1, 1, 1) : 0
     litSetView?(view)
     var gotG = false
     var sum = [Float](repeating: 0, count: n * 4)
     for k in 0..<frames {
         frame(t, sunAngle: sunAngle, relight: relight, extras: extras, taa: taa) { color in
-            if hdr { _ = hdrSnapshot(color, snap) }
-            copyToBuffer(hdr ? snap : color, 0, 0, 0, t.w, t.h, cbuf, 0, t.w * 4)
+            if floatTarget { _ = hdrSnapshot(color, snap) }
+            copyToBuffer(floatTarget ? snap : color, 0, 0, 0, t.w, t.h, cbuf, 0, t.w * 4)
             if k == frames - 1 {
                 copyToBuffer(t.depth, 0, 0, 0, t.w, t.h, dbuf, 0, t.w * 4)
                 gotG = litCopyGbuffer?(gbuf, 0) == 1
@@ -682,6 +709,101 @@ func depthMatches(_ depth: Float, _ key: UInt32) -> Bool {
     return d <= 1 || d == 0xFFFF
 }
 func lumOf(_ px: [UInt8], _ i: Int) -> Double { 0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2]) }
+
+// Post (LITFLOW_POST=1): per time of day (LITFLOW_POSTTIMES, default noon,dusk,sunset,midnight), the relit frame through the
+// post chain with the anti-aliasing, each effect added in turn in the same process (mmc_debug_post): "before" (the legacy
+// curve, no effects: the look before post, through the same float frame), "agx" (the tone curve alone), "bloom", "full"
+// (bloom, light shafts, eye adaptation), and the full chain with the other curves; the mean 8-bit luma of each and the
+// exposure's state. The exposure snaps to its target at each picture's first frame and follows at 1/60 s a frame. With
+// "time": each stage's cost at the panel's resolution, and whole frames with and without post. Then exits.
+if postOn {
+    let postDebug = fn("mmc_debug_post", (@convention(c) (Int32, Int32, Double, Int32) -> Int32).self)
+    let postExposure = fn("mmc_debug_post_exposure", (@convention(c) (UnsafeMutablePointer<Float>) -> Int32).self)
+    let postTime = fn("mmc_debug_post_time", (@convention(c) (Int64, Int64, UnsafePointer<Float>, Int32, UnsafeMutablePointer<Double>) -> Int32).self)
+    check(postDebug(-1, -1, 1.0 / 60, 1) == 1, "post is on (\(exp))")
+    let n = Int(W) * Int(H)
+    func meanLuma(_ px: [UInt8]) -> Double {
+        var s = 0.0
+        for i in stride(from: 0, to: n * 4, by: 4) { s += lumOf(px, i) }
+        return s / Double(n)
+    }
+    // Pixels at 8-bit white (all three channels 255): clipped highlights.
+    func clipped(_ px: [UInt8]) -> Double {
+        var c = 0
+        for i in stride(from: 0, to: n * 4, by: 4) where px[i] == 255 && px[i + 1] == 255 && px[i + 2] == 255 { c += 1 }
+        return 100 * Double(c) / Double(n)
+    }
+    let name = ProcessInfo.processInfo.environment["LITFLOW_NAME"] ?? "view"
+    let suns: [String: (Float, Float)] = ["noon": (noon, 1), "morning": (morning, 1), "dusk": (dusk, 0.55), "sunset": (1.53, 0.4),
+                                          "low": (-1.45, 0.6), "midnight": (midnight, 0.2)]
+    let list = (ProcessInfo.processInfo.environment["LITFLOW_POSTTIMES"] ?? "noon,dusk,sunset,midnight").split(separator: ",").map(String.init)
+    if ProcessInfo.processInfo.environment["LITFLOW_TIMEONLY"] != "1" {
+        for t in list {
+            guard let (angle, skyFactor) = suns[t] else { print("      unknown time \(t)"); continue }
+            setLightmap(skyFactor: skyFactor)
+            for _ in 0..<16 { frame(small, sunAngle: angle, relight: true, extras: false) }   // the sky's tables for this sun
+            for (label, effects, curve) in [("before", Int32(0), Int32(0)), ("agx", 0, 1), ("bloom", 1, 1), ("bloom-shafts", 3, 1),
+                                            ("full", 7, 1), ("full-aces", 7, 2), ("full-gt", 7, 3)] {
+                _ = postDebug(effects, curve, 1.0 / 60, 1)
+                let r = capture(half, sunAngle: angle, relight: true, extras: false, frames: 24, taa: true)
+                writePNG(r.color, Int(W), Int(H), "post-\(name)-\(t)-\(label).png")
+                var e = [Float](repeating: 0, count: 8)
+                _ = postExposure(&e)
+                print(String(format: "      %@ %@ %@: mean luma %.1f, %.2f%% clipped white; exposure %+.2f stops (target %+.2f), metered log2 luminance %.2f",
+                             name, t, label, meanLuma(r.color), clipped(r.color), e[0], e[1], e[2]))
+            }
+            check(postRan, "the post chain ran (\(t))")
+        }
+        // Eye adaptation over time: from noon's exposure into midnight at once, the exposure per frame at 120 Hz (what the
+        // smoothing does), then back.
+        setLightmap(skyFactor: 1)
+        _ = postDebug(7, 1, 1.0 / 120, 1)
+        for _ in 0..<8 { frame(small, sunAngle: noon, relight: true, extras: false, taa: true) }
+        for (label, angle, sf) in [("noon -> midnight", midnight, Float(0.2)), ("midnight -> noon", noon, Float(1))] {
+            setLightmap(skyFactor: sf)
+            var trace: [String] = []
+            for k in 0..<720 {
+                frame(small, sunAngle: angle, relight: true, extras: false, taa: true)
+                var e = [Float](repeating: 0, count: 8)
+                _ = postExposure(&e)
+                if [0, 15, 30, 60, 120, 240, 480, 719].contains(k) { trace.append(String(format: "%.2f s %+.2f", Double(k + 1) / 120, e[0])) }
+            }
+            print("      adaptation \(label) at 120 Hz (stops): " + trace.joined(separator: ", "))
+        }
+    }
+    if timing {
+        let full = targets(3456, 2234)
+        setLightmap(skyFactor: 0.4)
+        _ = postDebug(7, 1, 1.0 / 120, 1)
+        for _ in 0..<8 { frame(full, sunAngle: 1.53, relight: true, extras: false, taa: true) }
+        var out = [Double](repeating: 0, count: 10)
+        var pp = matrices(width: full.w, height: full.h) + [Float(1.53)]
+        for round in 0..<2 {
+            guard postTime(full.color, full.depth, &pp, 40, &out) == 1 else { print("FAIL  post timing"); break }
+            print(String(format: "      round %d: post at 3456 x 2234 (sunset, the sun on screen), median (fastest) of 40: bloom %.3f (%.3f) ms, exposure %.3f (%.3f), light shafts %.3f (%.3f), composite %.3f (%.3f), copy into the frame %.3f (%.3f)",
+                         round, out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7], out[8], out[9]))
+        }
+        // Whole frames (sky, main pass, shadows, relight and aerial perspective in the anti-aliasing's resolve) with and
+        // without post, alternating, after 8 to settle.
+        var times = [Double](repeating: 0, count: 4096)
+        var with: [Double] = [], without: [Double] = []
+        for k in 0..<120 {
+            postSkip = k % 2 == 1
+            _ = gpuTimesTake(&times, 4096)
+            frame(full, sunAngle: 1.53, relight: true, extras: false, taa: true)
+            let c = Int(gpuTimesTake(&times, 4096))
+            if c > 0 { if postSkip { without.append(times[c - 1] * 1000) } else { with.append(times[c - 1] * 1000) } }
+        }
+        postSkip = false
+        let ws = with.sorted(), os = without.sorted()
+        if !ws.isEmpty && !os.isEmpty {
+            print(String(format: "      frame at 3456 x 2234 (sunset): with post %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), 60 each",
+                         ws[ws.count / 2], ws[0], os[os.count / 2], os[0], ws[ws.count / 2] - os[os.count / 2], ws[0] - os[0]))
+        }
+    }
+    print("done")
+    exit(0)
+}
 
 // The forward frame (no relight) and the relit one, morning sun in the east (LITFLOW_TIMEONLY=1 skips to the timing;
 // LITFLOW_GIONLY=1 to the GI cache's comparison).
