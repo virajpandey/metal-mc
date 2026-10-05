@@ -173,6 +173,21 @@ loom {
 			if (project.hasProperty("litView")) {
 				environmentVariable "METALMC_LITVIEW", project.findProperty("litView").toString()
 			}
+			// Colored block light (-PmetalExp=lit,...,coloredlight; ColoredLight.swift; debug views -PlitView=11 the block
+			// light alone, 12 its check against vanilla's): -PclGain=<brightness, 1>, -PclFlicker=<fire's flicker, 0.12>,
+			// -PclIter=<flood-fill passes a frame, 4>, -PclBelow=<blocks of the volume below the camera, 64>.
+			if (project.hasProperty("clGain")) {
+				environmentVariable "METALMC_CLGAIN", project.findProperty("clGain").toString()
+			}
+			if (project.hasProperty("clFlicker")) {
+				environmentVariable "METALMC_CLFLICKER", project.findProperty("clFlicker").toString()
+			}
+			if (project.hasProperty("clIter")) {
+				environmentVariable "METALMC_CLITER", project.findProperty("clIter").toString()
+			}
+			if (project.hasProperty("clBelow")) {
+				environmentVariable "METALMC_CLBELOW", project.findProperty("clBelow").toString()
+			}
 			// The GI cache with lit mode (-PmetalExp=lit,...,gi; Gi.swift): -PgiBudget=<cells updated a frame, 16384>,
 			// -PgiRange=<blocks where level-0 cells end, 160>, -PgiCap=<log2 of the cells, 21>, -PgiSpp=<samples an
 			// update, 4>, -PgiHistory=<updates averaged, 64>.

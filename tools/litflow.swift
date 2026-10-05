@@ -30,6 +30,16 @@
 //   -reflections.png, -changed-dry.png if anything but water changed; <mode>-water-<name>-view-water.png).
 //   litflow <dylib> - - compile: compiles every shader variant of the anti-aliasing's resolve, the far field and lit mode's
 //   own pass under METALMC_EXP=$LITFLOW_EXP (default lit,rtshadows,sky,water), then exits (no world, no GPU work).
+//   LITFLOW_CL=1 adds colored block light (METALMC_EXP=...,coloredlight, ColoredLight.swift) and runs only its section:
+//   the blocks around the camera from the world's region files (as the game's Java side sends them), the test gallery
+//   (LITFLOW_CLSCENE, default mod/src/client/resources/metalmc/coloredlight_scene.txt; "none" for the world as it is)
+//   applied to them and to the LOD, then per view (LITFLOW_CLVIEWS=name:x,y,z,yaw,pitch;...; default the gallery from
+//   above and low over its mixing area, and the default view's real terrain) and time of day (LITFLOW_CLTIMES, default midnight,noon) the relit frame with
+//   vanilla's block light and with the colored light (cl-<view>-<time>-vanilla.png, -colored.png, -colored-taa.png),
+//   the light alone and the sanity check's view (-light.png, -check.png), its numbers, the flood fill checked against
+//   a CPU reference, a block change, and with "time" its cost (the volume's work from scratch, still, moving, after an
+//   edit; the relight and the anti-aliasing's resolve with and without it). Set LITFLOW_VIEW to the first view (the LOD
+//   is opened around it).
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -43,9 +53,10 @@ let timing = args.count >= 6 && args[5] == "time"
 let cullRun = args.count >= 6 && args[5] == "cull"
 let giOn = ProcessInfo.processInfo.environment["LITFLOW_GI"] == "1" && mode != "off"
 let waterOn = ProcessInfo.processInfo.environment["LITFLOW_WATER"] == "1" && mode != "off"
+let clOn = ProcessInfo.processInfo.environment["LITFLOW_CL"] == "1" && mode != "off" && mode != "compile"
 let exp = mode == "compile" ? (ProcessInfo.processInfo.environment["LITFLOW_EXP"] ?? "lit,rtshadows,sky,water")
     : (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
-        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "")
+        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "") + (clOn ? ",coloredlight" : "")
 setenv("METALMC_EXP", exp, 1)
 let lit = mode != "off", sky = mode == "sky" || mode == "hdr", hdr = mode == "hdr"
 guard let lib = dlopen(args[1], RTLD_NOW) else { print("dlopen failed"); exit(1) }
@@ -153,6 +164,15 @@ if mode == "compile" {
             }
         } else { print("      (no lit mode source in this library: an older build)") }
     }
+    if let src = source("mmc_debug_cl_shader_source") {
+        attempt("colored light's kernels (upload, edit, list, flood fill, resolve, clear)") {
+            let l = try device.makeLibrary(source: src, options: nil)
+            for k in ["cl_upload", "cl_edit", "cl_list_begin", "cl_list", "cl_propagate", "cl_resolve", "cl_clear"] {
+                let p = try device.makeComputePipelineState(function: l.makeFunction(name: k)!)
+                if k == "cl_propagate" || k == "cl_resolve" { check(p.maxTotalThreadsPerThreadgroup >= 512, "\(k) takes 512 threads a threadgroup (\(p.maxTotalThreadsPerThreadgroup))") }
+            }
+        }
+    }
     print(failures == 0 ? "done: every variant compiles" : "FAIL  \(failures) failed")
     exit(failures == 0 ? 0 : 1)
 }
@@ -185,8 +205,9 @@ var framesDrawn = 0
 
 // The world's LOD around the camera.
 let viewSpec = (ProcessInfo.processInfo.environment["LITFLOW_VIEW"] ?? "8,150,8,100,22").split(separator: ",").map { Double($0)! }
-let cam = SIMD3<Double>(viewSpec[0], viewSpec[1], viewSpec[2])
-let yaw = Float(viewSpec[3]) * .pi / 180, pitch = Float(viewSpec[4]) * .pi / 180
+// (vars: the colored light's section moves the camera between its views.)
+var cam = SIMD3<Double>(viewSpec[0], viewSpec[1], viewSpec[2])
+var yaw = Float(viewSpec[3]) * .pi / 180, pitch = Float(viewSpec[4]) * .pi / 180
 check(lodOpen(args[2], 2048, Int32(cam.x), Int32(cam.z)) == 1, "LOD opened on \(args[2])")
 var st = [Int64](repeating: 0, count: 4)
 var lastQuads: Int64 = -1, stable = 0
@@ -198,6 +219,39 @@ while stable < 24 && Date().timeIntervalSince(t0) < 600 {
     Thread.sleep(forTimeInterval: 0.25)
 }
 check(st[0] == 2, "LOD built: \(st[1]) nodes, \(st[2]) quads in \(Int(Date().timeIntervalSince(t0))) s")
+// Colored block light (LITFLOW_CL=1): the blocks around the camera into the light's store (the volume reaches 128 blocks
+// out: 10 chunks either way), then the test scene into the store and the LOD, and the LOD's rebuild of what it touched.
+typealias ClFrameF = @convention(c) (Double, Double, Double) -> Void
+let clFrameC: ClFrameF? = clOn ? fn("mmc_cl_frame", ClFrameF.self) : nil
+if clOn {
+    let load = fn("mmc_debug_cl_load", (@convention(c) (UnsafePointer<CChar>, Int32, Int32, Int32, Int32) -> Int32).self)
+    let ccx = Int32((cam.x / 16).rounded(.down)), ccz = Int32((cam.z / 16).rounded(.down))
+    let tl = Date()
+    // With "time" far enough east for the moving camera's 240 blocks too.
+    let reach: Int32 = timing ? 26 : 10
+    let n = load(args[2], ccx - 10, ccz - 10, ccx + reach, ccz + 10)
+    check(n > 0, "colored light: \(n) chunks around the camera read from the region files in \(String(format: "%.1f", Date().timeIntervalSince(tl))) s")
+    let scenePath = ProcessInfo.processInfo.environment["LITFLOW_CLSCENE"]
+        ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("mod/src/client/resources/metalmc/coloredlight_scene.txt").path
+    if scenePath != "none" {
+        let scene = fn("mmc_debug_cl_scene", (@convention(c) (UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32).self)
+        lodStatus(&st)
+        let before = st[2]
+        let placed = scene(scenePath, args[2])
+        check(placed > 0, "colored light: the scene's \(placed) blocks placed (\(scenePath))")
+        // The LOD picks the chunks up on its next pass (every 2 s) and rebuilds their nodes: wait for the quad count to
+        // change and settle.
+        let tw = Date()
+        var changedAt: Date? = nil, last = before
+        while Date().timeIntervalSince(tw) < 120 {
+            Thread.sleep(forTimeInterval: 0.5)
+            lodStatus(&st)
+            if st[2] != last { last = st[2]; changedAt = Date() }
+            if let c = changedAt, Date().timeIntervalSince(c) > 6 { break }
+        }
+        print("      the LOD rebuilt with the scene: \(before) -> \(st[2]) quads in \(Int(Date().timeIntervalSince(tw))) s")
+    }
+}
 // LITFLOW_GATE=<dir>: the LOD's build (about 100 s of CPU at background priority, no GPU work) runs before the GPU lock is
 // taken: litflow writes <dir>/ready and waits for <dir>/go, which a wrapper writes once it holds the lock
 // (tools/bench/gpuwait.sh), so the lock is held only for the GPU work.
@@ -315,6 +369,8 @@ func frame(_ t: Targets, sunAngle: Float, relight: Bool, extras: Bool = true, ta
     // Water: the reflections on or off, the waves 1/120 s on from the last frame (as at 120 Hz).
     if let litWaterSwitch { _ = litWaterSwitch(reflectWater ? 1 : 0, 100 + Double(framesDrawn) / 120) }
     framesDrawn += 1
+    // Colored block light: the volume's work for this camera, before the relight (as GameRendererLodMixin calls it).
+    if relight, let clFrameC { clFrameC(cam.x, cam.y, cam.z) }
     if relight, let litRelight {
         // Lit.relight's p: matrices, sun angle, fog color (strength 0: none), fog distances, our sky drew.
         var lp = mats + [sunAngle, 0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, sky ? 1 : 0]
@@ -682,6 +738,194 @@ func depthMatches(_ depth: Float, _ key: UInt32) -> Bool {
     return d <= 1 || d == 0xFFFF
 }
 func lumOf(_ px: [UInt8], _ i: Int) -> Double { 0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2]) }
+
+// Colored block light (LITFLOW_CL=1): its own section, then exit.
+if clOn {
+    let n = Int(W) * Int(H)
+    let clSwitch = fn("mmc_debug_cl_on", (@convention(c) (Int32, Double) -> Int32).self)
+    let clBench = fn("mmc_debug_cl_bench", (@convention(c) (Double, Double, Double, Int32, UnsafeMutablePointer<Double>) -> Int32).self)
+    let clVerify = fn("mmc_debug_cl_verify", (@convention(c) (UnsafeMutablePointer<Int64>) -> Int32).self)
+    let clInvalidate = fn("mmc_debug_cl_invalidate", (@convention(c) () -> Void).self)
+    let clBlock = fn("mmc_cl_block", (@convention(c) (Int32, Int32, Int32, Int32, Int32) -> Void).self)
+    let clClassify = fn("mmc_cl_classify", (@convention(c) (UnsafePointer<CChar>) -> Int32).self)
+    // A fixed clock for the fire's flicker (the pictures repeat), which also keeps the frame's volume valid for the timings.
+    check(clSwitch(1, 100) == 1, "colored light is on (lit,coloredlight)")
+    struct ClView { let name: String; let pos: SIMD3<Double>; let yaw: Float; let pitch: Float }
+    let views: [ClView] = (ProcessInfo.processInfo.environment["LITFLOW_CLVIEWS"] ?? "above:0.5,227.6,2.5,0,47;low:0.5,207.1,15.5,0,24;world:8,150,8,100,22")
+        .split(separator: ";").map { s in
+            let parts = s.split(separator: ":"), v = parts[1].split(separator: ",").map { Double($0)! }
+            return ClView(name: String(parts[0]), pos: SIMD3(v[0], v[1], v[2]), yaw: Float(v[3]), pitch: Float(v[4]))
+        }
+    func use(_ v: ClView) { cam = v.pos; yaw = v.yaw * .pi / 180; pitch = v.pitch * .pi / 180 }
+    let suns: [String: (Float, Float)] = ["midnight": (midnight, 0.2), "noon": (noon, 1), "dusk": (dusk, 0.55), "morning": (morning, 1)]
+    let times = (ProcessInfo.processInfo.environment["LITFLOW_CLTIMES"] ?? "midnight,noon").split(separator: ",").map(String.init)
+    var bench = [Double](repeating: 0, count: 2 * 512)
+    /// Frames of the volume's work alone until its flood fill has nothing left (up to `limit`): how many it took.
+    func settle(limit: Int = 64) -> Int {
+        for k in 0..<limit {
+            _ = clBench(cam.x, cam.y, cam.z, 1, &bench)
+            if bench[1] == 0 { return k }
+        }
+        return limit
+    }
+    func verify(_ what: String) {
+        var out = [Int64](repeating: 0, count: 6)
+        guard clVerify(&out) == 1 else { check(false, "verify ran"); return }
+        print("      \(what): flood fill against the CPU's: \(out[1]) of \(out[0]) cells differ (largest \(out[4]) levels), \(out[5]) brighter than the CPU's; \(out[3]) cells lit; \(out[2]) cells' codes differ from the store's")
+        // Reported, not fatal: the pictures still come.
+        print((out[1] == 0 && out[2] == 0 ? "ok    " : "FAIL  ") + "the volume's light is vanilla's flood fill per color, exactly (\(what))")
+    }
+    for v in views {
+        use(v)
+        print("      view \(v.name): (\(v.pos.x), \(v.pos.y), \(v.pos.z)) yaw \(v.yaw) pitch \(v.pitch)")
+        print("      settled in \(settle()) frames of the volume's work")
+        verify("view \(v.name)")
+        for t in times {
+            guard let (angle, skyFactor) = suns[t] else { continue }
+            setLightmap(skyFactor: skyFactor)
+            for _ in 0..<16 { frame(small, sunAngle: angle, relight: true, extras: false) }
+            _ = clSwitch(0, 100)
+            let off = capture(half, sunAngle: angle, relight: true, extras: false)
+            _ = clSwitch(1, 100)
+            let on = capture(half, sunAngle: angle, relight: true, extras: false)
+            let onT = capture(half, sunAngle: angle, relight: true, extras: false, frames: 24, taa: true)
+            writePNG(off.color, Int(W), Int(H), "cl-\(v.name)-\(t)-vanilla.png")
+            writePNG(on.color, Int(W), Int(H), "cl-\(v.name)-\(t)-colored.png")
+            // Side by side, vanilla's block light left and the colored light right.
+            var pair = [UInt8](repeating: 255, count: 2 * n * 4)
+            for y in 0..<Int(H) {
+                for x in 0..<Int(W) {
+                    for k in 0..<4 {
+                        pair[(y * 2 * Int(W) + x) * 4 + k] = off.color[(y * Int(W) + x) * 4 + k]
+                        pair[(y * 2 * Int(W) + Int(W) + x) * 4 + k] = on.color[(y * Int(W) + x) * 4 + k]
+                    }
+                }
+            }
+            writePNG(pair, 2 * Int(W), Int(H), "cl-\(v.name)-\(t)-pair.png")
+            writePNG(onT.color, Int(W), Int(H), "cl-\(v.name)-\(t)-colored-taa.png")
+            let lightView = capture(half, sunAngle: angle, relight: true, view: 11, extras: false, frames: 1)
+            let checkView = capture(half, sunAngle: angle, relight: true, view: 12, extras: false, frames: 1)
+            writePNG(lightView.color, Int(W), Int(H), "cl-\(v.name)-\(t)-light.png")
+            writePNG(checkView.color, Int(W), Int(H), "cl-\(v.name)-\(t)-check.png")
+            // Relit terrain (not light sources) by vanilla's block light level at the pixel, and what the check did there:
+            // red the volume scaled down to vanilla's level, green colored light, blue a share of vanilla's light made up.
+            var lit = 0, dark = 0, applied = 0, clamped = 0, filled = 0, outside = 0, darkLit = 0, darkClamped = 0
+            var fillSum = 0.0, lumOff = 0.0, lumOn = 0.0, rgbOff = SIMD3<Double>.zero, rgbOn = SIMD3<Double>.zero
+            for i in 0..<n {
+                let gx = on.gbuf[2 * i], gy = on.gbuf[2 * i + 1]
+                guard gx >> 29 != 0, depthMatches(on.depth[i], gy & 0xFFFF) else { continue }
+                let level = Double(gy >> 24) / 16
+                if level >= 15 { continue }
+                let r = checkView.color[4 * i], g = checkView.color[4 * i + 1], b = checkView.color[4 * i + 2]
+                let isOutside = r == g && r > 150 && r < 200 && b < 20
+                let isClamped = r > 200, isApplied = g > 150 && !isOutside
+                if level > 0 {
+                    lit += 1
+                    if isOutside { outside += 1 }
+                    if isApplied { applied += 1 }
+                    if isClamped { clamped += 1 }
+                    if b > 10 { filled += 1; fillSum += Double(b) / 230 }
+                    lumOff += lumOf(off.color, 4 * i); lumOn += lumOf(on.color, 4 * i)
+                    rgbOff += SIMD3(Double(off.color[4 * i]), Double(off.color[4 * i + 1]), Double(off.color[4 * i + 2]))
+                    rgbOn += SIMD3(Double(on.color[4 * i]), Double(on.color[4 * i + 1]), Double(on.color[4 * i + 2]))
+                } else {
+                    dark += 1
+                    if isClamped { darkClamped += 1 }
+                    if lumOf(lightView.color, 4 * i) > 3 { darkLit += 1 }
+                }
+            }
+            let l = Double(max(lit, 1))
+            print(String(format: "      %@ %@: %d relit pixels with block light, %d without; with: colored %.1f%%, scaled down to vanilla's level %.1f%%, vanilla's made up %.1f%% (mean share %.2f), outside the volume %.1f%%; mean luma %.1f -> %.1f, mean RGB (%.0f, %.0f, %.0f) -> (%.0f, %.0f, %.0f)",
+                         v.name, t, lit, dark, 100 * Double(applied) / l, 100 * Double(clamped) / l, 100 * Double(filled) / l,
+                         filled > 0 ? fillSum / Double(filled) : 0, 100 * Double(outside) / l, lumOff / l, lumOn / l,
+                         rgbOff.x / l, rgbOff.y / l, rgbOff.z / l, rgbOn.x / l, rgbOn.y / l, rgbOn.z / l))
+            print("      \(v.name) \(t): where vanilla has no block light, \(darkClamped) pixels had volume light the check removed, \(darkLit) show block light")
+            print((darkLit == 0 ? "ok    " : "FAIL  ") + "nothing glows where vanilla's block light is 0 (\(v.name), \(t))")
+        }
+    }
+    // A block change: a soul torch placed in the mixing area, then broken (as the Java side sends them), the frames each
+    // takes to settle, and the check against the CPU after both.
+    use(views[0])
+    setLightmap(skyFactor: 0.2)
+    _ = settle()
+    let soulCode = Int32(0 | 10 << 4) | (clClassify("minecraft:soul_torch") << 8)
+    let ex: Int32 = -12, ey: Int32 = 200, ez: Int32 = 32
+    clBlock(0, ex, ey, ez, soulCode)
+    var settleTrace: [Int] = []
+    for _ in 0..<16 { _ = clBench(cam.x, cam.y, cam.z, 1, &bench); settleTrace.append(Int(bench[1])) }
+    print("      soul torch placed at (\(ex), \(ey), \(ez)): bricks the flood fill ran over, frame by frame: \(settleTrace)")
+    verify("after placing a soul torch")
+    let placed = capture(half, sunAngle: midnight, relight: true, extras: false)
+    writePNG(placed.color, Int(W), Int(H), "cl-\(views[0].name)-midnight-edit-placed.png")
+    clBlock(0, ex, ey, ez, 0)
+    settleTrace = []
+    for _ in 0..<16 { _ = clBench(cam.x, cam.y, cam.z, 1, &bench); settleTrace.append(Int(bench[1])) }
+    print("      and broken: \(settleTrace)")
+    verify("after breaking it")
+    if timing {
+        // The volume's work at the panel's resolution doesn't depend on it; the relight's does.
+        func stat(_ s: [Double]) -> (Double, Double) { let t = s.sorted(); return t.isEmpty ? (-1, -1) : (t[t.count / 2], t[0]) }
+        func series(_ k: Int) -> String { (0..<k).map { String(format: "%.3f/%d", bench[2 * $0], Int(bench[2 * $0 + 1])) }.joined(separator: " ") }
+        clInvalidate()
+        _ = clBench(cam.x, cam.y, cam.z, 12, &bench)
+        print("      from scratch (every section uploaded, light from nothing), GPU ms/bricks by frame: \(series(12))")
+        _ = settle()
+        _ = clBench(cam.x, cam.y, cam.z, 60, &bench)
+        print(String(format: "      still: median %.3f ms (fastest %.3f) a frame, %d bricks", stat((0..<60).map { bench[2 * $0] }).0,
+                     stat((0..<60).map { bench[2 * $0] }).1, Int(bench[1])))
+        // Moving as the real-terrain flight does (20 blocks a second at 120 Hz), then 6 times faster: the volume moves a
+        // section at a time, and the sections that enter it are uploaded and lit.
+        for (speed, label) in [(1.0 / 6, "20 blocks/s"), (1.0, "120 blocks/s")] {
+            var ms: [Double] = [], bricks: [Double] = []
+            var p = cam
+            for _ in 0..<240 {
+                p.x += speed
+                _ = clBench(p.x, p.y, p.z, 1, &bench)
+                ms.append(bench[0]); bricks.append(bench[1])
+            }
+            let (med, fast) = stat(ms)
+            print(String(format: "      moving at %@ for 240 frames: median %.3f ms (fastest %.3f, slowest %.3f), mean %.3f; flood fill in %d frames, %.0f bricks on average there",
+                         label, med, fast, ms.max() ?? 0, ms.reduce(0, +) / Double(ms.count), bricks.filter { $0 > 0 }.count,
+                         bricks.reduce(0, +) / Double(max(bricks.filter { $0 > 0 }.count, 1))))
+        }
+        _ = settle()
+        clBlock(0, ex, ey, ez, soulCode)
+        _ = clBench(cam.x, cam.y, cam.z, 8, &bench)
+        print("      a torch placed, by frame: \(series(8))")
+        clBlock(0, ex, ey, ez, 0)
+        _ = settle()
+        // The relight with and without the colored light, at the panel's resolution, in its own pass and in the
+        // anti-aliasing's resolve (the code is in either way: "without" is the volume switched off).
+        let full = targets(3456, 2234)
+        setLightmap(skyFactor: 0.2)
+        for _ in 0..<8 { frame(full, sunAngle: midnight, relight: true, extras: false) }
+        frame(full, sunAngle: midnight, relight: false, extras: false)
+        let mats = matrices(width: full.w, height: full.h)
+        litLevelPass?()
+        var h = full.color
+        var clear: [Float] = [0.62, 0.75, 0.95, 1]
+        _ = passBegin(&h, 1, 0, &clear, full.depth, 0, 0, 0, 0, full.w, full.h)
+        var p = mats + [0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, 0, 1]
+        var c = [cam.x, cam.y, cam.z]
+        _ = lodDraw(&p, &c)
+        passEnd()
+        submit(submitIndex); _ = waitSubmit(submitIndex, 10_000_000_000); submitIndex += 1
+        var lp = mats + [midnight, 0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, sky ? 1 : 0]
+        var two = [Double](repeating: 0, count: 2), four = [Double](repeating: 0, count: 4)
+        for round in 0..<2 {
+            for on in [Int32(1), 0] {
+                _ = clSwitch(on, 100)
+                litTime?(full.color, full.depth, &lp, lightmap, 60, &two)
+                litTimeTaa?(full.color, full.depth, &lp, lightmap, 60, &four)
+                print(String(format: "      round %d, colored light %@: relight pass %.3f ms (fastest %.3f); anti-aliasing resolve with the relight %.3f (fastest %.3f), without %.3f (fastest %.3f)",
+                             round, on == 1 ? "on " : "off", two[0], two[1], four[0], four[2], four[1], four[3]))
+            }
+        }
+        _ = clSwitch(1, 100)
+    }
+    print("done")
+    exit(0)
+}
 
 // The forward frame (no relight) and the relit one, morning sun in the east (LITFLOW_TIMEONLY=1 skips to the timing;
 // LITFLOW_GIONLY=1 to the GI cache's comparison).

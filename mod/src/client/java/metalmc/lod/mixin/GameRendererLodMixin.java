@@ -64,6 +64,9 @@ abstract class GameRendererLodMixin {
         // wrote, after the shadows (it takes their visibility) and before the aerial perspective; with anti-aliasing, in
         // its resolve as it loads the color.
         if (metalmc.backend.MetalLit.ENABLED && Lod.SUN_SKY) {
+            // Colored block light (METALMC_EXP=coloredlight, metalmc.light.ColoredLight): the light volume's work, which the
+            // relight samples.
+            if (metalmc.backend.MetalColoredLight.ENABLED) metalmc.light.ColoredLight.frame(cameraState.pos.x, cameraState.pos.y, cameraState.pos.z);
             metalmc.backend.MetalLit.relight(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, Lod.SUN_ANGLE, cameraState.fogData,
                 net.minecraft.client.Minecraft.getInstance().gameRenderer.levelLightmap(), metalmc.sky.Sky.frameActive, TemporalAA.ENABLED);

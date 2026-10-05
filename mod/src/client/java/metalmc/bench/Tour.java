@@ -256,6 +256,7 @@ final class Tour {
     );
 
     static List<Step> steps() {
+        if (ColoredLightTour.ENABLED) return ColoredLightTour.STEPS;
         if (TAA_TOUR) return TAA_STEPS;
         if (FIDELITY_TOUR) return FIDELITY_STEPS;
         if (ZOOM_TOUR) return ZOOM_STEPS;
