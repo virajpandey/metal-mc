@@ -110,7 +110,9 @@ shadow camera (`shadowModelView`: 100 back along the sun or moon direction with 
   transparency). Our LOD, near chunks and far field don't draw into the G-buffer.
 - `-PbenchTour=shader`: noon overview and ground view, afternoon, sunset, a pool of water built in the sky, a closed room
   lit by torches and glowstone, night; screenshots in `mod/run/screenshots/<label>-tour-*.png`.
-- `METALMC_EXTPIPE_VIEW=<target>[@<pass>][:scale]` shows a target (as it was after that pass, or `@gbuffers`) on the
-  screen instead of the frame, absolute values times scale; NaN magenta, infinity cyan.
+- `METALMC_EXTPIPE_VIEW=<target>[.a][@<pass>][:scale],...` (`-PextPipeView=`) shows targets in a grid over the screen
+  instead of the frame: each as it was after that pass (`@gbuffers`: when the G-buffer was done; none: at the end of the
+  frame), its alpha with `.a`, absolute values times the scale; NaN magenta, infinity cyan, depth as (1 - depth)^(1/4);
+  `frame` is a cell with the frame itself.
 - `tools/extpipe_check.swift`: loads and compiles a description and runs frames with an empty G-buffer offline
   (`EXTCHECK_VIEWS=` for the same views).

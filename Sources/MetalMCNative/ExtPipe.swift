@@ -1273,89 +1273,144 @@ final class ExtPipe {
         phase = 0
     }
 
-    // MARK: Debug view (METALMC_EXTPIPE_VIEW=<target>[:scale], or mmc_ext_debug_view): a target on the screen
+    // MARK: Debug view (METALMC_EXTPIPE_VIEW, or mmc_ext_debug_view): targets on the screen
 
-    /// "<target>[@<pass>]" and a scale: the target as it was after that pass (default: the end of the frame).
+    /// "<target>[.a][@<pass>][:scale]", comma-separated: each target (its alpha with .a) as it was after that pass (or
+    /// "gbuffers": when the G-buffer was done; default: the end of the frame), in a grid over the screen. "frame" is a
+    /// cell with the frame itself.
     static var view: (String, Float)? = {
         guard let v = ProcessInfo.processInfo.environment["METALMC_EXTPIPE_VIEW"], !v.isEmpty else { return nil }
-        let parts = v.split(separator: ":")
-        return (String(parts[0]), parts.count > 1 ? Float(parts[1]) ?? 1 : 1)
+        return (v, 1)
     }()
     var viewPSO: [Bool: MTLRenderPipelineState] = [:]
-    var viewCapture: MTLTexture?
+    var viewCaptures: [String: MTLTexture] = [:]
+    var frameCopy: MTLTexture?
 
-    /// After pass `program` (or "gbuffers" when the G-buffer is done): keeps a copy of the viewed target if it asks for it.
-    func captureView(after program: String, _ cb: MTLCommandBuffer) {
-        guard let (spec, _) = ExtPipe.view, spec.contains("@") else { return }
-        let parts = spec.split(separator: "@")
-        var name = String(parts[0])
-        if name.hasSuffix(".a") { name = String(name.dropLast(2)) }
-        guard parts.count == 2, parts[1] == program, let t = targets[name], !t.tex.isEmpty else { return }
-        let src = t.current
-        if viewCapture == nil || viewCapture!.width != src.width || viewCapture!.height != src.height || viewCapture!.pixelFormat != src.pixelFormat {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
-            d.usage = [.shaderRead]
-            d.storageMode = .private
-            viewCapture = ctx.device.makeTexture(descriptor: d)
+    struct ViewSpec { let spec: String; let name: String; let alpha: Bool; let pass: String?; let scale: Float }
+
+    static func viewSpecs(_ list: String, _ scale: Float) -> [ViewSpec] {
+        list.split(separator: ",").map { item in
+            let colon = item.split(separator: ":")
+            let s = colon.count > 1 ? (Float(colon[1]) ?? scale) : scale
+            let at = colon[0].split(separator: "@")
+            var name = String(at[0])
+            let alpha = name.hasSuffix(".a")
+            if alpha { name = String(name.dropLast(2)) }
+            return ViewSpec(spec: String(colon[0]), name: name, alpha: alpha, pass: at.count > 1 ? String(at[1]) : nil, scale: s)
         }
-        guard let dst = viewCapture, let blit = cb.makeBlitCommandEncoder() else { return }
-        blit.copy(from: src, sourceSlice: 0, sourceLevel: 0, to: dst, destinationSlice: 0, destinationLevel: 0, sliceCount: 1, levelCount: 1)
-        blit.endEncoding()
     }
 
-    /// Draws the current copy of target `name` over the screen, times `scale` (absolute values; alpha ignored; NaN magenta,
-    /// infinity cyan).
-    func debugView(_ spec: String, _ scale: Float) {
-        var name = String(spec.split(separator: "@").first ?? "")
-        let alpha = name.hasSuffix(".a")
-        if alpha { name = String(name.dropLast(2)) }
-        guard let screen, let t = targets[name], !t.tex.isEmpty else { return }
-        let source = spec.contains("@") ? viewCapture : t.current
-        guard let source else { return }
-        let depth = t.isDepth
-        if viewPSO[depth] == nil {
-            let src = """
-            #include <metal_stdlib>
-            using namespace metal;
-            struct VOut { float4 pos [[position]]; };
-            vertex VOut extview_vs(uint vid [[vertex_id]]) {
-                float2 uv = float2((vid << 1) & 2, vid & 2);
-                VOut o; o.pos = float4(uv * 2.0 - 1.0, 0.0, 1.0); return o;
+    /// After pass `program` (or "gbuffers" when the G-buffer is done): copies of the viewed targets that ask for it.
+    func captureView(after program: String, _ cb: MTLCommandBuffer) {
+        guard let (list, scale) = ExtPipe.view else { return }
+        for v in ExtPipe.viewSpecs(list, scale) where v.pass == program {
+            guard let t = targets[v.name], !t.tex.isEmpty else { continue }
+            let src = t.current
+            var dst = viewCaptures[v.spec]
+            if dst == nil || dst!.width != src.width || dst!.height != src.height || dst!.pixelFormat != src.pixelFormat {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
+                d.usage = [.shaderRead]
+                d.storageMode = .private
+                dst = ctx.device.makeTexture(descriptor: d)
+                viewCaptures[v.spec] = dst
             }
-            fragment float4 extview_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], constant float4& p [[buffer(0)]]) {
-                constexpr sampler s(filter::nearest);
-                float4 c = t.sample(s, in.pos.xy / p.xy);
-                if (p.w > 0.5) c = c.aaaa;
-                if (any(isnan(c))) return float4(1.0, 0.0, 1.0, 1.0);
-                if (any(isinf(c))) return float4(0.0, 1.0, 1.0, 1.0);
-                return float4(abs(c.rgb * p.z), 1.0);
-            }
-            fragment float4 extview_depth_fs(VOut in [[stage_in]], depth2d<float> t [[texture(0)]], constant float4& p [[buffer(0)]]) {
-                constexpr sampler s(filter::nearest);
-                float d = t.sample(s, in.pos.xy / p.xy);
-                float v = pow(saturate(1.0 - d) * p.z, 0.25);
-                return float4(v, v, v, 1.0);
-            }
-            """
-            guard let lib = try? ctx.device.makeLibrary(source: src, options: nil) else { return }
-            let d = MTLRenderPipelineDescriptor()
-            d.vertexFunction = lib.makeFunction(name: "extview_vs")
-            d.fragmentFunction = lib.makeFunction(name: depth ? "extview_depth_fs" : "extview_fs")
-            d.colorAttachments[0].pixelFormat = screen.pixelFormat
-            viewPSO[depth] = try? ctx.device.makeRenderPipelineState(descriptor: d)
+            guard let dst, let blit = cb.makeBlitCommandEncoder() else { continue }
+            blit.copy(from: src, sourceSlice: 0, sourceLevel: 0, to: dst, destinationSlice: 0, destinationLevel: 0, sliceCount: 1, levelCount: 1)
+            blit.endEncoding()
         }
-        guard let pso = viewPSO[depth] else { return }
+    }
+
+    /// Draws the viewed targets over the screen in a grid: absolute values times the scale; NaN magenta, infinity cyan;
+    /// depth as (1 - depth)^(1/4).
+    func debugView(_ list: String, _ scale: Float) {
+        guard let screen else { return }
+        let specs = ExtPipe.viewSpecs(list, scale)
+        guard !specs.isEmpty else { return }
+        let cols = Int(Double(specs.count).squareRoot().rounded(.up))
+        let rows = (specs.count + cols - 1) / cols
+        let cb = ctx.ensureCB()
+        ctx.endBlit()
+        if specs.contains(where: { $0.name == "frame" }) {
+            if frameCopy == nil || frameCopy!.width != screen.width || frameCopy!.height != screen.height || frameCopy!.pixelFormat != screen.pixelFormat {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: screen.pixelFormat, width: screen.width, height: screen.height, mipmapped: false)
+                d.usage = [.shaderRead]
+                d.storageMode = .private
+                frameCopy = ctx.device.makeTexture(descriptor: d)
+            }
+            if let fc = frameCopy, let blit = cb.makeBlitCommandEncoder() {
+                blit.copy(from: screen, sourceSlice: 0, sourceLevel: 0, to: fc, destinationSlice: 0, destinationLevel: 0, sliceCount: 1, levelCount: 1)
+                blit.endEncoding()
+            }
+        }
         let d = MTLRenderPassDescriptor()
         d.colorAttachments[0].texture = screen
-        d.colorAttachments[0].loadAction = .dontCare
+        d.colorAttachments[0].loadAction = .clear
+        d.colorAttachments[0].clearColor = MTLClearColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1)
         d.colorAttachments[0].storeAction = .store
-        guard let enc = ctx.ensureCB().makeRenderCommandEncoder(descriptor: d) else { return }
-        enc.setRenderPipelineState(pso)
-        var p = SIMD4<Float>(Float(screen.width), Float(screen.height), scale, alpha ? 1 : 0)
-        enc.setFragmentBytes(&p, length: 16, index: 0)
-        enc.setFragmentTexture(source, index: 0)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: d) else { return }
+        let cw = screen.width / cols, ch = screen.height / rows
+        for (i, v) in specs.enumerated() {
+            let source: MTLTexture?
+            var depth = false
+            if v.name == "frame" {
+                source = frameCopy
+            } else if let t = targets[v.name], !t.tex.isEmpty {
+                source = v.pass != nil ? viewCaptures[v.spec] : t.current
+                depth = t.isDepth
+            } else {
+                source = nil
+            }
+            guard let source, let pso = viewPipeline(depth: depth, format: screen.pixelFormat) else { continue }
+            // Cell i, counted from the top left of the picture (rows of memory are GL's: row 0 at the bottom).
+            let x = (i % cols) * cw, y = (rows - 1 - i / cols) * ch
+            enc.setRenderPipelineState(pso)
+            enc.setViewport(MTLViewport(originX: Double(x), originY: Double(y), width: Double(cw - 2), height: Double(ch - 2), znear: 0, zfar: 1))
+            var p = SIMD4<Float>(Float(x), Float(y), Float(cw - 2), Float(ch - 2))
+            var q = SIMD4<Float>(v.scale, v.alpha ? 1 : 0, 0, 0)
+            enc.setFragmentBytes(&p, length: 16, index: 0)
+            enc.setFragmentBytes(&q, length: 16, index: 1)
+            enc.setFragmentTexture(source, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        }
         enc.endEncoding()
+    }
+
+    func viewPipeline(depth: Bool, format: MTLPixelFormat) -> MTLRenderPipelineState? {
+        if let p = viewPSO[depth] { return p }
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct VOut { float4 pos [[position]]; };
+        vertex VOut extview_vs(uint vid [[vertex_id]]) {
+            float2 uv = float2((vid << 1) & 2, vid & 2);
+            VOut o; o.pos = float4(uv * 2.0 - 1.0, 0.0, 1.0); return o;
+        }
+        // p: the cell's origin and size in pixels; q: scale, alpha only.
+        fragment float4 extview_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], constant float4& p [[buffer(0)]],
+                                   constant float4& q [[buffer(1)]]) {
+            constexpr sampler s(filter::nearest);
+            float4 c = t.sample(s, (in.pos.xy - p.xy) / p.zw);
+            if (q.y > 0.5) c = c.aaaa;
+            if (any(isnan(c))) return float4(1.0, 0.0, 1.0, 1.0);
+            if (any(isinf(c))) return float4(0.0, 1.0, 1.0, 1.0);
+            return float4(abs(c.rgb * q.x), 1.0);
+        }
+        fragment float4 extview_depth_fs(VOut in [[stage_in]], depth2d<float> t [[texture(0)]], constant float4& p [[buffer(0)]],
+                                         constant float4& q [[buffer(1)]]) {
+            constexpr sampler s(filter::nearest);
+            float d = t.sample(s, (in.pos.xy - p.xy) / p.zw);
+            float v = pow(saturate((1.0 - d) * q.x), 0.25);
+            return float4(v, v, v, 1.0);
+        }
+        """
+        guard let lib = try? ctx.device.makeLibrary(source: src, options: nil) else { return nil }
+        let d = MTLRenderPipelineDescriptor()
+        d.vertexFunction = lib.makeFunction(name: "extview_vs")
+        d.fragmentFunction = lib.makeFunction(name: depth ? "extview_depth_fs" : "extview_fs")
+        d.colorAttachments[0].pixelFormat = format
+        let p = try? ctx.device.makeRenderPipelineState(descriptor: d)
+        viewPSO[depth] = p
+        return p
     }
 
     func runStage(_ s: String) {
