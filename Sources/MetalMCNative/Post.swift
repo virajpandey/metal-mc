@@ -75,9 +75,9 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_LIGHT_LEVEL 222u
 #define POST_FIREFLY 256.0
 
-// Eye adaptation: the histogram's range (log2 of scene light), the percentiles its mean is taken between, the darkest
-// albedo lit terrain's light is worked out with (lit mode meters light, not color), the reference (the metered log2
-// light that gets 0 stops: noon outdoors), how much of a darker or brighter scene's difference the exposure makes up,
+// Eye adaptation: the histogram's range (log2), the percentiles its mean is taken between, the darkest albedo lit
+// terrain's light is worked out with and how far the meter goes from luminance (0) toward light (1, luminance over
+// albedo), the reference (the metered log2 value that gets 0 stops: noon outdoors), how much of a darker or brighter scene's difference the exposure makes up,
 // its limits in stops, and how fast it follows (seconds: up, into the dark; down, into the light).
 #define POST_BINS 128
 #define POST_LOG_MIN (-14.0)
@@ -85,8 +85,9 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_METER_LOW 0.30
 #define POST_METER_HIGH 0.85
 #define POST_METER_ALBEDO 0.04
-#define POST_ADAPT_REF (\(litEnabled ? "-1.0" : "-2.1"))
-#define POST_ADAPT_DARK 0.45
+#define POST_METER_LIGHT 0.5
+#define POST_ADAPT_REF (\(litEnabled ? "-1.9" : "-2.1"))
+#define POST_ADAPT_DARK 0.6
 #define POST_ADAPT_BRIGHT 0.3
 #define POST_EV_MIN (-2.0)
 #define POST_EV_MAX 2.0
@@ -106,7 +107,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // The tone curves' exposure (each curve's own mid-tones: these keep noon's terrain about as bright as before post) and
 // AgX's look (ASC CDL power and saturation on its sigmoid's output, like its "punchy" look but gentler).
 #define POST_AGX_EXPOSURE 1.0
-#define POST_AGX_POWER 1.15
+#define POST_AGX_POWER 1.0
 #define POST_AGX_SAT 1.3
 #define POST_ACES_EXPOSURE 1.6
 #define POST_GT_EXPOSURE 1.0
@@ -243,10 +244,12 @@ static float postBinLog(float bin) {
 }
 
 // The histogram of a bloom level (quarter resolution, linear light), each texel's weight 1 at the screen's edges up to 4
-// a little below its middle (center-weighted metering that leans away from the sky). In lit mode it meters light rather
-// than color: the texel's luminance over its mean albedo luminance (alpha, from the G-buffer in the bloom's first pass;
-// 1 for sky, water and the rest): an incident-light meter, so a dark forest and bright sand under the same sun read
-// alike, and night, shade and caves read as less light. Threadgroups of 16 x 16 count into threadgroup memory first.
+// a little below its middle (center-weighted metering that leans away from the sky). In lit mode it meters halfway
+// between luminance and light: the texel's luminance over its mean albedo luminance (alpha, from the G-buffer in the
+// bloom's first pass; 1 for sky, water and the rest) to the power POST_METER_LIGHT. Luminance alone (0) let a dark
+// forest canopy read two stops darker than the plains under the same sun; light alone (1, an incident-light meter)
+// opened sunsets up by a stop because their land is lit dimly while the sky is bright. Threadgroups of 16 x 16 count
+// into threadgroup memory first.
 kernel void post_histogram(texture2d<float, access::read> src [[texture(0)]], device atomic_uint* hist [[buffer(0)]],
                            uint2 gid [[thread_position_in_grid]], uint li [[thread_index_in_threadgroup]]) {
     threadgroup atomic_uint local[POST_BINS];
@@ -255,7 +258,7 @@ kernel void post_histogram(texture2d<float, access::read> src [[texture(0)]], de
     uint w = src.get_width(), h = src.get_height();
     if (gid.x < w && gid.y < h) {
         float4 v = src.read(gid);
-        float l = postLuma(v.rgb) / clamp(v.a, POST_METER_ALBEDO, 1.0);
+        float l = postLuma(v.rgb) / pow(clamp(v.a, POST_METER_ALBEDO, 1.0), POST_METER_LIGHT);
         float x = (log2(max(l, 1e-30)) - POST_LOG_MIN) / (POST_LOG_MAX - POST_LOG_MIN);
         uint bin = x < 0.0 ? 0u : uint(clamp(1.0 + x * float(POST_BINS - 1), 1.0, float(POST_BINS - 1)));
         float2 p = (float2(gid) + 0.5) / float2(w, h) * 2.0 - 1.0;
@@ -422,9 +425,9 @@ static float3 postToneMap(float3 x, float4 tone) {
     x = max(x, 0.0);
     if (curve == 0) return skyToneMap(x, float4(H, tone.y, 0.0, 0.0));
     float3 d = curve == 2 ? postAces(x * POST_ACES_EXPOSURE) : (curve == 3 ? postGt(x * POST_GT_EXPOSURE) : postAgx(x * POST_AGX_EXPOSURE));
-    if (H <= 1.0) return d;
+    if (H <= 1.0) return min(d, 1.0);
     float t = max(postLuma(x) - POST_EDR_KNEE, 0.0) / POST_EDR_SPAN;
-    return d * (1.0 + (H - 1.0) * (1.0 - exp(-t * t)));
+    return min(d * (1.0 + (H - 1.0) * (1.0 - exp(-t * t))), H);
 }
 
 // Offline check (mmc_debug_post_curve): scene-linear inputs (exposed) through a tone curve at a headroom.

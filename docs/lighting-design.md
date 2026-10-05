@@ -861,38 +861,40 @@ curve). The log says every 1200 frames: "post: N frames; exposure +x stops (targ
 ### In game (2026-10-05, lab mode: 3456 x 2234 fullscreen, TAA, vsync, LOD 8192, `lit,nearchunks,rtshadows,sky,gi,water,post`)
 
 - **It runs.** "post: 3456x2234, bloom 7 levels down to 27x18, light shafts at 864x559, tone curve agx", reading the
-  anti-aliasing's history; the nine scenes of the lab tour, no errors; post.metal edited and reloaded live (0.4 s to
-  compile). Screenshots go through the SDR copy (identity on post's SDR frame).
-- **Before and after** (`bench_out/agents/post/` in the main checkout: `before/<scene>.png` is lab3, the same code and
-  switches without post at commit cbb4db8; `session1-final/<scene>.png` is post after session 1's tuning;
-  `compare-<scene>.png` stacks the two at 1100 px; `session1-first/` the first pass before tuning). Mean 8-bit luma
-  (and the share of pixels under 8):
+  anti-aliasing's history; two sessions, the nine scenes of the lab tour each time, no errors; post.metal edited and
+  reloaded live (0.4-0.8 s to compile). Screenshots go through the SDR copy (identity on post's SDR frame).
+- **Before and after**, in the main checkout's `bench_out/agents/post/`: `before/<scene>.png` is lab3 (the same code and
+  switches without post, commit cbb4db8); `session1-final/` post metering luminance (AgX power 1.15); `session2-final/`
+  post metering light (power 1.0); `compare-<scene>.png` in each stacks before over after at 1100 px; `session1-first/`
+  the first pass before any tuning. Mean 8-bit luma (the share of pixels under 8):
 
-  | Scene | Before | After |
-  |---|---|---|
-  | noon_overview | 114.2 (0.00%) | 111.9 (0.03%) |
-  | sunset_water | 115.1 (0.47%) | 119.2 (0.76%) |
-  | torch_cave | 31.6 (4.6%) | 48.8 (18.4%) |
-  | night_torches | 21.7 (9.9%) | 37.2 (8.9%) |
-  | forest | 78.5 (6.6%) | 93.1 (9.1%) |
-  | mineshaft | 67.6 | 88.1 |
-  | rain | 72.8 | 88.7 |
-  | water_closeup | 101.9 | 111.5 |
-  | mountain_view | 103.7 (2.3%) | 103.0 (13.0%) |
+  | Scene | Before | Session 1 (luminance meter) | Session 2 (light meter) |
+  |---|---|---|---|
+  | noon_overview | 114.2 (0.0%) | 111.9 (0.0%) | 112.8 (0.0%) |
+  | sunset_water | 115.1 (0.5%) | 119.2 (0.8%) | 141.3 (0.0%) |
+  | torch_cave | 31.6 (4.6%) | 48.8 (18.4%) | 57.1 (4.3%) |
+  | night_torches | 21.7 (9.9%) | 37.2 (8.9%) | 45.4 (3.4%) |
+  | forest | 78.5 (6.6%) | 93.1 (9.1%) | 78.2 (14.8%) |
+  | mineshaft | 67.6 | 88.1 | 86.2 |
+  | rain | 72.8 | 88.7 | 94.2 |
+  | water_closeup | 101.9 | 111.5 | 147.3 |
+  | mountain_view | 103.7 (2.3%) | 103.0 (13.0%) | 103.9 (9.0%) |
 
   - Sunset: crepuscular rays fan out from the sun through the gaps in the clouds and darken the sky in their shadows, the
     sun blooms warm over the water with its reflection, the far shore sits in lit haze. The first pass (shafts 0.35) had
     them strong enough to wash the clouds and the far silhouettes; 0.22 keeps them.
-  - Noon: about as bright as before (the reference calibrated on it), the lava pool on the left glows, the sky a softer
-    blue (AgX takes bright saturated light toward white), the clouds a light gray rather than white.
-  - Cave and night: readable. The cave's walls come up from near black, the lantern and torches glow, the foreground
-    keeps its blacks (AgX's toe: more pixels under 8 than before, in the parts that were nearly black anyway). The village
-    at midnight shows its fields, river and houses, the torches and windows glow, the sky stays a night sky.
-  - What it showed about metering luminance: under the same sun the forest's dark canopy read two stops darker than the
-    plains (log2 -4.9 against -2.9) and mountain_view, half sky and haze with the far LOD still loading on a cold cache,
-    read two stops brighter, so the forest's sky washed out and the mountain's forest went black. Session 1 limited it
-    (60% -> 45% of a darker scene's difference, 70% -> 30% of a brighter one's, metering weighted below the middle);
-    the fix is to meter light, not color (lit terrain's luminance over its albedo, below).
+  - Noon: as bright as before, the lava pool on the left glows, the sky a softer blue (AgX takes bright saturated light
+    toward white), the clouds a light gray rather than white.
+  - Caves and night: readable. The cave's walls come up from near black with their detail, the lantern and torches glow;
+    the village at midnight shows its fields, river and houses, torches and windows glow, the sky stays a night sky.
+    AgX's look power of 1.15 crushed a quarter to a third of the dark frames under 8; 1.0 keeps them (session 2).
+  - The meter, three ways. Luminance (session 1): under the same sun the forest's dark canopy read two stops darker than
+    the plains (log2 -4.9 against -2.9), so the forest got +1.4 stops and its sky washed out. Light, luminance over albedo
+    (session 2): noon read -0.95 against its reference of -1.0, the forest matched the plains, caves and night came up
+    without crushing; but a sunset's land is lit dimly under a bright sky, so sunset_water got +1 stop (the sky washed
+    pale, mean luma 141) and so did dusk offline. The default is halfway (luminance over the square root of albedo,
+    `POST_METER_LIGHT` 0.5), with the reference recalibrated to the midpoint (-1.9); see the offline numbers below. Not
+    yet seen in game.
   - ACES (`METALMC_TONEMAP=aces`) tried live at sunset, noon and forest: more contrast, but it takes the sky around the
     setting sun to flat white where AgX keeps its gradient and color. AgX stays the default.
 
@@ -900,11 +902,23 @@ curve). The log says every 1200 frames: "post: N frames; exposure +x stops (targ
 
 Speed wasn't the goal tonight; these are the measurements to start from.
 
-- **In game, traced** (`trace 5` in the lab at sunset_water, the full look with post, `passes.py` on the game log; the
-  compute passes' totals overlap the passes around them, so they don't add up): post bloom 1.27 ms, exposure 0.05,
-  light shafts 1.42, composite 0.92; the copy into the frame 0.61 ms of fragment work (it was the anti-aliasing's copy's
-  0.38). The frame's command buffer 7.28 ms; the game held 119 fps at 120 Hz there.
-OFFLINE_COSTS
+- **Offline, each stage alone** (`LITFLOW_POST=1 litflow ... sky time`, 3456 x 2234, the default view at sunset with the
+  sun on screen, median of 40): bloom 1.46 ms, exposure 0.04, light shafts 0.18, composite 0.65, the copy into the frame
+  0.40 (the anti-aliasing's own copy cost about that; post's replaces it). Whole frames (sky, main pass, shadows, the
+  relight and aerial perspective in the resolve) with and without post, alternating: 8.50 against 6.14 ms, +2.36.
+- **In game, traced** (`trace 5` in the lab, `passes.py` on the game log; compute passes' totals overlap their
+  neighbors, so they don't add up): session 2 over sunset_water and noon_overview: bloom 1.37 ms, exposure 0.04, shafts
+  0.80, composite 0.64, the copy 0.40 of fragment work (0.61 in session 1, before the composite's output went from
+  RGBA16Float to RGB10A2). sunset_water held 119 fps at 120 Hz with the whole look and post.
+- Where the bloom's 1.46 ms goes: its first pass reads the frame (4 bytes a pixel), the G-buffer (8) and the depth (4) at
+  every pixel, 124 MB at the panel's resolution; the rest of the chain is small. Reading the G-buffer and depth once per
+  2 x 2 block would take most of it away (below).
+- Eye adaptation, measured offline at 120 Hz steps: noon -> midnight at once, +0.07 stops after 0.01 s, +0.69 after 1 s,
+  +1.08 after 2 s, +1.65 after 6 s; midnight -> noon, +1.62 -> +0.32 after 1 s, +0.16 after 2 s.
+- The tone curves (`mmc_debug_post_curve`, litflow): at headroom 2, 4 and 8 every curve is the SDR one below the knee to
+  the 4th decimal and reaches the headroom (AgX: 4 -> 0.84 in SDR, 1.24 at headroom 2, 2.04 at 4); AgX's outset matrix
+  takes saturated highlights a little past 1 (the check flagged it), now clamped to the headroom.
+OFFLINE_METER
 
 ### Not done, and next
 
