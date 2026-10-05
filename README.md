@@ -137,6 +137,8 @@ Backface culling stays off until an image test checks face winding.
 ## Benchmark protocol
 
 - Every run records its conditions (a `CONDITIONS` line in `summary.txt`: thermal state at start and end, Low Power Mode, GPU frame-time standard deviation). Runs are never deleted.
+- Every in-game run (`tools/bench/bench_lod.sh`, `fidelity.sh`, `lab.sh`) appends a line to the run ledger, `bench_out/ledger.jsonl` in the main checkout: commit, branch, switches, fixture, the summary numbers, and flags for what voids a timing (lock screen, fps pinned at 120 uncapped, LOD still building, windowed). `python3 tools/bench/ledger.py --show` lists them ([lab mode](docs/lab-mode.md#the-run-ledger)).
+- Look work runs in one long-lived game (`tools/bench/lab.sh`): shaders reload from files on save, a control file moves between saved scenes and takes screenshots ([lab mode](docs/lab-mode.md)).
 - A run may be excluded only for interference identified in advance: Low Power Mode on, thermal state `serious` or `critical`, or another GPU-heavy process running. Every exclusion is recorded with its reason.
 - High variance is not grounds for exclusion. It may be the stutter we are looking for, so it gets investigated.
 - Standalone numbers (procedural worlds, the LOD prototype, `fixtures/`) describe that workload only. In-game claims need in-game measurements against the Minecraft 26.3 OpenGL and Vulkan baselines.

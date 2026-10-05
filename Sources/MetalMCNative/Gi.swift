@@ -1395,7 +1395,18 @@ final class GiCache: @unchecked Sendable {
               let li = buf(12 * 16, .storageModeShared), let env = buf(9 * 16), let dsv = dev.makeTexture(descriptor: sv) else { return nil }
         check = c; keys = k; stamp = s; value = v; meta = m; list = l; counters = n; mats = t; light = li; envBuffer = env; dummySkyView = dsv
         do {
-            let lib = try dev.makeLibrary(source: giShaderSource(zeroCopy: zeroCopy), options: nil)
+            // Lab mode (ShaderLab.swift): after an edit, the kernels are swapped and the table kept (as debugReload does).
+            let lib = try ShaderLab.library(zeroCopy ? "gi" : "gi_copied", giShaderSource(zeroCopy: zeroCopy), device: dev) { [weak self] new in
+                guard let self else { return }
+                var next: [String: MTLComputePipelineState] = [:]
+                for name in self.pipes.keys {
+                    guard let f = new.makeFunction(name: name), let p = try? dev.makeComputePipelineState(function: f) else {
+                        log("gi: reload: \(name) failed, the old kernels stay"); return
+                    }
+                    next[name] = p
+                }
+                self.pipes = next
+            }
             for name in ["gi_begin", "gi_request", "gi_schedule", "gi_args", "gi_update", "gi_resolve", "gi_debug_view", "gi_invalidate",
                          "gi_count", "gi_light", "gi_test_primary", "gi_test_rays", "gi_test_keys", "gi_test_upsample", "gi_test_pack",
                          "gi_test_shadow", "gi_test_taa"] {

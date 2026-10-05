@@ -315,11 +315,16 @@ final class Taa: @unchecked Sendable {
         if key == self.key, !history.isEmpty { return true }
         do {
             if library == nil {
-                let lib = try ctx.device.makeLibrary(source: taaShaderSource, options: nil)
+                // Lab mode (ShaderLab.swift): after an edit, forget both libraries and their pipelines; the next frame
+                // builds them again (and restarts the history).
+                let lib = try ShaderLab.library("taa", taaShaderSource) { [self] _ in
+                    library = nil; pipe = nil; skyPipe = nil; litPipes = [:]; copyPipes = [:]; foldedCopyPipes = [:]
+                    skyFailed = false; litFailed = false; failed = false; self.key = ""
+                }
                 // The plain resolve from a library with 16 x 16 tiles (TAA_T); the variants with a heavy load use 32.
                 let small = MTLCompileOptions()
                 small.preprocessorMacros = ["TAA_T": NSNumber(value: 16)]
-                let plainLib = try ctx.device.makeLibrary(source: taaShaderSource, options: small)
+                let plainLib = try ShaderLab.library("taa", taaShaderSource, options: small)
                 pipe = try ctx.device.makeComputePipelineState(function: resolveFunction(plainLib, sky: false))
                 library = lib
             }

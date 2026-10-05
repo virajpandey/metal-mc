@@ -68,6 +68,14 @@ loom {
 			// -PfidelityTime=<ticks>: time of day for the fidelity tour (6000 noon, 13000 dusk, 18000 midnight).
 			property "metalmc.fidelity.time", (project.findProperty("fidelityTime") ?: "6000").toString()
 			property "metalmc.farProbe", (project.findProperty("farProbe") ?: "0").toString()
+			// Lab mode (docs/lab-mode.md, tools/bench/lab.sh): -PbenchLab=1 keeps the game up after the world loads, running
+			// the commands appended to run/metalmc-control.txt (scenes from tools/bench/scenes.json); -PshaderDir=<dir>
+			// (absolute, or relative to mod/) takes our Metal shaders from files there and recompiles them when they're saved.
+			property "metalmc.lab", (project.findProperty("benchLab") ?: "0").toString()
+			property "metalmc.lab.scenes", file("../tools/bench/scenes.json").absolutePath
+			if (project.hasProperty("shaderDir")) {
+				environmentVariable "METALMC_SHADERDIR", file(project.findProperty("shaderDir").toString()).absolutePath
+			}
 			property "metalmc.bench.extraWait", (project.findProperty("benchExtraWait") ?: "0").toString()
 			property "metalmc.bench.fly", (project.findProperty("benchFly") ?: "0").toString()
 			property "metalmc.bench.hitches", (project.findProperty("benchHitches") ?: "0").toString()

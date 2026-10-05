@@ -14,7 +14,9 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=$ROOT/bench_out
 mkdir -p "$OUT/old_worlds"
 cd "$ROOT/mod" || exit 1
-dialog() { "$OUT/winlist" | grep -E "UserNotificationCenter|SecurityAgent|CoreServicesUIAgent|Agents Overlay|^layer [1-9][0-9]* alpha [^ ]+ NotificationCenter " | head -1; }
+dialog() { "$WINLIST" | grep -E "UserNotificationCenter|SecurityAgent|CoreServicesUIAgent|Agents Overlay|^layer [1-9][0-9]* alpha [^ ]+ NotificationCenter " | head -1; }
+# The lock screen (loginwindow's shield) over the game paces it at 120 Hz: noted as METALMC_LOCKED lines for the ledger.
+locked() { "$WINLIST" 2>/dev/null | awk '$1 == "layer" && $2 >= 1900 && $4 > 0 && $5 == "loginwindow" { found = 1 } END { exit !found }'; }
 # With the lid closed the built-in display is off: the game can't take it fullscreen and runs in an 854 x 480 window,
 # which made four calibration runs worthless (2026-10-01). Wait for the lid, and run again if fullscreen failed anyway.
 lid() { ioreg -r -k AppleClamshellState -d 4 | grep -q '"AppleClamshellState" = Yes'; }
@@ -23,6 +25,8 @@ lid() { ioreg -r -k AppleClamshellState -d 4 | grep -q '"AppleClamshellState" = 
 source "$ROOT/tools/bench/gpulock.inc"
 MAIN=$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk 'NR==1{print $2}')
 LOCK=${MAIN:-$ROOT}/bench_out/gpu.lockdir
+# The window lister (bench_out/winlist, built from tools/bench/winlist.swift): a worktree uses the main checkout's.
+WINLIST=$OUT/winlist; [ -x "$WINLIST" ] || WINLIST=${MAIN:-$ROOT}/bench_out/winlist
 trap 'gpu_unlock "$LOCK"' EXIT
 TIMED=; case " $* " in *" -PbenchFly="*) TIMED=1 ;; esac
 for TRY in 1 2 3; do
@@ -36,10 +40,11 @@ for TRY in 1 2 3; do
   fi
   gpu_lock "$LOCK" "game run $(basename "$LOG")" 2>> "$OUT/dialog_waits.log"
   [ -d run/saves/claudeworld ] && mv run/saves/claudeworld "$OUT/old_worlds/claudeworld-$(date +%s)"
+  mkdir -p run/saves   # a fresh worktree has no run directory yet
   cp -Rp "../fixtures/$FIX" run/saves/claudeworld   # -p keeps mtimes, so the LOD's region cache still matches
   # Let Spotlight and the security scanners finish with the fresh copy before timing anything.
   sleep ${SETTLE:-30}
-  : > "$LOG.dialogs"
+  : > "$LOG.dialogs"; : > "$LOG.locked"
   # The game is forked by gradle's daemon and inherits its priority: a daemon started at background priority (by a build
   # under taskpolicy -b) runs the game on the efficiency cores, 3-5x slower (2026-10-01). Stop any such daemon first.
   if ps -Ao pri,command | awk '/GradleDaemon/ && !/awk/ && $1 < 20 { found = 1 } END { exit !found }'; then
@@ -47,11 +52,12 @@ for TRY in 1 2 3; do
     env JAVA_HOME=/opt/homebrew/opt/openjdk@25 ./gradlew --stop > /dev/null 2>&1
   fi
   ( sleep "$T"; pkill -f KnotClient ) & WD=$!
-  ( while sleep 10; do d=$(dialog); [ -n "$d" ] && echo "METALMC_DIALOG $(date +%T) $d" >> "$LOG.dialogs"; done ) & DW=$!
+  ( while sleep 10; do d=$(dialog); [ -n "$d" ] && echo "METALMC_DIALOG $(date +%T) $d" >> "$LOG.dialogs"
+                       locked && echo "METALMC_LOCKED $(date +%T)" >> "$LOG.locked"; done ) & DW=$!
   env JAVA_HOME=/opt/homebrew/opt/openjdk@25 ./gradlew runClient "$@" > "$LOG" 2>&1
   echo "exit $?" >> "$LOG"
   kill $WD $DW 2>/dev/null
-  cat "$LOG.dialogs" >> "$LOG"
+  cat "$LOG.dialogs" "$LOG.locked" >> "$LOG"
   if grep -q "Couldn't enter fullscreen" "$LOG" && [ $TRY -lt 3 ]; then
     echo "$(date +%T) $(basename "$LOG"): the game couldn't go fullscreen (try $TRY), running it again" >> "$OUT/dialog_waits.log"
     sleep 30; continue
@@ -59,4 +65,4 @@ for TRY in 1 2 3; do
   if [ -z "$TIMED" ] || [ ! -s "$LOG.dialogs" ]; then break; fi
   echo "$(date +%T) $(basename "$LOG"): a dialog showed up during the run (try $TRY): $(head -1 "$LOG.dialogs")" >> "$OUT/dialog_waits.log"
 done
-: > "$LOG.dialogs"
+: > "$LOG.dialogs"; : > "$LOG.locked"

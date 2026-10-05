@@ -674,7 +674,10 @@ final class Lit: @unchecked Sendable {
         if failed { return false }
         if library != nil { return true }
         do {
-            let lib = try ctx.device.makeLibrary(source: litShaderSource, options: nil)
+            // Lab mode (ShaderLab.swift): after an edit, forget it all; the next use builds it again from the new library.
+            let lib = try ShaderLab.library("lit", litShaderSource) { [self] _ in
+                library = nil; envPipe = nil; wavesPipe = nil; waterSkyPipe = nil; relightPipes = [:]; waveStillLevelsMade = false; failed = false
+            }
             envPipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "lit_env")!)
             if litWater {
                 wavesPipe = try ctx.device.makeComputePipelineState(function: lib.makeFunction(name: "lit_water_waves")!)

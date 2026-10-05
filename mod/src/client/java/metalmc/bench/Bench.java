@@ -50,7 +50,7 @@ public final class Bench {
     static final boolean TOUR = "1".equals(System.getProperty("metalmc.tour")) || "lod".equals(System.getProperty("metalmc.tour"))
         || Tour.MP_TOUR || Tour.FIDELITY_TOUR || Tour.END_TOUR || Tour.WALK_TOUR || Tour.ZOOM_TOUR || Tour.TAA_TOUR;
 
-    private enum State { WAITING, WARMUP, RUNNING, TOUR, PREGEN, DONE }
+    private enum State { WAITING, WARMUP, RUNNING, TOUR, PREGEN, LAB, DONE }
     private static int lodWaitTicks;
 
     private static State state = State.WAITING;
@@ -124,7 +124,16 @@ public final class Bench {
                     server.execute(() -> metalmc.lod.FarTerrainProbe.run(server));
                 }
                 log("world loaded; warming up for " + WARMUP_TICKS + " ticks; " + presentInfo(mc)
-                    + "; app active " + metalmc.backend.MetalLod.activateApp());
+                    + "; app active " + metalmc.backend.MetalLod.activateApp() + "; fullscreen=" + mc.options.fullscreen().get()
+                    + " window=" + mc.getWindow().getWidth() + "x" + mc.getWindow().getHeight());
+                // Lab mode (-PbenchLab=1): no timed run; the game stays up for the control file's commands.
+                if (Lab.ENABLED) {
+                    state = State.LAB;
+                    Lab.start(mc);
+                }
+            }
+            case LAB -> {
+                if (Lab.onTick(mc, player)) state = State.DONE;
             }
             case WARMUP -> {
                 if (!Tour.MP_TOUR) place(player, 0);

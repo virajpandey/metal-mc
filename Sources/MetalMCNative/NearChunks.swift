@@ -853,7 +853,11 @@ final class NearRenderer: @unchecked Sendable {
                     let opts = MTLCompileOptions()
                     opts.languageVersion = .version3_0
                     opts.preserveInvariance = true
-                    let lib = try ctx.device.makeLibrary(source: nearShaderSource, options: opts)
+                    // Lab mode (ShaderLab.swift): after an edit, the new library in place of this one; the pipelines are
+                    // made again from it as they're asked for.
+                    let lib = try ShaderLab.library("near_chunks", nearShaderSource, options: opts) { [self] new in
+                        lock.lock(); library = new; pipelines = [:]; lock.unlock()
+                    }
                     lock.lock(); library = lib; lock.unlock()
                     // The main pass's usual formats, so the first frame doesn't compile on the render thread (in lit mode,
                     // with the G-buffer).
