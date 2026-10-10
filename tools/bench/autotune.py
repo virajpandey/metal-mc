@@ -261,9 +261,10 @@ def next_center(center, cands, obj, knobs, steps):
     return new
 
 
-#: Class weights in the tuning (tools/twindiff.swift's --weights): the sky (SEUS's clouds are volumetric, ours aren't yet)
-#: and water (the water helper is rebuilding it tonight) count a quarter, like the unlit class.
-WEIGHTS = os.environ.get("AUTOTUNE_WEIGHTS", "sky=0.25,water=0.25,unlit=0.25")
+#: Class weights in the tuning (tools/twindiff.swift's --weights). With volumetric clouds (main, 2026-10-10) the sky counts
+#: fully; water half (ours reflects and refracts now, but differs from SEUS's in character); unlit (entities) a quarter.
+#: Before the clouds and water merges the sky and water counted a quarter.
+WEIGHTS = os.environ.get("AUTOTUNE_WEIGHTS", "sky=1,water=0.5,unlit=0.25")
 
 
 def score_shot(ours, scene, mask, out_json):

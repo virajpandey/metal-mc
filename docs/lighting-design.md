@@ -1940,8 +1940,9 @@ ours to style.
 - **The mask** (lab command `mask LABEL`, `Sources/MetalMCNative/LabMask.swift`; classes and colors in
   docs/lab-mode.md): every pixel of our frame classified from lit mode's G-buffer, the depth and the traced sun
   visibility of 16 frames: sky, water, vegetation, sunlit, shade, blocklit, far (past 512 blocks), unlit. Vegetation is
-  an albedo-hue rule (green albedo, and faces that aren't axis-aligned) until the G-buffer flags foliage; vanilla's near
-  water is a surface at a source block's height (8/9) where no lit terrain shows.
+  leaflight's foliage class (leaves and plants; grass blocks' tops are ground), or without leaflight an albedo-hue rule
+  (green albedo, and faces that aren't axis-aligned); water is the G-buffer's water flag (near water too since the water
+  merge), or a surface at a source block's height (8/9) where no lit terrain shows.
 - **The score** (`tools/twindiff.swift`): both frames at half resolution (2 x 2 boxes in linear light; a box whose mask
   pixels don't mostly agree is left out), in OKLab. Per class: the share; mean L, a, b and chroma C; L at the 10th, 50th
   and 90th percentiles; local contrast LC = mean |L - blur(L)| (box radius 2, twice). Then
@@ -1952,8 +1953,9 @@ ours to style.
       K  = |dLC|                                local contrast
       score = 100 x sum over classes of weight x share x (dE + 0.5 P + 2 K)
 
-  with weights 1, but sky, water and unlit 0.25 in the tuning (SEUS's clouds are volumetric and ours aren't yet; the
-  water helper is rebuilding water; unlit is entities). For scale: OKLab L 0.01 is about one step of a 100-step gray
+  with weights 1, but sky and unlit 0.25 (twindiff's defaults, which the census numbers here use: SEUS's clouds were
+  volumetric and ours weren't; unlit is entities). The tuning weighted water a quarter too before the water merge, and
+  after the clouds and water merges the sky 1 and water a half (`AUTOTUNE_WEIGHTS`). For scale: OKLab L 0.01 is about one step of a 100-step gray
   ramp; a scene at 20 points is about a fifth of an L unit off on average. Night and caves score against a target of our
   own (`tools/bench/twinsum.py`): terrain luma 35-45 (ffmpeg's YAVG of the bottom 55%, as the census measures it; SEUS is
   near black at 29-33), half a point per level outside the band; torchlight as warm as SEUS's (the block-lit class's
