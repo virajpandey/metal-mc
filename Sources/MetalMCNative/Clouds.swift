@@ -43,14 +43,15 @@ private func cloudSetting(_ name: String, _ fallback: Float) -> Float {
     return v
 }
 /// METALMC_CLOUDCOVER: clear, scattered (the default), overcast, or a number in coverage units (the weather map's
-/// coverage is this plus its own variation, +-0.06: 0.3 a few puffs, 0.4 scattered cumulus, 0.5 broken, 0.55 and up a
-/// closed deck). Rain takes it to overcast with the game's rain level, thunder to a darker, towering deck.
+/// coverage is this plus its own variation, about +-0.05: 0.3 a few puffs, 0.4 scattered cumulus, 0.5 broken, 0.55 and
+/// up a closed deck). Rain takes it to overcast with the game's rain level, thunder to a darker, towering deck. 0.43:
+/// at 0.4 the second game session's noon_overview had only a few small clouds left (the weather map low there).
 let cloudCoverDefault: Float = {
     switch cloudEnv["METALMC_CLOUDCOVER"] ?? "scattered" {
     case "clear": return 0.3
-    case "scattered": return 0.4
+    case "scattered": return 0.43
     case "overcast": return 1.6
-    case let s: return Float(s) ?? 0.4
+    case let s: return Float(s) ?? 0.43
     }
 }()
 /// METALMC_CLOUDBASE, METALMC_CLOUDTOP: the layer, in metres (blocks) above sea level. 650-1700 m: low fair-weather
@@ -206,15 +207,14 @@ static float3 cloudsComposite(float3 c, uint2 q, float d, constant SkyFrame& sky
     }
     // The four texels' depths in one gather (its order: (0, 1), (1, 1), (1, 0), (0, 0) from the footprint's corner).
     float4 dd = cdepth.gather(sn, uv) * 1000.0;   // stored in km
+    // The common case's value (the hardware's bilinear), fetched alongside the gather instead of after it: in the
+    // resolve's load the two latencies one after the other were most of the composite's cost.
+    float4 acc = clouds.sample(sl, uv, level(0.0));
     // Terrain where none of the four has a cloud (no cloud, or terrain in front of it): as it was.
     if (!skyPx && all(dd <= 0.0)) return view == 1u || view == 2u ? float3(view == 2u ? 1.0 : 0.0) : c;
     float2 fr = fract(uv * cf.size.zw - 0.5);
     float4 bw = float4((1.0 - fr.x) * fr.y, fr.x * fr.y, fr.x * (1.0 - fr.y), (1.0 - fr.x) * (1.0 - fr.y));
-    float4 acc;
-    if (!skyPx || all(dd >= 0.0)) {
-        // The common case: the hardware's bilinear.
-        acc = clouds.sample(sl, uv, level(0.0));
-    } else {
+    if (skyPx && any(dd < 0.0)) {
         // A sky pixel beside texels whose pixels were all terrain nearer than the clouds: the others only.
         float2 hp = uv * cf.size.zw - 0.5;
         int2 i0 = int2(floor(hp)), hmax = int2(cf.size.zw) - 1;
@@ -274,7 +274,7 @@ private let cloudsShaderSource = skyShaderHeader + cloudsShaderHeader + """
 // The base shape's values bunch up, so the sky goes from a few puffs (0.3) through scattered cumulus (0.4) to a closed deck
 // (0.55) in a narrow band: a spread of 1.8 (+-0.3 across the map) made it either a deck or empty overhead most places.
 #define CLOUD_COVER_BIAS 0.0
-#define CLOUD_COVER_SPREAD 0.35
+#define CLOUD_COVER_SPREAD 0.3
 #define CLOUD_RAIN_TYPE 0.55
 // The height profile: how fast density rises off the flat base (1 / the share of the layer), stratus tops (share of the layer).
 #define CLOUD_BASE_SHARP 14.0
@@ -1451,9 +1451,10 @@ final class Clouds: @unchecked Sendable {
         f.shape = SIMD4(cover + (1.6 - cover) * rain + 0.3 * storm, 1 + 0.4 * rain + 0.8 * storm, rain, storm)
         let cs = cascades(cam: cam, light: SIMD3(f.light.x, f.light.y, f.light.z), height: height)
         let lit = f.light.w > 0 && f.light.y > 0
-        // The near cascade every frame, the middle and far ones on alternate frames (they're coarse, and the clouds drift a
-        // few centimetres a frame); all three when the light changed (moon and sun) or there's nothing made yet. Each keeps
-        // the center it was made with.
+        // One cascade a frame: the near one every other frame, the middle and far ones every fourth (the clouds drift a few
+        // centimetres a frame, the near cascade's texels are 64 m); all three when the light changed (moon and sun) or
+        // there's nothing made yet. Each keeps the center it was made with. (The near one every frame plus one of the others
+        // took 0.16-0.36 ms in game.)
         let lightKey = SIMD4(f.light.x, f.light.y, f.light.z, f.light == f.sun ? 1 : 0)
         var renderCascades: [UInt32] = [0]
         let lightMoved = lightKey.w != cascadeLight.w || !(simd_dot(SIMD3(lightKey.x, lightKey.y, lightKey.z),
@@ -1463,9 +1464,9 @@ final class Clouds: @unchecked Sendable {
             cascadeMade = cs
             cascadeLight = lightKey
         } else {
-            renderCascades.append(frames % 2 == 0 ? 1 : 2)
-            cascadeMade[0] = cs[0]
-            cascadeMade[Int(renderCascades[1])] = cs[Int(renderCascades[1])]
+            let c = frames % 2 == 0 ? 0 : (frames % 4 == 1 ? 1 : 2)
+            renderCascades = [UInt32(c)]
+            cascadeMade[c] = cs[c]
         }
         f.cascade0 = lit ? cascadeMade[0] : .zero
         f.cascade1 = lit ? cascadeMade[1] : .zero
