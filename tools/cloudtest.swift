@@ -78,6 +78,11 @@ let all: [View] = [
     View(name: "fly-1600", elev: 45, pos: (8, 1663, 8), yaw: 100, pitch: -10),
     View(name: "fly-1800", elev: 45, pos: (8, 1863, 8), yaw: 100, pitch: 10),
     View(name: "fly-3000", elev: 45, pos: (8, 3063, 8), yaw: 100, pitch: 20),
+    // Near the layer's top looking down into it (the game's fly-through: rings around the camera came from long steps
+    // through clear air skipping into the clouds' fronts at the same distances in every texel).
+    View(name: "fly-down", elev: 45, pos: (8, 1650, 8), yaw: 100, pitch: 35),
+    // A wide look up, for the share of the sky the clouds cover (with CLOUDTEST_VIEW=2, their transmittance).
+    View(name: "sky-share", elev: 70, pos: (8, 166, 8), yaw: 0, pitch: -89, fov: 110),
 ]
 let wanted = Set(args.dropFirst(3))
 let timing = wanted.contains("time")
