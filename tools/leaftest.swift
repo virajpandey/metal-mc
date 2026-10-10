@@ -326,14 +326,23 @@ for s in scenes {
         Thread.sleep(forTimeInterval: 0.25)
     }
     check(st[0] == 2, "\(s.name): LOD built: \(st[1]) nodes, \(st[2]) quads in \(Int(Date().timeIntervalSince(t0))) s")
+    // LEAFTEST_GATE=<dir>: the LOD's build (CPU) runs before the GPU lock is taken: write <dir>/ready, wait for <dir>/go,
+    // which a wrapper writes once it holds the lock (tools/bench/gpuwait.sh), as litflow's LITFLOW_GATE.
+    if let gate = ProcessInfo.processInfo.environment["LEAFTEST_GATE"] {
+        FileManager.default.createFile(atPath: gate + "/ready", contents: nil)
+        while !FileManager.default.fileExists(atPath: gate + "/go") { Thread.sleep(forTimeInterval: 0.2) }
+        print("ok    GPU lock taken")
+    }
     let sun = sunAngle(s.time)
     let t = targets(sizeSpec[0], sizeSpec[1])
     // Warm-up: the shadows' tile structures build in the background, nearest first, as tiles are drawn.
     for _ in 0..<240 { frame(t, sun: sun) }
     Thread.sleep(forTimeInterval: 3)
     for _ in 0..<120 { frame(t, sun: sun) }
-    let (color, g) = capture(t, sun: sun)
-    writePNG(color, Int(t.w), Int(t.h), "\(s.name)-\(tag).png")
+    // LEAFTEST_PICS=0: the timing only (with LEAFTEST_TIME=1).
+    let pics = ProcessInfo.processInfo.environment["LEAFTEST_PICS"] != "0"
+    let (color, g) = pics ? capture(t, sun: sun) : ([], [])
+    if pics { writePNG(color, Int(t.w), Int(t.h), "\(s.name)-\(tag).png") }
     if !g.isEmpty {
         // The G-buffer's classes over lit terrain (face code 1-7), the albedo's blue byte's low bits with leaflight.
         var lit = 0, leaves = 0, plants = 0, other3 = 0
@@ -352,11 +361,11 @@ for s in scenes {
                      100 * Double(other3) / Double(max(lit, 1))))
         if expSet.contains("leaflight") { writePNG(pic, Int(t.w), Int(t.h), "\(s.name)-classes.png") }
     }
-    if expSet.contains("leaflight") {
+    if pics && expSet.contains("leaflight") {
         writePNG(capture(t, sun: sun, view: 14).color, Int(t.w), Int(t.h), "\(s.name)-traced.png")
         writePNG(capture(t, sun: sun, view: 13, frames: 1).color, Int(t.w), Int(t.h), "\(s.name)-view13.png")
     }
-    writePNG(capture(t, sun: sun, view: 6).color, Int(t.w), Int(t.h), "\(s.name)-\(tag)-sunvis.png")
+    if pics { writePNG(capture(t, sun: sun, view: 6).color, Int(t.w), Int(t.h), "\(s.name)-\(tag)-sunvis.png") }
     release(t.color); release(t.depth)
     if ProcessInfo.processInfo.environment["LEAFTEST_TIME"] == "1" {
         let big = targets(3456, 2234)

@@ -202,10 +202,10 @@ let foliageRelightHeader = """
 #define LEAF_BACK 0.7
 #endif
 #ifndef PLANT_TRANS
-#define PLANT_TRANS 0.5
+#define PLANT_TRANS 0.12
 #endif
 #ifndef LEAF_FWD
-#define LEAF_FWD 0.2
+#define LEAF_FWD 0.03
 #endif
 #ifndef LEAF_G
 #define LEAF_G 0.6
@@ -257,8 +257,11 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
         float c = -dot(toCam, L);   // 1: looking into the sun through the leaf
         float g2 = LEAF_G * LEAF_G, x = max(1.0 + g2 - 2.0 * LEAF_G * c, 1e-4);
         float hg = (1.0 - g2) / (x * sqrt(x));   // Henyey-Greenstein x 4 pi: 1 for no lobe
-        float back = cls == LIT_LEAF && fi < 6u ? mix(LEAF_FRONT, LEAF_BACK, saturate(0.5 - 0.5 * dot(n, L))) : PLANT_TRANS;
-        add += env[0].rgb * T * (back + LEAF_FWD * hg);
+        // A plant takes no lobe: a blade lets light through diffusely, and the grass around it, which the rays don't see,
+        // shades it from a low sun.
+        float facing = fi < 6u ? saturate(0.5 - 0.5 * dot(n, L)) : 0.5;   // 1: the face turned away from the sun
+        float through = cls == LIT_LEAF ? mix(LEAF_FRONT, LEAF_BACK, facing) + LEAF_FWD * hg : PLANT_TRANS;
+        add += env[0].rgb * T * through;
     }
     // A soft sheen (LEAF_SHEEN): a leaf's or a blade's waxy surface reflects the sun, most at grazing angles: a broad GGX
     // lobe (LEAF_ROUGH) with Schlick's Fresnel (F0 0.04) on the face (a plant: on the vertical), times the direct sun's

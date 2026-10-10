@@ -1352,10 +1352,12 @@ light that falls on them comes out of their other side, green.
 - Writers: the LOD by material (every leaf tint, cherry, the poplars 160-162); the far field's canopy layer by its
   material; the near chunks by the block atlas sprite their quad's texture comes from. Vanilla's mesh carries no block
   identity, so the Java side sends the atlas's leaf and plant sprites (`MetalFoliage.code`: names ending in `_leaves`,
-  vines and azalea bushes as leaves; grass, ferns, flowers, saplings, crops, double plants, petals and the like as
-  plants) whenever the atlas the near chunks sample changes; the native side makes a class map of the atlas (a texel per
-  16-pixel cell, R8Uint: class | sway << 2), and `near_vs` reads it at the middle of its quad's texture (its vertex and
-  the opposite corner span it) and hands it to `near_fs` flat.
+  vines and azalea bushes as leaves; grass, ferns, flowers, saplings, crops, double plants and sugar cane as plants; flat
+  cover on the ground, petals, leaf litter, lily pads, as nothing: light through it lands on the ground under it)
+  whenever the atlas the near chunks sample changes, each by its texture's own rectangle from its UVs (26.3's atlas pads
+  its sprites by 16 pixels: `getX()` and `getY()` are the slot's corner, not the texture's); the native side makes a
+  class map of the atlas (a texel per 16-pixel cell, R8Uint: class | sway << 2), and `near_vs` reads it at the middle of
+  its quad's texture (its vertex and the opposite corner span it) and hands it to `near_fs` flat.
 
 ### Light through leaves (`leaflight`)
 
@@ -1363,22 +1365,27 @@ light that falls on them comes out of their other side, green.
   between leaf blocks are culled), so a ray's closest hits come in pairs, into a canopy and out of it, and the distance
   between them is the blocks of leaves it crossed. A hit's quad tells its material and face (the GI cache's zero-copy
   table: with `leaflight` the tiles' structures carry their quad ranges and the instance structure its table even
-  without `gi`). Within 24 blocks of the surface the hits are taken in order (short closest-hit queries, cheap); past
-  that one any-hit query covers the rest of the ray, as the plain shadow ray did (anything opaque: no light; more
-  leaves: 3 blocks more). The direct sun gets through `exp(-1.2 x blocks)`, 0.3 a block (`METALMC_LEAFT`): a layer or
-  two let some through, a deep canopy none; it is the visibility as before, which the relight's sun term and the water's
-  glint read. A second channel (the texture is RG8 then) keeps `exp(-0.2 x blocks)` (0 for anything opaque), up to
-  about 27 blocks in 8 bits. The traced pixel's class comes from the G-buffer: a leaf's face turned away from the sun
-  gets a ray too (through its own canopy; if the near range has no surface at all the canopy isn't in the structures,
-  and it takes a crown's 3 blocks), a plant takes the vertical for the ray's offset and always gets one.
+  without `gi`). First the plain shadow ray, as without `leaflight`: nothing in the way (most sunlit terrain), the sun;
+  something that isn't a leaf, none. Only a ray whose hit is a leaf walks: within 24 blocks of the surface the hits in
+  order (short closest-hit queries, cheap), then one any-hit query for the rest of the way (anything opaque: no light;
+  more leaves, another crown or a forest ahead of a low sun: 3 blocks more). The direct sun gets through
+  `exp(-1.2 x blocks)`, 0.3 a block (`METALMC_LEAFT`): a layer or two let some through, a deep canopy none; it is the
+  visibility as before, which the relight's sun term and the water's glint read. A second channel (the texture is RG8
+  then) keeps `exp(-0.2 x blocks)` (0 for anything opaque), up to about 27 blocks in 8 bits. The traced pixel's class
+  comes from the G-buffer: a leaf's face turned away from the sun gets a ray too (through its own canopy; with nothing
+  in the way at all its canopy isn't in the structures, the far field's or a tile still building, and it takes a
+  crown's 3 blocks), a plant takes the vertical for the ray's offset and always gets one.
 - **The relight's foliage term** (`litFoliageLight`, spliced into lit_relight_header.metal; every constant a `#define`
   there): for a leaf or plant pixel, added to the relight's light:
-  - the sun's light scattered through the leaves: `sun x exp(-LEAF_FALLOFF x blocks) x (back + LEAF_FWD x HG)`.
-    Scattered light falls off more slowly than the direct beam, and green more slowly than red and blue (a leaf
-    absorbs little green): `LEAF_FALLOFF` (0.8, 0.32, 1.0) a block. `back` goes from `LEAF_FRONT` (0.1) on a face
-    toward the sun to `LEAF_BACK` (0.7) on one turned away (plants, thin every way, `PLANT_TRANS` 0.5); `HG` is a
-    Henyey-Greenstein lobe (g `LEAF_G` 0.6, times 4 pi: 1 with no lobe, 10 looking into the sun) around the sun's
-    direction, `LEAF_FWD` 0.2: leaves between the camera and the sun glow.
+  - the sun's light scattered through the leaves: `sun x exp(-falloff x blocks) x (back + LEAF_FWD x HG)`. Scattered
+    light falls off more slowly than the direct beam, and in the leaf's own color more slowly than in the rest (a green
+    leaf absorbs little green, a pale oak's little of any): per channel the falloff goes from `LEAF_FALLOFF_MIN` (0.3 a
+    block) in the albedo's strongest channel to `LEAF_FALLOFF_MAX` (1.0) in one it lacks, by the linear albedo over its
+    largest channel, so oaks pass green light, pale oaks gray, cherries pink (a fixed green-slowest falloff turned the
+    pale oaks' canopy green). `back` goes from `LEAF_FRONT` (0.1) on a face toward the sun to `LEAF_BACK` (0.7) on one
+    turned away (plants, thin every way, `PLANT_TRANS` 0.5); `HG` is a Henyey-Greenstein lobe (g `LEAF_G` 0.6, times 4
+    pi: 1 with no lobe, 10 looking into the sun) around the sun's direction, `LEAF_FWD` 0.2: leaves between the camera
+    and the sun glow.
   - the sky through the leaves: a pixel under cover takes at least the sky's light from above through the blocks of
     leaves its sky light level says are over it (vanilla's leaves dim sky light a level a block), with the same falloff,
     `LEAF_SKY` 0.8, times AO, from the first block of cover in (a face out in the open sees the sky itself, which the
@@ -1407,3 +1414,50 @@ light that falls on them comes out of their other side, green.
 - The traced shadows' structures don't move; at 0.04 blocks the difference doesn't show (with `wave` and not
   `leaflight` the shadow rays start 0.06 blocks off the surface instead of 0.03, so a leaf swaying into its own block
   doesn't shadow itself).
+
+### Verified offline (`tools/leaftest.swift`, no game)
+
+- `leaftest <dylib> - - compile`: every shader foliage changes compiles as the library builds it (the LOD's quads with
+  the G-buffer, the near chunks solid and cutout, the shadows' kernel, lit mode's relight pass, the anti-aliasing's
+  resolve in all its variants) under the full look with `leaflight,wave`, with `leaflight` alone, with `wave` alone
+  (no `lit`), and without either; litflow's compile mode passes with `leaflight` too (the far field's march).
+- Without the switches every shader is the same text as before: each change sits in a Swift interpolation that is
+  empty then (the LOD's, the near chunks', the far field's, the shadows' and the relight's sources).
+- The forest scene on the LOD alone (the LOD's level 0 stands in for the near chunks, flat material colors, no post;
+  1728 x 1117, 16-frame means), `lit,rtshadows,sky,gi` against the same with `leaflight,wave`: leaves 69.5% of the lit
+  terrain (debug view 13); terrain luma (the bottom 55%: mean, 10th percentile, saturation) 55.4 / 25 / 15.7 ->
+  70.4 / 45 / 21.3; the crowns' sides away from the sun green instead of dark.
+
+### In game (2026-10-10, lab mode: 3456 x 2234, TAA, the full look `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post`)
+
+- Two lab sessions (`leaves1`, `leaves2`). "Off" is the same session with the foliage term and the leaf walk switched
+  off in the hot-reloaded shaders: it reproduces the census's frame (forest 49.1 / 18 / 17.4 against census1's
+  49.6 / 18 / 17.8).
+- **The first session found the near chunks unclassed** (debug view 13: only the LOD's distant leaves green). 26.3's
+  atlas pads every sprite by 16 pixels, and the rectangles had come from the slots' corners; with a 16-pixel shift in the
+  lab's shader the canopy classed at once, and MetalFoliage now sends each texture's own rectangle from its UVs.
+  Second session: leaves 50.4% of the forest frame, grass 0.6%, nothing else.
+- Terrain luma (bottom 55%: mean / 10th percentile / saturation), off (session 2) -> on (session 2, then session 3
+  with the forward lobe and the plants' transmission cut, below), and SEUS's twin:
+
+  | Scene | Off | On (session 2) | On (session 3) | SEUS |
+  |---|---|---|---|---|
+  | forest | 48.7 / 18 / 17.3 | 61.3 / 27 / 24.8 | 60.6 / 26 / 24.4 | 88.2 / 53 / 24.2 |
+  | mountain_view | 48.3 / 19 / 8.2 | 62.8 / 24 / 9.9 | 61.3 / 23 / 9.6 | 93.2 / 46 / 15.4 |
+  | noon_overview | 82.5 / 38 / 21.9 | 84.4 / 40 / 22.4 | 84.1 / 40 / 22.3 | 116.7 / 64 / 25.8 |
+  | sunset_water | 82.7 / 38 / 24.4 | 87.6 / 44 / 27.6 | 85.8 / 43 / 26.7 | 92.4 / 41 / 13.9 |
+  | night_torches | 54.8 / 26 / 20.3 | 54.9 / 26 / 20.3 | | |
+
+- **The look.** The forest's canopy glows: the cutout leaves' holes show lit green leaves instead of black, the crowns'
+  sides away from the sun are green, the sunlit tops a little brighter; its saturation is SEUS's now (24.8 against
+  24.2). The rest of the gap to SEUS is the exposure and the shade's fill (the grade helper's). mountain_view: the pale
+  oaks' canopy light gray, the oak and birch forest green. noon_overview's far forests lighter green. Night: unchanged.
+  Pairs (ours only, before | after) in `bench_out/agents/leaves/boards/game2-<scene>.jpg`; with SEUS's twin in
+  `~/Projects/metal-mc-private/twins/census1/boards-leaves/`.
+- **Tuned on the way.** A fixed green-slowest falloff turned the pale oaks' canopy green (now from the leaf's own
+  color). Flat ground cover classed as plants (leaf litter) glowed in the open (it isn't a plant any more). At sunset,
+  looking into the sun, the forward lobe (then `LEAF_FWD` 0.2, ten times that straight into the sun) and `PLANT_TRANS`
+  0.5 turned the foreground's grass into a bright yellow field and the backlit tree bright orange, where SEUS keeps
+  both dark with lit rims: a blade or a leaf passes on 0.15-0.3 of the light on its far side, so 0.03 and 0.25 now.
+- **Waving**: two shots half a second apart differ by 5.6 levels on average over the terrain (the sway); the canopy is
+  as crisp with it as without (no smearing in the anti-aliasing; the sway is 0.001-0.003 blocks a frame).
