@@ -43,14 +43,14 @@ private func cloudSetting(_ name: String, _ fallback: Float) -> Float {
     return v
 }
 /// METALMC_CLOUDCOVER: clear, scattered (the default), overcast, or a number in coverage units (the weather map's
-/// coverage is this plus its own variation: about -0.3 nearly clear, 0.4 scattered cumulus, 1.6 a closed deck). Rain
-/// takes it to overcast with the game's rain level.
+/// coverage is this plus its own variation: about -0.3 nearly clear, 0.56 scattered cumulus, 1.6 a closed deck). Rain
+/// takes it to overcast with the game's rain level, thunder to a darker, towering deck.
 let cloudCoverDefault: Float = {
     switch cloudEnv["METALMC_CLOUDCOVER"] ?? "scattered" {
     case "clear": return -0.3
-    case "scattered": return 0.4
+    case "scattered": return 0.56
     case "overcast": return 1.6
-    case let s: return Float(s) ?? 0.4
+    case let s: return Float(s) ?? 0.56
     }
 }()
 /// METALMC_CLOUDBASE, METALMC_CLOUDTOP: the layer, in metres (blocks) above sea level. 650-1700 m: low fair-weather
@@ -239,6 +239,15 @@ static float3 cloudsComposite(float3 c, uint2 q, float d, constant SkyFrame& sky
     if (sky.tone.y < 60000.0) o = skyToneMap(o, sky.tone);
     return skyEncode(o);
 }
+// The clouds in a direction of the upper hemisphere from the camera, for reflections (the water's, Lit.swift): rgb what they
+// add over the sky behind them (aerial perspective included), a their transmittance. map: Clouds.reflectionBinding()'s
+// texture, a paraboloid map with the water's sky map's mapping (the horizon the circle of radius 1/2 around the middle).
+// In scene-linear light: reflected = sky(R) * a + rgb.
+static float4 cloudsReflected(float3 dir, texture2d<float> map) {
+    constexpr sampler sm(filter::linear, address::clamp_to_edge);
+    float3 d = normalize(float3(dir.x, max(dir.y, 0.0), dir.z));
+    return map.sample(sm, d.xz / (1.0 + d.y) * 0.5 + 0.5, level(0.0));
+}
 // ---- end of the clouds' shared part ----
 """ : ""
 
@@ -299,6 +308,15 @@ private let cloudsShaderSource = skyShaderHeader + cloudsShaderHeader + """
 #define CLOUD_AMBIENT 1.0
 #define CLOUD_AMB_BASE 0.45
 #define CLOUD_AMB_GROUND 0.6
+// Cirrus: a thin sheet of ice cloud high above the cumulus (altitude, m), how much of the sky it covers where the weather
+// allows (0 none), its optical depth at full density looking straight up, the size of its streaks along and across the wind
+// (m; powers of two over the integer frame (2, 1), (-1, 2), so they tile with the camera's wrap), its phase's forward g.
+#define CIRRUS_ALT 8000.0
+#define CIRRUS_COVER 0.55
+#define CIRRUS_TAU 0.35
+#define CIRRUS_ALONG 16384.0
+#define CIRRUS_ACROSS 2048.0
+#define CIRRUS_G 0.6
 // The light's own stretch from each sample up to the deep shadow map's next stored height: samples, the longest (m).
 #define CLOUD_LIGHT_SAMPLES 2
 #define CLOUD_LIGHT_STRETCH 600.0
@@ -451,6 +469,8 @@ static float2 cloudsWeather(float2 xz, constant CloudFrame& cf, texture2d<float>
     float4 w = weather.sample(kCloudRepeat, (xz + cf.noise.xy) * (1.0 / CLOUD_WEATHER_TILE), level(lod));
     float cov = saturate(cf.shape.x + CLOUD_COVER_BIAS + (w.r - 0.5) * CLOUD_COVER_SPREAD);
     float type = mix(saturate(0.62 + (w.g - 0.5) * 1.3), CLOUD_RAIN_TYPE, cf.shape.z);
+    // Thunder: cumulonimbus, the deck towering to the layer's top.
+    type = mix(type, 1.0, cf.shape.w);
     return float2(cov, type);
 }
 
@@ -465,11 +485,13 @@ static float cloudsDensity(float3 rel, float alt, float2 wt, constant CloudFrame
     float3 np = float3(rel.x + cf.noise.z, alt, rel.z + cf.noise.w);
     float shape = base.sample(kCloudRepeat, np * (1.0 / CLOUD_BASE_TILE), level(lod)).r;
     float d = saturate(cloudRemap(shape * prof, 1.0 - wt.x, 1.0, 0.0, 1.0)) * wt.x;
-    if (fine && d > 0.0) {
+    if (d > 0.0) {
         // Two lookups, the second turned 45 degrees and a factor sqrt 2 finer (an integer matrix: it still tiles with the
         // camera's wrap): one lattice of Worley cells is regular enough to show on flat cloud tops, two together aren't.
+        // Without the detail (far away, long steps) its mean erosion still applies: dropping it made the far clouds
+        // denser, a flat deck beyond a line where the detail stopped.
         float dfbm = 0.5;
-        if (d < CLOUD_DETAIL_MAXD) {
+        if (fine && d < CLOUD_DETAIL_MAXD) {
             float3 dp = np * (1.0 / CLOUD_DETAIL_TILE);
             dfbm = 0.5 * (detail.sample(kCloudRepeat, dp, level(0.0)).r
                         + detail.sample(kCloudRepeat, float3(dp.x - dp.z, dp.y * 1.41421356, dp.x + dp.z), level(0.0)).r);
@@ -642,6 +664,52 @@ static float4 cloudsThroughAir(CloudsRay r, float3 dir, constant SkyFrame& sky, 
     return float4(r.L * ap.transmittance + (1.0 - r.T) * front, r.T);
 }
 
+// Where a view ray meets the cirrus sheet (m; 0 if it doesn't: under the planet's horizon, or past CLOUD_MAX_DIST).
+static float cloudsCirrusHit(float3 dir, constant CloudFrame& cf) {
+    if (CIRRUS_COVER <= 0.0 || cf.layer.z >= CIRRUS_ALT) return 0.0;
+    float a = max((1.0 - dir.y * dir.y) * cf.layer.w, 1e-14);
+    float r0, r1;
+    if (!cloudsRoots(a, dir.y, cf.layer.z - CIRRUS_ALT, r0, r1)) return 0.0;
+    float t = r1;
+    float g0, g1;
+    if (cf.layer.z > 0.0 && cloudsRoots(a, dir.y, cf.layer.z, g0, g1) && g1 > 0.0 && (g0 > 0.0 ? g0 : g1) < t) return 0.0;
+    return t < 1.3 * CLOUD_MAX_DIST ? t : 0.0;
+}
+
+// The cirrus at a ray's crossing tc: fibrous streaks (the detail noise stretched along the wind, in the integer frame
+// (2, 1), (-1, 2)), in patches where the weather map (another part of it) allows, a thin sheet lit by a single scattering
+// with a forward lobe (ice) and the sky's ambient, through the air in front. rgb what it adds, a its transmittance.
+static float4 cloudsCirrus(float3 dir, float tc, constant CloudFrame& cf, constant SkyFrame& sky, device const float4* env,
+                           texture2d<float> weather, texture3d<float> detail, texture2d<float> trans,
+                           texture3d<float> apScatter, texture3d<float> apTrans) {
+    float3 p = dir * tc;
+    float2 xz = p.xz + cf.noise.xy;
+    float patch = weather.sample(kCloudRepeat, xz * (1.0 / CLOUD_WEATHER_TILE) + 0.5, level(1.0)).r;
+    float cov = saturate((patch - 0.5) * 3.0 + CIRRUS_COVER) * (1.0 - cf.shape.z);
+    if (cov <= 0.0) return float4(0.0, 0.0, 0.0, 1.0);
+    float2 uv = float2((2.0 * xz.x + xz.y) / CIRRUS_ALONG, (2.0 * xz.y - xz.x) / CIRRUS_ACROSS);
+    float n = detail.sample(kCloudRepeat, float3(uv, 0.37), level(1.0)).r * 0.6
+            + detail.sample(kCloudRepeat, float3(uv * float2(2.0, 2.0), 0.61), level(0.0)).r * 0.4;
+    float d = smoothstep(1.0 - 0.6 * cov, 1.25 - 0.6 * cov, n) * cov;
+    if (d <= 0.0) return float4(0.0, 0.0, 0.0, 1.0);
+    // The sheet's slant: its local vertical tilts by x / R across the planet.
+    float mu = max(abs(dir.y + dot(p.xz, dir.xz) * 2.0 * cf.layer.w), 0.03);
+    float tau = d * CIRRUS_TAU / mu;
+    float T = exp(-tau);
+    float c = dot(dir, cf.light.xyz);
+    float ph = mix(cloudsHG(CIRRUS_G, c), cloudsHG(-0.2, c), 0.25);
+    float3 E = 0.0;
+    if (cf.light.w > 0.0) {
+        float r = sky.atmo.planet.x + CIRRUS_ALT * 0.001;
+        float lmu = clamp(cf.light.y + dot(p.xz, cf.light.xz) * 2.0 * cf.layer.w, -1.0, 1.0);
+        E = skyTransmittanceToSpace(trans, sky.atmo, r, lmu) * skySunVisible(sky.atmo, r, lmu, sky.sunHoriz.z) * cf.light.w * ph;
+    }
+    float3 L = (E + env[0].rgb * 0.5) * (1.0 - T);
+    SkyAerial ap = skyAerialPerspective(p, sky, apScatter, apTrans);
+    float3 front = skyOvercast(sky, ap.inscatter) + skyNight(sky, dir) * (1.0 - ap.transmittance);
+    return float4(L * ap.transmittance + (1.0 - T) * front, T);
+}
+
 // ------------------------------------------------------------------------------------------------------- per frame
 
 // The sky's light for the clouds: out[0] the open sky's mean radiance over the upper hemisphere (512 directions through
@@ -739,7 +807,7 @@ static uint2 cloudsDueOffset(uint frame) {
 
 // A texel's view ray, where it runs through the layer, and whether its 2 x 2 pixels are all terrain nearer than where
 // the ray meets the clouds (then none of them shows any).
-struct CloudsTexel { float3 dir; float2 s0, s1; int segs; bool blocked; };
+struct CloudsTexel { float3 dir; float2 s0, s1; int segs; float tc; bool blocked; };
 static CloudsTexel cloudsTexel(uint2 gid, constant CloudFrame& cf, depth2d<float> depth, bool terrain = true) {
     CloudsTexel x;
     float2 uv = (float2(gid) + 0.5) / cf.size.zw;
@@ -748,15 +816,16 @@ static CloudsTexel cloudsTexel(uint2 gid, constant CloudFrame& cf, depth2d<float
     x.s0 = 0.0;
     x.s1 = 0.0;
     x.segs = cloudsSegments(x.dir, cf, x.s0, x.s1);
+    x.tc = cloudsCirrusHit(x.dir, cf);
     x.blocked = false;
-    if (x.segs == 0 || !terrain) return x;
+    if ((x.segs == 0 && x.tc <= 0.0) || !terrain) return x;
     constexpr sampler gs(filter::nearest, address::clamp_to_edge);
     float2 fuv = (float2(gid * 2u) + 1.0) / cf.size.xy;
     float4 g4 = depth.gather(gs, fuv);
     float dfar = min(min(g4.x, g4.y), min(g4.z, g4.w));
     if (dfar > 0.0) {
         float4 hq = cf.invViewProj * float4(fuv * 2.0 - 1.0, dfar, 1.0);
-        x.blocked = length(hq.xyz / hq.w) < x.s0.x;
+        x.blocked = length(hq.xyz / hq.w) < (x.segs > 0 ? x.s0.x : x.tc);
     }
     return x;
 }
@@ -813,9 +882,20 @@ static bool cloudsHistory(uint2 gid, float3 dir, float refDepth, constant CloudF
 static float4 cloudsMarchTexel(CloudsTexel x, float jit, constant CloudFrame& cf, constant SkyFrame& sky, device const float4* env,
                                texture2d<float> weather, texture3d<float> base, texture3d<float> detail, texture2d<float> trans,
                                texture2d<float> shadow, texture3d<float> apScatter, texture3d<float> apTrans, thread float& depthOut) {
-    CloudsRay r = cloudsMarch(x.dir, x.segs, x.s0, x.s1, jit, cf, sky, env, weather, base, detail, trans, shadow);
+    CloudsRay r;
+    r.L = 0.0;
+    r.T = 1.0;
+    r.depth = 0.0;
+    if (x.segs > 0) r = cloudsMarch(x.dir, x.segs, x.s0, x.s1, jit, cf, sky, env, weather, base, detail, trans, shadow);
     depthOut = 1.0 - r.T > 0.002 ? r.depth : 0.0;
-    return cloudsThroughAir(r, x.dir, sky, apScatter, apTrans);
+    float4 c = cloudsThroughAir(r, x.dir, sky, apScatter, apTrans);
+    // The cirrus behind: what it adds comes through the cumulus in front.
+    if (x.tc > 0.0 && r.T > CLOUD_T_MIN) {
+        float4 ci = cloudsCirrus(x.dir, x.tc, cf, sky, env, weather, detail, trans, apScatter, apTrans);
+        c = float4(c.rgb + c.a * ci.rgb, c.a * ci.a);
+        if (depthOut <= 0.0 && ci.a < 0.998) depthOut = x.tc;
+    }
+    return c;
 }
 
 // The march at half the resolution each way: this frame's texel of each block (one thread a block), blended into its
@@ -842,7 +922,7 @@ kernel void clouds_march(texture2d<float, access::write> outColor [[texture(0)]]
     uint2 gid = tid * cloudsBlock() + cloudsDueOffset(frame);
     if (gid.x >= uint(cf.size.z) || gid.y >= uint(cf.size.w)) return;
     CloudsTexel x = cloudsTexel(gid, cf, depth);
-    if (x.segs == 0 || x.blocked) {
+    if ((x.segs == 0 && x.tc <= 0.0) || x.blocked) {
         outColor.write(float4(0.0, 0.0, 0.0, 1.0), gid);
         outDepth.write(float4(x.blocked ? -1.0 : 0.0), gid);
         return;
@@ -891,7 +971,7 @@ kernel void clouds_carry(texture2d<float, access::write> outColor [[texture(0)]]
     // its turn (sky pixels beside it want that), one it has uncovered finds no history (its texels were terrain) and is
     // marched now.
     CloudsTexel x = cloudsTexel(gid, cf, depth, false);
-    if (x.segs == 0 || x.blocked) {
+    if ((x.segs == 0 && x.tc <= 0.0) || x.blocked) {
         outColor.write(float4(0.0, 0.0, 0.0, 1.0), gid);
         outDepth.write(float4(x.blocked ? -1.0 : 0.0), gid);
         return;
@@ -908,6 +988,41 @@ kernel void clouds_carry(texture2d<float, access::write> outColor [[texture(0)]]
                                   apTrans, curDepth);
     outColor.write(cur, gid);
     outDepth.write(float4(curDepth * 0.001), gid);
+}
+
+// The clouds over the upper hemisphere from the camera, for reflections (cloudsReflected): each texel a direction of the
+// paraboloid map, marched with a new jitter every frame and blended into what it held (directions are fixed in the world,
+// and the clouds are far: no reprojection).
+kernel void clouds_reflection(texture2d<float, access::read_write> map [[texture(0)]],
+                              texture3d<float> base [[texture(5)]],
+                              texture3d<float> detail [[texture(6)]],
+                              texture2d<float> weather [[texture(7)]],
+                              texture2d<float> trans [[texture(8)]],
+                              texture3d<float> apScatter [[texture(9)]],
+                              texture3d<float> apTrans [[texture(10)]],
+                              texture2d<float> shadow [[texture(11)]],
+                              constant CloudFrame& cf [[buffer(0)]],
+                              constant SkyFrame& sky [[buffer(1)]],
+                              device const float4* env [[buffer(2)]],
+                              constant float4& blend [[buffer(3)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= map.get_width() || gid.y >= map.get_height()) return;
+    float2 pp = (float2(gid) + 0.5) / float2(map.get_width(), map.get_height()) * 2.0 - 1.0;
+    float r2 = dot(pp, pp);
+    if (r2 > 1.0) { pp *= rsqrt(r2); r2 = 1.0; }
+    CloudsTexel x;
+    x.dir = normalize(float3(2.0 * pp.x, 1.0 - r2, 2.0 * pp.y) / (1.0 + r2));
+    x.s0 = 0.0;
+    x.s1 = 0.0;
+    x.segs = cloudsSegments(x.dir, cf, x.s0, x.s1);
+    x.tc = cloudsCirrusHit(x.dir, cf);
+    x.blocked = false;
+    float4 cur = float4(0.0, 0.0, 0.0, 1.0);
+    if (x.segs > 0 || x.tc > 0.0) {
+        float dd;
+        cur = cloudsMarchTexel(x, cloudsJitter(gid, cf.misc.x), cf, sky, env, weather, base, detail, trans, shadow, apScatter, apTrans, dd);
+    }
+    map.write(blend.x >= 1.0 ? cur : mix(map.read(gid), cur, blend.x), gid);
 }
 
 // Cloud shadows on RtShadows' visibility (lit mode): for each traced texel, at the pixel it traced this frame (the same
@@ -1048,6 +1163,10 @@ final class Clouds: @unchecked Sendable {
     private var historyDepth: [MTLTexture] = []
     private var current = 0
     private var visOut: MTLTexture?
+    /// The clouds over the upper hemisphere for reflections (cloudsReflected; RGBA16Float, 128 x 128), and whether it holds
+    /// a frame yet (the first one is written whole, not blended).
+    private var reflection: MTLTexture?
+    private var reflectionFrames = 0
     private var dummyColor: MTLTexture?
     private var dummyDepth: MTLTexture?
     private var dummyShadow: MTLTexture?
@@ -1055,8 +1174,10 @@ final class Clouds: @unchecked Sendable {
     /// the anti-aliasing's binding or the composite pass, so a frame that skips frame() can't composite stale clouds).
     private(set) var cf = CloudFrameGPU()
     private var frameReady: (width: Int, height: Int)?
-    /// The shadow map was made in the last frame() (for shadowBinding, which the god rays may call after the composite).
+    /// The shadow map was made in the last frame() (for shadowBinding, which the god rays may call after the composite), and
+    /// the clouds were (for frameTexture, which the post chain calls after it).
     private var shadowMade = false
+    private var madeThisFrame = false
     private var prevViewProj = matrix_identity_float4x4
     private var prevCam = SIMD3<Double>(repeating: .nan)
     /// The deep shadow map's cascades as they were made (their centers), and the light they were made for.
@@ -1082,7 +1203,7 @@ final class Clouds: @unchecked Sendable {
                 library = nil; pipes = [:]; compositePipes = [:]; noiseMade = false; failed = false
             }
             for name in ["clouds_noise_base", "clouds_noise_detail", "clouds_noise_weather", "clouds_env", "clouds_shadow",
-                         "clouds_march", "clouds_carry", "clouds_vis", "clouds_debug_view"] {
+                         "clouds_march", "clouds_carry", "clouds_vis", "clouds_reflection", "clouds_debug_view"] {
                 guard let f = lib.makeFunction(name: name) else { throw NSError(domain: "clouds", code: 1, userInfo: [NSLocalizedDescriptionKey: "no \(name)"]) }
                 pipes[name] = try ctx.device.makeComputePipelineState(function: f)
             }
@@ -1205,11 +1326,12 @@ final class Clouds: @unchecked Sendable {
                sunAngle: Float, rainBrightness: Float, thunder: Float, seaLevel: Double) -> Bool {
         frameReady = nil
         shadowMade = false
+        madeThisFrame = false
         let sky = Sky.shared
         guard cloudsEnabled, ctx.pass == nil, sky.ready, ensure(), let env, let shadow, let base = baseNoise, let detail = detailNoise,
               let weather, let trans = sky.transmittance, let apScatter = sky.apScatter, let apTrans = sky.apTrans,
               let skyView = sky.skyView, let pEnv = pipes["clouds_env"], let pShadow = pipes["clouds_shadow"],
-              let pMarch = pipes["clouds_march"], let pCarry = pipes["clouds_carry"] else { return false }
+              let pMarch = pipes["clouds_march"], let pCarry = pipes["clouds_carry"], let pRefl = pipes["clouds_reflection"] else { return false }
         let w = color.width, h = color.height, hw = (w + 1) / 2, hh = (h + 1) / 2
         guard ensureTargets(hw, hh) else { return false }
         frames += 1
@@ -1240,7 +1362,9 @@ final class Clouds: @unchecked Sendable {
         f.noise = SIMD4(wrap(cam.x - drift.x), wrap(cam.z - drift.y), wrap(cam.x - drift.x - evolve.x), wrap(cam.z - drift.y - evolve.y))
         let rain = min(max(1 - rainBrightness, 0), 1)
         let cover = coverOverride.isNaN ? cloudCoverDefault : coverOverride
-        f.shape = SIMD4(cover + (1.6 - cover) * rain, 1 + 0.4 * rain, rain, thunder)
+        // Rain takes the coverage to a closed deck and thickens it; thunder (which comes with rain) more, and darker.
+        let storm = min(max(thunder, 0), 1)
+        f.shape = SIMD4(cover + (1.6 - cover) * rain + 0.3 * storm, 1 + 0.4 * rain + 0.8 * storm, rain, storm)
         let cs = cascades(cam: cam, light: SIMD3(f.light.x, f.light.y, f.light.z), height: height)
         let lit = f.light.w > 0 && f.light.y > 0
         // The near cascade every frame, the middle and far ones on alternate frames (they're coarse, and the clouds drift a
@@ -1323,11 +1447,29 @@ final class Clouds: @unchecked Sendable {
         menc.dispatchThreads(MTLSize(width: (hw + bx - 1) / bx, height: (hh + 1) / 2, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         menc.setComputePipelineState(pCarry)
         menc.dispatchThreads(MTLSize(width: hw, height: hh, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        // The reflection map (the water's): every texel each frame, blended (a fifth new; the first frame whole).
+        if reflection == nil {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 128, height: 128, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            reflection = ctx.device.makeTexture(descriptor: d)
+            reflection?.label = "MetalMC clouds for reflections"
+            reflectionFrames = 0
+        }
+        if let reflection {
+            var blend = SIMD4<Float>(reflectionFrames == 0 ? 1 : 0.2, 0, 0, 0)
+            menc.setComputePipelineState(pRefl)
+            menc.setTexture(reflection, index: 0)
+            menc.setBytes(&blend, length: 16, index: 3)
+            menc.dispatchThreads(MTLSize(width: 128, height: 128, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            reflectionFrames += 1
+        }
         menc.endEncoding()
         current = next
         cf = f
         frameReady = (w, h)
         shadowMade = lit
+        madeThisFrame = true
         prevViewProj = viewProj
         prevCam = cam
         prevSize = (w, h)
@@ -1361,6 +1503,20 @@ final class Clouds: @unchecked Sendable {
             enc.setTexture(dummyDepth, index: 19)
         }
         enc.setBytes(&f, length: MemoryLayout<CloudFrameGPU>.stride, index: 5)
+    }
+
+    /// The clouds over the upper hemisphere, for passes that call cloudsReflected (the water's reflections): the map, or a
+    /// 1 x 1 stand-in (no clouds: transmittance 1) when there's none yet.
+    func reflectionBinding() -> MTLTexture? {
+        guard cloudsEnabled, ensure() else { return nil }
+        return shadowMade || reflectionFrames > 0 ? (reflection ?? dummyColor) : dummyColor
+    }
+
+    /// The clouds as the composite took them this frame (RGBA16Float at half the resolution each way: rgb their light, a their
+    /// transmittance), for the post chain's light shafts (Post.swift): a 1 x 1 stand-in (no clouds) when they didn't run.
+    func frameTexture() -> MTLTexture? {
+        guard cloudsEnabled, ensure() else { return nil }
+        return madeThisFrame && history.count == 2 ? history[current] : dummyColor
     }
 
     /// The deep shadow map and this frame's CloudFrame, for passes that call cloudTransmittanceToSun (the god rays): the
