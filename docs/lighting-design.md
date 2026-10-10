@@ -1690,6 +1690,40 @@ LOD's sway). Session 2's traces had other work on the GPU in them (the clears to
 So about 0.5 ms in a forest with `leaflight` (the walk 0.3, the relight 0.15-0.2) and about 0.1 more with `wave` (the
 near chunks' lookup and sway), against the brief's 0.15. Where it goes, and what would take it down, is in "Not done".
 
+### Round 2: the cost (2026-10-10, offline, `leaftest` with `LEAFTEST_TIME=1`, 3456 x 2234)
+
+Where it went (forest; the shadows' pass "through" against "leaves opaque" in the same process, medians of 60, the
+relight's own pass across processes; A/B switches `METALMC_LEAFQUERY`, `LEAFTERM`, `LEAFSHEEN`, `LEAFCAND`):
+
+| | ms |
+|---|---|
+| the shadows' pass, leaves through against opaque (round 1's walk) | +0.26 to +0.35 (noise across batches) |
+| of that, the walk itself (rays that hit a leaf taking 3 blocks instead) | 0.11 |
+| of that, the rest: the hit's quad lookup on every ray that hits anything (2 dependent reads), the G-buffer read | 0.15 |
+| rays from leaves' faces turned away from the sun | 0 (no change without them) |
+| the relight's foliage term (`METALMC_LEAFTERM=0`: 1.183 -> 1.005) | 0.18 |
+| of that, the sheen (`METALMC_LEAFSHEEN=0`) | 0.04 |
+
+Changes:
+- **The walk as one traversal**: an intersection query over the whole ray with every triangle reported (forced
+  non-opaque); a leaf face the ray goes into adds -t, one it comes out of +t, so the sum is the length inside leaves
+  whatever order the traversal finds them in (closed canopies; a ray that starts inside has one exit more, one that ends
+  inside one entry more); anything that isn't a leaf ends it. Alone it cost the same as round 1's walk (closest hits one
+  by one within 24 blocks, then an any-hit query); as the shadow ray itself (one traversal instead of an any-hit ray
+  and then the walk) it takes 0.10 ms off: forest +0.248 against round 1's +0.350 in the same batch, mountain_view
+  +0.208 (round 1: +0.33). More than `RT_LEAF_CAND` (24) faces: deep, dark (8: +0.213; kept at 24).
+- **The relight's term trimmed**: the exp2s skipped where they give 1 or nothing (no leaves toward the sun, no cover),
+  Smith's visibility in Hammon's form (no square roots): within the noise (forest 1.201 against 1.183-1.190).
+
+So `leaflight` now costs about 0.44 ms in the forest view (0.25 in the shadows' pass, 0.19 in the relight) and 0.34 in
+mountain_view (0.21 + 0.13), from about 0.52 and 0.47: still well over the 0.15 asked for. What's left is structural:
+- the quad lookup on every hit: leaves as their own geometry (or instances, with a mask) in each tile's structure would
+  let the hardware take the opaque triangles and report only leaves (the GI cache's tile meshes and hit table would
+  need the third range);
+- the relight's term (0.18): evaluated once per traced sample in rt_shadow (it reads the sample's G-buffer texel
+  already) instead of at every leaf pixel; the visibility texture's free channel is one (with clouds, b is the clouds'
+  shadow), so the term would need a scalar form or a channel of its own.
+
 ### Not done, and next
 
 - **Cost.** The walk through leaves is near its minimum per ray (an any-hit query that stops at the first leaf, short
@@ -2476,3 +2510,144 @@ with every shot's settings and scores in `evals.jsonl`, `twins-base1/`, `autotun
   sky's blue only restores the clear patches.
 - **Night and caves** are scored against a target of our own (luma 35-45, SEUS's warmth, no crushed shadows); nobody's
   frames are the answer there, so the defaults were judged by eye as much as by the number.
+
+## Entities, particles and rain in our light (prototype, `METALMC_EXP=lit,entities` and `rain`, 2026-10-10)
+
+`Sources/MetalMCNative/Entities.swift` (the patches, the entity texel, the relight's entity path, the forward light),
+splices marked "Entities" in Lit.swift (the relight's face-code-0 line, lit_relight_fs's early out, the light kept at
+each relight), Backend.swift (the pipelines registered in mmc_pipeline_create, the forward light bound in the level's
+main pass) and Water.swift (its four MSL helpers made internal). No Java. Off by default; without the switches every
+shader is the same text as before (each change sits in a Swift interpolation that is empty then). Both need `lit`.
+
+Lit mode relit the terrain only. Mobs, block entities, items and particles kept vanilla's lightmap light, which knows
+nothing of our sun and its traced shadows, our sky, the colored block light or the GI cache: as the world is relit
+(exposure, leaves, water) they drift from it, too flat by day and gray under torches; and vanilla's rain is a
+saturated blue texture at its lightmap's light (census1's rain: bright blue streaks over the overcast).
+
+### Entities into the G-buffer (`entities`)
+
+- **Patched pipelines.** Vanilla's entity pipelines that write depth (`entity_solid`, `entity_solid_offset_forward`,
+  `entity_cutout`, `entity_cutout_cull`, `entity_cutout_z_offset`, `entity_cutout_dissolve`, `armor_cutout_no_cull`,
+  `armor_decal_cutout_no_cull`, `item_cutout`: mobs, block entities such as chests, signs and beds, armor, items in the
+  world) and `opaque_particle` (flames, smoke, dust, splashes) get a variant for the level's main pass whose shaders are
+  patched from SPIRV-Cross's MSL, as water's are (`PipelineBox.installWater`, compiled off the render thread): the vertex
+  shader passes on its raw color, its light coordinates and (an entity's) normal; the fragment shader writes an entity
+  texel into the G-buffer after vanilla's color. The translucent ones (`entity_translucent`, `entity_translucent_cull`,
+  `item_translucent`, `armor_translucent`: players' skins, translucent items, a slime's outer cube) write one where the
+  fragment is mostly opaque (alpha 0.5 or more) and read the old texel back elsewhere (programmable blending).
+- **The entity texel.** Terrain's texels have a face code of 1-7 (x bits 29-31), water's code 0 with bit 28; an
+  entity's has code 0, bit 28 clear and bit 27 set, so every other reader (the shadows' kernel, the GI cache, water's
+  rays, post's meter) sees "not lit terrain" there, as before. x: the albedo (the texture times the vertex color and the
+  color modulator, the hurt overlay mixed in; sRGB 8 bits, blue rounded to even, its low bit 1 for a particle), the
+  normal's low 3 bits at 24, bit 27; y: a 15-bit depth key (bits 5-19 of the depth), sky and block light in whole levels
+  (4 bits each), the normal's other 9 bits. The normal is octahedral about the y axis, 6 bits a coordinate on 0-62 so
+  the axes are exact: a degree off at most. A back face of a two-sided part takes the normal flipped, as vanilla lights
+  it.
+- **The relight** (`litEntityPixel`, where `litRelightPixel` finds face code 0; in lit_relight_header.metal):
+  - the sun times the normal's cosine times the traced visibility at the pixel (the shadows' kernel already casts a ray
+    from every pixel with depth, entities included; entities cast no shadows themselves, they aren't in the structures);
+  - the sky on the normal: the six axis faces' light (lit_env's) weighted by the normal's squared components, or the GI
+    cache's light where it has some for the normal's dominant face (the cache works from depth, so entities' pixels get
+    cells like terrain's);
+  - the moon, as on terrain; block light from the colored light volume at the point (or vanilla's lightmap);
+  - vanilla's fog; and the overlay test as on terrain, with vanilla's light for an entity worked out again: its lightmap
+    at the texel's levels times light.glsl's face light (two fixed lights, 0.4 to 1) on the stored normal. Layers
+    blended over the entity afterwards (an enderman's or spider's eyes, glint, rain, a slime's outer cube) are found by
+    it and kept, as on terrain.
+  - Particles have no normal: they are lit from all sides like plants (the sun at `0.25 + 0.5 x its height`, the sky's
+    light on faces that aren't axis-aligned), and full-bright ones (flames, level 15) glow like the light sources they
+    come from, with post's emitter rule. Entities at level 15 (burning, blazes) stay full bright, as vanilla has them.
+- **Debug views** (`METALMC_LITVIEW`): on entity texels 1 albedo, 2 the normal (particles magenta), 3 light levels,
+  5 the new light, 6 sun visibility, 7 the overlay test, 8 the GI cache, 11-12 colored light.
+
+### Translucent particles and rain (forward)
+
+- Blended over what's behind them, translucent particles (`translucent_particle`: campfire smoke, spells) and the
+  weather can't take a texel of their own. Their shaders take our light at their light levels instead of vanilla's
+  lightmap (`mmcForwardLight`: the sun's and the sky's light the relight used the frame before, lit from all sides,
+  the moon, vanilla's block light from its lightmap), and they leave the G-buffer as it was (they read it back). The
+  relight keeps a copy of lit_env's light each frame (`EntityLight.keep`, a 128-byte blit) and the level's main pass
+  binds it (buffers 12 and 13 in both stages); without our sky's atmosphere they keep vanilla's light.
+- **Rain** (`rain`): vanilla's rain texture is a column of 1-texel streaks across a block-wide quad, blue (0.3, 0.42,
+  0.78); magnified near the camera a streak was 9 pixels wide. Its texels (blue) are drawn gray-white, at
+  `METALMC_RAINALBEDO` (0.6) of the light around them, fainter (`METALMC_RAINALPHA` 0.7 of vanilla's alpha) and thin:
+  only the middle `METALMC_RAINWIDTH` (0.35) of each texel column, its coverage of the pixel kept where a texel is
+  narrower than a pixel. The light is the forward light with only `METALMC_RAINSUN` (0.15) of the sun's: rain falls
+  from cloud, and the fifth of the sun our sky keeps in full rain turned the streaks yellow. Not over water's texels:
+  the relight takes the water layer off what's drawn to see the floor, which turned streaks there olive. Snow's
+  texels (white) keep their flakes and take the same light.
+- **Rain over the sky, with clouds**: the clouds' composite (in the anti-aliasing's resolve, after the relight) lays the
+  cloud layer over whatever a sky pixel holds, so it covered every streak drawn over the sky (rain falls below the
+  clouds). A rain streak over a pixel without a G-buffer texel (the sky) now goes into the G-buffer instead of the
+  color: its color (sRGB 8 bits a channel, x bits 24-31 clear) and alpha (y, 1-255: a texel no other writer makes),
+  over-composited with any streak there already (programmable blending), and `litRainOverSky` puts it on at the end of
+  the frame's light: in the relight without clouds, right after `cloudsComposite` in the resolve with them (one splice
+  in Taa.swift). Without TAA and with clouds (the relight's own pass, the clouds' own composite) streaks over the sky
+  are lost.
+- **Water drops** among the particles (rain's splashes, drips: blue in vanilla's particle atlas, blue dots over the
+  grass in rain) go near white (water shows the sky's light; a gray albedo made the splashes dark specks on the sand),
+  the albedo and the forward color alike (the latter with vanilla's light worked out from the color drawn, so the
+  overlay test finds them plain), except full-bright ones.
+
+### The hand (`hand`, with `entities`)
+
+`METALMC_EXP=lit,entities,hand` sends the first-person hand and held items with the level's features
+(`metalmc.extpipe.ExtHand`, as the external pipeline's hand goes; `MetalLit.HAND`, overworld only) instead of vanilla's
+hand pass after the post chain: the translucent entity pipeline (the arm) and the item pipelines put them in the
+G-buffer, and the relight lights them like everything around (the sun's traced visibility at the hand, the torch's
+colored light in a cave, the night). Off by default: the hand is then drawn with the level's depth (it can dip into a
+wall right in front of the camera), and goes through the anti-aliasing (its history is clipped to the neighborhood, so
+turning softens it rather than trailing it; not looked at in motion).
+
+### In game (2026-10-10, lab mode: 3456 x 2234, TAA, the full look `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave`)
+
+- Sessions `ent0` (without `entities,rain`), `ent1` (with), `ent2` (with `hand`, the rain's sun share and water drops):
+  the rain scene and a close view of its pen (`tp 21 67 171 146 30`), night_torches and the same pen at midnight,
+  torch_cave and a close view of a torch (`tp 122.5 13 -49.5 135 61`). All 17 pipelines patched at load (item_cutout is
+  three pipelines of one name), none failed.
+- **Mobs**: by day in rain the horses and pigs were vanilla's flat bright colors over the relit, darker world (the
+  census's pigs glowed pink); now they take the overcast's light: tops lighter than sides, the same level as the grass
+  around them. At midnight the horses by the pen's torches were a bright gray (vanilla's lightmap is near daylight next
+  to a torch); now they're lit warm by the torches' colored light, dark away from them, and the village's iron golem
+  and villagers sit in the night instead of glowing. Debug views on the pen: the normals (2) as on terrain, the overlay
+  test (7) green on the mobs (plain), red where a horse's markings layer is half see-through (relit from the color
+  drawn, as designed), rain's streaks magenta.
+- **Particles**: the torch's flame glows (the emitter rule: a white-yellow core that blooms) where it was a dim orange
+  under a gray smoke blob; its smoke is lit warm and dark by the torch.
+- **Rain**: the saturated blue bars are gone: thin gray streaks against the overcast, fainter over terrain (a faint
+  streak changes the color drawn by less than the overlay test's tolerance, 6% plus 2.5 levels, so the relight takes it
+  for plain terrain and relights it away: only the stronger streaks show over the ground).
+- **The hand** (`ent2`): in the G-buffer (debug view 2 shows its normals), lit by the night and the pen's torches, warm
+  in the cave by the torch.
+- Boards (ours only, before | after) in `bench_out/agents/leaves/boards/ent1-<shot>.jpg` (rain, pen, night, nightpen,
+  cave, cavetorch) and crops `ent1-crop-*.jpg`; with SEUS's census twin (rain, night_torches, torch_cave: its rain twin
+  shows no rain) in `~/Projects/metal-mc-private/twins/census1/boards-leaves/`; the shots in
+  `bench_out/agents/leaves/game5/`.
+- A rain shot taken right after `scene rain` showed the foreground's grass near black in one session and not in the
+  other; the same view 200 ticks later was normal (debug views 6 and 8: sun visibility and the GI cache as elsewhere).
+  Something settling after the jump (the GI cache's or the visibility's history), not the entities: not chased.
+
+### Costs
+
+- The relight's code-0 path (the entity texel's relight compiled into the relight and the anti-aliasing's resolve) costs
+  0.02-0.04 ms on frames with no entities on screen (offline, the relight's own pass: forest 1.181 -> 1.223 ms,
+  noon_overview 0.873 -> 0.896); an entity pixel costs about what a terrain pixel does. The patched pipelines' G-buffer
+  write and the forward light's 128-byte copy a frame are noise. The in-game traces of these sessions mixed scenes (the
+  pen, the cave, the forest) and weren't clean enough to give more than that.
+
+### Not done, and next
+
+- **Rain over terrain stays faint**: a faint streak changes the color drawn by less than the overlay test's tolerance,
+  so the relight relights it away; the stronger streaks show. Rain over terrain texels has no bit to say so.
+- **The hand** is behind `hand`: not looked at in motion (TAA), and it can dip into a wall right in front of the camera.
+- **Block models drawn as entities** (falling blocks, moving pistons, minecart contents, item frames' frames:
+  `solid_block`, `cutout_block`) keep vanilla's light: their vertex format has no normal (the face could come from the
+  position's derivatives) and their vertex color has vanilla's face shade in it.
+- **Entities cast no shadows** (they aren't in the ray structures), and translucent particles take no colored light and
+  no traced shadow (their light is the forward light's).
+- **Without TAA and with clouds**, streaks over the sky are lost (the relight's own pass and the clouds' own composite).
+- `entity_translucent_emissive`, `eyes`, `breeze_wind`, `energy_swirl` and the glint pipelines stay vanilla's (emissive
+  or additive layers; the overlay test keeps them over a relit entity).
+- **Checked last** (session `ent5`, on 14f98cd, with `clouds,godrays` too): all 17 pipelines patched; rain thin and gray
+  over the overcast with clouds; no streaks over water; mobs and the hand relit. After it, main's grade merged in and
+  entities call its `litGrade` like terrain (compile-checked, not seen in game).

@@ -57,6 +57,19 @@ public final class MetalLit {
         return WATER && MetalDevice.current != null;
     }
 
+    /**
+     * METALMC_EXP=lit,entities,hand: the first-person hand and held items go with the level's features (metalmc.extpipe.ExtHand,
+     * as the external pipeline's hand does) instead of vanilla's hand pass after the level, so the entity pipelines' G-buffer
+     * variants (Sources/MetalMCNative/Entities.swift) put them in the G-buffer and the relight lights them like the world
+     * around them. Overworld only (the level pass has the G-buffer there). Off by default: the hand is then drawn with the
+     * level's depth (it can dip into a wall right in front of the camera) and goes through the anti-aliasing.
+     */
+    public static final boolean HAND = ENABLED && experiment("entities") && experiment("hand");
+
+    public static boolean handInLevel(boolean overworld) {
+        return HAND && overworld && MetalDevice.current != null;
+    }
+
     /** Resolved on first use, so nothing loads the library unless the Metal backend is running. */
     private static final class Native {
         private static final Linker LINKER = Linker.nativeLinker();
