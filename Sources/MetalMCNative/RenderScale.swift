@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 
 // Render scale and its governor (docs/frame-budget.md, "Render scale and the governor").
 //
@@ -57,6 +58,22 @@ struct RenderScaleSetting {
 
 let renderScaleSetting = RenderScaleSetting.parse(ProcessInfo.processInfo.environment["METALMC_SCALE"])
 
+/// The drawable's width in pixels (the panel's resolution, which the upscaled level, the hand and the HUD are at), from the
+/// surface's configuration (mmc_surface2_configure); 0 before it.
+nonisolated(unsafe) var renderOutputWidth = 0
+
+/// Texture detail under a render scale: the level's pass is narrower than the output, so texture coordinates' screen
+/// derivatives are larger by the ratio and the GPU would pick mips that much blurrier (0.42 of a level at 0.75), detail no
+/// upscaler gets back. Our terrain shaders (the near chunks, the LOD) multiply their gradients by this, the pass's width
+/// over the output's (1 without a scale), so they choose mips as if drawn at the output's resolution: a mip bias of
+/// log2(scale), what temporal upscalers ask of the renderer (the jitter then resolves the finer texels over frames).
+/// METALMC_EXP=nomipbias leaves it at 1.
+func renderMipScale() -> Float {
+    guard !renderNoMipBias, renderOutputWidth > 0, ctx.passWidth > 0, ctx.passWidth < renderOutputWidth else { return 1 }
+    return max(0.5, Float(ctx.passWidth) / Float(renderOutputWidth))
+}
+private let renderNoMipBias = experiments.contains("nomipbias")
+
 final class RenderScaleGovernor: @unchecked Sendable {
     static let shared = RenderScaleGovernor()
 
@@ -74,6 +91,8 @@ final class RenderScaleGovernor: @unchecked Sendable {
     private var labText: String?
     /// Completed frames' GPU times (ms) drawn at the current scale (completion handlers, any thread).
     private var samples: [Double] = []
+    /// The last completed command buffer's GPU end (seconds), for each frame's own time.
+    private var lastGpuEnd: Double = 0
     /// The scale handed out for the frame being recorded (render thread), and with which every submit is tagged.
     private(set) var scale: Float
     /// Per-feature quality, 1 (full) to 0, in quarters: what the governor gives up after the scale.
@@ -109,7 +128,19 @@ final class RenderScaleGovernor: @unchecked Sendable {
     /// The submit's tag: the scale its frame was drawn at.
     var tag: Float { scale }
 
-    /// Completion handler of a submit (any thread): its GPU time and the scale it was drawn at.
+    /// Completion handler of a submit (any thread): its command buffer's GPU start and end (seconds) and the scale it was
+    /// drawn at. Frames overlap on the GPU (the next one's vertex work starts under this one's fragment work), so a command
+    /// buffer's span counts some of its neighbors' work: 19 ms spans at 12 ms frames in game. The frame's own GPU time is
+    /// what it added after the frame before it ended: end - max(start, the previous end).
+    func gpuFrame(start: Double, end: Double, tag: Float) {
+        lock.lock()
+        let own = end - Swift.max(start, lastGpuEnd)
+        lastGpuEnd = Swift.max(lastGpuEnd, end)
+        lock.unlock()
+        gpuFrame(Swift.max(own, 0), tag: tag)
+    }
+
+    /// A frame's own GPU time (seconds) and the scale it was drawn at (the offline simulation calls this directly).
     func gpuFrame(_ seconds: Double, tag: Float) {
         lock.lock()
         if setting.auto && tag == scale {
@@ -211,11 +242,18 @@ final class RenderScaleGovernor: @unchecked Sendable {
         else { change(scale: RenderScaleGovernor.quantize(up), quality: quality, why: why, now: now) }
     }
 
-    /// Lab mode: <shader dir>/render_scale.txt, read every 240 frames, overrides METALMC_SCALE while it's there.
+    /// Lab mode: <shader dir>/render_scale.txt, read every 240 frames, overrides METALMC_SCALE while it's there; and
+    /// quadcull.txt (1 or 0) switches the LOD's quad culling (Lod.swift, METALMC_EXP=quadcull), to trace it against the
+    /// render scale in one session.
     private func labOverride() {
         guard let dir = ShaderLab.dir else { return }
         labChecks += 1
         guard labChecks % 240 == 1 else { return }
+        if let q = (try? String(contentsOfFile: dir + "/quadcull.txt", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+           q == "1" || q == "0", lodQuadCullOn != (q == "1") {
+            lodQuadCullOn = q == "1"
+            log("render scale: lab override: the LOD's quad culling \(lodQuadCullOn ? "on" : "off")")
+        }
         let text = (try? String(contentsOfFile: dir + "/render_scale.txt", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text != labText else { return }
         labText = text
@@ -312,6 +350,25 @@ public func mmc_debug_governor_sim(_ fixedMs: Double, _ perPixelMs: Double, _ no
     out[0] = Double(gov.totalChanges)
     out[1] = sum / Double(max(1, total))
     return Double(late) / Double(max(1, total))
+}
+
+/// Offline check (tools/taautest.swift): the shaders the render scale's mip bias is in compile under this METALMC_EXP: the
+/// near chunks' library and every LOD pipeline for a main pass's formats (lit mode's with its G-buffer). Returns how many
+/// failed (each logged).
+@_cdecl("mmc_debug_terrain_compile")
+public func mmc_debug_terrain_compile() -> Int32 {
+    var failed: Int32 = 0
+    let opts = MTLCompileOptions()
+    opts.languageVersion = .version3_0
+    opts.preserveInvariance = true
+    do { _ = try ctx.device.makeLibrary(source: nearShaderSource, options: opts) } catch {
+        log("near chunks: shaders failed: \(error)")
+        failed += 1
+    }
+    LodRenderer.shared.lastFormats = (litEnabled ? [.rg11b10Float, litGbufferFormat] : [.bgra8Unorm], .depth32Float)
+    let n = mmc_debug_lod_pipelines()
+    if n != 0 { failed += max(n, 1) }
+    return failed
 }
 
 /// The render scale for the frame that starts now (Java's metalmc.render.RenderScale, at the start of every frame): a

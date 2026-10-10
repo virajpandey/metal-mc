@@ -401,8 +401,9 @@ static float linearFog(float d, float s, float e) {
 // darken slightly instead of showing whatever color they store (through vanilla's cutout leaves you see
 // shaded leaves further in); water's texels are all translucent and keep the flat color, since water blends.
 // Full-resolution grass sides blend vanilla's tinted fringe (grass_block_side_overlay) over the dirt.
+// mip: the render scale's gradient scale (RenderScale.swift, renderMipScale; 1 at the output's resolution).
 static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites, const device uint* aoBits,
-                       texture2d<float> atlas, sampler atlasSampler) {
+                       texture2d<float> atlas, sampler atlasSampler, float mip) {
     float ao = lodAO(in, aoBits);
     float3 color = unpack_unorm4x8_to_float(in.color).rgb * ao;
     if (u.camFrac.w > 0.5) {
@@ -412,14 +413,14 @@ static float4 lodShade(VOut in, constant LodUniforms& u, constant LodSpriteGPU* 
         bool top = face == 2 || face == 3;
         float4 rect = top ? sprites[mat].top : sprites[mat].side;
         float2 size = rect.zw - rect.xy;
-        float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size, dfdy(bc) * size));
+        float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size * mip, dfdy(bc) * size * mip));
         float luma = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
         float mean = top ? sprites[mat].luma.x : sprites[mat].luma.y;
         color *= clamp(mix(mat == MAT_WATER ? 1.0 : TRANSPARENT_SHADE, luma / max(mean, 0.02), t.a), 0.0, 2.0);
         if ((in.matFace >> 23) & 1) {
             float4 orect = sprites[GRASS_SIDE_SPRITE].top;
             float2 osize = orect.zw - orect.xy;
-            float4 o = atlas.sample(atlasSampler, orect.xy + fract(bc) * osize, gradient2d(dfdx(bc) * osize, dfdy(bc) * osize));
+            float4 o = atlas.sample(atlasSampler, orect.xy + fract(bc) * osize, gradient2d(dfdx(bc) * osize * mip, dfdy(bc) * osize * mip));
             color = mix(color, unpack_unorm4x8_to_float(in.color2).rgb * ao * (o.r / GRASS_GRAY), o.a);
         }
     }
@@ -455,7 +456,7 @@ static float3 lodLitK(VOut in, constant LodUniforms& u, texture2d<float> lightma
 // lodShade with unlit vertex colors: the same color (k applied here), and the albedo (material color, texture detail
 // and the grass fringe, without light, shade or AO) for the G-buffer.
 static LodOut lodShadeLit(VOut in, constant LodUniforms& u, constant LodSpriteGPU* sprites, const device uint* aoBits,
-                          texture2d<float> atlas, sampler atlasSampler, texture2d<float> lightmap, sampler ls) {
+                          texture2d<float> atlas, sampler atlasSampler, texture2d<float> lightmap, sampler ls, float mip) {
     float ao = lodAO(in, aoBits);
     float sky, block;
     float3 k = lodLitK(in, u, lightmap, ls, sky, block);
@@ -467,14 +468,14 @@ static LodOut lodShadeLit(VOut in, constant LodUniforms& u, constant LodSpriteGP
         bool top = face == 2 || face == 3;
         float4 rect = top ? sprites[mat].top : sprites[mat].side;
         float2 size = rect.zw - rect.xy;
-        float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size, dfdy(bc) * size));
+        float4 t = atlas.sample(atlasSampler, rect.xy + fract(bc) * size, gradient2d(dfdx(bc) * size * mip, dfdy(bc) * size * mip));
         float luma = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
         float mean = top ? sprites[mat].luma.x : sprites[mat].luma.y;
         albedo *= clamp(mix(mat == MAT_WATER ? 1.0 : TRANSPARENT_SHADE, luma / max(mean, 0.02), t.a), 0.0, 2.0);
         if ((in.matFace >> 23) & 1) {
             float4 orect = sprites[GRASS_SIDE_SPRITE].top;
             float2 osize = orect.zw - orect.xy;
-            float4 o = atlas.sample(atlasSampler, orect.xy + fract(bc) * osize, gradient2d(dfdx(bc) * osize, dfdy(bc) * osize));
+            float4 o = atlas.sample(atlasSampler, orect.xy + fract(bc) * osize, gradient2d(dfdx(bc) * osize * mip, dfdy(bc) * osize * mip));
             albedo = mix(albedo, unpack_unorm4x8_to_float(in.color2).rgb * (o.r / GRASS_GRAY), o.a);
         }
     }
@@ -501,13 +502,14 @@ static LodOut lodShadeLit(VOut in, constant LodUniforms& u, constant LodSpriteGP
 
 // The fragment functions' return type, the lightmap they take in lit mode, and the shading they call.
 #define LOD_FS_OUT LodOut
-#define LOD_FS_LIGHTMAP , texture2d<float> lightmap [[texture(29)]], sampler lightSampler [[sampler(14)]]
-#define LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler) lodShadeLit(in, u, sprites, aoBits, atlas, atlasSampler, lightmap, lightSampler)
+#define LOD_FS_LIGHTMAP , texture2d<float> lightmap [[texture(29)]], sampler lightSampler [[sampler(14)]], constant float& lodMip [[buffer(25)]]
+#define LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler) lodShadeLit(in, u, sprites, aoBits, atlas, atlasSampler, lightmap, lightSampler, lodMip)
 #else
 #define LOD_FS_OUT float4
-#define LOD_FS_LIGHTMAP
-#define LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler) lodShade(in, u, sprites, aoBits, atlas, atlasSampler)
+#define LOD_FS_LIGHTMAP , constant float& lodMip [[buffer(25)]]
+#define LOD_SHADE(in, u, sprites, aoBits, atlas, atlasSampler) lodShade(in, u, sprites, aoBits, atlas, atlasSampler, lodMip)
 #endif
+// (lodMip, fragment buffer 25: the render scale's texture gradient scale, RenderScale.swift's renderMipScale.)
 
 fragment LOD_FS_OUT lod_fs(VOut in [[stage_in]], constant LodUniforms& u [[buffer(19)]],
                            constant LodSpriteGPU* sprites [[buffer(20)]], const device uint* aoBits [[buffer(22)]],
@@ -1838,6 +1840,8 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     enc.setFragmentBuffer(r.spriteBuffer ?? r.colorBuffer, offset: 0, index: 20)
     enc.setVertexBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
     enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
+    var lodMip = renderMipScale()   // render scale (RenderScale.swift): the texture gradients' scale, fragment buffer 25
+    enc.setFragmentBytes(&lodMip, length: 4, index: 25)
     if foliageWaveLod { Foliage.shared.bindLod(enc, cam: SIMD3(cx, cy, cz)) }   // wave,wavelod (Foliage.swift): the wind, buffer 26
     if xforms.count * 16 <= 4096 {
         enc.setVertexBytes(xforms, length: xforms.count * 16, index: 20)

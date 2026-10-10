@@ -44,6 +44,11 @@ var buf = [Float](repeating: 0, count: size * size)
 var stats = [Double](repeating: 0, count: 3)
 let compileFailed = test(Int32(size), Int32(size), 1, 0, 1, 3, &buf, &stats)
 check(compileFailed == 0, "every variant of the upscaling resolve compiles under METALMC_EXP=\(ProcessInfo.processInfo.environment["METALMC_EXP"] ?? "") (\(Int(compileFailed)) failed)")
+// The terrain shaders the render scale's mip bias is in (the near chunks, every LOD pipeline).
+if let tsym = dlsym(lib, "mmc_debug_terrain_compile") {
+    let terrain = unsafeBitCast(tsym, to: (@convention(c) () -> Int32).self)()
+    check(terrain == 0, "the near chunks' and the LOD's shaders compile with the mip bias (\(terrain) failed)")
+}
 
 func run(_ label: String, scale: Float, frames: Int, jsign: Float = 1, mode: Int32) -> [Double] {
     let rms = test(Int32(size), Int32(size), scale, Int32(frames), jsign, mode, &buf, &stats)
