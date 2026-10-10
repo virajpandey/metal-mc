@@ -192,9 +192,10 @@ let foliageRelightHeader = """
 //   leaf's own color more slowly than the rest (a green leaf absorbs little green, a pale oak's little of any): per
 //   channel exp(-falloff x blocks), the falloff from LEAF_FALLOFF_MIN in the albedo's strongest channel to
 //   LEAF_FALLOFF_MAX in a channel it lacks (by the linear albedo over its largest channel). It comes out of every face,
-//   most out of the faces turned away from the sun (LEAF_FRONT to LEAF_BACK by the face's angle; plants, thin both ways,
-//   PLANT_TRANS), and more toward the camera the nearer it looks into the sun (forward scattering, a Henyey-Greenstein
-//   lobe, LEAF_FWD and LEAF_G).
+//   most out of the faces turned away from the sun (LEAF_FRONT to LEAF_BACK by the face's angle), and more toward the
+//   camera the nearer it looks into the sun (forward scattering, a Henyey-Greenstein lobe, LEAF_FWD and LEAF_G). A plant
+//   takes PLANT_TRANS and no lobe: a blade lets light through diffusely, and the grass around it, which the rays don't
+//   see, shades it from a low sun.
 // - The sky through the leaves: under cover, at least the open sky's light through the blocks of leaves the sky light
 //   level says are above (vanilla's leaves dim sky light a level a block), with the same falloff (LEAF_SKY): with the GI
 //   cache, whose rays stop at leaves, a canopy's inside would be black.

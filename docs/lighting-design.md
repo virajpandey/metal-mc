@@ -1554,9 +1554,10 @@ light that falls on them comes out of their other side, green.
     block) in the albedo's strongest channel to `LEAF_FALLOFF_MAX` (1.0) in one it lacks, by the linear albedo over its
     largest channel, so oaks pass green light, pale oaks gray, cherries pink (a fixed green-slowest falloff turned the
     pale oaks' canopy green). `back` goes from `LEAF_FRONT` (0.1) on a face toward the sun to `LEAF_BACK` (0.7) on one
-    turned away (plants, thin every way, `PLANT_TRANS` 0.5); `HG` is a Henyey-Greenstein lobe (g `LEAF_G` 0.6, times 4
-    pi: 1 with no lobe, 10 looking into the sun) around the sun's direction, `LEAF_FWD` 0.2: leaves between the camera
-    and the sun glow.
+    turned away; `HG` is a Henyey-Greenstein lobe (g `LEAF_G` 0.6, times 4 pi: 1 with no lobe, 10 looking into the sun)
+    around the sun's direction, `LEAF_FWD` 0.03: leaves between the camera and the sun glow. A plant takes
+    `PLANT_TRANS` (0.12) and no lobe: a blade lets light through diffusely, and the grass around it, which the rays
+    don't see, shades it from a low sun.
   - the sky through the leaves: a pixel under cover takes at least the sky's light from above through the blocks of
     leaves its sky light level says are over it (vanilla's leaves dim sky light a level a block), with the same falloff,
     `LEAF_SKY` 0.8, times AO, from the first block of cover in (a face out in the open sees the sky itself, which the
@@ -1579,9 +1580,11 @@ light that falls on them comes out of their other side, green.
   root: the vertices at the top of its texture sway (0.12 blocks, `METALMC_WAVEPLANT`), the bottom ones stay put, the
   upper half of a double plant twice as much at its top, all by the root block, so a plant's crossed quads and its two
   halves move as one.
-- In `near_vs`, and in `lod_vs` for full-resolution leaves, fading out from 80 to 160 blocks (`METALMC_WAVELODFADE`;
-  past vanilla's render distance the sway is under a pixel anyway). The LOD's texture coordinates keep the leaf's own
-  place, so the texture moves with it.
+- In `near_vs`; with `wavelod` too in `lod_vs` for full-resolution leaves, fading out from 80 to 160 blocks
+  (`METALMC_WAVELODFADE`). Past vanilla's render distance, where the LOD's level 0 starts at the usual settings, the
+  sway is under a pixel, and the test on every LOD vertex cost 0.12-0.16 ms (below), so the LOD's is off unless asked
+  for (a short render distance brings the LOD's level 0 close). The LOD's texture coordinates keep the leaf's own place,
+  so the texture moves with it.
 - The traced shadows' structures don't move; at 0.04 blocks the difference doesn't show (with `wave` and not
   `leaflight` the shadow rays start 0.06 blocks off the surface instead of 0.03, so a leaf swaying into its own block
   doesn't shadow itself).
@@ -1593,7 +1596,10 @@ light that falls on them comes out of their other side, green.
   resolve in all its variants) under the full look with `leaflight,wave`, with `leaflight` alone, with `wave` alone
   (no `lit`), and without either; litflow's compile mode passes with `leaflight` too (the far field's march).
 - Without the switches every shader is the same text as before: each change sits in a Swift interpolation that is
-  empty then (the LOD's, the near chunks', the far field's, the shadows' and the relight's sources).
+  empty then. Checked against main (138a237, with water round 2) built from a copy with the same source getter: the
+  anti-aliasing's, lit mode's, the far field's, post's, the GI cache's, colored light's, the LOD's, the near chunks' and
+  the shadows' sources are the same byte for byte under six `METALMC_EXP` sets without `leaflight` and `wave` (none;
+  `lit`; `lit,nearchunks,rtshadows`; the full look; `nearchunks,rtshadows,sky`; `lit,rtshadows,sky,water,hdr`).
 - The forest scene on the LOD alone (the LOD's level 0 stands in for the near chunks, flat material colors, no post;
   1728 x 1117, 16-frame means), `lit,rtshadows,sky,gi` against the same with `leaflight,wave`: leaves 69.5% of the lit
   terrain (debug view 13); terrain luma (the bottom 55%: mean, 10th percentile, saturation) 55.4 / 25 / 15.7 ->
@@ -1629,6 +1635,59 @@ light that falls on them comes out of their other side, green.
   color). Flat ground cover classed as plants (leaf litter) glowed in the open (it isn't a plant any more). At sunset,
   looking into the sun, the forward lobe (then `LEAF_FWD` 0.2, ten times that straight into the sun) and `PLANT_TRANS`
   0.5 turned the foreground's grass into a bright yellow field and the backlit tree bright orange, where SEUS keeps
-  both dark with lit rims: a blade or a leaf passes on 0.15-0.3 of the light on its far side, so 0.03 and 0.25 now.
+  both dark with lit rims: a blade or a leaf passes on 0.15-0.3 of the light on its far side, so `LEAF_FWD` 0.03 and
+  `PLANT_TRANS` 0.25 (session 3), and since grass still read bright, 0.12 for plants with no lobe (session 4).
 - **Waving**: two shots half a second apart differ by 5.6 levels on average over the terrain (the sway); the canopy is
   as crisp with it as without (no smearing in the anti-aliasing; the sway is 0.001-0.003 blocks a frame).
+- After merging main's water round 2 (session 4, the final constants): the forest 60.6 / 27 / 24.4 and mountain_view
+  60.8 / 23 / 9.7, as before the merge; debug view 13 classes the same pixels (leaves 50.4%, plants 0.6%). At sunset,
+  with plants at 0.12 and no lobe, the foreground's grass is a soft golden backlight (session 2's was a glaring yellow
+  field, "off" a flat one); SEUS keeps it darker. sunset_water's terrain numbers now take in the sea's reflections
+  (water's round 2), so they don't compare with the table above.
+
+### Costs (3456 x 2234)
+
+Offline (`tools/leaftest.swift` with `LEAFTEST_TIME=1`, the LOD alone, so the near chunks' part isn't in it; medians of
+60; the shadows' pass with the sun through leaves and with leaves opaque alternating in one process, the rest across
+processes with and without the switches):
+
+| | forest | mountain_view |
+|---|---|---|
+| the shadows' pass, leaves opaque -> through | 0.226 -> 0.549 ms (+0.32) | 0.177 -> 0.509 (+0.33) |
+| the relight's own pass, without -> with `leaflight` | 1.005 -> 1.194 (+0.19) | 0.789 -> 0.926 (+0.14) |
+| the level pass, `leaflight` -> + the LOD's sway (now `wavelod`) | 1.585 -> 1.701 (+0.12) | 3.380 -> 3.542 (+0.16) |
+| the level pass, without -> with `leaflight` (the LOD's class) | 1.581 -> 1.585 | 3.237 -> 3.380 (across processes: noise?) |
+
+In the game (session 1, the forest, the same frames with the foliage term and the leaf walk switched off in the lab's
+shaders, then on; 3 traced frames, so rough): the shadows' pass 0.244 -> 0.682 ms, the anti-aliasing's resolve (with
+the relight) 3.21 -> 3.52, the main pass's vertex stage 1.28 -> 1.36 (the near chunks' class lookup and sway, and the
+LOD's sway). Session 2's traces had other work on the GPU in them (the clears took 5 ms) and aren't used.
+
+So about 0.5 ms in a forest with `leaflight` (the walk 0.3, the relight 0.15-0.2) and about 0.1 more with `wave` (the
+near chunks' lookup and sway), against the brief's 0.15. Where it goes, and what would take it down, is in "Not done".
+
+### Not done, and next
+
+- **Cost.** The walk through leaves is near its minimum per ray (an any-hit query that stops at the first leaf, short
+  closest-hit queries for the canopy, then one query over the rest of the way, the costly one, which the plain ray had
+  too); it costs in proportion to the rays that meet leaves: most of a forest view. Next: trace the walk at a lower
+  rate and keep it (a history of the second channel: the canopy's light changes slowly), or leaves as their own
+  geometry in each tile's structure (a third quad range: then the first query could skip leaves with an intersection
+  function only on them, and leaf rays wouldn't need the second full query). The relight's term (0.15-0.2 ms) is a
+  hundred-odd ALU operations on every leaf pixel inside the anti-aliasing's resolve: the sheen alone is a fifth of it
+  (`LEAF_SHEEN 0` drops it), and the three exp2 of the falloff could share one table.
+- **The near chunks' class lookup** reads a second corner and the class map per vertex; the classes could be written
+  into the records instead (the codec has free bits in both forms: an aligned record's w0 bits 25-31, a generic
+  record's w5-w7), with the map sent before the first sections mesh.
+- **Plants at a low sun.** The traced rays don't see grass (it isn't in the LOD), so grass isn't shaded by the grass
+  around it: at sunset the foreground's tufts are lit where SEUS has them dark with lit rims (the plants' transmission is
+  down to 0.12 for it, with no forward lobe). A plant could take a share of the visibility of the ground it stands on.
+- **Leaves at night**: the moon's light through leaves is left out (the rays go toward the moon then).
+- **Snow and ice** (the brief's third "if you finish early" item): not started. Class 3 of the two bits is free for it.
+- **The sky through leaves** uses the sky light level as a canopy depth; under stone it would count stone as leaves
+  for leaf pixels only (leaves under an overhang get a little sky through it). The GI cache's bounce rays stop at
+  leaves; passing them through like the sun's rays would light the forest floor under canopies, which this doesn't
+  touch.
+- **Water's rays** (reflections, refraction) still stop at leaves; `rtThroughLeaves` (Foliage.swift) is what they would
+  call to see through canopies.
+- In the game with `hdr`, the far field's canopy in a far view, and a long flight with `wave`: not looked at.
