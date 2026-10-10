@@ -289,7 +289,10 @@ func entityPatchFragment(_ src: String, _ kind: EntityPatchKind) -> String? {
             // Rain's texels are blue, snow's white. A rain streak keeps the middle of its texel column (lf[3].y of its width;
             // where a texel is narrower than a pixel, that share of it), gray-white and fainter (lf[3].x), its light
             // reflected (lf[3].z); snow keeps its texture's gray levels. Not over water's texels: the relight takes the
-            // water layer off what's drawn to see the floor, which turned the streaks there olive.
+            // water layer off what's drawn to see the floor, which turned the streaks there olive. Over a pixel without a
+            // texel (the sky) a streak goes into the G-buffer instead of the color, over-composited with any streak there
+            // already, and the frame's light puts it on at the end (litRainOverSky): with the clouds, after their
+            // composite, which would cover it.
             body = """
                     float4 mmcT = Sampler0.sample(Sampler0Smplr, in.texCoord0);
                     float mmcRain = saturate((mmcT.b - mmcT.r - 0.15) * 4.0);
@@ -299,6 +302,15 @@ func entityPatchFragment(_ src: String, _ kind: EntityPatchKind) -> String? {
                     float mmcCover = max(min(mmcF + 0.5 * mmcW, mmcH) - max(mmcF - 0.5 * mmcW, -mmcH), 0.0) / min(mmcW, 1.0);
                     float3 mmcLin = mix(mmcDecode(float3(dot(mmcT.rgb, float3(0.2126, 0.7152, 0.0722)))), mmcLf[3].z * float3(0.95, 0.98, 1.0), mmcRain) * in.mmcE;
                     out.\(colorName) = float4(mmcEncode(mmcLin), mmcT.a * in.mmcColor.a * \(dt).ColorModulator.a * mix(1.0, saturate(mmcCover) * mmcLf[3].x, mmcRain));
+                    if (mmcRain > 0.5 && (mmcPrev.x >> 24) == 0u) {
+                        float mmcA = saturate(out.\(colorName).a), mmcPa = float(mmcPrev.y & 255u) / 255.0;
+                        float3 mmcPr = float3(float(mmcPrev.x & 255u), float((mmcPrev.x >> 8) & 255u), float((mmcPrev.x >> 16) & 255u)) / 255.0;
+                        float mmcNa = mmcA + mmcPa * (1.0 - mmcA);
+                        float3 mmcNr = (saturate(out.\(colorName).rgb) * mmcA + mmcPr * (mmcPa * (1.0 - mmcA))) / max(mmcNa, 1e-4);
+                        uint3 mmcQ = uint3(round(saturate(mmcNr) * 255.0));
+                        out.mmcGbuf = uint2(mmcQ.r | (mmcQ.g << 8) | (mmcQ.b << 16), uint(round(mmcNa * 255.0)));
+                        out.\(colorName).a = 0.0;
+                    }
             """
         }
         return waterBeforeLastReturn(s, """
@@ -395,9 +407,9 @@ final class EntityLight: @unchecked Sendable {
 
 // MARK: - The relight
 
-/// The relight of an entity texel (spliced into litRelightHeader before litRelightPixel with entities on; empty without,
-/// so the relight's text is unchanged then). Called where litRelightPixel finds face code 0.
-let entityRelightHeader: String = !entityLight ? "" : """
+/// The relight of an entity texel (spliced into litRelightHeader before litRelightPixel with entities or rain on; empty
+/// without, so the relight's text is unchanged then). Called where litRelightPixel finds face code 0.
+let entityRelightHeader: String = !(entityLight || rainLook) ? "" : """
 
 // Entities (METALMC_EXP=entities, Entities.swift): an entity's, item's or particle's texel (x bits 27-31: 00001; see
 // there), relit like the terrain: the sun with the traced visibility at the pixel, the sky by the normal (the GI cache's
@@ -407,6 +419,16 @@ let entityRelightHeader: String = !entityLight ? "" : """
 \(postEnabled ? "#ifndef LIT_EMIT\n#define LIT_EMIT 6.0\n#endif\n" : "")constant float3 kLitEntityL0 = float3(0.161690, 0.808452, -0.565916);   // normalize(0.2, 1, -0.7): Lighting's level lights
 constant float3 kLitEntityL1 = float3(-0.161690, 0.808452, 0.565916);
 static bool litIsEntity(uint2 g) { return (g.x >> 27) == 1u; }
+// Rain over a pixel without a texel (the sky; METALMC_EXP=rain): the streaks the weather pass left there instead of in the
+// color (x: their color, sRGB-encoded 8 bits a channel, bits 24-31 clear; y: their alpha, 1-255), composited at the end
+// of the frame's light: here without the clouds, after the clouds' composite with them (it would cover them: rain falls
+// below the clouds).
+static bool litIsRainSky(uint2 g) { return (g.x >> 24) == 0u && g.y != 0u; }
+static float3 litRainOverSky(float3 c, uint2 g) {
+    if (!litIsRainSky(g)) return c;
+    float3 r = float3(float(g.x & 255u), float((g.x >> 8) & 255u), float((g.x >> 16) & 255u)) / 255.0;
+    return mix(c, r, float(g.y & 255u) / 255.0);
+}
 static float3 litEntityNormal(uint2 g) {
     uint o = ((g.x >> 24) & 7u) | ((g.y >> 23) << 3);
     float2 e = float2(float(o & 63u), float((o >> 6) & 63u)) / 62.0 * 2.0 - 1.0;
@@ -417,7 +439,7 @@ static float3 litEntityNormal(uint2 g) {
 static float3 litEntityPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<half, access::read> vis, texture2d<float> lightmap,
                              constant LitFrame& f, constant float4* env\(litGi ? ", texture2d<float> giStandIn, texture2d<uint> gi" : "")\(clEnabled ? ", texture3d<float> clRGB, texture3d<float> clAux, constant ClFrame& clf, texture2d<half> clSh" : "")) {
     uint view = uint(f.misc.z);
-    if (!litIsEntity(g)) return view != 0u ? float3(0.0) : dst;
+    if (!litIsEntity(g)) return view != 0u ? float3(0.0) : \(cloudsEnabled ? "dst" : "litRainOverSky(dst, g)");
     // Something nearer was drawn over it since: its color stays.
     uint dk = (((as_type<uint>(d) >> 5) & 0x7FFFu) - (g.y & 0x7FFFu)) & 0x7FFFu;
     if (dk > 1u && dk != 0x7FFFu) return view != 0u ? float3(0.2, 0.0, 0.2) : dst;\(litGi ? "\n    uint2 giOwn = giUpsampleTexel(gi, q);" : "")

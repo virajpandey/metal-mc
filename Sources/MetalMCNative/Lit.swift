@@ -233,7 +233,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
                               constant LitFrame& f, constant float4* env\(litGiRelightArgs)\(litClRelightArgs)) {
     uint code = g.x >> 29;
     uint view = uint(f.misc.z);
-    if (code == 0u) return \(entityLight ? entityRelightCall : "view != 0u ? float3(0.0) : dst");
+    if (code == 0u) return \(entityLight || rainLook ? entityRelightCall : "view != 0u ? float3(0.0) : dst");
     // Something nearer was drawn over the terrain since (an entity, water, a cloud): its color stays.
     if (!litDepthMatches(d, g.y & 0xFFFFu)) return view != 0u ? float3(0.2, 0.0, 0.2) : dst;\(litGiTexel)
     float3 albedo = float3(float(g.x & 255u), float((g.x >> 8) & 255u), float((g.x >> 16) & 255u)) / 255.0;
@@ -434,7 +434,7 @@ fragment float4 lit_relight_fs(LitVOut in [[stage_in]], float4 dst [[color(0)]],
                                constant float4* env [[buffer(1)]]\(litWater ? ",\n                               texture2d<float> waterSky [[texture(6)]],\n                               texture2d<float> waves [[texture(7)]],\n                               texture2d<float> waterTrace [[texture(11)]],\n                               texture2d<float> wavesDetail [[texture(13)]],\n                               texture2d<uint> waterTraceAS [[texture(14)]],\n                               texture2d<float, access::read> waterColor [[texture(12)]]" : "")\(clEnabled ? ",\n                               texture3d<float> clRGB [[texture(8)]],\n                               texture3d<float> clAux [[texture(9)]],\n                               constant ClFrame& clf [[buffer(2)]],\n                               texture2d<half> clSh [[texture(10)]]" : "")) {
     uint2 q = uint2(in.pos.xy);
     uint2 g = gbuf.read(q).rg;
-    if ((g.x >> 29) == 0u && f.misc.z == 0.0\(litWater ? " && !litIsWater(g)" : "")\(entityLight ? " && !litIsEntity(g)" : "")) return dst;
+    if ((g.x >> 29) == 0u && f.misc.z == 0.0\(litWater ? " && !litIsWater(g)" : "")\(entityLight || rainLook ? " && !litIsEntity(g)" : "")\(rainLook ? " && !litIsRainSky(g)" : "")) return dst;
 \(litWater ? litRelightFsWater : litRelightFsReturn)
 }
 
