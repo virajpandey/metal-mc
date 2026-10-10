@@ -179,15 +179,18 @@ let nearFoliageVertex: String = """
 let foliageRelightHeader = """
 
 // Light through foliage (METALMC_EXP=leaflight, Foliage.swift). Leaves and plants are thin: sunlight that falls on them
-// comes out of their other side too, green, and a canopy glows from inside instead of going black. For a leaf or plant
-// pixel (litFoliageClass), light added to the relight's (per unit of albedo, before the daylight scale and the exposure):
+// comes out of their other side too, in their own color, and a canopy glows from inside instead of going black. For a leaf
+// or plant pixel (litFoliageClass), light added to the relight's (per unit of albedo, before the daylight scale and the
+// exposure):
 // - The sun through the leaves. The traced rays (RtShadows) go on through leaf blocks: the direct beam gets 0.3 a block
 //   through (the relight's sun term, as before) and vis.g = exp(-RT_LEAF_K x the blocks of leaves crossed) toward the sun
-//   (0: something opaque in the way). Light scattered inside leaves falls off more slowly than the direct beam, and green
-//   more slowly than red and blue (a leaf absorbs little green): exp(-LEAF_FALLOFF x blocks), per channel. It comes out of
-//   every face, most out of the faces turned away from the sun (LEAF_FRONT to LEAF_BACK by the face's angle; plants, thin
-//   both ways, PLANT_TRANS), and more toward the camera the nearer it looks into the sun (forward scattering, a
-//   Henyey-Greenstein lobe, LEAF_FWD and LEAF_G).
+//   (0: something opaque in the way). Light scattered inside leaves falls off more slowly than the direct beam, and the
+//   leaf's own color more slowly than the rest (a green leaf absorbs little green, a pale oak's little of any): per
+//   channel exp(-falloff x blocks), the falloff from LEAF_FALLOFF_MIN in the albedo's strongest channel to
+//   LEAF_FALLOFF_MAX in a channel it lacks (by the linear albedo over its largest channel). It comes out of every face,
+//   most out of the faces turned away from the sun (LEAF_FRONT to LEAF_BACK by the face's angle; plants, thin both ways,
+//   PLANT_TRANS), and more toward the camera the nearer it looks into the sun (forward scattering, a Henyey-Greenstein
+//   lobe, LEAF_FWD and LEAF_G).
 // - The sky through the leaves: under cover, at least the open sky's light through the blocks of leaves the sky light
 //   level says are above (vanilla's leaves dim sky light a level a block), with the same falloff (LEAF_SKY): with the GI
 //   cache, whose rays stop at leaves, a canopy's inside would be black.
@@ -207,8 +210,11 @@ let foliageRelightHeader = """
 #ifndef LEAF_G
 #define LEAF_G 0.6
 #endif
-#ifndef LEAF_FALLOFF
-#define LEAF_FALLOFF float3(0.8, 0.32, 1.0)
+#ifndef LEAF_FALLOFF_MIN
+#define LEAF_FALLOFF_MIN 0.3
+#endif
+#ifndef LEAF_FALLOFF_MAX
+#define LEAF_FALLOFF_MAX 1.0
 #endif
 #ifndef LEAF_SKY
 #define LEAF_SKY 0.8
@@ -235,13 +241,19 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
                               constant LitFrame& f, constant float4* env, float sky, float ao, float3 skyAmb, float3 albedo) {
     if (cls == 0u) return float3(0.0);
     float3 add = float3(0.0);
+    // The falloff through leaves per channel, from the leaf's own color (the linear albedo, as its square, over its largest
+    // channel), in log2 units per block.
+    float3 alin = albedo * albedo;
+    float3 tint = alin / max(max(alin.r, max(alin.g, alin.b)), 1e-4);
+    float3 falloff2 = (LEAF_FALLOFF_MAX - (LEAF_FALLOFF_MAX - LEAF_FALLOFF_MIN) * tint) * 1.44269504;
     // The sun (not the moon: at night the rays went toward it, and its light through leaves is too faint to matter).
     float2 v = litFoliageVis(vis, q, f, sky);
     float3 L = f.sunDir.xyz;
     float3 toCam = -rel * rsqrt(max(dot(rel, rel), 1e-8));
     if (f.sunDir.w < 0.5 && v.y > 0.0) {
-        // exp(-LEAF_FALLOFF x blocks), blocks = -log(v.y) / RT_LEAF_K
-        float3 T = pow(float3(v.y), LEAF_FALLOFF * (1.0 / RT_LEAF_K));
+        // exp(-falloff x blocks), blocks = -ln(v.y) / RT_LEAF_K
+        float blocks = log2(max(v.y, 1e-4)) * (-0.69314718 / RT_LEAF_K);
+        float3 T = exp2(-falloff2 * blocks);
         float c = -dot(toCam, L);   // 1: looking into the sun through the leaf
         float g2 = LEAF_G * LEAF_G, x = max(1.0 + g2 - 2.0 * LEAF_G * c, 1e-4);
         float hg = (1.0 - g2) / (x * sqrt(x));   // Henyey-Greenstein x 4 pi: 1 for no lobe
@@ -261,14 +273,14 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
             float G = 0.5 / (nl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(nl * nl * (1.0 - a2) + a2));
             float m = 1.0 - saturate(dot(toCam, H)), m2 = m * m;
             float F = 0.04 + 0.96 * m2 * m2 * m;
-            float lum = max(dot(skyDecode(albedo), float3(0.2126, 0.7152, 0.0722)), 0.02);
+            float lum = max(dot(alin, float3(0.2126, 0.7152, 0.0722)), 0.02);
             add += env[0].rgb * (LEAF_SHEEN * v.x * D * G * F * nl / lum);
         }
     }
     // The sky through the blocks of leaves above, where it gives more than the relight's sky term: under cover only (a
     // face out in the open sees the sky itself, which the sky term has; from a block of cover in, it sees leaves around).
     float cover = max(15.0 - sky, 0.0);
-    float3 skyFol = env[3].rgb * exp(-LEAF_FALLOFF * cover) * (LEAF_SKY * ao * saturate(cover * 0.5));
+    float3 skyFol = env[3].rgb * exp2(-falloff2 * cover) * (LEAF_SKY * ao * saturate(cover * 0.5));
     add += max(skyFol - skyAmb, 0.0);
     return add;
 }
@@ -385,15 +397,19 @@ let foliageRtClassify = """
 /// RtShadows' kernel with leaflight: the ray (the walk through leaves, or the plain shadow ray in a frame without the
 /// G-buffer and the instance table) and both channels written.
 let foliageRtWrite = """
-    // (direct transmittance, blocks of leaves toward the sun; -1: something opaque in the way)
-    float2 tl;
-    if (p.sample.w != 0u) {
-        tl = rtThroughLeaves(accel, tiles, r, cls == 1u && ndl < -0.05);
-    } else {
-        intersector<instancing> isect;
-        isect.accept_any_intersection(true);
-        isect.assume_geometry_type(geometry_type::triangle);
-        tl = isect.intersect(r, accel, 0xFF).type == intersection_type::none ? float2(1.0, 0.0) : float2(0.0, -1.0);
+    // (direct transmittance, blocks of leaves toward the sun; -1: something opaque in the way). First the plain shadow ray
+    // over the whole way, as without leaflight: nothing in the way (most sunlit terrain), the sun; something that isn't a
+    // leaf, none; a leaf, the walk through leaves. A leaf's face turned away from the sun with nothing at all in the way:
+    // its canopy isn't in the structures (the far field's, a tile still building), a crown's RT_LEAF_FAR blocks.
+    float2 tl = float2(0.0, -1.0);
+    intersector<instancing> isect;
+    isect.accept_any_intersection(true);
+    isect.assume_geometry_type(geometry_type::triangle);
+    auto hit = isect.intersect(r, accel, 0xFF);
+    if (hit.type == intersection_type::none) {
+        tl = p.sample.w != 0u && cls == 1u && ndl < -0.05 ? float2(exp(-RT_LEAF_SIGMA * RT_LEAF_FAR), RT_LEAF_FAR) : float2(1.0, 0.0);
+    } else if (p.sample.w != 0u && rtLeaf(rtHitQuad(tiles, hit.instance_id, hit.geometry_id, hit.primitive_id).y & 255u)) {
+        tl = rtThroughLeaves(accel, tiles, r, false);
     }
     // Far away, where the haze takes over, toward the open sky's (1, 1), as shadeOf fades the visibility.
     float s = p.shade.x * (1.0 - smoothstep(p.shade.y, p.shade.z, length(pos)));

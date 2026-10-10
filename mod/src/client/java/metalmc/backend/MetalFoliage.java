@@ -49,9 +49,11 @@ public final class MetalFoliage {
     /** Crops by their stage textures' prefixes. */
     private static final String[] CROPS = {"wheat_stage", "carrots_stage", "potatoes_stage", "beetroots_stage",
         "torchflower_crop_stage", "pitcher_crop_bottom_stage"};
-    /** Flat plants on the ground and thin columns: lit as plants, they don't sway. */
-    private static final Set<String> STILL = Set.of("pink_petals", "pink_petals_stem", "wildflowers", "wildflowers_stem",
-        "leaf_litter", "lily_pad", "sugar_cane", "big_dripleaf_top", "big_dripleaf_stem", "small_dripleaf_top",
+    /**
+     * Thin columns: lit as plants, they don't sway. (Flat cover on the ground, petals, leaf litter, lily pads, isn't a
+     * plant at all: light through it lands on the ground under it.)
+     */
+    private static final Set<String> STILL = Set.of("sugar_cane", "big_dripleaf_stem", "small_dripleaf_top",
         "small_dripleaf_side", "small_dripleaf_stem_top", "small_dripleaf_stem_bottom");
     /** Plants that hang (their bottom sways). */
     private static final Set<String> HANGING = Set.of("pale_hanging_moss", "pale_hanging_moss_tip", "hanging_roots");
@@ -109,23 +111,26 @@ public final class MetalFoliage {
         if (!(tex instanceof TextureAtlas atlas)) return;
         var acc = (metalmc.light.mixin.TextureAtlasAccessor) atlas;
         Map<Identifier, TextureAtlasSprite> sprites = acc.metalmc$texturesByName();
+        int w = acc.metalmc$width(), h = acc.metalmc$height();
         int[] rects = new int[5 * sprites.size()];
         int n = 0;
         for (var e : sprites.entrySet()) {
             int code = code(e.getKey().getPath());
             if (code == 0) continue;
             TextureAtlasSprite s = e.getValue();
-            rects[5 * n] = s.getX();
-            rects[5 * n + 1] = s.getY();
-            rects[5 * n + 2] = s.contents().width();
-            rects[5 * n + 3] = s.contents().height();
+            // The texture's own rectangle, from its UVs: getX() and getY() are its slot's corner, which a padding (16
+            // pixels in 26.3's atlas) separates from where the texture is drawn.
+            rects[5 * n] = Math.round(s.getU0() * w);
+            rects[5 * n + 1] = Math.round(s.getV0() * h);
+            rects[5 * n + 2] = Math.round((s.getU1() - s.getU0()) * w);
+            rects[5 * n + 3] = Math.round((s.getV1() - s.getV0()) * h);
             rects[5 * n + 4] = code;
             n++;
         }
         long addr = MemoryUtil.nmemAlloc(4L * Math.max(1, 5 * n));
         try {
             for (int i = 0; i < 5 * n; i++) MemoryUtil.memPutInt(addr + 4L * i, rects[i]);
-            Native.SET_SPRITES.invokeExact(mv.handle, acc.metalmc$width(), acc.metalmc$height(), addr, n);
+            Native.SET_SPRITES.invokeExact(mv.handle, w, h, addr, n);
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {

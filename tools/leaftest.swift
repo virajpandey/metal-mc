@@ -369,6 +369,31 @@ for s in scenes {
             print(String(format: "      %@ at 3456 x 2234: the shadows' pass with the sun through leaves %.3f ms (fastest %.3f), leaves opaque %.3f (fastest %.3f): +%.3f",
                          s.name, out[0], out[2], out[1], out[3], out[0] - out[1]))
         }
+        // The level pass alone (the LOD and the far field with the G-buffer), each in a submit of its own: median and
+        // fastest GPU ms (with wave, the LOD's sway is in it).
+        let gpuTimes = fn("mmc_gpu_times_take", (@convention(c) (UnsafeMutablePointer<Double>, Int32) -> Int32).self)
+        var tbuf = [Double](repeating: 0, count: 256)
+        _ = gpuTimes(&tbuf, 256)
+        var levelTimes: [Double] = []
+        for _ in 0..<60 {
+            var h = big.color
+            var clear: [Float] = [0.62, 0.75, 0.95, 1]
+            litLevelPass()
+            _ = passBegin(&h, 1, 1, &clear, big.depth, 1, 0, 0, 0, big.w, big.h)
+            var p = mats + [0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, 0, 1]
+            _ = lodDraw(&p, &c)
+            passEnd()
+            submit(submitIndex)
+            _ = waitSubmit(submitIndex, 10_000_000_000)
+            submitIndex += 1
+            let k = gpuTimes(&tbuf, 256)
+            if k > 0 { levelTimes.append(tbuf[Int(k) - 1] * 1000) }
+        }
+        levelTimes.sort()
+        if !levelTimes.isEmpty {
+            print(String(format: "      %@ at 3456 x 2234: the level pass %.3f ms (fastest %.3f) [%@%@]", s.name, levelTimes[levelTimes.count / 2],
+                         levelTimes[0], tag, expSet.contains("wave") ? ", wave" : ""))
+        }
         // The relight's own pass on this frame's G-buffer (median, fastest).
         frame(big, sun: sun)
         var lp = mats + [sun, 0.62, 0.75, 0.95, 0, 1e9, 2e9, 1e9, 2e9, sky ? 1 : 0]
