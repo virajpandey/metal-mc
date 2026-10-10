@@ -175,10 +175,11 @@ let litRelightHeader = """
 // GI cache's sky and bounced light, or the open sky's: what fills the shade) and on block light; the sky term's tint
 // (LIT_SHADE_WARM > 0 warmer, < 0 bluer, at the same luminance); block light's warmth (the same way), saturation (1: as
 // the lightmap or the colored light volume gives it) and falloff (block light times (level / 15)^LIT_BLOCK_FALLOFF: 0 as
-// before, more for pools of light around the sources). 1, 0 and 1: the light as before.
-#define LIT_SUN_GAIN 1.0
-#define LIT_SKY_GAIN 1.0
-#define LIT_SHADE_WARM 0.0
+// before, more for pools of light around the sources). Tuned against the SEUS twins with post (its tone curve and
+// exposure take the brighter light); without post 1, 0, 1 and 0: lit mode's light as before.
+#define LIT_SUN_GAIN \(postEnabled ? "1.4" : "1.0")
+#define LIT_SKY_GAIN \(postEnabled ? "2.0" : "1.0")
+#define LIT_SHADE_WARM \(postEnabled ? "(-0.15)" : "0.0")
 #define LIT_BLOCK_GAIN 1.0
 #define LIT_BLOCK_WARM 0.0
 #define LIT_BLOCK_SAT 1.0

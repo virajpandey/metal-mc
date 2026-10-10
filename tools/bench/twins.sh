@@ -8,7 +8,7 @@
 #   TWINS_NOGAME=1 bash tools/bench/twins.sh census2      score the shots already there again (a new scorer, new twins)
 # Env: TWINS_OUT (<main checkout>/bench_out/twins/<label>), TWINS_SEUS (~/Projects/metal-mc-private/twins/census1),
 #      TWINS_PREFIX (seus1), TWINS_SCENES (all nine, in scenes.json's order), TWINS_SETTLE (ticks after each scene, 300),
-#      TWINS_NOGAME, LAB_MINUTES (20), and lab.sh's
+#      TWINS_TRACE=1 (per-pass GPU times at the last scene into passes.txt), TWINS_NOGAME, LAB_MINUTES (20), and lab.sh's
 #      (LAB_FAR, LAB_FIXTURE, ...). Boards hold SEUS's pixels: TWINS_OUT stays out of the repository (bench_out is).
 LABEL=${1:?usage: twins.sh <label> [LAB_EXP]}
 EXP=${2:-${LAB_EXP:-lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post}}
@@ -43,6 +43,8 @@ if [ -z "$TWINS_NOGAME" ]; then
       echo "shot twins-$LABEL-$s"
       echo "mask twins-$LABEL-$s"
     done
+    # TWINS_TRACE=1: per-pass GPU times of 5 frames at the last scene (tools/bench/passes.py on the game log).
+    if [ -n "$TWINS_TRACE" ]; then echo "trace 5"; echo "wait 40"; fi
     echo "quit"
   } > "$SCRIPT"
   echo "== $(date '+%T') twins $LABEL: a lab session with $EXP"
@@ -54,6 +56,7 @@ if [ -z "$TWINS_NOGAME" ]; then
   cp "bench_out/run_twins-$LABEL.log" "$OUT/game.log" 2>/dev/null
   # Commands that failed, and scenes that didn't settle.
   grep -h '\[metalmc-lab\]' "bench_out/run_twins-$LABEL.log" | grep -E ' -> error|not settled' | tail -20
+  if [ -n "$TWINS_TRACE" ]; then python3 tools/bench/passes.py "bench_out/run_twins-$LABEL.log" > "$OUT/passes.txt" 2>&1; fi
 fi
 
 echo "== $(date '+%T') scoring against $SEUS/$PREFIX-*.png"

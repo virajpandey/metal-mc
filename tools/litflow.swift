@@ -176,7 +176,7 @@ if mode == "compile" {
                 _ = try device.makeComputePipelineState(function: l.makeFunction(name: k)!)
             }
             // The local tone map's kernels (a library from before them has none).
-            for k in ["post_local_stats", "post_local_box"] {
+            for k in ["post_local_stats", "post_local_box", "post_outdoor"] {
                 if let fn = l.makeFunction(name: k) { _ = try device.makeComputePipelineState(function: fn) }
             }
             for format in [MTLPixelFormat.rg11b10Float, .rgba16Float] {

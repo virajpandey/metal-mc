@@ -114,7 +114,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // contrast, which crushed dark scenes).
 #define POST_AGX_EXPOSURE 1.0
 #define POST_AGX_POWER 1.0
-#define POST_AGX_SAT 1.3
+#define POST_AGX_SAT 1.15
 #define POST_ACES_EXPOSURE 1.6
 #define POST_GT_EXPOSURE 1.0
 // HDR output: above this luminance (exposed) the highlights are carried on toward the headroom, over this span.
@@ -129,14 +129,18 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // + 1 grid texels (16 pixels each) wide, and POST_LOCAL_EPS (stops squared) sets how strong an edge has to be for the
 // base to follow it rather than smooth over it (the skyline does; the leaves' and the blocks' texture doesn't).
 #define POST_LOCAL 0.0
-#define POST_LOCAL_DARK 0.0
+#define POST_LOCAL_DARK 0.38
 #define POST_LOCAL_RANGE 4.0
 #define POST_LOCAL_RADIUS 5
 #define POST_LOCAL_EPS 0.5
-// How much of the day's lift (POST_EV and POST_LOCAL_DARK) stays with the sun at the horizon and below it: all of it from
-// the sun 30 degrees up, this share at 4 degrees and under. Dusk keeps its backlit mood (the sky's own adaptation already
-// opens it up as the sun sets); night and caves have the adaptation's own knobs.
-#define POST_DUSK 1.0
+// The grade's exposure lift, stops (the tuned look; POST_EV stays the user's compensation, METALMC_POSTEV). It and
+// POST_LOCAL_DARK are the day's lift: all of it with the sun 30 degrees up and outdoors; POST_DUSK of it with the sun 4
+// degrees up or lower (dusk keeps its backlit mood: the sky's own adaptation already opens it up as the sun sets), and
+// POST_CAVE of it where the view is under cover (the share of sky and of sky light in a 64 x 64 grid of the G-buffer, 0.2
+// to 0.6): night and caves have the eye adaptation's own knobs and keep their pools of light.
+#define POST_GRADE_EV 0.75
+#define POST_DUSK 0.25
+#define POST_CAVE 1.0
 
 // The Purkinje shift (night vision): in dim light the rods take over, which see no color and favor blue-green, so a
 // moonlit field turns blue-gray while a torch's pool keeps its warmth. Per pixel, by its own light before the exposure
@@ -342,6 +346,7 @@ kernel void post_exposure(device atomic_uint* hist [[buffer(0)]], device float4*
         wsum += w;
     }
     float metered = wsum > 0.0 ? sum / wsum : POST_ADAPT_REF;
+    float outdoor = expo[1].w;   // post_outdoor's, kept
     float d = POST_ADAPT_REF - metered;   // > 0: darker than the reference
     // Darker: little within POST_ADAPT_KNEE stops of the reference (daylight's own swings, which the sky's adaptation to
     // the sun's height already covers: dusk, shade, a forest), more past it (night, caves, interiors).
@@ -355,7 +360,36 @@ kernel void post_exposure(device atomic_uint* hist [[buffer(0)]], device float4*
         ev = e.x + (target - e.x) * (1.0 - exp(-f.adapt.x / tau));
     }
     expo[0] = float4(ev, target, metered, 1.0);
-    expo[1] = float4(total, lo, hi, 0.0);
+    expo[1] = float4(total, lo, hi, outdoor);
+}
+
+// How much of the view is outdoors, for the day's lift (POST_CAVE): over a 64 x 64 grid of the frame, the sky (depth 0)
+// counts 1 and lit terrain its sky light level / 15; followed over time with a time constant of 0.5 s (snapped with the
+// exposure). One threadgroup of 256 threads; expo[1].w.
+kernel void post_outdoor(texture2d<uint, access::read> gbuf [[texture(0)]], depth2d<float, access::read> depth [[texture(1)]],
+                         device float4* expo [[buffer(0)]], constant PostFrame& f [[buffer(1)]],
+                         uint li [[thread_index_in_threadgroup]]) {
+    threadgroup float2 acc[256];
+    float2 sn = 0.0;
+    float2 size = float2(depth.get_width(), depth.get_height());
+    bool lit = gbuf.get_width() > 1u;
+    for (uint k = li; k < 4096u; k += 256u) {
+        uint2 q = uint2((float2(k % 64u, k / 64u) + 0.5) / 64.0 * size);
+        if (depth.read(q) <= 0.0) { sn += float2(1.0); continue; }
+        uint2 g = lit ? gbuf.read(q).rg : uint2(0u);
+        if ((g.x >> 29) != 0u) sn += float2(saturate(float((g.y >> 16) & 255u) / 240.0), 1.0);
+    }
+    acc[li] = sn;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (li < s) acc[li] += acc[li + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (li != 0u) return;
+    float o = lit && acc[0].y > 0.0 ? acc[0].x / acc[0].y : 1.0;
+    float prev = expo[1].w;
+    bool keep = f.adapt.y < 0.5 && prev >= 0.0 && prev <= 1.0 && expo[0].w > 0.5;
+    expo[1].w = keep ? prev + (o - prev) * (1.0 - exp(-f.adapt.x / 0.5)) : o;
 }
 
 // ---------------------------------------------------------------------------------------------------- local tone map
@@ -571,9 +605,10 @@ kernel void post_composite(texture2d<float, access::read> scene [[texture(0)]], 
     float3 b = f.effects.x > 0.5 ? bloom.sample(s, uv, level(0.0)).rgb : c;
     float3 sh = f.effects.y > 0.5 ? shafts.sample(s, uv, level(0.0)).rgb : float3(0.0);
     c = max(mix(c, b, POST_BLOOM) + sh, 0.0);
-    // The day's lift: all of it from the sun 30 degrees up, POST_DUSK of it from 4 degrees down.
-    float lift = mix(POST_DUSK, 1.0, smoothstep(0.07, 0.5, f.sun.y));
-    float ev = expo[0].x + POST_EV * lift;
+    // The day's lift: all of it with the sun 30 degrees up and outdoors, POST_DUSK of it from 4 degrees down, POST_CAVE
+    // of it under cover (post_outdoor's estimate).
+    float lift = mix(POST_DUSK, 1.0, smoothstep(0.07, 0.5, f.sun.y)) * mix(POST_CAVE, 1.0, smoothstep(0.2, 0.6, expo[1].w));
+    float ev = expo[0].x + POST_EV + POST_GRADE_EV * lift;
     // Night vision, by the pixel's own light (before the exposure).
     if (POST_PURKINJE > 0.0) c = postPurkinje(c, lum);
     // The local tone map: the pixel's own light against the edge-aware base (the frame's light before the bloom, as the
@@ -673,6 +708,7 @@ final class Post: @unchecked Sendable {
     private var compositePipe: MTLComputePipelineState?
     private var localStatsPipe: MTLComputePipelineState?
     private var localBoxPipe: MTLComputePipelineState?
+    private var outdoorPipe: MTLComputePipelineState?
     private var copyPipes: [String: MTLRenderPipelineState] = [:]   // by the pass's color, depth and stencil formats
 
     /// The bloom's levels: down[0] is half the frame's resolution, each next half the one before; up[i] holds levels
@@ -732,6 +768,7 @@ final class Post: @unchecked Sendable {
             compositePipe = try pipe("post_composite")
             localStatsPipe = try pipe("post_local_stats")
             localBoxPipe = try pipe("post_local_box")
+            outdoorPipe = try pipe("post_outdoor")
             library = lib
         } catch {
             log("post: shaders failed: \(error)")
@@ -916,6 +953,16 @@ final class Post: @unchecked Sendable {
             enc.setBuffer(exposure, offset: 0, index: 1)
             enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 2)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            // How much of the view is outdoors (the day's lift fades under cover), after the exposure: it keeps its value
+            // beside the exposure's state.
+            if let outdoorPipe {
+                enc.setComputePipelineState(outdoorPipe)
+                enc.setTexture(f.effects.z > 0.5 ? Lit.shared.gbuffer : dummyGbuf, index: 0)
+                enc.setTexture(depth, index: 1)
+                enc.setBuffer(exposure, offset: 0, index: 0)
+                enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 1)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
             enc.endEncoding()
             // The local tone map's base (the offline timing counts it with the exposure): the statistics of the bloom's
             // second level on the grid, the guided filter's coefficients, their mean.
@@ -1029,8 +1076,8 @@ final class Post: @unchecked Sendable {
         frames += 1
         if frames % 1200 == 1, let e = exposure {
             let v = e.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2)
-            log(String(format: "post: %d frames; exposure %+.2f stops (target %+.2f, metered log2 light %.2f), from %@, tone curve %@%@",
-                       frames, v[0].x, v[0].y, v[0].z, input === color ? "the frame" : "the anti-aliasing's history",
+            log(String(format: "post: %d frames; exposure %+.2f stops (target %+.2f, metered log2 light %.2f), outdoors %.2f, from %@, tone curve %@%@",
+                       frames, v[0].x, v[0].y, v[0].z, v[1].w, input === color ? "the frame" : "the anti-aliasing's history",
                        postToneCurves[toneCurve], headroom > 1 ? String(format: ", headroom %.2f", headroom) : ""))
         }
         return true

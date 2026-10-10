@@ -52,7 +52,9 @@ FULL_LOOK = "lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post"
 # name: (file, default, low, high, step, log-scale step). The defaults are the built-in sources'.
 KNOBS = {
     "POST_EV": ("post.metal", 0.0, -1.5, 2.5, 0.3, False),
+    "POST_GRADE_EV": ("post.metal", 0.0, -1.5, 2.5, 0.3, False),
     "POST_DUSK": ("post.metal", 1.0, 0.0, 1.0, 0.25, False),
+    "POST_CAVE": ("post.metal", 1.0, 0.0, 1.0, 0.25, False),
     "POST_ADAPT_REF": ("post.metal", -1.9, -3.5, -0.5, 0.35, False),
     "POST_ADAPT_DARK_NEAR": ("post.metal", 0.2, 0.0, 0.7, 0.1, False),
     "POST_ADAPT_DARK": ("post.metal", 0.7, 0.1, 1.0, 0.15, False),
@@ -69,9 +71,10 @@ KNOBS = {
     "LIT_BLOCK_SAT": ("lit_relight_header.metal", 1.0, 0.5, 3.0, 0.25, True),
     "LIT_BLOCK_FALLOFF": ("lit_relight_header.metal", 0.0, 0.0, 6.0, 0.8, False),
 }
-# The day's knobs. The exposure is POST_EV (stops, on top of the eye adaptation), not POST_ADAPT_REF: within the
-# adaptation's knee a change of the reference moves the exposure by only 20-30% of it (lab, 2026-10-10).
-DAY_KNOBS = ["POST_EV", "POST_LOCAL", "POST_LOCAL_DARK", "POST_AGX_SAT", "LIT_SKY_GAIN", "LIT_SUN_GAIN"]
+# The day's knobs. The exposure is POST_GRADE_EV (stops, on top of the eye adaptation, fading at dusk and under
+# cover), not POST_ADAPT_REF: within the adaptation's knee a change of the reference moves the exposure by only 20-30% of
+# it (lab, 2026-10-10). (The first sessions tuned POST_EV, which then faded the same way.)
+DAY_KNOBS = ["POST_GRADE_EV", "POST_LOCAL_DARK", "POST_DUSK", "POST_AGX_SAT", "LIT_SKY_GAIN", "LIT_SUN_GAIN", "LIT_SHADE_WARM"]
 NIGHT_KNOBS = ["POST_ADAPT_DARK", "LIT_BLOCK_GAIN", "LIT_BLOCK_FALLOFF", "LIT_BLOCK_WARM", "LIT_BLOCK_SAT"]
 DAY_SCENES = ["noon_overview", "forest", "sunset_water", "water_closeup", "mountain_view"]
 NIGHT_SCENES = ["night_torches", "torch_cave", "mineshaft"]
@@ -461,6 +464,10 @@ def compare(args, log):
             futs.append(pool.submit(subprocess.run, [TWINDIFF, dst, twin, mask, "--name", f"{scene} {name}", "--json",
                                                      dst[:-4] + ".json", "--board", os.path.join(log.dir, f"board-{name}-{scene}.jpg"),
                                                      "--quiet"], check=True))
+    if args.trace:
+        # Per-pass GPU times of 5 frames at the last scene with the last settings (tools/bench/passes.py on the game log).
+        sess.run("trace 5", "wait 40", timeout=120)
+        log("traced 5 frames at " + args.scenes[-1] + " (tools/bench/passes.py on the session's game log)")
     for f in futs:
         f.result()
     for name, _ in configs:
@@ -487,11 +494,14 @@ def main():
     ap.add_argument("--start")
     ap.add_argument("--minutes", type=float, default=38)
     ap.add_argument("--settle", type=int, default=300, help="ticks to wait after each scene move (default 300)")
+    ap.add_argument("--lab-minutes", type=int, help="the lab session's limit (default --minutes + 6)")
     ap.add_argument("--passes", type=int, default=50)
     ap.add_argument("--exp", default=FULL_LOOK)
     ap.add_argument("--out")
     ap.add_argument("--attach", action="store_true", help="drive a lab session that's already running")
     ap.add_argument("--compare", nargs="+")
+    ap.add_argument("--trace", action="store_true", help="compare: trace 5 frames' passes at the end")
+    ap.add_argument("--no-quit", action="store_true", help="leave the session running at the end")
     ap.add_argument("--apply")
     a = ap.parse_args()
     if a.apply:
@@ -510,7 +520,7 @@ def main():
     build_twindiff()
     proc = None
     if not a.attach:
-        proc = start_session(a.label, a.exp, int(a.minutes) + 6, log)
+        proc = start_session(a.label, a.exp, a.lab_minutes or int(a.minutes) + 6, log)
     wait_shader_files()
     try:
         if a.compare:
@@ -518,7 +528,7 @@ def main():
         else:
             tune(a, log)
     finally:
-        if proc:
+        if proc and not a.no_quit:
             try:
                 Session(log).run("quit", timeout=60)
             except Exception:  # noqa: BLE001

@@ -1326,3 +1326,111 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - Not seen in game with the final defaults: noon_overview (the first scene of session 3 caught the LOD still loading);
   sessions 1 and 2 put noon within 2% of before with each meter, and the defaults sit between them.
 - With the external pipeline (`METALMC_EXTPIPE`): not tried together.
+
+## The grade (2026-10-10, with `post`)
+
+SEUS PTGI runs inside our engine through the external pipeline, with our camera and our geometry, so every pixel of our
+frame has a twin in its frame. The grade makes "does it look like SEUS" a number and pushes it down with knobs that cost
+nothing a frame: the light's balance in the relight, a local tone map, the exposure and the curve's saturation. SEUS is
+the direction, not a pixel target: its water, its clouds and its leaves are other helpers' work, and night and caves are
+ours to style.
+
+### The class mask and the score
+
+- **The mask** (lab command `mask LABEL`, `Sources/MetalMCNative/LabMask.swift`; classes and colors in
+  docs/lab-mode.md): every pixel of our frame classified from lit mode's G-buffer, the depth and the traced sun
+  visibility of 16 frames: sky, water, vegetation, sunlit, shade, blocklit, far (past 512 blocks), unlit. Vegetation is
+  an albedo-hue rule (green albedo, and faces that aren't axis-aligned) until the G-buffer flags foliage; vanilla's near
+  water is a surface at a source block's height (8/9) where no lit terrain shows.
+- **The score** (`tools/twindiff.swift`): both frames at half resolution (2 x 2 boxes in linear light; a box whose mask
+  pixels don't mostly agree is left out), in OKLab. Per class: the share; mean L, a, b and chroma C; L at the 10th, 50th
+  and 90th percentiles; local contrast LC = mean |L - blur(L)| (box radius 2, twice). Then
+
+      dE = sqrt(dL^2 + da^2 + db^2 + dC^2)      the class means' distance (chroma as a 4th axis: a class of mixed hues
+                                                averages a and b toward gray, so they alone miss a saturation gap)
+      P  = (|dL10| + |dL50| + |dL90|) / 3       the shape of the lightness distribution
+      K  = |dLC|                                local contrast
+      score = 100 x sum over classes of weight x share x (dE + 0.5 P + 2 K)
+
+  with weights 1, but sky, water and unlit 0.25 in the tuning (SEUS's clouds are volumetric and ours aren't yet; the
+  water helper is rebuilding water; unlit is entities). For scale: OKLab L 0.01 is about one step of a 100-step gray
+  ramp; a scene at 20 points is about a fifth of an L unit off on average. Night and caves score against a target of our
+  own (`tools/bench/twinsum.py`): terrain luma 35-45 (ffmpeg's YAVG of the bottom 55%, as the census measures it; SEUS is
+  near black at 29-33), half a point per level outside the band; torchlight as warm as SEUS's (the block-lit class's
+  OKLab a, b and chroma against SEUS's, 100 x share x distance); no crushed shadows (100 x share x how far the shade and
+  block-lit classes' 10th percentile of L is under 0.12).
+- **One command**: `bash tools/bench/twins.sh <label> [LAB_EXP]` runs a lab session, shoots the nine scenes with their
+  masks, scores them and writes the boards (ours | SEUS over mask | the lightness difference) and `summary.md` to the
+  main checkout's `bench_out/twins/<label>/`. After each `scene` it waits 300 ticks: `scene` settles the LOD and the
+  terrain, not the GI cache, the shadows' structures and the anti-aliasing, and after the 1.7 km jump to mountain_view
+  a shot scored 22.9 at once, 20.1 after 100 ticks and 19.4 after 400 and 800.
+
+### The knobs
+
+All are `#define`s in the hot-reloaded shader files (docs/lab-mode.md), so a lab session can turn them live.
+
+| Knob | File | What it does |
+|---|---|---|
+| `POST_EV` | post.metal | exposure compensation, stops, on top of the eye adaptation; `METALMC_POSTEV` |
+| `POST_GRADE_EV` | post.metal | the grade's exposure lift, stops (fades with the sun, `POST_DUSK`) |
+| `POST_DUSK` | post.metal | the share of the day's lift (`POST_GRADE_EV`, `POST_LOCAL_DARK`) kept with the sun 4 degrees up or lower; all of it from 30 degrees |
+| `POST_ADAPT_REF`, `POST_ADAPT_DARK_NEAR`, `POST_ADAPT_DARK` | post.metal | the eye adaptation's reference and how much of a darker scene's difference it makes up within 2.5 stops and past them (night and caves) |
+| `POST_LOCAL`, `POST_LOCAL_DARK` | post.metal | the local tone map: how much of the base's distance above mid-gray goes (the sky), and below it (the land in shade, lifted) |
+| `POST_LOCAL_EPS`, `POST_LOCAL_RADIUS`, `POST_LOCAL_RANGE` | post.metal | its guided filter's edge threshold (stops squared), box (grid texels of 16 pixels), and the most stops counted |
+| `POST_AGX_SAT`, `POST_AGX_POWER` | post.metal | AgX's look: saturation and power (contrast) on its sigmoid's output |
+| `POST_PURKINJE`, `_LO`, `_HI` | post.metal | night vision: how far dim pixels go toward the rods' picture, and the light levels it spans |
+| `LIT_SUN_GAIN`, `LIT_SKY_GAIN` | lit_relight_header.metal | the sun's light and the sky term's (the GI cache's sky and bounced light): their ratio is the sun-to-sky balance, the sky gain is what fills the shade |
+| `LIT_SHADE_WARM` | lit_relight_header.metal | the sky term's tint, at the same luminance (> 0 warmer, < 0 bluer) |
+| `LIT_BLOCK_GAIN`, `_WARM`, `_SAT`, `_FALLOFF` | lit_relight_header.metal | block light's gain, warmth, saturation, and falloff (times (level / 15)^falloff: pools of light around the sources) |
+
+The relight's knobs are spliced in with their tuned values only with `post` (lit mode without post keeps its light: its
+8-bit frame has no tone curve to take a brighter sun).
+
+### The local tone map
+
+Post's composite moves each pixel's light by `-k (base - mid-gray)` stops, k = `POST_LOCAL` above mid-gray and
+`POST_LOCAL_DARK` below, at most `POST_LOCAL_RANGE` stops counted, where the base is a large-scale, edge-aware log2
+luminance: a guided filter (He, Sun and Tang) with log luminance as its own guide, on a grid at 1/16 of the resolution
+(216 x 140 at the panel's): `post_local_stats` takes the mean of log2 L and of its square over 4 x 4 texels of the
+bloom's second level (a quarter of the resolution, linear light), `post_local_box` runs the filter's two box means
+(11 x 11 grid texels, 176 pixels), and the composite applies the coefficients, sampled bilinearly, to each pixel's own
+log2 luminance: `base = a log2 L + b`. Where a window holds an edge (the skyline: a variance of a stop or two) a is near
+1 and the base follows the pixel across it, so the sky and the land each get their own exposure with no halo; where it's
+flat (a canopy's texture, under `POST_LOCAL_EPS` = 0.5 stops squared) the base is the window's mean and the detail is
+kept. Its pivot is mid-gray at the frame's exposure.
+
+### Autotune
+
+`tools/bench/autotune.py <label> --knobs ... --scenes ...` drives one lab session: per pass it evaluates the current
+settings (the center) and each knob a step down and up, scene by scene (the camera moves once per scene and pass, then
+300 ticks to converge), rewriting the `#define`s (the relight's header first, then post.metal, whose reload snaps the
+eye adaptation to the new light), waiting for the reload and 40 ticks (6 for post alone), taking a `shot` and scoring
+it in the background against the scene's SEUS twin and its mask (made once per scene: the classes don't depend on the
+knobs). Each knob then moves to the minimum of the parabola through its three points (log-scale for gains), within a
+step, damped by 0.8, all at once; a knob whose probes were both worse has its step shrunk, one whose minimum lies past a
+step has it grown; a center worse than the best so far sends the search back with every step halved. Five scenes and
+15 candidates take about 6.5 minutes a pass (post probes about 1.5 s each, the light's about 5 s). Checked offline on a
+synthetic objective with coupled knobs and noise: from 51 to within 0.7 of its minimum in 4 passes.
+
+Measured noise: the same settings scored 34.46 and 34.47 in two sessions (five day scenes). Exposure, the shadow lift,
+the sun gain and the sky gain all brighten, so along that direction the objective is flat to a point or two, and the
+search wanders along it; the knobs that change the look's balance (the dusk share, the sky's share against the sun's,
+saturation) converge.
+
+### Dusk, caves and night
+
+One exposure lift for every scene overshot the sunset: SEUS keeps its land dark and backlit, and our sky's own
+adaptation (Sky.prepare, up to 3.5 stops as the sun sets) already opens it up, so the first day session's +0.7 stops
+took sunset_water from 4.1 points to 9.4 (land luma 117 against SEUS's 92) and washed its mood out. The day's lift
+(`POST_GRADE_EV` and the local tone map's `POST_LOCAL_DARK`) now fades with the sun, all of it from 30 degrees up and
+`POST_DUSK` of it at 4 degrees and under, and with the view under cover (`POST_CAVE`): `post_outdoor`, one threadgroup
+after the exposure, takes the mean of the sky's share and lit terrain's sky light over a 64 x 64 grid of the G-buffer
+and follows it with a time constant of 0.5 s (snapped with the exposure). The two caves are lit at noon, so without it
+the day's lift would open them up too and flatten their pools of light; with it, night and caves are set by the eye
+adaptation's own knobs (`POST_ADAPT_DARK`) and block light's.
+
+**The Purkinje shift** (`POST_PURKINJE`, off by default): in dim light the rods take over, which see no color and favor
+blue-green. Per pixel, by its own light before the exposure (all rods below 2^-9 in scene units, none above 2^-4.5), the
+composite mixes toward the rods' picture: their luminance from CIE XYZ (Thompson, Shirley and Ferwerda 2002), divided by
+white's so a gray keeps its brightness while reds darken and blue-greens brighten, as a gray tinted toward blue. A
+moonlit field turns blue-gray; a torch's pool, far brighter, keeps its warmth.
