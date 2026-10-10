@@ -207,6 +207,14 @@ final class RtShadows: @unchecked Sendable {
         return frameStructure
     }
 
+    /// The same for water's reflection and refraction rays (Water.swift), with the structure's origin and, with the GI
+    /// cache, its GiTile table (their hits are read and lit like the cache's bounce hits); taken once.
+    private var waterStructure: WaterStructure?
+    func takeWaterStructure() -> WaterStructure? {
+        defer { waterStructure = nil }
+        return waterStructure
+    }
+
     func takeDeferred(width: Int, height: Int) -> (lit: MTLTexture, params: SIMD4<Float>)? {
         defer { deferred = nil }
         guard let d = deferred, d.width == width, d.height == height else { return nil }
@@ -546,6 +554,7 @@ final class RtShadows: @unchecked Sendable {
         enc.dispatchThreads(MTLSize(width: hw, height: hh, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
         frameStructure = (tlas, tlasAccels, SIMD3<Float>(Float(cam.x - origin.x), Float(cam.y - origin.y), Float(cam.z - origin.z)))
+        if litWater { waterStructure = WaterStructure(tlas: tlas, accels: tlasAccels, cam: cam, origin: origin, gi: tlasGi) }
         // Lit mode with the GI cache: its frame, on the same depth, projection, origin and instance structure.
         if litGi && giOn {
             encodeGi(cb: cb, depth: depth, invViewProj: params.invViewProj, cam: cam, sunAngle: sunAngle, cloudHeight: cloudHeight, tlas: tlas,
