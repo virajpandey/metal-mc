@@ -1691,3 +1691,66 @@ near chunks' lookup and sway), against the brief's 0.15. Where it goes, and what
 - **Water's rays** (reflections, refraction) still stop at leaves; `rtThroughLeaves` (Foliage.swift) is what they would
   call to see through canopies.
 - In the game with `hdr`, the far field's canopy in a far view, and a long flight with `wave`: not looked at.
+
+## Entities, particles and rain in our light (prototype, `METALMC_EXP=lit,entities` and `rain`, 2026-10-10)
+
+`Sources/MetalMCNative/Entities.swift` (the patches, the entity texel, the relight's entity path, the forward light),
+splices marked "Entities" in Lit.swift (the relight's face-code-0 line, lit_relight_fs's early out, the light kept at
+each relight), Backend.swift (the pipelines registered in mmc_pipeline_create, the forward light bound in the level's
+main pass) and Water.swift (its four MSL helpers made internal). No Java. Off by default; without the switches every
+shader is the same text as before (each change sits in a Swift interpolation that is empty then). Both need `lit`.
+
+Lit mode relit the terrain only. Mobs, block entities, items and particles kept vanilla's lightmap light, which knows
+nothing of our sun and its traced shadows, our sky, the colored block light or the GI cache: as the world is relit
+(exposure, leaves, water) they drift from it, too flat by day and gray under torches; and vanilla's rain is a
+saturated blue texture at its lightmap's light (census1's rain: bright blue streaks over the overcast).
+
+### Entities into the G-buffer (`entities`)
+
+- **Patched pipelines.** Vanilla's entity pipelines that write depth (`entity_solid`, `entity_solid_offset_forward`,
+  `entity_cutout`, `entity_cutout_cull`, `entity_cutout_z_offset`, `entity_cutout_dissolve`, `armor_cutout_no_cull`,
+  `armor_decal_cutout_no_cull`, `item_cutout`: mobs, block entities such as chests, signs and beds, armor, items in the
+  world) and `opaque_particle` (flames, smoke, dust, splashes) get a variant for the level's main pass whose shaders are
+  patched from SPIRV-Cross's MSL, as water's are (`PipelineBox.installWater`, compiled off the render thread): the vertex
+  shader passes on its raw color, its light coordinates and (an entity's) normal; the fragment shader writes an entity
+  texel into the G-buffer after vanilla's color. The translucent ones (`entity_translucent`, `entity_translucent_cull`,
+  `item_translucent`, `armor_translucent`: players' skins, translucent items, a slime's outer cube) write one where the
+  fragment is mostly opaque (alpha 0.5 or more) and read the old texel back elsewhere (programmable blending).
+- **The entity texel.** Terrain's texels have a face code of 1-7 (x bits 29-31), water's code 0 with bit 28; an
+  entity's has code 0, bit 28 clear and bit 27 set, so every other reader (the shadows' kernel, the GI cache, water's
+  rays, post's meter) sees "not lit terrain" there, as before. x: the albedo (the texture times the vertex color and the
+  color modulator, the hurt overlay mixed in; sRGB 8 bits, blue rounded to even, its low bit 1 for a particle), the
+  normal's low 3 bits at 24, bit 27; y: a 15-bit depth key (bits 5-19 of the depth), sky and block light in whole levels
+  (4 bits each), the normal's other 9 bits. The normal is octahedral about the y axis, 6 bits a coordinate on 0-62 so
+  the axes are exact: a degree off at most. A back face of a two-sided part takes the normal flipped, as vanilla lights
+  it.
+- **The relight** (`litEntityPixel`, where `litRelightPixel` finds face code 0; in lit_relight_header.metal):
+  - the sun times the normal's cosine times the traced visibility at the pixel (the shadows' kernel already casts a ray
+    from every pixel with depth, entities included; entities cast no shadows themselves, they aren't in the structures);
+  - the sky on the normal: the six axis faces' light (lit_env's) weighted by the normal's squared components, or the GI
+    cache's light where it has some for the normal's dominant face (the cache works from depth, so entities' pixels get
+    cells like terrain's);
+  - the moon, as on terrain; block light from the colored light volume at the point (or vanilla's lightmap);
+  - vanilla's fog; and the overlay test as on terrain, with vanilla's light for an entity worked out again: its lightmap
+    at the texel's levels times light.glsl's face light (two fixed lights, 0.4 to 1) on the stored normal. Layers
+    blended over the entity afterwards (an enderman's or spider's eyes, glint, rain, a slime's outer cube) are found by
+    it and kept, as on terrain.
+  - Particles have no normal: they are lit from all sides like plants (the sun at `0.25 + 0.5 x its height`, the sky's
+    light on faces that aren't axis-aligned), and full-bright ones (flames, level 15) glow like the light sources they
+    come from, with post's emitter rule. Entities at level 15 (burning, blazes) stay full bright, as vanilla has them.
+- **Debug views** (`METALMC_LITVIEW`): on entity texels 1 albedo, 2 the normal (particles magenta), 3 light levels,
+  5 the new light, 6 sun visibility, 7 the overlay test, 8 the GI cache, 11-12 colored light.
+
+### Translucent particles and rain (forward)
+
+- Blended over what's behind them, translucent particles (`translucent_particle`: campfire smoke, spells) and the
+  weather can't take a texel of their own. Their shaders take our light at their light levels instead of vanilla's
+  lightmap (`mmcForwardLight`: the sun's and the sky's light the relight used the frame before, lit from all sides,
+  the moon, vanilla's block light from its lightmap), and they leave the G-buffer as it was (they read it back). The
+  relight keeps a copy of lit_env's light each frame (`EntityLight.keep`, a 128-byte blit) and the level's main pass
+  binds it (buffers 12 and 13 in both stages); without our sky's atmosphere they keep vanilla's light.
+- **Rain** (`rain`): vanilla's rain texture is a column of 1-texel streaks across a block-wide quad, blue (0.3, 0.42,
+  0.78); magnified near the camera a streak was 9 pixels wide. Its texels (blue) are drawn gray-white, at
+  `METALMC_RAINALBEDO` (0.6) of the light around them, fainter (`METALMC_RAINALPHA` 0.55 of vanilla's alpha) and thin:
+  only the middle `METALMC_RAINWIDTH` (0.35) of each texel column, its coverage of the pixel kept where a texel is
+  narrower than a pixel. Snow's texels (white) keep their flakes and take the same light.

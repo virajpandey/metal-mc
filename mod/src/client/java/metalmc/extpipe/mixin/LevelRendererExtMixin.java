@@ -76,6 +76,7 @@ abstract class LevelRendererExtMixin {
     @Inject(method = "render", at = @At(value = "INVOKE",
         target = "Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher;prepareFrame(Lnet/minecraft/client/renderer/SubmitNodeStorage;)Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher$PreparedFrame;"))
     private void metalmc$extHand(CallbackInfo ci) {
-        if (MetalExtPipe.ENABLED) ExtHand.submit(gameRenderer, submitNodeStorage);
+        // Also lit mode's hand (metalmc.backend.MetalLit.HAND, METALMC_EXP=lit,entities,hand).
+        if (MetalExtPipe.ENABLED || metalmc.backend.MetalLit.HAND) ExtHand.submit(gameRenderer, submitNodeStorage);
     }
 }

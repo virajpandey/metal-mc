@@ -464,7 +464,8 @@ final class PipelineBox {
     /// ExtPipe hook (ExtPipe.swift, METALMC_EXTPIPE): uniform and vertex input names, for routing this pipeline's draws.
     var ext: ExtPipelineInfo?
     /// Water hook (Water.swift, METALMC_EXP=lit,water): a translucent terrain pipeline's MSL, and the patched functions
-    /// its variant for the level's main pass takes (they write the G-buffer where the texel is water).
+    /// its variant for the level's main pass takes (they write the G-buffer where the texel is water). Entities.swift's
+    /// patched entity, particle and weather pipelines take theirs through the same hook (installWater).
     var waterSource: WaterPipelineSource?
     private var waterFunctions: (vs: MTLFunction, fs: MTLFunction)?
     private var variants: [UInt64: MTLRenderPipelineState] = [:]
@@ -687,6 +688,13 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
                                                       fs: String(cString: fsSrc), fsEntry: String(cString: fsEntry))
                 WaterNear.shared.register(box)
             }
+            // Entities hook (Entities.swift, METALMC_EXP=lit,entities or rain): vanilla's entity, item, particle and weather
+            // pipelines get a variant for the level's main pass that writes their texels into the G-buffer or takes our
+            // light, compiled off the render thread.
+            if let kind = entityPatchKind(pipeName), let fsSrc, let fsEntry {
+                EntityGbuffer.shared.register(box, kind: kind, vs: String(cString: vsSrc), vsEntry: String(cString: vsEntry),
+                                              fs: String(cString: fsSrc), fsEntry: String(cString: fsEntry))
+            }
             return makeHandle(box)
         } catch {
             writeError("\(error)", err, errLen)
@@ -774,16 +782,20 @@ public func mmc_pass_begin(_ colors: UnsafePointer<Int64>, _ count: Int32, _ cle
         let cb = ctx.ensureCB()
         // Lit hook (Lit.swift, METALMC_EXP=lit): the level's main pass (marked by mmc_lit_level_pass) gets the terrain
         // G-buffer as a second color target.
+        var litAttached = false
         if litEnabled && Lit.shared.pendingLevelPass {
             Lit.shared.pendingLevelPass = false
             if count == 1, colors[0] != 0, Lit.shared.attach(d, color: (from(colors[0]) as TextureBox).texture) {
                 ctx.passColorFormats.append(litGbufferFormat)
+                litAttached = true
             }
         }
         profAttach(d, "pass \(w)x\(h) colors=\(count) depth=\(depth != 0) clear=\(clearMask)/\(depthClear)")
         guard let enc = cb.makeRenderCommandEncoder(descriptor: d) else { return 0 }
         ctx.statPasses += 1
         ctx.statPassPixels += w * h
+        // Entities hook (Entities.swift): the light the forward-lit particles and rain take, in the pass that draws them.
+        if litAttached && (entityLight || rainLook) { EntityLight.shared.bind(enc) }
         if let foldedCopy {
             // First, before Minecraft's state is set up below: the whole target, no depth test (the encoder's default).
             enc.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(w), height: Double(h), znear: 0, zfar: 1))

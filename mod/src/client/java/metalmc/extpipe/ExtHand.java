@@ -32,9 +32,12 @@ public final class ExtHand {
         CameraRenderState cam = state.levelRenderState.cameraRenderState;
         PlayerRenderState player = state.levelRenderState.playerRenderState;
         Minecraft mc = Minecraft.getInstance();
+        // Lit mode's hand (metalmc.backend.MetalLit.HAND): the same route, into lit mode's G-buffer, in the overworld.
+        boolean litHand = metalmc.backend.MetalLit.handInLevel(
+            state.levelRenderState.skyRenderState.skybox == net.minecraft.world.level.dimension.DimensionType.Skybox.OVERWORLD);
         if (cam.isPanoramicMode || !player.hasPlayer || !state.optionsRenderState.cameraType.isFirstPerson()
             || cam.entityRenderState.isSleeping || state.guiRenderState.isHudHidden
-            || mc.gameMode == null || mc.gameMode.getPlayerMode() == GameType.SPECTATOR || !MetalExtPipe.handWanted()) {
+            || mc.gameMode == null || mc.gameMode.getPlayerMode() == GameType.SPECTATOR || !(MetalExtPipe.handWanted() || litHand)) {
             return;
         }
         // renderItemInHand's pose: the view rotation undone (the level's model-view applies it again).

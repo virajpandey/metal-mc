@@ -64,15 +64,15 @@ static inline uint2 mmcWaterGbuffer(float4 c, float2 uv, float2 light, float z) 
 """
 
 /// The body of a struct named `name` in SPIRV-Cross's output: the range between its opening brace's line and its closing
-/// `};`.
-private func waterStructRange(_ src: String, _ name: String) -> Range<String.Index>? {
+/// `};`. (These four helpers patch Entities.swift's pipelines too.)
+func waterStructRange(_ src: String, _ name: String) -> Range<String.Index>? {
     guard let start = src.range(of: "struct \(name)\n{\n") ?? src.range(of: "struct \(name)\n{\r\n") else { return nil }
     guard let end = src.range(of: "};", range: start.upperBound..<src.endIndex) else { return nil }
     return start.upperBound..<end.lowerBound
 }
 
 /// The member of a struct body declared with `attr` (e.g. "[[color(0)]]"): its name.
-private func waterMember(_ body: Substring, _ attr: String) -> String? {
+func waterMember(_ body: Substring, _ attr: String) -> String? {
     for line in body.split(separator: "\n") where line.contains(attr) {
         let decl = line.split(separator: "[")[0].trimmingCharacters(in: .whitespaces)
         if let name = decl.split(separator: " ").last { return String(name) }
@@ -81,7 +81,7 @@ private func waterMember(_ body: Substring, _ attr: String) -> String? {
 }
 
 /// The member named `name` of a struct body, if it's there.
-private func waterHasMember(_ body: Substring, _ name: String) -> Bool {
+func waterHasMember(_ body: Substring, _ name: String) -> Bool {
     body.split(separator: "\n").contains { line in
         let decl = line.split(separator: "[")[0].trimmingCharacters(in: .whitespaces)
         return decl.split(separator: " ").last.map(String.init) == name
@@ -89,7 +89,7 @@ private func waterHasMember(_ body: Substring, _ name: String) -> Bool {
 }
 
 /// Inserts `text` before the last `return out;` of the source (SPIRV-Cross's entry point comes last and returns once).
-private func waterBeforeLastReturn(_ src: String, _ text: String) -> String? {
+func waterBeforeLastReturn(_ src: String, _ text: String) -> String? {
     guard let r = src.range(of: "    return out;\n", options: .backwards) else { return nil }
     var s = src
     s.insert(contentsOf: text, at: r.lowerBound)
