@@ -1897,6 +1897,14 @@ against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only 
   on the cloudy side of SEUS's twin), sunset_water golden cumulus over the sun's glare, the cloud shadows patches on the
   terrain; no rings looking down from 1650 m; at 1200 m, inside the layer, the nearest clouds soft and streaky;
   moonlit clouds a warm gray at night.
+- Session 3 (main merged: water round 2, the far plane at 6 x the LOD's reach; `session3/`): the water reflects the
+  clouds (noon_overview's river, water_closeup, sunset_water's gold), and the horizon from 1650 m has no unhazed strip.
+  Noon and sunset_water, 13 frames: sky light and shadow map 0.20 ms, march 0.69, shadows on the visibility 0.08 (water's
+  own rays 0.72 in the same frames).
+- Session 4 (main merged again: leaves; `leaflight,wave` on too; `session4/`): forest's canopy lit through its leaves
+  under broken cumulus, noon_overview's clouds in the river. Forest, 5 frames, camera still: sky light and shadow map
+  0.17 ms, march 1.17, shadows on the visibility 0.13: about 1.75 ms with the composite. Broken cumulus is the march's
+  worst case (rays cross clouds and gaps without turning opaque; a deck stops them early).
 
 ### Not done, and next
 
@@ -1905,6 +1913,10 @@ against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only 
   come through the gaps only.
 - **Inside the layer** the steps are even over the whole stretch (about 2 km looking along the layer), so the nearest
   clouds are soft and streaky: steps growing with the distance from a camera inside the layer.
+- **Leaves under a cloud:** with leaflight the clouds multiply the visibility's r (the direct sun) and pass its g (the
+  leaves toward the sun) through, so the sun through leaves doesn't take their shadow and canopies keep their glow under a
+  cloud. The relight's leaf term needs the clouds' factor itself (a third channel, or `cloudTransmittanceToSun` in
+  `litFoliageLight`); scaling g would tint the light, since g stands for blocks of leaves.
 - **Storms** are a uniform dark deck from below: darker cells, ragged bases and a storm's edge need weather of their own.
 - **Moonlight** on the clouds is a warm gray against the night's blue: the moon's light could take the night's tint.
 - **The coverage knob** is steep (0.3 a few puffs, 0.55 a closed deck): equalizing the base shape's histogram would make
@@ -1912,3 +1924,7 @@ against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only 
 - **Motion** was only checked with teleports: a flight with the clouds on would show any ghosting at silhouettes.
 - **The composite** costs 0.25 ms of the resolve: it could skip pixels whose four texels have no cloud if the cirrus wrote
   a depth too (now only the cumulus do).
+- **Broken cumulus** costs the march up to 1.2 ms (session 4's forest): over the 1.5 ms target with everything. The
+  knobs, untried in game: one light sample (`CLOUD_LIGHT_SAMPLES` 1: about a quarter of a cloudy step's fetches), 32
+  steps for long stretches (48 kept distant small clouds whole: +11%), or each texel every 16th frame
+  (`cloudUpdate`: half the march, slower to settle after a disocclusion).
