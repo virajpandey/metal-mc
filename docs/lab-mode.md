@@ -148,9 +148,10 @@ has a twin in its frame. Three tools make "does it look like SEUS" a number (doc
   better; the formula is in lighting-design.md); the census's luma numbers (ffmpeg's YAVG, YLOW and SATAVG of the bottom
   55% and the top 20%); a board: ours | SEUS over the mask | the lightness difference (red: ours brighter, blue: darker).
   About a second a scene.
-- `tools/bench/twins.sh <label> [LAB_EXP]`: one command for a census. A lab session (the full look by default; a
-  throwaway scene first, as a session's first scene can catch the LOD mid-build), `scene`, `shot` and `mask` for all nine
-  scenes, each scored against `~/Projects/metal-mc-private/twins/census1/seus1-<scene>.png`, the boards and
+- `tools/bench/twins.sh <label> [LAB_EXP]`: one command for a census. A lab session (the Claude edition's switches by
+  default, `...,post,leaflight,wave,clouds`; a throwaway scene first, as a session's first scene can catch the LOD
+  mid-build; 300 ticks after each scene to converge), `scene`, `shot` and `mask` for all nine scenes, each scored
+  against `~/Projects/metal-mc-private/twins/census1/seus1-<scene>.png`, the boards and
   `summary.md` (tools/bench/twinsum.py) in the main checkout's `bench_out/twins/<label>/` (TWINS_OUT). TWINS_NOGAME=1
   scores the shots already there again. Boards hold SEUS's pixels: they stay in bench_out, out of the repository.
 - `tools/bench/autotune.py <label> --knobs ... --scenes ...`: a lab session that searches the look's knobs (the

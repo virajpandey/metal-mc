@@ -47,7 +47,8 @@ LAB_LOG = os.path.join(SHADERS, "shaderlab.log")
 SEUS = os.environ.get("TWINS_SEUS", os.path.expanduser("~/Projects/metal-mc-private/twins/census1"))
 PREFIX = os.environ.get("TWINS_PREFIX", "seus1")
 TWINDIFF = os.path.join(ROOT, "bench_out", "twindiff")
-FULL_LOOK = "lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post"
+# The Claude edition's switches (main, 2026-10-10: water, leaves and clouds merged).
+FULL_LOOK = "lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds"
 
 # name: (file, default, low, high, step, log-scale step). The defaults are the built-in sources' with post (the grade's
 # tuned look, 2026-10-10); the look before it is bench_out/agents/grade/configs/base.json's.
