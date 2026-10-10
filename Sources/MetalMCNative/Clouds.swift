@@ -67,8 +67,10 @@ private let cloudTimeFixed: Double? = Double(cloudEnv["METALMC_CLOUDTIME"] ?? ""
 /// METALMC_CLOUDVIEW: debug views (1 the clouds alone over black, 2 their transmittance, 3 the deep shadow map's cascades
 /// over the screen, 4 cloud shadows only: the relight's visibility from the clouds alone).
 private let cloudViewDefault = Int(cloudEnv["METALMC_CLOUDVIEW"] ?? "") ?? 0
-/// METALMC_CLOUDMOON: the moon's illuminance on the clouds at night (scene units).
-private let cloudMoonIllum = max(0, cloudSetting("METALMC_CLOUDMOON", 0.12))
+/// METALMC_CLOUDMOON: the moon's illuminance on the clouds at night (scene units). 0.05: moonlit cumulus a few times the
+/// night sky's glow (Sky's skyNightLevel, 0.004 at the zenith), faint as on a moonlit night; at 0.12 they were nearly ten
+/// times it, light gray against SEUS's barely visible ones.
+private let cloudMoonIllum = max(0, cloudSetting("METALMC_CLOUDMOON", 0.05))
 
 /// The noise tiles (m): the weather map's, which the base (4096) and detail (512) tiles divide, so the camera's position
 /// and the wind's drift are wrapped modulo it and every lookup stays seamless.
@@ -279,8 +281,10 @@ private let cloudsShaderSource = skyShaderHeader + cloudsShaderHeader + """
 // The height profile: how fast density rises off the flat base (1 / the share of the layer), stratus tops (share of the layer).
 #define CLOUD_BASE_SHARP 14.0
 #define CLOUD_STRATUS_TOP 0.3
-// Extinction (1/m) at density 1, the detail noise's erosion, the single-scattering albedo.
-#define CLOUD_SIGMA 0.07
+// Extinction (1/m) at density 1, the detail noise's erosion, the single-scattering albedo. The coverage's remap leaves
+// densities of about 0.1-0.4 in a cloud, so 0.3 gives a cumulus the optical depth of a real one (30-100 across a km; at
+// 0.07 it was 5-20: the light diffused through everything, and sunsets came out cream all over, without dark bodies).
+#define CLOUD_SIGMA 0.3
 #define CLOUD_EROSION 0.5
 #define CLOUD_ALBEDO 0.98
 
@@ -310,8 +314,10 @@ private let cloudsShaderSource = skyShaderHeader + cloudsShaderHeader + """
 #define CLOUD_MS_B 0.4
 #define CLOUD_MS_C 0.5
 #define CLOUD_MS_DIFFUSE 3.0
-#define CLOUD_MS_FALL 0.12
-#define CLOUD_MS_ABSORB 0.02
+// (0.12 and 0.02 with the thinner clouds: at a low sun the diffusion then lit whole bodies through 10-20 of optical depth
+// toward the sun, golden all over; now a backlit body darkens and its rims stay bright.)
+#define CLOUD_MS_FALL 0.3
+#define CLOUD_MS_ABSORB 0.03
 #define CLOUD_POWDER 0.6
 #define CLOUD_POWDER_DEPTH 4.0
 #define CLOUD_AMBIENT 1.0
@@ -326,8 +332,10 @@ private let cloudsShaderSource = skyShaderHeader + cloudsShaderHeader + """
 #define CIRRUS_ALONG 65536.0
 #define CIRRUS_ACROSS 8192.0
 #define CIRRUS_G 0.6
-// The light's own stretch from each sample up to the deep shadow map's next stored height: samples, the longest (m).
-#define CLOUD_LIGHT_SAMPLES 2
+// The light's own stretch from each sample up to the deep shadow map's next stored height: samples, the longest (m). One
+// (jittered, accumulated): the same pictures as two within the noise (PSNR 38 dB at mountain and sunset, offline), 5-11%
+// off the clouds' frame; 32 steps for long stretches instead of 48 changed far clouds' shapes (27 dB).
+#define CLOUD_LIGHT_SAMPLES 1
 #define CLOUD_LIGHT_STRETCH 600.0
 // The history: each texel is marched every CLOUD_UPDATE frames (4 or 8; the others carry their history over, reprojected;
 // set in Clouds.swift, cloudUpdate, whose dispatch follows it: not to edit here), how far a cloud's depth may differ
@@ -538,12 +546,16 @@ static int cloudsSegments(float3 dir, constant CloudFrame& cf, thread float2& s0
 
 // The light reaching a point of the layer (cf.light: the sun, or the moon at night): its illuminance through Sky's
 // transmittance table at the point's altitude and local light height (the vertical tilts by x / R across the planet),
-// and the terminator (a cloud 1.5 km up sees the sun 1.2 degrees after the ground's sunset).
+// and the terminator (a cloud 1.5 km up sees the sun 1.2 degrees after the ground's sunset). The moon's light (opposite
+// the sun) takes the relight's moon tint (Lit.swift's kLitMoonTint, luminance 1): moonlit clouds were a warm gray against
+// the blue night.
+constant float3 kCloudMoonTint = float3(0.857, 1.006, 1.371);
 static float3 cloudsLightAt(float3 rel, float alt, constant CloudFrame& cf, constant SkyFrame& sky, texture2d<float> trans) {
     float3 L = cf.light.xyz;
     float r = sky.atmo.planet.x + max(alt, 1.0) * 0.001;
     float mu = clamp(L.y + dot(rel.xz, L.xz) * 2.0 * cf.layer.w, -1.0, 1.0);
-    return skyTransmittanceToSpace(trans, sky.atmo, r, mu) * skySunVisible(sky.atmo, r, mu, sky.sunHoriz.z) * cf.light.w;
+    float3 tint = dot(L, cf.sun.xyz) < 0.0 ? kCloudMoonTint : float3(1.0);
+    return skyTransmittanceToSpace(trans, sky.atmo, r, mu) * skySunVisible(sky.atmo, r, mu, sky.sunHoriz.z) * cf.light.w * tint;
 }
 
 // The optical depth toward the light from a point of the layer (h its height in it): the light's own stretch from the point
@@ -620,7 +632,6 @@ static CloudsRay cloudsMarch(float3 dir, int segs, float2 s0, float2 s1, float j
         float dt0 = len / float(n);
         float lod = max(log2(dt0 / 64.0), 0.0), wlod = max(log2(dt0 / 128.0), 0.0);
         bool fine = dt0 < CLOUD_FINE_STEP;
-        float3 sunL = float3(-1.0);
         float t = seg.x + jit * dt0, dt = dt0, skipped = 0.0;
         for (int i = 0; i < n + 16 && t < seg.y; i++) {
             float3 p = dir * t;
@@ -648,7 +659,9 @@ static CloudsRay cloudsMarch(float3 dir, int segs, float2 s0, float2 s1, float j
             float hfr = saturate((alt - cf.layer.x) / thick);
             float3 S = ambSky * mix(CLOUD_AMB_BASE, 1.0, hfr) + ambGround * (1.0 - hfr);
             if (lit) {
-                if (sunL.x < 0.0) sunL = cloudsLightAt(p, alt, cf, sky, trans);
+                // The light at this sample (reddened by the air at its own altitude and local sun height: across 100 km of
+                // a sunset the sun's height changes by most of a degree; it was taken once per stretch).
+                float3 sunL = cloudsLightAt(p, alt, cf, sky, trans);
                 float tauL = cloudsLightDepth(p, hfr, cf, weather, base, detail, shadow, jit);
                 float ms = CLOUD_MS_DIFFUSE / (4.0 * SKY_PI) * exp(-CLOUD_MS_ABSORB * tauL) / (1.0 + CLOUD_MS_FALL * tauL), ka = 1.0, kb = 1.0;
                 for (int o = 0; o < 3; o++) {
@@ -739,8 +752,9 @@ static float4 cloudsCirrus(float3 dir, float tc, constant CloudFrame& cf, consta
 
 // ------------------------------------------------------------------------------------------------------- per frame
 
-// The sky's light for the clouds: out[0] the open sky's mean radiance over the upper hemisphere (512 directions through
-// the sky view table), out[1] the ground's (the atmosphere's ground albedo, lit by the sun and that sky), both scene units.
+// The sky's light for the clouds: out[0] the open sky's radiance over the upper hemisphere weighted by height (512
+// directions through the sky view table), out[1] the ground's (the atmosphere's ground albedo, lit by the sun and that
+// sky), both scene units.
 kernel void clouds_env(device float4* out [[buffer(0)]], constant SkyFrame& f [[buffer(1)]],
                        texture2d<float> trans [[texture(0)]], texture2d<float> skyView [[texture(1)]],
                        uint i [[thread_index_in_threadgroup]]) {
@@ -771,7 +785,11 @@ kernel void clouds_env(device float4* out [[buffer(0)]], constant SkyFrame& f [[
     float3 irr = acc[0][1].rgb * (2.0 * SKY_PI / 512.0);
     float r0 = f.view.y;
     float3 sun = skyTransmittanceToSpace(trans, f.atmo, r0, f.sun.y) * skySunVisible(f.atmo, r0, f.sun.y, f.sunHoriz.z) * f.sun.w;
-    out[0] = float4(mean, 0.0);
+    // The sky's light weighted by height (the radiance of an even sky that gives the same light on a level surface): at a
+    // low sun the even mean took most of its color from the glow around the sun on the horizon, and the clouds' shaded
+    // sides came out warm instead of the zenith's blue. (mean: the even one, kept for reference.)
+    (void)mean;
+    out[0] = float4(irr / SKY_PI, 0.0);
     out[1] = float4(f.atmo.planet.w * (irr + sun * max(f.sun.y, 0.0)) / SKY_PI, 0.0);
 }
 
@@ -1118,19 +1136,20 @@ kernel void clouds_vis(texture2d<half, access::read> vis [[texture(0)]], texture
                        constant CloudFrame& cf [[buffer(0)]], constant float4x4& inv [[buffer(1)]],
                        constant uint4& sp [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-    // r the direct visibility, which the clouds' transmittance multiplies; the other channels as they were (with leaflight,
-    // g: the leaves toward the sun, Foliage.swift).
+    // r the direct visibility, which the clouds' transmittance multiplies; g as it was (with leaflight: the leaves toward
+    // the sun, Foliage.swift); b 1 - the clouds' transmittance, for the relight's light through leaves (with leaflight the
+    // texture has four channels; 0, no clouds, where they weren't worked out).
     half4 v = vis.read(gid);
     uint2 full = uint2(depth.get_width(), depth.get_height());
     uint2 fp = min(gid * sp.x + sp.yz, full - 1u);
     float d = depth.read(fp);
-    if (d <= 0.0 || sp.w == 0u || (v.r <= 0.0h && uint(cf.misc.y) != 4u)) { out.write(v, gid); return; }
+    if (d <= 0.0 || sp.w == 0u || (v.r <= 0.0h && uint(cf.misc.y) != 4u)) { out.write(half4(v.rg, 0.0h, 1.0h), gid); return; }
     float2 uv = (float2(fp) + 0.5) / float2(full);
     float4 h = inv * float4(uv * 2.0 - 1.0, d, 1.0);
     float T = cloudTransmittanceToSun(h.xyz / h.w, cf, shadow);
     // Debug view 4: the clouds' shadows alone.
-    if (uint(cf.misc.y) == 4u) { out.write(half4(half(T), v.gba), gid); return; }
-    out.write(half4(v.r * half(T), v.gba), gid);
+    if (uint(cf.misc.y) == 4u) { out.write(half4(half(T), v.g, half(1.0 - T), 1.0h), gid); return; }
+    out.write(half4(v.r * half(T), v.g, half(1.0 - T), 1.0h), gid);
 }
 
 // Without anti-aliasing: the clouds over the frame as a pass of its own, after the sky's aerial perspective (programmable
@@ -1665,9 +1684,11 @@ final class Clouds: @unchecked Sendable {
         // The shadow map was made toward the clouds' light; the rays toward the moon only match it at night.
         let mapMoon = cf.light != cf.sun
         let matches = mapMoon == towardMoon && shadowMade
-        // The visibility's own format (with leaflight two channels: Foliage.swift's leaves toward the sun in g, kept).
-        if visOut == nil || visOut!.width != vis.width || visOut!.height != vis.height || visOut!.pixelFormat != vis.pixelFormat {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: vis.pixelFormat, width: vis.width, height: vis.height, mipmapped: false)
+        // The visibility's own format; with leaflight four channels: Foliage.swift's leaves toward the sun in g, kept, and the
+        // clouds' shadow in b for the light through leaves (litFoliageCloud).
+        let format: MTLPixelFormat = foliageLight ? .rgba8Unorm : vis.pixelFormat
+        if visOut == nil || visOut!.width != vis.width || visOut!.height != vis.height || visOut!.pixelFormat != format {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: vis.width, height: vis.height, mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
             d.storageMode = .private
             visOut = ctx.device.makeTexture(descriptor: d)
