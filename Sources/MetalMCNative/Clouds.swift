@@ -1266,6 +1266,9 @@ final class Clouds: @unchecked Sendable {
     /// the clouds were (for frameTexture, which the post chain calls after it).
     private var shadowMade = false
     private var madeThisFrame = false
+    /// The reflection map was made this frame and not yet blended into the water's sky map (intoWaterSky takes it once: a
+    /// frame without the clouds, which doesn't reset madeThisFrame, then doesn't blend the last frame's clouds in).
+    private var waterSkyPending = false
     private var prevViewProj = matrix_identity_float4x4
     private var prevCam = SIMD3<Double>(repeating: .nan)
     /// The deep shadow map's cascades as they were made (their centers), and the light they were made for.
@@ -1423,6 +1426,7 @@ final class Clouds: @unchecked Sendable {
         frameReady = nil
         shadowMade = false
         madeThisFrame = false
+        waterSkyPending = false
         let sky = Sky.shared
         guard cloudsEnabled, ctx.pass == nil, sky.ready, ensure(), let env, let shadow, let base = baseNoise, let detail = detailNoise,
               let weather, let trans = sky.transmittance, let apScatter = sky.apScatter, let apTrans = sky.apTrans,
@@ -1575,6 +1579,7 @@ final class Clouds: @unchecked Sendable {
         frameReady = (w, h)
         shadowMade = lit
         madeThisFrame = true
+        waterSkyPending = true
         prevViewProj = viewProj
         prevCam = cam
         prevSize = (w, h)
@@ -1620,8 +1625,9 @@ final class Clouds: @unchecked Sendable {
     /// The water's sky map (Lit.swift, made this frame in `cb`): the clouds' reflection map blended in (sky x a + rgb), so the
     /// water's reflections that escape to the sky show the clouds. Nothing when the clouds didn't run this frame.
     func intoWaterSky(cb: MTLCommandBuffer, sky: MTLTexture) {
-        guard cloudsEnabled, madeThisFrame, reflectionFrames > 0, let reflection, let p = pipes["clouds_water_sky"],
+        guard cloudsEnabled, waterSkyPending, reflectionFrames > 0, let reflection, let p = pipes["clouds_water_sky"],
               let enc = cb.makeComputeCommandEncoder() else { return }
+        waterSkyPending = false
         enc.label = "MetalMC clouds into the water's sky map"
         enc.setComputePipelineState(p)
         enc.setTexture(sky, index: 0)
