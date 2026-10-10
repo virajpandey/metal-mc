@@ -24,6 +24,11 @@ import simd
 /// On with `shadows=true` in config/metalmc.properties (mmc_set_rt_shadows at startup) or METALMC_EXP=rtshadows.
 nonisolated(unsafe) var lodRtShadows = experiments.contains("rtshadows")
 
+/// The tiles' structures carry their quad ranges and the instance structure a table of them (GiTile, zero copy), so a ray
+/// can tell what it hit: for the GI cache's bounce rays (lit,gi), and for the sun's rays through leaves (leaflight,
+/// Foliage.swift).
+let rtHitQuads = litGi || foliageLight
+
 @_cdecl("mmc_set_rt_shadows")
 public func mmc_set_rt_shadows(_ on: Int32) {
     if on != 0 { lodRtShadows = true }
@@ -57,11 +62,11 @@ static float3 relAt(constant ShadowParams& p, uint2 q, float z) {
     float4 h = p.invViewProj * float4(uv * 2.0 - 1.0, z, 1.0);
     return h.xyz / h.w;
 }
-
+\(foliageLight ? foliageRtHeader : "")
 kernel void rt_shadow(instance_acceleration_structure accel [[buffer(0)]],
                       constant ShadowParams& p [[buffer(1)]],
                       depth2d<float, access::read> depth [[texture(0)]],
-                      texture2d<half, access::write> out [[texture(1)]],
+                      texture2d<half, access::write> out [[texture(1)]],\(foliageLight ? "\n                      texture2d<uint, access::read> gbuf [[texture(2)]],\n                      const device RtTile* tiles [[buffer(2)]]," : "")
                       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(p.sizes.z) || gid.y >= uint(p.sizes.w)) return;
     uint2 full = uint2(p.sizes.xy);
@@ -83,25 +88,27 @@ kernel void rt_shadow(instance_acceleration_structure accel [[buffer(0)]],
     if (dot(n, -pos) < 0.0) n = -n;
     float3 an = abs(n);
     n = an.x > an.y && an.x > an.z ? float3(sign(n.x), 0, 0) : (an.y > an.z ? float3(0, sign(n.y), 0) : float3(0, 0, sign(n.z)));
-    // Clearly facing away from the sun: in shadow. Faces edge-on to it (the sides of blocks at noon) get a ray like the
+\(foliageLight ? foliageRtClassify : "")    // Clearly facing away from the sun: in shadow. Faces edge-on to it (the sides of blocks at noon) get a ray like the
     // rest, so they only darken where something is actually in the way; vanilla's face shading already dims them.
     float ndl = dot(n, p.sun.xyz);
-    if (ndl < -0.05) { out.write(half4(shadeOf(p, pos, 0.0)), gid); return; }
+    if (ndl < -0.05\(foliageLight ? " && cls == 0u" : "")) { out.write(half4(shadeOf(p, pos, 0.0)), gid); return; }
     // A ray toward a point on the sun's disk, from just off the surface (farther off with distance: depth precision).
     float3 t1 = normalize(cross(p.sun.xyz, float3(0, 0, 1)));
     float3 t2 = cross(p.sun.xyz, t1);
     if (p.disk.w > 0.5) { out.write(half4(1.0), gid); return; }
     ray r;
-    r.origin = pos + n * (0.03 + length(pos) * 0.0008) + p.camOffset.xyz;
+    r.origin = pos + n * (\(foliageWave && !foliageLight ? "0.06" : "0.03") + length(pos) * 0.0008) + p.camOffset.xyz;
     r.direction = normalize(p.sun.xyz + t1 * p.disk.x + t2 * p.disk.y);
     r.min_distance = 0.0;
     r.max_distance = p.disk.z;
+\(foliageLight ? foliageRtWrite + "\n" : """
     intersector<instancing> isect;
     isect.accept_any_intersection(true);
     isect.assume_geometry_type(geometry_type::triangle);
     auto hit = isect.intersect(r, accel, 0xFF);
     out.write(half4(shadeOf(p, pos, hit.type == intersection_type::none ? 1.0 : 0.0)), gid);
-}
+
+""")}
 
 struct ApplyOut { float4 pos [[position]]; };
 vertex ApplyOut rt_shadow_vs(uint vid [[vertex_id]]) {
@@ -118,6 +125,9 @@ fragment half4 rt_shadow_fs(ApplyOut in [[stage_in]], constant uint& scale [[buf
     return half4(half3(lit.read(hc).r), 1.0h);
 }
 """
+
+/// The kernel's source, for an offline compile check (mmc_debug_foliage_shader_source).
+func rtShadowSourceForCheck() -> String { rtShadowSource }
 
 private struct ShadowParams {
     var invViewProj: simd_float4x4
@@ -221,6 +231,20 @@ final class RtShadows: @unchecked Sendable {
         return (v.texture, v.scale, v.moon)
     }
 
+    /// Leaflight (Foliage.swift), offline A/B: false treats leaves as opaque again (mmc_debug_foliage_rays).
+    var leafRays = true
+    /// Leaflight: what the kernel's G-buffer and instance table slots get in a frame without them (it doesn't read them
+    /// then: sample.w 0).
+    private var leafStand: (gbuf: MTLTexture, table: MTLBuffer)?
+    private func leafStandIns() -> (gbuf: MTLTexture, table: MTLBuffer)? {
+        if let leafStand { return leafStand }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg32Uint, width: 1, height: 1, mipmapped: false)
+        d.usage = .shaderRead
+        guard let t = ctx.device.makeTexture(descriptor: d), let b = ctx.device.makeBuffer(length: 16, options: .storageModeShared) else { return nil }
+        leafStand = (t, b)
+        return leafStand
+    }
+
     func dummyLit() -> MTLTexture {
         if let dummy { return dummy }
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: 1, height: 1, mipmapped: false)
@@ -294,9 +318,9 @@ final class RtShadows: @unchecked Sendable {
         ]
         var verts: [Float] = [], idx: [UInt32] = []
         var giRanges: [(first: Int, count: Int)] = []
-        if litGi {
-            // The same quads, one geometry per quad range of the node's buffer: the GI cache's bounce rays find the quad
-            // they hit from the geometry and primitive index (zero copy).
+        if rtHitQuads {
+            // The same quads, one geometry per quad range of the node's buffer: the GI cache's bounce rays (and the sun's
+            // rays through leaves) find the quad they hit from the geometry and primitive index (zero copy).
             (verts, idx, giRanges) = giTileMesh(quads: q, start: n.start, tile: t, level: n.level)
         } else {
             for k in 0..<lodBucketsPerTile where k < 6 || k >= 12 {
@@ -333,7 +357,7 @@ final class RtShadows: @unchecked Sendable {
         g.triangleCount = idx.count / 3
         g.opaque = true
         let d = MTLPrimitiveAccelerationStructureDescriptor()
-        d.geometryDescriptors = litGi ? giGeometries(vb: vb, ib: ib, triangles: idx.count / 3, ranges: giRanges) : [g]
+        d.geometryDescriptors = rtHitQuads ? giGeometries(vb: vb, ib: ib, triangles: idx.count / 3, ranges: giRanges) : [g]
         let sizes = dev.accelerationStructureSizes(descriptor: d)
         guard let accel = dev.makeAccelerationStructure(size: sizes.accelerationStructureSize),
               let scratch = dev.makeBuffer(length: max(sizes.buildScratchBufferSize, 16), options: .storageModePrivate),
@@ -403,7 +427,7 @@ final class RtShadows: @unchecked Sendable {
             for t in 0..<(lodTilesPerSide * lodTilesPerSide) where mask & (1 << UInt16(t)) != 0 {
                 guard let e = blas[TileKey(node: id, tile: t)] else { continue }
                 e.lastUsed = frame
-                if litGi {
+                if rtHitQuads {
                     giTiles.append(giTileEntry(n.buffer, e.giRanges))
                     if !nodeUsed { giBuffers.append(n.buffer); nodeUsed = true }
                 }
@@ -469,7 +493,8 @@ final class RtShadows: @unchecked Sendable {
         let sc = rtShadowScale
         let w = color.width, h = color.height, hw = (w + sc - 1) / sc, hh = (h + sc - 1) / sc
         if litTexture == nil || litTexture!.width != hw || litTexture!.height != hh {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: hw, height: hh, mipmapped: false)
+            // With leaflight (Foliage.swift) a second channel: the blocks of leaves toward the sun, for the relight.
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: foliageLight ? .rg8Unorm : .r8Unorm, width: hw, height: hh, mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
             d.storageMode = .private
             litTexture = dev.makeTexture(descriptor: d)
@@ -501,7 +526,7 @@ final class RtShadows: @unchecked Sendable {
             aenc.endEncoding()
             instanceKey = key
             tlasAccels = accels
-            if litGi {
+            if rtHitQuads {
                 tlasGi = gi.tiles.count == instances.count
                     ? dev.makeBuffer(bytes: gi.tiles, length: gi.tiles.count * 16, options: .storageModeShared).map { ($0, gi.buffers) } : nil
             }
@@ -510,6 +535,19 @@ final class RtShadows: @unchecked Sendable {
         enc.setComputePipelineState(kernel)
         enc.setAccelerationStructure(tlas, bufferIndex: 0)
         enc.useResources(tlasAccels, usage: .read)
+        if foliageLight {
+            // Leaves let the sun through (Foliage.swift): the G-buffer's classes and what a ray hit (sample.w 1), when this
+            // frame has both.
+            if leafRays, let g = Lit.shared.gbuffer, g.width == w, g.height == h, let t = tlasGi {
+                enc.setTexture(g, index: 2)
+                enc.setBuffer(t.table, offset: 0, index: 2)
+                enc.useResources(t.buffers, usage: .read)
+                params.sample.w = 1
+            } else if let stand = leafStandIns() {
+                enc.setTexture(stand.gbuf, index: 2)
+                enc.setBuffer(stand.table, offset: 0, index: 2)
+            }
+        }
         enc.setBytes(&params, length: MemoryLayout<ShadowParams>.stride, index: 1)
         enc.setTexture(depth, index: 0)
         enc.setTexture(lit, index: 1)

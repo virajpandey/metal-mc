@@ -532,7 +532,7 @@ using namespace metal;
 // Lit mode (METALMC_EXP=lit, Lit.swift): the near chunks also write the terrain G-buffer.
 #define LIT_MODE \(litEnabled ? 1 : 0)
 \(litShaderHeader)
-
+\(foliageSprites ? "#define NEAR_FOLIAGE 1\n" + foliageNearHeader : "")\(foliageSprites && foliageWave ? "#define NEAR_WAVE 1\n" + foliageWindHeader : "")
 struct NearGlobals {
     packed_int3 cameraBlockPos;
     float glintAlpha;
@@ -631,7 +631,7 @@ struct NearVertex {
     float2 lightLevels;
     uint litFace [[flat]];
 #endif
-};
+\(foliageSprites ? "    uint foliage [[flat]];   // the quad's sprite's foliage code (Foliage.swift): class | sway << 2\n" : "")};
 
 #if LIT_MODE
 // Vanilla's face shade (top 1, bottom 0.5, x 0.6, z 0.8): the gray levels have it, the G-buffer's AO doesn't.
@@ -668,13 +668,13 @@ vertex NearVertex near_vs(uint vid [[vertex_id]], uint section [[base_instance]]
                           device const NearSection* sections [[buffer(17)]],
                           constant float4x4& projMat [[buffer(18)]],
                           constant NearTerrain& terrain [[buffer(19)]],
-                          constant NearGlobals& globals [[buffer(20)]],
+                          constant NearGlobals& globals [[buffer(20)]],\(foliageSprites ? "\n                          texture2d<uint, access::read> foliageMap [[texture(18)]]," : "")\(foliageSprites && foliageWave ? "\n                          constant FoliageWind& wind [[buffer(22)]]," : "")
                           texture2d<float> lightmap [[texture(16)]], sampler lightmapSampler [[sampler(12)]]) {
     NearCorner c = nearDecode(quads, vid >> 2, vid & 3u);
     NearSection sec = sections[section];
     float3 pos = c.pos + float3(int3(sec.position) - int3(globals.cameraBlockPos)) + float3(globals.cameraOffset);
     NearVertex o;
-    o.position = (projMat * terrain.modelView) * float4(pos, 1.0);
+\(foliageSprites ? nearFoliageVertex : "")    o.position = (projMat * terrain.modelView) * float4(pos, 1.0);
     o.position.y = -o.position.y;
     o.sphericalVertexDistance = length(pos);
     o.cylindricalVertexDistance = max(length(pos.xz), abs(pos.y));
@@ -776,7 +776,7 @@ fragment NearOut near_fs(NearVertex in [[stage_in]],
     float shade = in.litFace < 6u ? kNearShade[in.litFace] : 1.0;
     out.gbuf = litPack(sampled.rgb * saturate(in.vertexColor.rgb / gray), gray / shade, in.litFace, in.position.z,
                        in.lightLevels.y, in.lightLevels.x);
-    return out;
+\(foliageLight && foliageSprites ? "    out.gbuf = litPackFoliage(out.gbuf, in.foliage & 3u);   // leaves and plants (METALMC_EXP=leaflight, Foliage.swift)\n" : "")    return out;
 }
 #else
 fragment float4 near_fs(NearVertex in [[stage_in]],
@@ -992,6 +992,8 @@ public func mmc_near_draw(_ layer: Int32, _ records: UnsafePointer<Int32>, _ cou
         ctx.bindTexture(enc, 1, (from(res[12]) as TextureBox).texture, nearLightmapIndex)
         ctx.bindSampler(enc, 1, (from(res[13]) as SamplerBox).state, nearLightmapSamplerIndex)
     }
+    // Foliage (Foliage.swift): the atlas sprites' class map (vertex texture 18) and the wind (vertex buffer 22).
+    if foliageSprites { Foliage.shared.bindNear(enc, atlas: (from(res[10]) as TextureBox).texture) }
 
     var drawn = 0
     arena.lock.lock()
@@ -1021,6 +1023,10 @@ public func mmc_near_draw(_ layer: Int32, _ records: UnsafePointer<Int32>, _ cou
     }
     for i in [nearLightmapIndex, nearAtlasIndex] { ctx.boundTextures[0][i] = nil; ctx.boundTextures[1][i] = nil }
     for i in [nearLightmapSamplerIndex, nearAtlasSamplerIndex] { ctx.boundSamplers[0][i] = nil; ctx.boundSamplers[1][i] = nil }
+    if foliageSprites {
+        ctx.boundTextures[0][Foliage.nearMapIndex] = nil
+        ctx.boundBuffers[0][Foliage.nearWindIndex] = nil; ctx.boundOffsets[0][Foliage.nearWindIndex] = -1
+    }
 
     if layer == 1 {
         r.frames += 1

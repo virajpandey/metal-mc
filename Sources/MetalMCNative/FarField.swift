@@ -978,7 +978,7 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
     // Lit mode: the G-buffer's albedo, AO, face and sky light; water and what's seen through it stay unlit (LIT_NONE).
     float3 litAlbedo = float3(0.0);
     float litAO = 1.0, litSky = sky;
-    uint litFace = LIT_NONE;\(litWater ? "\n    bool litWaterTop = false;   // water (METALMC_EXP=water): a water surface, flagged for the relight's reflections" : "")
+    uint litFace = LIT_NONE;\(litWater ? "\n    bool litWaterTop = false;   // water (METALMC_EXP=water): a water surface, flagged for the relight's reflections" : "")\(foliageLight ? "\n    bool litLeaf = false;   // leaflight (Foliage.swift): the canopy's leaves" : "")
 #endif
     if (onCanopy) {
         // The canopy: its top with the corner occlusion of taller crowns around it, its sides darker toward the underside
@@ -993,7 +993,7 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
         color = litAlbedo * kShade[face] * lit * ao;
         litAO = ao;
         litSky = face == 3 ? max(0.0, sky - kUnderCanopy) : sky;
-        litFace = uint(face);
+        litFace = uint(face);\(foliageLight ? "\n        { uint m = cm; litLeaf = \(foliageLodLeafTest); }" : "")
 #else
         color = colors[cm * 3u + (face == 2 ? 0u : (face == 3 ? 2u : 1u))].rgb * kShade[face] * lit
               * detail(u, sprites, atlas, atlasSampler, cm, face, rel, mip) * ao;
@@ -1057,7 +1057,7 @@ FF_EARLY fragment FFOut ff_fs(float4 pos [[position]], constant LodUniforms& u [
     float4 clip = u.proj * (u.view * float4(rel, 1.0));
     out.depth = min(clip.z / clip.w, pos.z);
 #if LIT_MODE
-    out.gbuf = \(litWater ? "litWaterTop ? litPackWater(2u, out.depth, litSky, 0.0) : " : "")litPack(litAlbedo, litAO, litFace, out.depth, litSky, 0.0);
+    out.gbuf = \(litWater ? "litWaterTop ? litPackWater(2u, out.depth, litSky, 0.0) : " : "")litPack(litAlbedo, litAO, litFace, out.depth, litSky, 0.0);\(foliageLight ? "\n    if (litLeaf) out.gbuf = litPackFoliage(out.gbuf, LIT_LEAF);" : "")
 #endif
     return out;
 }
