@@ -57,9 +57,12 @@ let waterOn = ProcessInfo.processInfo.environment["LITFLOW_WATER"] == "1" && mod
 // post section (pictures of each effect at several times of day, the exposure's numbers; with "time" each stage's cost).
 let postOn = ProcessInfo.processInfo.environment["LITFLOW_POST"] == "1" && (mode == "sky" || mode == "hdr")
 let clOn = ProcessInfo.processInfo.environment["LITFLOW_CL"] == "1" && mode != "off" && mode != "compile"
+// LITFLOW_CLOUDS=1 (with sky or hdr): the volumetric clouds (METALMC_EXP=...,clouds, Clouds.swift) before the shadows; runs
+// only the clouds section (with LITFLOW_POST=1 too, through the post chain as in the game).
+let cloudsOn = ProcessInfo.processInfo.environment["LITFLOW_CLOUDS"] == "1" && (mode == "sky" || mode == "hdr")
 let exp = mode == "compile" ? (ProcessInfo.processInfo.environment["LITFLOW_EXP"] ?? "lit,rtshadows,sky,water")
     : (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
-        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "") + (clOn ? ",coloredlight" : "") + (postOn ? ",post" : "")
+        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "") + (clOn ? ",coloredlight" : "") + (postOn ? ",post" : "") + (cloudsOn ? ",clouds" : "")
 setenv("METALMC_EXP", exp, 1)
 let lit = mode != "off", sky = mode == "sky" || mode == "hdr", hdr = mode == "hdr"
 guard let lib = dlopen(args[1], RTLD_NOW) else { print("dlopen failed"); exit(1) }
@@ -363,6 +366,9 @@ func targets(_ w: Int32, _ h: Int32) -> Targets {
     // With post the game's main target is RG11B10Float (92), as with HDR's packed default.
     Targets(color: textureCreate(hdr ? 115 : (postOn ? 92 : 70), w, h, 1, 1, 1), depth: textureCreate(252, w, h, 1, 1, 1), w: w, h: h)
 }
+// The clouds' entry point (LITFLOW_CLOUDS=1), off for a frame with cloudsSkip, and the rain (1 clear) they're made for.
+let cloudsFrame = cloudsOn ? fn("mmc_clouds_frame", (@convention(c) (Int64, Int64, UnsafePointer<Float>, UnsafePointer<Double>) -> Int32).self) : nil
+var cloudsSkip = false, cloudsRainBrightness: Float = 1
 // The post chain's entry points (LITFLOW_POST=1).
 let postApply = postOn ? fn("mmc_post_apply", (@convention(c) (Int64, Int64, UnsafePointer<Float>, UnsafePointer<Double>, Int32) -> Int32).self) : nil
 var postRan = false, postSkip = false
@@ -391,6 +397,11 @@ func frame(_ t: Targets, sunAngle: Float, relight: Bool, extras: Bool = true, ta
         _ = setPipeline(bandPipe); draw(6, 1, 0, 0)
     }
     passEnd()
+    // Clouds (LITFLOW_CLOUDS=1): this frame's clouds before the shadows, as GameRendererLodMixin calls them (cloudsSkip: off).
+    if let cloudsFrame, !cloudsSkip {
+        var cp = mats + [sunAngle, cloudsRainBrightness, 0, 63]
+        _ = cloudsFrame(t.color, t.depth, &cp, &c)
+    }
     let traced = shadowsApply(t.color, t.depth, &mats, &c, sunAngle, 0.42, 192, 0) == 1
     var ran = false
     // Water: the reflections on or off, the waves 1/120 s on from the last frame (as at 120 Hz).
@@ -767,6 +778,62 @@ func depthMatches(_ depth: Float, _ key: UInt32) -> Bool {
     return d <= 1 || d == 0xFFFF
 }
 func lumOf(_ px: [UInt8], _ i: Int) -> Double { 0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2]) }
+
+// Clouds (LITFLOW_CLOUDS=1): per time of day (LITFLOW_CLOUDTIMES, default noon,sunset,morning) the relit frame with the
+// anti-aliasing (and post with LITFLOW_POST=1) without and with the clouds, 48 frames each (the clouds' history and the
+// anti-aliasing's settle; METALMC_CLOUDVIEW=4 in the environment shows the cloud shadows alone), the mean luma of the sky
+// (top fifth) and of the terrain (bottom 55%); with "time", whole frames at 3456 x 2234 with and without the clouds,
+// alternating. Then exits.
+if cloudsOn {
+    func meanLuma(_ px: [UInt8], rows: Range<Int>) -> Double {
+        var s = 0.0
+        for y in rows { for x in 0..<Int(W) { s += lumOf(px, (y * Int(W) + x) * 4) } }
+        return s / Double(rows.count * Int(W))
+    }
+    let name = ProcessInfo.processInfo.environment["LITFLOW_NAME"] ?? "view"
+    let suns: [String: (Float, Float)] = ["noon": (noon, 1), "morning": (morning, 1), "dusk": (dusk, 0.55), "sunset": (1.49, 0.45),
+                                          "midnight": (midnight, 0.2)]
+    let list = (ProcessInfo.processInfo.environment["LITFLOW_CLOUDTIMES"] ?? "noon,sunset,morning").split(separator: ",").map(String.init)
+    if ProcessInfo.processInfo.environment["LITFLOW_TIMEONLY"] != "1" {
+        for t in list {
+            guard let (angle, skyFactor) = suns[t] else { print("      unknown time \(t)"); continue }
+            setLightmap(skyFactor: skyFactor)
+            for (label, skip) in [("off", true), ("on", false)] {
+                cloudsSkip = skip
+                for _ in 0..<16 { frame(small, sunAngle: angle, relight: true, extras: false) }   // the sky's tables for this sun
+                let r = capture(half, sunAngle: angle, relight: true, extras: false, frames: 48, taa: true)
+                writePNG(r.color, Int(W), Int(H), "clouds-\(name)-\(t)-\(label).png")
+                // The readback's rows are bottom first: the picture's top fifth is its last rows.
+                let h = Int(H)
+                print(String(format: "      %@ %@ clouds %@: mean luma, sky (top fifth) %.1f, terrain (bottom 55%%) %.1f, frame %.1f", name, t, label,
+                             meanLuma(r.color, rows: (h - h / 5)..<h), meanLuma(r.color, rows: 0..<(h * 55 / 100)), meanLuma(r.color, rows: 0..<h)))
+            }
+        }
+        cloudsSkip = false
+    }
+    if timing {
+        let full = targets(3456, 2234)
+        setLightmap(skyFactor: 1)
+        for _ in 0..<16 { frame(full, sunAngle: noon, relight: true, extras: false, taa: true) }
+        var times = [Double](repeating: 0, count: 4096)
+        var with: [Double] = [], without: [Double] = []
+        for k in 0..<160 {
+            cloudsSkip = k % 2 == 1
+            _ = gpuTimesTake(&times, 4096)
+            frame(full, sunAngle: noon, relight: true, extras: false, taa: true)
+            let c = Int(gpuTimesTake(&times, 4096))
+            if c > 0 && k >= 8 { if cloudsSkip { without.append(times[c - 1] * 1000) } else { with.append(times[c - 1] * 1000) } }
+        }
+        cloudsSkip = false
+        let ws = with.sorted(), os = without.sorted()
+        if !ws.isEmpty && !os.isEmpty {
+            print(String(format: "      frame at 3456 x 2234 (noon, %@): with the clouds %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), %d each",
+                         name, ws[ws.count / 2], ws[0], os[os.count / 2], os[0], ws[ws.count / 2] - os[os.count / 2], ws[0] - os[0], ws.count))
+        }
+    }
+    print("done")
+    exit(0)
+}
 
 // Post (LITFLOW_POST=1): per time of day (LITFLOW_POSTTIMES, default noon,dusk,sunset,midnight), the relit frame through the
 // post chain with the anti-aliasing, each effect added in turn in the same process (mmc_debug_post): "before" (the legacy

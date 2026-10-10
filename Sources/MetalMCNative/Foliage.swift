@@ -244,7 +244,18 @@ static float2 litFoliageVis(texture2d<half, access::read> vis, uint2 q, constant
     float cover = max(15.0 - sky, 0.0);
     return float2(saturate((sky - 12.0) / 3.0), exp(-RT_LEAF_K * cover));
 }
+\(cloudsEnabled ? """
 
+// Clouds hook (Clouds.swift, METALMC_EXP=clouds): the clouds' transmittance toward the sun at the traced texel, for the
+// light through leaves (the direct beam, vis.r, has it already). The visibility's b holds 1 - it (Clouds.shadeVisibility);
+// 1 without rays this frame, or where the clouds didn't work it out (b 0).
+static float litFoliageCloud(texture2d<half, access::read> vis, uint2 q, constant LitFrame& f) {
+    if (f.size.z <= 0.0) return 1.0;
+    uint s = uint(f.size.z);
+    return 1.0 - float(vis.read(min(q / s, uint2(vis.get_width() - 1, vis.get_height() - 1))).b);
+}
+
+""" : "\n")
 static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, texture2d<half, access::read> vis,
                               constant LitFrame& f, constant float4* env, float sky, float ao, float3 skyAmb, float3 albedo) {
     if (cls == 0u) return float3(0.0);
@@ -269,7 +280,7 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
         // shades it from a low sun.
         float facing = fi < 6u ? saturate(0.5 - 0.5 * dot(n, L)) : 0.5;   // 1: the face turned away from the sun
         float through = cls == LIT_LEAF ? mix(LEAF_FRONT, LEAF_BACK, facing) + LEAF_FWD * hg : PLANT_TRANS;
-        add += env[0].rgb * T * through;
+        add += env[0].rgb * T * through\(cloudsEnabled ? " * litFoliageCloud(vis, q, f)" : "");
     }
     // A soft sheen (LEAF_SHEEN): a leaf's or a blade's waxy surface reflects the sun, most at grazing angles: a broad GGX
     // lobe (LEAF_ROUGH) with Schlick's Fresnel (F0 0.04) on the face (a plant: on the vertical), times the direct sun's

@@ -338,9 +338,9 @@ kernel void post_exposure(device atomic_uint* hist [[buffer(0)]], device float4*
 // Each quarter-resolution texel's 4 x 4 pixels: r the share that is sky (reverse-Z: depth 0; vanilla's clouds write
 // depth, so they shadow the air like terrain does), g how much air there is in front of the rest (1 - exp(-distance /
 // POST_SHAFT_DEPTH) at their mean depth: the haze the shafts light builds up with distance, so a tree nearby gets
-// little of it and a ridge a few hundred blocks off nearly all).
+// little of it and a ridge a few hundred blocks off nearly all).\(cloudsEnabled ? "\n// Clouds hook (Clouds.swift, METALMC_EXP=clouds): they don't write depth, so the sky's share is only as open as their\n// transmittance there (rays through the gaps)." : "")
 kernel void post_shaft_mask(depth2d<float> depth [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
-                            constant PostFrame& f [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+                            constant PostFrame& f [[buffer(0)]],\(cloudsEnabled ? " texture2d<float> clouds [[texture(2)]]," : "") uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
     float2 inv = 1.0 / float2(depth.get_width(), depth.get_height());
@@ -356,7 +356,7 @@ kernel void post_shaft_mask(depth2d<float> depth [[texture(0)]], texture2d<float
         float4 h = f.invViewProj * float4(c * inv * 2.0 - 1.0, mean, 1.0);
         air = 1.0 - exp(-length(h.xyz / h.w) / POST_SHAFT_DEPTH);
     }
-    dst.write(float4(n / 16.0, air, 0.0, 0.0), gid);
+    dst.write(float4(n / 16.0\(cloudsEnabled ? " * clouds.sample(sampler(filter::linear, address::clamp_to_edge), c * inv, level(0.0)).a" : ""), air, 0.0, 0.0), gid);
 }
 
 // One pass of the radial blur toward the sun (after Mitchell, "Volumetric Light Scattering as a Post-Process", GPU Gems
@@ -812,6 +812,7 @@ final class Post: @unchecked Sendable {
             enc.setComputePipelineState(maskPipe)
             enc.setTexture(depth, index: 0)
             enc.setTexture(shaftMask, index: 1)
+            if cloudsEnabled { enc.setTexture(Clouds.shared.frameTexture(), index: 2) }   // Clouds hook: their transmittance
             enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 0)
             enc.dispatchThreads(grid(shaftMask), threadsPerThreadgroup: tg)
             enc.setComputePipelineState(blurPipe)

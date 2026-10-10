@@ -108,7 +108,8 @@ private final class ShaderLabFiles: @unchecked Sendable {
         dir = ShaderLab.dir ?? ""
         let all: [(file: String, text: String)] = [
             ("sky_header.metal", skyShaderHeader), ("lit_header.metal", litShaderHeader),
-            ("lit_relight_header.metal", litRelightHeader), ("gi_upsample_header.metal", giUpsampleHeader)]
+            ("lit_relight_header.metal", litRelightHeader), ("gi_upsample_header.metal", giUpsampleHeader),
+            ("clouds_header.metal", cloudsShaderHeader)]
         headers = all.filter { $0.text.utf8.count >= 64 }
         let readme = dir + "/README.txt"
         if !FileManager.default.fileExists(atPath: readme) {
