@@ -2124,6 +2124,25 @@ with every shot's settings and scores in `evals.jsonl`, `twins-base1/`, `autotun
   the lifted sky; the sunset's land was already brighter than SEUS's before the grade), and a short re-tune in the same
   set scored a smaller exposure lift (0.45) and shadow lift (0.23) two points better over the five day scenes. The
   defaults now: exposure lift 0.5, shadow lift 0.28, dusk 0.1, and the Purkinje shift on at night (0.6).
+- **The final defaults, verified** (after clouds round 2, which moved the look before the grade a lot: noon's terrain luma
+  79 -> 120, the forest's 56 -> 43; before the grade, the defaults, the defaults with the sky's blue at 1.0 and 1.6):
+
+  | scene | before | grade | sky 1.0 | sky 1.6 | terrain Y / p10 / sat: before, grade | SEUS |
+  |---|---|---|---|---|---|---|
+  | noon_overview | 13.66 | 11.74 | 11.66 | 11.65 | 120.3 / 25 / 8.6, 138.8 / 52 / 8.9 | 116.6 / 64 / 26.2 |
+  | forest | 25.74 | 10.18 | 10.26 | 10.33 | 43.0 / 22 / 17.3, 71.1 / 43 / 23.9 | 88.2 / 53 / 24.6 |
+  | mountain_view | 16.19 | 9.23 | 9.24 | 9.22 | 58.8 / 23 / 9.6, 86.2 / 50 / 11.5 | 93.2 / 46 / 15.8 |
+  | sunset_water | 7.22 | 6.04 | 6.02 | 6.01 | 81.4 / 31 / 13.8, 86.6 / 42 / 13.5 | 92.4 / 41 / 14.2 |
+  | water_closeup | 10.08 | 16.35 | 16.72 | 16.76 | 84.0 / 53 / 7.2, 108.0 / 79 / 8.2 | 68.0 / 40 / 26.4 |
+  | rain (SEUS's has none) | 32.73 | 20.29 | 20.38 | 20.46 | 53.2 / 30 / 16.3, 78.5 / 61 / 18.5 | 115.9 / 67 / 29.5 |
+  | night_torches (night points) | 4.36 | 0.17 | 0.14 | 0.12 | 53.5 / 28 / 19.9, 38.2 / 22 / 7.3 | 29.5 / 23 / 4.2 |
+  | torch_cave (night points) | 7.64 | 0.11 | 0.11 | 0.11 | 54.1 / 18 / 11.0, 41.2 / 21 / 11.4 | 32.4 / 24 / 4.2 |
+  | mineshaft (night points) | 20.30 | 1.43 | 1.13 | 1.14 | 83.3 / 54 / 26.3, 46.8 / 28 / 22.3 | 31.0 / 18 / 8.0 |
+
+  Day total 72.9 -> 53.5 (-27%), night points 32.3 -> 1.7. The sunset now gains (7.2 -> 6.0) with the dusk share at
+  0.1; water_closeup still loses (its water is brighter than SEUS's before the grade, 84 against 68). The sky's blue
+  barely moves the scores (most of our sky is cumulus now, which it leaves white) but turns the clear patches from a pale
+  gray-blue to a blue near SEUS's: default 1.5.
 - **By eye**: noon and the forest come up to SEUS's brightness with their greens (the forest's cast shadows under the
   trees stay lighter than SEUS's); mountain_view's snowy spruce reads white instead of gray; the sunset keeps its
   backlit land; the village at night has warm pools on the houses and a blue-gray moonlit field (with the Purkinje
@@ -2132,11 +2151,11 @@ with every shot's settings and scores in `evals.jsonl`, `twins-base1/`, `autotun
 
 ### Costs (in game, traced: mountain_view, the Claude edition's set, 3456 x 2234)
 
-- The local tone map (`post_local_stats` and the two `post_local_box` passes on the 216 x 140 grid): 0.070 ms.
-- `post_outdoor` (in the exposure's pass: 0.082 ms against 0.04 before).
-- The composite with the local tone map, the lift and the Purkinje shift: 0.70 ms (0.66 before).
+- The local tone map (`post_local_stats` and the two `post_local_box` passes on the 216 x 140 grid): 0.066-0.070 ms.
+- `post_outdoor` (in the exposure's pass: 0.080-0.082 ms against 0.04 before).
+- The composite with the local tone map, the lift, the Purkinje shift and the sky's blue: 0.70-0.72 ms (0.66 before).
 - The relight's grade (a few multiplies per pixel in the anti-aliasing's resolve) doesn't show in its 3.35 ms.
-- About 0.15 ms a frame in all. The mask runs only in lab mode, on a request (16 frames of one compute pass).
+- About 0.15-0.17 ms a frame in all. The mask runs only in lab mode, on a request (16 frames of one compute pass).
 
 ### Not done, and next
 
@@ -2160,5 +2179,12 @@ with every shot's settings and scores in `evals.jsonl`, `twins-base1/`, `autotun
 - **The mask**: the sun visibility is the traced samples' mean over 16 frames (4 x 4 blocks at shadow edges); vanilla's
   near water by height is a fallback now that the G-buffer flags it; classes from before leaflight (the hue rule, grass
   tops as vegetation) don't compare one to one with classes from after (totals do).
+- **The sun's glow at sunset**: SEUS's big warm halo around a low sun (and in the water under it) is mostly bloom
+  (the clouds helper's finding; Sky.swift now draws the sharp aureole). Ours is the 5%, even-shaped bloom
+  (`POST_BLOOM`, `POST_BLOOM_SHAPE`), a small glow. A wider, stronger bloom only for light far above its surroundings
+  (a threshold on the wide levels) would make the halo without softening noon; untried (the knobs are in autotune's
+  table: `POST_BLOOM`, `POST_BLOOM_SHAPE`).
+- **The sky's coverage**: after clouds round 2 most of our sky in these scenes is cumulus, SEUS's mostly clear; the
+  sky's blue only restores the clear patches.
 - **Night and caves** are scored against a target of our own (luma 35-45, SEUS's warmth, no crushed shadows); nobody's
   frames are the answer there, so the defaults were judged by eye as much as by the number.
