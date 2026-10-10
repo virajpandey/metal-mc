@@ -941,8 +941,6 @@ half-resolution rays (sharper reflections of the shore) another 1.7 ms there.
 
 ## Colored block light (prototype, `METALMC_EXP=lit,coloredlight`, 2026-10-05)
 
-## Colored block light (prototype, `METALMC_EXP=lit,coloredlight`, 2026-10-05)
-
 Lit mode took block light from vanilla's lightmap: one warm white at vanilla's level. With `coloredlight` (and `lit`;
 meant with `nearchunks`, whose terrain is what's relit near the camera) block light has the color of what gives it off:
 torches and lanterns a candle-warm orange, fire and campfires a redder orange that flickers, soul fire cyan, redstone
