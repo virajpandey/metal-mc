@@ -1,0 +1,15 @@
+{
+	"required": true,
+	"package": "metalmc.render.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"GameRendererScaleMixin",
+		"SkyRendererScaleMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

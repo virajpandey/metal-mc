@@ -755,11 +755,13 @@ fragment NearOut near_fs(NearVertex in [[stage_in]],
                          constant NearTerrain& terrain [[buffer(19)]],
                          constant NearGlobals& globals [[buffer(20)]],
                          constant NearFog& fog [[buffer(21)]],
+                         constant float& mipScale [[buffer(23)]],
                          texture2d<float> atlas [[texture(17)]], sampler atlasSampler [[sampler(13)]],
                          texture2d<float> lightmap [[texture(16)]], sampler lightmapSampler [[sampler(12)]]) {
     float2 pixelSize = 1.0f / float2(terrain.textureSize);
-    float2 du = dfdx(in.texCoord0);
-    float2 dv = dfdy(in.texCoord0);
+    // Render scale (RenderScale.swift, renderMipScale): the gradients as at the output's resolution (1 without a scale).
+    float2 du = dfdx(in.texCoord0) * mipScale;
+    float2 dv = dfdy(in.texCoord0) * mipScale;
     float4 sampled = globals.useRgss == 1 ? sampleRGSS(atlas, atlasSampler, in.texCoord0, pixelSize, du, dv)
                                           : sampleNearest(atlas, atlasSampler, in.texCoord0, pixelSize, du, dv, sqrt(du * du + dv * dv));
     float2 lightUv = clamp(in.lightLevels / 16.0 + 0.5 / 16.0, float2(0.5 / 16.0), float2(15.5 / 16.0));
@@ -783,10 +785,12 @@ fragment float4 near_fs(NearVertex in [[stage_in]],
                         constant NearTerrain& terrain [[buffer(19)]],
                         constant NearGlobals& globals [[buffer(20)]],
                         constant NearFog& fog [[buffer(21)]],
+                        constant float& mipScale [[buffer(23)]],
                         texture2d<float> atlas [[texture(17)]], sampler atlasSampler [[sampler(13)]]) {
     float2 pixelSize = 1.0f / float2(terrain.textureSize);
-    float2 du = dfdx(in.texCoord0);
-    float2 dv = dfdy(in.texCoord0);
+    // Render scale (RenderScale.swift, renderMipScale): the gradients as at the output's resolution (1 without a scale).
+    float2 du = dfdx(in.texCoord0) * mipScale;
+    float2 dv = dfdy(in.texCoord0) * mipScale;
     float4 sampled = globals.useRgss == 1 ? sampleRGSS(atlas, atlasSampler, in.texCoord0, pixelSize, du, dv)
                                           : sampleNearest(atlas, atlasSampler, in.texCoord0, pixelSize, du, dv, sqrt(du * du + dv * dv));
     float4 color = sampled * in.vertexColor;
@@ -818,7 +822,7 @@ kernel void near_decode_test(device const uint* quads [[buffer(0)]], device floa
 // Binding slots, clear of vanilla's (uniform i is index i, push constants 24, vertex slots 30 and 29) and set through
 // ctx's binding caches, which are cleared again after the draw.
 private let nearQuadsIndex = 16, nearSectionsIndex = 17, nearProjectionIndex = 18, nearTerrainIndex = 19
-private let nearGlobalsIndex = 20, nearFogIndex = 21
+private let nearGlobalsIndex = 20, nearFogIndex = 21, nearMipScaleIndex = 23
 private let nearLightmapIndex = 16, nearAtlasIndex = 17
 private let nearLightmapSamplerIndex = 12, nearAtlasSamplerIndex = 13
 
@@ -994,6 +998,9 @@ public func mmc_near_draw(_ layer: Int32, _ records: UnsafePointer<Int32>, _ cou
     }
     // Foliage (Foliage.swift): the atlas sprites' class map (vertex texture 18) and the wind (vertex buffer 22).
     if foliageSprites { Foliage.shared.bindNear(enc, atlas: (from(res[10]) as TextureBox).texture) }
+    // Render scale (RenderScale.swift): the texture gradients' scale (fragment buffer 23), 1 at the output's resolution.
+    var mipScale = renderMipScale()
+    enc.setFragmentBytes(&mipScale, length: 4, index: nearMipScaleIndex)
 
     var drawn = 0
     arena.lock.lock()
@@ -1017,7 +1024,7 @@ public func mmc_near_draw(_ layer: Int32, _ records: UnsafePointer<Int32>, _ cou
     // may assume our bindings are still there.
     ctx.pipe = nil
     ctx.boundPipeState = nil
-    for i in [nearQuadsIndex, nearSectionsIndex, nearProjectionIndex, nearTerrainIndex, nearGlobalsIndex, nearFogIndex] {
+    for i in [nearQuadsIndex, nearSectionsIndex, nearProjectionIndex, nearTerrainIndex, nearGlobalsIndex, nearFogIndex, nearMipScaleIndex] {
         ctx.boundBuffers[0][i] = nil; ctx.boundBuffers[1][i] = nil
         ctx.boundOffsets[0][i] = -1; ctx.boundOffsets[1][i] = -1
     }

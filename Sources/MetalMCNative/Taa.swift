@@ -27,8 +27,8 @@ import simd
 // Lit hook (Lit.swift): the relight as the resolve loads each pixel; with water (METALMC_EXP=lit,water) its reflections
 // after it (this frame's waves' tile and sky map are textures 13 and 14, which Lit.bindDeferred binds; without our sky
 // litWaterPixel leaves water alone).
-private let taaRelightLoad = "        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));"
-private let taaWaterLoad = """
+let taaRelightLoad = "        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));"
+let taaWaterLoad = """
         if (taaLit) {
             uint2 g = litGbuf.read(q).rg;
             c.rgb = litRelightPixel(c.rgb, q, d, g, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));
@@ -40,19 +40,20 @@ private let taaWaterLoad = """
 
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
 // Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise. Clouds hook (Clouds.swift, METALMC_EXP=clouds only):
-// their composite, after the aerial perspective in the sky variant.
+// their composite, after the aerial perspective in the sky variant. (These and the lets below are the upscaling resolve's
+// too, TaaUpscale.swift.)
 // Volumetric light (Godrays.swift, METALMC_EXP=godrays only; without it the resolve's text is as before): the fog, applied in
 // the sky variant's load after the aerial perspective and the clouds, in front of both (its traced texels at texture 24, its
 // transmittance table at texture 25, the frame's fog at buffer 7).
-private let taaGodraysArgs = godraysEnabled ? """
+let taaGodraysArgs = godraysEnabled ? """
                         texture2d<float> godraysFog [[texture(24), function_constant(taaSky)]],
                         texture2d<float> godraysT [[texture(25), function_constant(taaSky)]],
                         constant GodraysShared& godraysG [[buffer(7), function_constant(taaSky)]],
 
 """ : ""
-private let taaGodraysLoad = godraysEnabled ? "\n            c.rgb = godraysApply(c.rgb, q, d, sky, godraysFog, godraysT, &godraysG);" : ""
+let taaGodraysLoad = godraysEnabled ? "\n            c.rgb = godraysApply(c.rgb, q, d, sky, godraysFog, godraysT, &godraysG);" : ""
 
-private let taaShaderSource = skyShaderHeader + cloudsShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "")
+let taaShaderSource = skyShaderHeader + cloudsShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "")
     + (godraysEnabled ? godraysHeader : "") + """
 
 // With the sky on (METALMC_EXP=sky), a second variant of the resolve applies the aerial perspective, the render

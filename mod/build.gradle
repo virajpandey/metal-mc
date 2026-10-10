@@ -98,6 +98,23 @@ loom {
 			if (project.hasProperty("taaBlend")) {
 				environmentVariable "METALMC_TAABLEND", project.findProperty("taaBlend").toString()
 			}
+			// Render scale (with -Ptaa=true; RenderScale.swift, TaaUpscale.swift): -PrenderScale=<0.5-1, or auto, or
+			// auto:MIN:MAX> draws the level at that scale and upscales it in the anti-aliasing (1, the default, for bench
+			// runs whatever the config says); -PtaauK=<the reconstruction's sharpness, 4.5>, -PtaauSharpen=<0-1, 0.6>,
+			// -PgovBudget=<the governor's frame time in ms, 8.333>.
+			property "metalmc.renderScale", (project.findProperty("renderScale") ?: "1").toString()
+			if (project.hasProperty("renderScale")) {
+				environmentVariable "METALMC_SCALE", project.findProperty("renderScale").toString()
+			}
+			if (project.hasProperty("taauK")) {
+				environmentVariable "METALMC_TAAU_K", project.findProperty("taauK").toString()
+			}
+			if (project.hasProperty("taauSharpen")) {
+				environmentVariable "METALMC_TAAU_SHARPEN", project.findProperty("taauSharpen").toString()
+			}
+			if (project.hasProperty("govBudget")) {
+				environmentVariable "METALMC_GOVBUDGET", project.findProperty("govBudget").toString()
+			}
 			if (project.hasProperty("waterGain")) {
 				environmentVariable "METALMC_WATERGAIN", project.findProperty("waterGain").toString()
 			}

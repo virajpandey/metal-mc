@@ -52,6 +52,10 @@
 		{
 			"config": "metalmc_extpipe.client.mixins.json",
 			"environment": "client"
+		},
+		{
+			"config": "metalmc_render.client.mixins.json",
+			"environment": "client"
 		}
 	],
 	"depends": {

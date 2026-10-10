@@ -1365,6 +1365,7 @@ public func mmc_submit(_ index: Int64) {
             ctx.profLabels = []
             ctx.profNext = 0
         }
+        let scaleTag = RenderScaleGovernor.shared.tag   // render scale hook (RenderScale.swift): the scale this frame was drawn at
         cb.addCompletedHandler { cb in
             if traced, let sb = ctx.profSampleBuffer, let data = try? sb.resolveCounterRange(0..<samples) {
                 let ts = data.withUnsafeBytes { Array($0.bindMemory(to: UInt64.self)) }
@@ -1399,6 +1400,7 @@ public func mmc_submit(_ index: Int64) {
                 ctx.icbLock.unlock()
             }
             let gpu = cb.gpuEndTime - cb.gpuStartTime
+            RenderScaleGovernor.shared.gpuFrame(start: cb.gpuStartTime, end: cb.gpuEndTime, tag: scaleTag)
             ctx.cond.lock()
             if ctx.gpuSeconds.count < 1_000_000 { ctx.gpuSeconds.append(gpu) }
             if index > ctx.completed { ctx.completed = index }
@@ -1497,6 +1499,7 @@ public func mmc_surface2_configure(_ h: Int64, _ w: Int32, _ hh: Int32, _ displa
     let s: SurfaceBox = from(h)
     s.width = Int(w)
     s.height = Int(hh)
+    renderOutputWidth = Int(w)   // render scale hook (RenderScale.swift): the output's width, for the terrain's mip bias
     s.layer.drawableSize = CGSize(width: Int(w), height: Int(hh))
     s.layer.displaySyncEnabled = displaySync != 0
 }

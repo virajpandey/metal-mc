@@ -2651,3 +2651,26 @@ turning softens it rather than trailing it; not looked at in motion).
 - **Checked last** (session `ent5`, on 14f98cd, with `clouds,godrays` too): all 17 pipelines patched; rain thin and gray
   over the overcast with clouds; no streaks over water; mobs and the hand relit. After it, main's grade merged in and
   entities call its `litGrade` like terrain (compile-checked, not seen in game).
+
+## Render scale: what it asks of every feature (`METALMC_SCALE`, 2026-10-10)
+
+The level can be drawn at a fraction of the panel's resolution and upscaled in the anti-aliasing (docs/frame-budget.md,
+"Render scale, temporal upscaling and the governor"; `TaaUpscale.swift`, `RenderScale.swift`). For a lighting feature:
+
+- **Before the resolve, the level's size**: from `renderLevel` to the anti-aliasing the frame is a target of its own at
+  the scaled size (`metalmc.render.RenderScale.level(main)` in Java; the textures handed to the native side). Size
+  per-pixel buffers from the color or depth texture you are given, never the drawable or the window: the G-buffer, the
+  shadows, the GI cache's request, the water's rays and the clouds' buffers all do, and follow the scale with no code of
+  their own. A size change (the governor's steps) reallocates them, which restarts any history kept per pixel (the
+  clouds' history restarts on a step).
+- **In the resolve's load** (`taa_resolve` and `taa_upscale`, Taa.swift and TaaUpscale.swift): a hook there runs once
+  per rendered texel at the level's size, as now; `q` is in the level's pixels. A new hook must go into both kernels
+  (the upscaler copies the load's text: the relight, the water, the shadows' shade, the aerial perspective and the
+  clouds' composite and the god rays today).
+- **After the resolve** (post, the hand, the HUD): the panel's resolution, but the G-buffer and the depth stay the
+  level's: read them at their own size (`post_bloom_first` scales its coordinates by the depth's size over the frame's;
+  `post_shaft_mask` takes the frame's size from its uniforms).
+- **Textures in our terrain shaders** (the near chunks, the LOD): their gradients are scaled by `renderMipScale()` so
+  mips are picked as at the panel's resolution (a mip bias of log2(scale)).
+- **A cost knob**: `RenderScaleGovernor.shared.quality` (1 full to 0) is what the governor gives up after the scale
+  reaches its floor; the GI cache's updates a frame follow it. Steps of a march (clouds, god rays) can too.

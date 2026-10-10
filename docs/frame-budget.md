@@ -149,3 +149,186 @@ the rays); the resolve with relight and aerial perspective 2.32 ms.
   the anti-aliasing resolve would save about 2 ms of the lit frame. MetalFX's temporal scaler cost 9 ms here (Taa.swift),
   so it would be our own resolve. It changes the image (softer in motion), so it's a fidelity trade to measure, not a
   given; and the hand and the HUD must stay at native resolution, which means splitting vanilla's main target.
+  (Built 2026-10-10: the next section.)
+
+## Render scale, temporal upscaling and the governor (2026-10-10)
+
+The level is drawn at a fraction of the panel's resolution on each axis and resolved to the panel's by our own
+anti-aliasing; the hand, the HUD, the screen effects and post-processing stay at the panel's resolution. A governor can
+steer the scale (and then per-feature quality) to hold the refresh rate.
+
+Switches: `METALMC_SCALE` (gradle `-PrenderScale`, config `renderScale`): a number from 0.5 to 1 (1, the default: off,
+the old path bit for bit), or `auto` for the governor (`auto:MIN:MAX`, default 0.6 to 1). Needs TAA (`-Ptaa=true`).
+In lab mode `<shader dir>/render_scale.txt` (same syntax, read every 2 s) overrides it, so one session compares scales.
+Tuning: `METALMC_TAAU_K` (the reconstruction's sharpness, 4.5), `METALMC_TAAU_SHARPEN` (the copy's sharpening, 0.6),
+`METALMC_GOVBUDGET` (the governor's frame time, 8.333 ms).
+
+**Splitting vanilla's main target** (`metalmc.render.RenderScale`, `GameRendererScaleMixin`). vanilla's level reaches
+the main target only through `GameRenderer.mainRenderTarget()`: LevelRenderer's frame graph imports it as "main", clears
+it, composites into it, and makes the sky renderer with it. The hand, the screen effects, the GUI and vanilla's post
+effects use GameRenderer's own field. So from `renderLevel` to the anti-aliasing (`render3dHud`'s head), the accessor
+answers a target of our own at the scaled size (same formats as the main target, HDR's float included), and our passes
+before the anti-aliasing take it too. Everything sized from it follows without a change of its own: the G-buffer (the
+level pass's second color target), the relight, the traced shadows, the GI cache's per-pixel request and resolve, the
+water's rays, the sky's quarter-resolution view and its aerial perspective, the far field's march and the LOD (whose
+quad culling tests the scaled pixel centers, so it culls more). The sky renderer keeps the target it was made with, so a
+redirect points its pass at the frame's level target. The frame's start clears the main target; with a scale the clear
+is left out (the upscaler's copy writes every pixel of its color, and vanilla clears its depth before the hand), since
+with pass folding it would otherwise run as a pass of its own. Frames that can't be scaled draw at full resolution as
+before: vanilla's post effects (spectating a creeper: they want the level's depth at full size), the external pipeline,
+no TAA.
+
+**The upscaler** (TAAU, `TaaUpscale.swift`, kernel `taa_upscale`): the anti-aliasing's resolve with two changes, after
+the published temporal upsamplers (Karis's TAA, "High Quality Temporal Supersampling", 2014; the survey by Yang, Liu and
+Salvi, 2020). Each output pixel takes this frame's samples near it, the 3 x 3 rendered texels around the nearest one,
+each weighted by exp(-k d^2) for its distance d from the output pixel's center in output pixels (a sample sits at its
+texel's center minus the frame's jitter); and the current frame's share is W / (W + (1 / b - 1) E[W]), W the weights'
+sum, E[W] its mean over all jitters (the samples per output pixel times pi / k) and b the anti-aliasing's blend (0.1
+still, up to 0.3 in motion): a pixel with a sample at its center takes more of this frame, one with none near takes
+little, and on average it's b as before. The history, its reprojection, the Catmull-Rom history sample, the variance clip
+(over the 3 x 3 texels) and the copy with contrast-adaptive sharpening are the anti-aliasing's, at the panel's
+resolution, sharing its history (post-processing reads it unchanged). The jitter covers 16 Halton positions instead of
+8. Each threadgroup loads a 32 x 32 tile of the rendered frame and its 1-texel border (the load's heavy part, the relight,
+the water, the shadows' shade and the aerial perspective, runs once per rendered texel, 13% border as before), then
+resolves every output pixel whose nearest sample this frame is one of the tile's texels: the tiles partition the output
+exactly at any scale.
+
+**The governor** (`RenderScale.swift`). Each frame's GPU time (its command buffer's, one submit per frame) is recorded
+with the scale it was drawn at; only frames at the current scale count, so a change is judged on frames drawn after it.
+Over the last 32: too slow is, uncapped, the GPU time's 90th percentile above 92% of the frame time; paced by the display
+(vsync), where the GPU slows its clock to fit the work and its time stretches toward the frame's whatever the load, it's
+the frame intervals' 90th percentile 4% past the refresh with the GPU over 80% busy. Then the scale drops to what would
+bring the GPU time to 85% if all of it scaled with the pixels, on a grid of 0.05 (at least one step). A step up (0.05)
+needs the same model to predict under 85% after it, held for 1 s: the model is the hysteresis, a step up never predicts a
+step down. At the lowest scale the per-feature quality drops in quarters (the GI cache's cell updates a frame: its light
+converges more slowly, nothing pops) and comes back before the scale does. Through the anti-aliasing a step of the scale
+is a slight change of sharpness over a few frames, not a pop: the history stays at the panel's resolution. Features merged
+later read `RenderScaleGovernor.shared.quality` (1 to 0) for their own steps (cloud and god-ray steps).
+
+**Offline check** (`tools/taautest.swift`): the real kernels on a test image (a zone plate whose frequency rises past what
+the rendered frame can hold, and a hard edge), a still view, scored against the image box-filtered over each output
+pixel (RMS error; `bench_out/agents/speed/taautest/` in the main checkout):
+
+| | all | where the drawn frame can hold the image | past it |
+|---|---|---|---|
+| TAA at the panel's resolution (8 jitters) | 0.122 | 0.071 | 0.132 |
+| bilinear upscale of 0.75, no jitter | 0.238 | 0.110 | 0.249 |
+| TAAU 0.75 (32 frames) | 0.103 | 0.033 | 0.109 |
+| TAAU 0.75, the jitter's sign flipped | 0.215 | 0.223 | 0.214 |
+| TAAU 0.667, 0.6 | 0.099, 0.100 | 0.037, 0.041 | 0.103, 0.104 |
+| TAAU 0.75 after 8 frames | 0.152 | 0.061 | 0.160 |
+
+A still view's frame-to-frame change once converged (the RMS between the last two frames, 32 frames in, k 4.5):
+native TAA 0.102, TAAU 0.75 0.127, 0.667 0.108, 0.6 0.087, over the whole plate (not split by band; its far corner is
+past even the output's Nyquist, where any resolve flickers). (That table at k 3. At 0.75 with k 4.5: 0.109 / 0.041 / 0.114; k 6: 0.119 / 0.046 / 0.125. Against this box-filtered
+reference a smoother kernel always scores better, while in game a sharper one looks closer to native TAA, which keeps
+more of the frame's high frequencies (0.071 in band here): k 4.5, the default, keeps most of k 3's margin over native TAA
+and measured sharper in game.) The flipped sign doubling the error checks the sample positions; "past it" is mostly past the output's own Nyquist too
+(the plate's frequency reaches 1.4 cycles a pixel in the far corner), where every method aliases. Convergence takes the
+16 jitter positions (8 frames is half-way). The governor's rules are checked offline too (`tools/govsim.swift`: synthetic
+frames, GPU time = fixed + per-pixel x s^2 with noise, reported two frames late, uncapped or vsync with a GPU clock that
+stretches its time toward the frame): it settles where the load fits (0.75 for 3 + 7 s^2 ms) without oscillating
+uncapped, keeps late frames under 1% wherever the load can fit, and climbs back after heavy views also under vsync with
+the stretched clock (the GPU-time rule alone ratcheted down to 0.6 there and stayed).
+
+### The full look per pass, at the panel's resolution and scaled (2026-10-10, lab session 1)
+
+Lab mode, 3456 x 2234 fullscreen, uncapped, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave`
+(no clouds yet), LOD 8192, `trace 8` per row's scale at mountain_view (the heaviest of the nine: a high view over 30 km of
+LOD), medians. Other helpers were building and running games in turns, so these are noisy; compute passes' totals overlap
+their neighbors and don't add up (`bench_out/agents/speed/traces1/` in the main checkout, `passes.py`).
+
+| Pass | 1.0 | 0.75 | 0.6 |
+|---|---|---|---|
+| Sky (quarter resolution, then the full-resolution pass) | 0.04 + 0.24 | 0.07 + 0.47 | 0.04 + 0.33 |
+| **Main pass: vertex / fragment** | **3.15 / 5.78** | **3.14 / 2.58** | **3.90 / 2.00** |
+| Ray-traced shadows | 0.69 | 0.46 | 0.34 |
+| GI cache: light, begin, request and resolve | 1.52 | 1.28 | 1.04 |
+| GI cache: schedule and rays | 0.47 | 0.45 | 0.51 |
+| Water's rays | 0.77 | 0.47 | 0.33 |
+| Resolve with the relight, water and aerial perspective (TAA, then TAAU) | 2.92 | 2.32 | 1.85 |
+| Post: bloom, exposure, composite | 1.42 + 0.04 + 0.67 | 1.33 + 0.05 + 0.68 | 1.31 + 0.04 + 0.71 |
+| The copy into the frame (fragment) | 0.42 | 0.48 | 0.50 |
+| Present (fragment) | 0.37 | 0.41 | 0.42 |
+
+- What scales with the pixels does: the main pass's fragment stage -55% at 0.75 (-65% at 0.6), shadows, water, the GI
+  cache's per-pixel stage, the resolve's load. The upscaler's own per-output work (reconstruction, history, clip, at the
+  panel's 7.7 M pixels) is about 1.1 ms (from the resolve's two rows: 2.92 = L + 0.75 natively, 2.32 = 0.56 L + C).
+- **What doesn't**: the main pass's vertex stage (the LOD's quads, 3.1-3.9 ms in this view), post (2.1 ms, at the panel's
+  resolution by design), the copy and present (0.9), the upscaler's per-output work (1.1), the GI cache's rays (0.5).
+  That's about 8.5 ms: in this view 120 Hz can't be had by scaling alone, at any scale. In game, uncapped, the governor
+  (`auto`) went to 0.6 with GI quality 0 and held 88 fps at mountain_view, 93 at noon_overview, 111 at forest, 114 at
+  water_closeup.
+- Command buffers' GPU spans overlap: 19 ms spans at 12 ms frames (mountain_view at 0.6). A frame's own GPU time is
+  end - max(start, the previous frame's end); the governor uses that. The bench's `metal_gpu_ms` is the span and
+  overstates per-frame GPU time whenever frames overlap.
+- In 2-3 of 8 frames vanilla redraws its animated block atlas (a 2048 x 2048 texture and its four mips, render passes on
+  the game tick), and those passes' fragment spans reach 5 ms. That is most likely waiting for the frame before to stop
+  reading the atlas (the GPU busy with that frame meanwhile), not work; whether it costs a frame's overlap once a tick
+  is for the flights' frame times to show.
+
+**Lab session 2** (the same, with clouds; `bench_out/agents/speed/traces2/`, `boards2/`): mountain_view's main pass
+3.24 / 3.79 ms at 1.0 and 3.19 / 2.57 at 0.75; the clouds' march 0.56 -> 0.35 ms (their half-resolution buffers follow
+the level: 1728 x 1117 -> 1296 x 838); the upscaler with the clouds' composite in its load 2.62 ms against the plain
+resolve's 3.15.
+
+- **The LOD's quad culling at 0.75** (`quadcull`, exact): 70.9% of mountain_view's 1.34 M level-0 quads issued (67.5% in
+  the forest), the vertex stage 3.19 -> 2.91 ms, for a culling pass of 0.37 ms in a command buffer of its own (0.21 in
+  the forest); status 69 -> 71 fps in mountain_view, 84 -> 84 in the forest. Worth having on with a scale, not the lever
+  that makes 120 Hz.
+- **The governor** (uncapped, `auto`, with each frame's own GPU time now): agrees with the frame interval (13.9 ms GPU
+  at 13.8 ms frames) and goes straight to 0.6 and quality 0 in the heavy views: mountain_view 82 fps, noon_overview 82,
+  forest 103 (with clouds).
+- **The look, native against 0.75, back to back** (the same pose seconds apart; clouds drift and leaves wave between
+  them): sharpness (the scaled shot's gradient energy over native's) 0.70-0.82 with the reconstruction's k 3 and the
+  copy's sharpening 0.5 (forest 0.76, mountain_view 0.73, noon 0.80, torch_cave 0.82, water_closeup 0.70). At 100% the
+  0.75 frame is softer in fine texture (leaves, distant block faces), with no artifacts of its own: edges are clean,
+  water, clouds and the sky hold up. k 4.5 with sharpening 0.7 took the forest to 0.81; sharpening alone (0.8 at k 3)
+  didn't move it (0.755). In theory the still image converges to the scene convolved with the reconstruction's Gaussian
+  (sigma 0.41 output pixels at k 3), against native TAA's box over each pixel (sigma 0.29): k 6 would match it, at the
+  price of a blockier current frame where the history is rejected (disocclusions, waving leaves).
+- **A system dialog blocked the timed flights** from at least 12:15: macOS's "“claude” would like to access data from
+  other apps" (UserNotificationCenter, Don't Allow / Allow), which no helper may answer. run_mc.sh holds timed runs
+  until the screen is clear, since a dialog over the fullscreen game paces it at 120 Hz and voids uncapped numbers. The
+  vsync flights below ran anyway (a run paced at 120 Hz by vsync isn't changed by that), flagged in the ledger; the
+  uncapped flights wait for the dialog to go. The lab sessions' uncapped fps may have run under it too (when it appeared
+  isn't known).
+- The mip bias (the terrain's texture gradients scaled to the output's resolution) didn't change the forest's score:
+  there the leaves' texels are magnified (2 rendered pixels each), so it's the reconstruction, not the mips. It matters
+  for minified textures (distant terrain), where it keeps the native mip.
+
+### Flights (2026-10-10, vsync only, noisy)
+
+The real-terrain flight (`claudeworld-merged`, y 150, 20 blocks/s, LOD 32768, 60 s timed), 3456 x 2234 fullscreen at
+120 Hz, TAA on, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds` (before god rays and the
+grade), from a frozen copy of the branch at af7d06c. Other helpers built and ran in turns between the runs, and the
+system dialog above was on screen: **noisy**, one run each. Frames over 8.33 and 16.67 ms are the bench's
+`frames_over_8ms` and `frames_over_16ms`; own GPU time is each frame's (above), the span is the command buffers'.
+
+| Run (vsync on) | Frames | fps | ms p50 | ms p99 | Over 8.33 ms | Over 16.67 ms | Own GPU p50 / p99 | Span p50 |
+|---|---|---|---|---|---|---|---|---|
+| Native (1.0) | 3948 | 66.0 | 15.29 | 17.86 | 3947 | 344 | 15.08 / 17.12 | 24.01 |
+| 0.75 | 4901 | 81.9 | 12.39 | 15.01 | 4895 | 9 | 12.03 / 14.52 | 18.06 |
+| `auto` (0.6-1.0) | 2669 | 45.0 | 10.70 | 101.57 | 2586 | 362 | 10.46 / 21.00 | 14.33 |
+
+- **0.75 against native**: +24% fps, p99 -2.9 ms, frames over 16.67 ms 344 -> 9. Neither reaches 120 Hz (every frame
+  over 8.33 ms): the fixed costs above.
+- **`auto` is void**: about 35 s of it ran at about 10 fps (100 ms frames), the window throttled while the dialog had
+  focus. Before that the governor stepped 0.8 -> 0.65 -> 0.6 and quality 0 in the warm-up and stayed there: at 120 Hz
+  with this look no scale fits 8.33 ms, so a 120 Hz target sends it to its floor. Its own GPU p50 at 0.6 was 10.5 ms.
+- **Uncapped (vsync off): not run.** The dialog paces an uncapped fullscreen game at 120 Hz, so run_mc.sh holds those
+  runs until the screen is clear.
+
+To re-run on a quiet machine (no other runs, the dialog answered), from the repository's root, one flight each:
+
+```
+for s in 1 0.75 auto:0.7:1; do for vs in false true; do
+  BENCH_FIXTURE=claudeworld-merged BENCH_TIMEOUT=900 BENCH_VSYNC=$vs bash tools/bench/bench_lod.sh "fl-${s//:/_}-$vs" 32768 \
+    -PbenchY=150 -PbenchFly=20 -PbenchExtraWait=600 -PbenchHitches=1 -PbenchTrace=1 -Ptaa=true \
+    -PmetalExp=lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds,godrays -PrenderScale=$s
+done; done
+```
+
+Then read `fps_mean`, `ms_p50`, `ms_p99`, `frames_over_8ms`, `frames_over_16ms` and `metal_gpu_own_ms_p50`/`p99` from
+the `METALMC_BENCH` line of each `bench_out/run_fl-*.log`, and the governor's `render scale: now ...` lines for `auto`.
+Three runs of each, alternating, would make them more than one sample.

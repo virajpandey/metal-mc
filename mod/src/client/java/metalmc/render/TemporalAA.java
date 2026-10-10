@@ -29,8 +29,16 @@ public final class TemporalAA {
 
     /** Jitters {@code projection} in place for a {@code width} x {@code height} target. */
     public static void jitter(Matrix4f projection, int width, int height) {
+        jitter(projection, width, height, 8);
+    }
+
+    /**
+     * As above, over {@code phases} positions: 8 at the panel's resolution, 16 when the level is drawn at a scale and
+     * upscaled (RenderScale: each of its pixels covers more than one of the output's).
+     */
+    public static void jitter(Matrix4f projection, int width, int height, int phases) {
         UNJITTERED.set(projection);
-        int i = (frame++ & 7) + 1;
+        int i = Math.floorMod(frame++, phases) + 1;
         jitterX = halton(i, 2) - 0.5f;
         jitterY = halton(i, 3) - 0.5f;
         projection.translateLocal(2f * jitterX / width, 2f * jitterY / height, 0f);

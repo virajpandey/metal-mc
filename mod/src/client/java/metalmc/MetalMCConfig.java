@@ -54,6 +54,11 @@ public final class MetalMCConfig {
         # terrain, by blending each frame with the ones before it. About 1.8 ms of GPU per frame at the panel's
         # native resolution; a 120 Hz flight still drops no frames. Set to false for the raw image.
         taa=true
+        # Render scale (with taa): the world drawn at this fraction of the screen's resolution on each axis and rebuilt to
+        # full resolution by the anti-aliasing (the hand, the HUD and the screen effects stay sharp). 1 is full
+        # resolution; 0.75 draws 56% of the pixels. "auto" changes it on the fly (0.6 to 1) to hold the screen's refresh
+        # rate.
+        renderScale=1
 
         # Ray-traced sun shadows (Metal backend, prototype): terrain, trees and mountains cast shadows from the sun, out
         # to the LOD's far terrain. About 1 ms of GPU per frame at the panel's native resolution (enough to drop some
@@ -156,6 +161,14 @@ public final class MetalMCConfig {
     /** Temporal anti-aliasing (on by default): Taa.swift's resolve, about 1.8 ms of GPU per frame at the panel's resolution. */
     public static boolean taa() {
         return flag("taa", true);
+    }
+
+    /**
+     * Render scale (with taa): a number from 0.5 to 1 (1, the default: the panel's resolution) or "auto" (the governor);
+     * Sources/MetalMCNative/RenderScale.swift reads it as METALMC_SCALE (NativeLibrary passes it on).
+     */
+    public static String renderScale() {
+        return get("renderScale", "1");
     }
 
     /** Ray-traced sun shadows (off by default): RtShadows.swift, about 1 ms of GPU per frame at the panel's resolution. */

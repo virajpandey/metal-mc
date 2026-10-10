@@ -34,7 +34,9 @@ abstract class GameRendererLodMixin {
     @ModifyArg(method = "renderLevel", at = @At(value = "INVOKE",
         target = "Lnet/minecraft/client/renderer/ProjectionMatrixBuffer;getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;"))
     private Matrix4f metalmc$levelProjection(Matrix4f projection) {
-        if (TemporalAA.ENABLED) TemporalAA.jitter(projection, mainRenderTarget.width, mainRenderTarget.height);
+        // Render scale (metalmc.render.RenderScale): the jitter is in the level's pixels, over 16 positions when upscaled.
+        RenderTarget level = metalmc.render.RenderScale.level(mainRenderTarget);
+        if (TemporalAA.ENABLED) TemporalAA.jitter(projection, level.width, level.height, metalmc.render.RenderScale.scaled() ? 16 : 8);
         Lod.LEVEL_PROJECTION.set(projection);
         return projection;
     }
@@ -53,13 +55,21 @@ abstract class GameRendererLodMixin {
     @Inject(method = "render3dHud", at = @At("HEAD"))
     private void metalmc$temporalAA(CameraRenderState cameraState, PlayerRenderState playerState, OptionsRenderState optionsState,
                                     boolean consistentDepthRequired, CallbackInfo ci) {
-        if (mainRenderTarget.getColorTexture() == null || mainRenderTarget.getDepthTexture() == null) return;
+        // Render scale (metalmc.render.RenderScale): the level was drawn into its own, smaller target; everything up to the
+        // anti-aliasing works on that, which then upscales it into the main target.
+        RenderTarget level = metalmc.render.RenderScale.level(mainRenderTarget);
+        if (level.getColorTexture() == null || level.getDepthTexture() == null
+                || mainRenderTarget.getColorTexture() == null || mainRenderTarget.getDepthTexture() == null) {
+            metalmc.render.RenderScale.endLevel();
+            return;
+        }
         // Clouds hook (METALMC_EXP=clouds, metalmc.backend.MetalClouds): ours replace vanilla's slab, so nothing below takes
         // terrain in its height for a cloud; then this frame's clouds, before the shadows (they take the clouds' shadows).
+        // On the level's target: with a render scale their quarter-resolution march follows the level's resolution.
         if (metalmc.backend.MetalClouds.active()) {
             Lod.CLOUD_HEIGHT = 1e9f;
             var mc = net.minecraft.client.Minecraft.getInstance();
-            metalmc.backend.MetalClouds.frame(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(),
+            metalmc.backend.MetalClouds.frame(level.getColorTexture(), level.getDepthTexture(),
                 TemporalAA.ENABLED ? TemporalAA.UNJITTERED : Lod.LEVEL_PROJECTION, cameraState.viewRotationMatrix,
                 cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, Lod.SUN_CLEAR,
                 mc.level == null ? 0f : mc.level.getThunderLevel(1f), mc.level == null ? 63f : mc.level.getSeaLevel());
@@ -67,7 +77,7 @@ abstract class GameRendererLodMixin {
         if (Lod.active() && Lod.SUN_SKY) {
             // Full strength while the sun is more than about 6 degrees up, fading out as it sets; weaker in rain.
             float strength = 0.42f * Math.clamp((float) Math.cos(Lod.SUN_ANGLE) * 10f, 0f, 1f) * Lod.SUN_CLEAR;
-            metalmc.backend.MetalShadows.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
+            metalmc.backend.MetalShadows.apply(level.getColorTexture(), level.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, strength, Lod.CLOUD_HEIGHT, TemporalAA.ENABLED);
         }
         // Lit hook (METALMC_EXP=lit, metalmc.backend.MetalLit): the terrain relit from the G-buffer the level's main pass
@@ -79,7 +89,7 @@ abstract class GameRendererLodMixin {
             if (metalmc.backend.MetalColoredLight.ENABLED) metalmc.light.ColoredLight.frame(cameraState.pos.x, cameraState.pos.y, cameraState.pos.z);
             // Water (METALMC_EXP=water): the camera's fluid, and vanilla's water sprites for the G-buffer.
             metalmc.backend.MetalLit.water(cameraState.fogType == net.minecraft.world.level.material.FogType.WATER);
-            metalmc.backend.MetalLit.relight(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
+            metalmc.backend.MetalLit.relight(level.getColorTexture(), level.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, Lod.SUN_ANGLE, cameraState.fogData,
                 net.minecraft.client.Minecraft.getInstance().gameRenderer.levelLightmap(), metalmc.sky.Sky.frameActive, TemporalAA.ENABLED);
         }
@@ -88,20 +98,30 @@ abstract class GameRendererLodMixin {
         if (metalmc.sky.Sky.frameActive) {
             // Post hook (METALMC_EXP=post): where vanilla's clouds are, so this step lights them by day.
             if (metalmc.backend.MetalPost.ENABLED) metalmc.backend.MetalPost.clouds(Lod.CLOUD_HEIGHT - (float) cameraState.pos.y);
-            metalmc.backend.MetalSky.aerial(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
+            metalmc.backend.MetalSky.aerial(level.getColorTexture(), level.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, TemporalAA.ENABLED);
             // Clouds hook: without anti-aliasing, their composite as a pass of its own (with it, its resolve does it).
-            if (!TemporalAA.ENABLED) metalmc.backend.MetalClouds.composite(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(),
+            if (!TemporalAA.ENABLED) metalmc.backend.MetalClouds.composite(level.getColorTexture(), level.getDepthTexture(),
                 Lod.LEVEL_PROJECTION, cameraState.viewRotationMatrix);
         }
         if (TemporalAA.ENABLED) {
-            metalmc.backend.MetalTaa.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), TemporalAA.UNJITTERED,
-                cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, TemporalAA.jitterX, TemporalAA.jitterY, false);
+            if (level != mainRenderTarget) {
+                // Upscaled into the main target (TaaUpscale.swift); if it can't run, the main target has no level this
+                // frame and scaling stops.
+                if (!metalmc.backend.MetalScale.taa(level.getColorTexture(), level.getDepthTexture(), mainRenderTarget.getColorTexture(),
+                        TemporalAA.UNJITTERED, cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z,
+                        TemporalAA.jitterX, TemporalAA.jitterY, false)) metalmc.render.RenderScale.fail();
+            } else {
+                metalmc.backend.MetalTaa.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), TemporalAA.UNJITTERED,
+                    cameraState.viewRotationMatrix, cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, TemporalAA.jitterX, TemporalAA.jitterY, false);
+            }
         }
+        metalmc.render.RenderScale.endLevel();
         // Post hook (METALMC_EXP=post, metalmc.backend.MetalPost): bloom, eye adaptation, light shafts and the tone curve
-        // over the level's scene-linear light (our sky drew it), after the anti-aliasing, before the hand.
+        // over the level's scene-linear light (our sky drew it), after the anti-aliasing, before the hand. At the panel's
+        // resolution; the depth is the level's (smaller with a render scale).
         if (metalmc.backend.MetalPost.ENABLED && metalmc.sky.Sky.frameActive) {
-            metalmc.backend.MetalPost.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(),
+            metalmc.backend.MetalPost.apply(mainRenderTarget.getColorTexture(), level.getDepthTexture(),
                 TemporalAA.ENABLED ? TemporalAA.UNJITTERED : Lod.LEVEL_PROJECTION, cameraState.viewRotationMatrix,
                 cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, TemporalAA.ENABLED);
         }
