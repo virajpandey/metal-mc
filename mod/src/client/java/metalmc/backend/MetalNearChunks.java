@@ -111,6 +111,7 @@ public final class MetalNearChunks {
             || !(pass.uniformValue("Sampler2") instanceof TextureViewAndSampler lightmap)) {
             return -1;
         }
+        MetalFoliage.ensure(atlas.view());   // leaflight, wave: the atlas's leaf and plant sprites, when it changed
         int drawn;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             LongBuffer res = stack.mallocLong(14);
