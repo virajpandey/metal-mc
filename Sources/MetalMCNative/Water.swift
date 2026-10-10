@@ -241,12 +241,15 @@ let waterAbsorb: SIMD3<Double> = {
 let waterScatter = waterEnvFloat("METALMC_WATERSCATTER", 0.035, 0, 1)
 /// METALMC_WATERCAUSTICS: the caustics' strength on sunlit floors under water (0: none).
 let waterCaustics = waterEnvFloat("METALMC_WATERCAUSTICS", 1, 0, 8)
-/// METALMC_WATERREFRACT: how far the floor seen through the water is bent (0: not at all; 1: Snell's law).
-let waterRefract = waterEnvFloat("METALMC_WATERREFRACT", 1, 0, 4)
+/// METALMC_WATERREFRACT: how far the floor seen through the water is bent by the waves (0, the default: not at all, as
+/// vanilla drew it; 1: Snell's law). The look-up of the floor where the refracted ray meets it cost 0.5 ms at water_closeup
+/// (85% water, measured).
+let waterRefract = waterEnvFloat("METALMC_WATERREFRACT", 0, 0, 4)
 /// METALMC_WATERRT: 0 turns the traced reflections off (the sky's map alone, as in round 1). METALMC_WATERRTSCALE: pixels
-/// per traced texel along each axis (2, or 4 for a quarter of the rays).
+/// per traced texel along each axis (4, the default; 2: four times the texels, a sharper reflection, about 1.5 ms more at
+/// water_closeup, measured).
 let waterRtEnabled = litWater && waterEnv("METALMC_WATERRT") != "0"
-let waterRtScale = Int(waterEnv("METALMC_WATERRTSCALE") ?? "") == 4 ? 4 : 2
+let waterRtScale = Int(waterEnv("METALMC_WATERRTSCALE") ?? "") == 2 ? 2 : 4
 /// METALMC_WATERCHECKER=0: every texel traces its reflected ray each frame (default: half of them, a checkerboard).
 let waterChecker = waterEnv("METALMC_WATERCHECKER") != "0"
 /// METALMC_EXP=wet (with lit and water): in rain, lit terrain open to the sky gets wet: darker, with a film of water that
@@ -538,8 +541,9 @@ static float3 litWaterRelit(float3 c, float3 v, float3 e) {
 }
 
 // Water pixel q (color c as the relight left it, depth d, G-buffer texel g): its color with the reflections, the floor
-// and the water's own light. trace, traceAS: water_trace's outputs (the reflection and the depth along the refracted ray,
-// a < 0 where it has none; A and S packed); color, gbuf: the frame and the G-buffer, to look up the floor where the
+// and the water's own light. trace, traceAS: water_trace's outputs (the reflection and the visibility traced
+// toward the sun or the moon, a < 0 where it has none; A, what a white floor would add, S, packed, and the depth along
+// the refracted ray); color, gbuf: the frame and the G-buffer, to look up the floor where the
 // refracted ray meets it (color is a 1 x 1 stand-in in lit mode's own pass, which draws into the frame: there the floor
 // isn't bent); depth: for flowing water, whether it's a top. Anything that isn't water comes back as it came.
 static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half, access::read> vis, constant LitFrame& f,
@@ -559,25 +563,25 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
     float dist = length(rel);
     float3 V = -rel / max(dist, 1e-4);   // toward the camera
     float skyLevel = float((g.y >> 24) & 15u), blockLevel = float(g.y >> 28);
-    // The sun's (or at night the moon's) visibility at the surface as the relight's sun term has it: traced where the
-    // rays went, else the open sky.
-    float vis0 = saturate((skyLevel - 12.0) / 3.0), vTraced = vis0;
-    if (f.size.z > 0.0) {
-        uint s = uint(f.size.z);
-        vTraced = float(vis.read(min(q / s, uint2(vis.get_width() - 1, vis.get_height() - 1))).r) * saturate(skyLevel / 2.0);
-    }
-    float vSun = f.sunDir.w < 0.5 ? vTraced : vis0, vMoon = f.sunDir.w > 0.5 ? vTraced : vis0;
     uint face = (g.x >> 24) & 7u;
     bool top = face == 2u || (face == 7u && litWaterIsTop(depth, q, d, f.invViewProj, f.size.xy));
     float4 tr = float4(0.0, 0.0, 0.0, -1.0);
-    uint2 tas = uint2(0u);
+    uint4 tas = uint4(0u);
     if (top && V.y > 0.0 && f.water3.x > 0.0) {
         uint2 t = min(q / uint(f.water3.x), uint2(trace.get_width() - 1, trace.get_height() - 1));
         tr = trace.read(t);
-        tas = traceAS.read(t).rg;
+        tas = traceAS.read(t);
     }
     float3 o;
     if (!top || V.y <= 0.0 || tr.w < 0.0) {
+        // The sun's (or at night the moon's) visibility at the surface as the relight's sun term has it: traced where the
+        // rays went, else the open sky.
+        float vis0 = saturate((skyLevel - 12.0) / 3.0), vTraced = vis0;
+        if (f.size.z > 0.0) {
+            uint s = uint(f.size.z);
+            vTraced = float(vis.read(min(q / s, uint2(vis.get_width() - 1, vis.get_height() - 1))).r) * saturate(skyLevel / 2.0);
+        }
+        float vSun = f.sunDir.w < 0.5 ? vTraced : vis0, vMoon = f.sunDir.w > 0.5 ? vTraced : vis0;
         // A water column's side (falls, the world's edges), the surface seen from under it, or no rays here: the water as
         // it was drawn, relit (vanilla's water doesn't glow at night any more); tops get the sky's reflection in the
         // reflected direction where they're open to it, and the glints.
@@ -601,7 +605,9 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
         float rough2;
         float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / max(V.y, 0.02), rough2);
         float F = litWaterFresnel(max(dot(n, V), 1e-3));
-        float3 A = litWaterUnpack(tas.x), S = litWaterUnpack(tas.y);
+        float3 A = litWaterUnpack(tas.x), seen = litWaterUnpack(tas.y), S = litWaterUnpack(tas.z);
+        float thick = as_type<float>(tas.w);
+        float vSun = f.sunDir.w < 0.5 ? tr.w : 0.0, vMoon = f.sunDir.w > 0.5 ? tr.w : 0.0;
         float3 body = S;
         // (Where the water is deep enough that the floor adds nothing that shows, no floor to look up.)
         if (max(A.r, max(A.g, A.b)) > 0.0) {
@@ -611,7 +617,7 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
             uint2 q2 = q;
             if (color.get_width() > 1u && WATER_REFRACT > 0.0) {
                 float3 T = refract(-V, n, 1.0 / WATER_ETA), T0 = refract(-V, float3(0.0, 1.0, 0.0), 1.0 / WATER_ETA);
-                float4 cp = f.viewProj * float4(rel - V * tr.w + (T - T0) * (tr.w * WATER_REFRACT), 1.0);
+                float4 cp = f.viewProj * float4(rel - V * thick + (T - T0) * (thick * WATER_REFRACT), 1.0);
                 if (cp.w > 1e-4) {
                     int2 qq = int2(floor((cp.xy / cp.w * 0.5 + 0.5) * f.size.xy));
                     if (all(qq >= int2(0)) && all(qq < int2(f.size.xy))) {
@@ -624,8 +630,9 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
             bool moved = any(q2 != q);
             float3 c2 = moved ? color.read(q2).rgb : c;
             float4 l2 = moved ? litWaterLayer(gbuf.read(q2).rg) : layer;
-            // The layer off: the floor as vanilla drew it.
-            body += skyDecode(max((c2 - l2.a * l2.rgb) / max(1.0 - l2.a, 0.02), 0.0)) * A;
+            // The layer off: the floor as vanilla drew it, to our light (its reflectance against vanilla's light at most 1:
+            // what a white floor would show).
+            body += min(skyDecode(max((c2 - l2.a * l2.rgb) / max(1.0 - l2.a, 0.02), 0.0)) * A, seen);
         }
         o = body * (1.0 - F) + tr.rgb * F;
         // The glints: the sun's (lit_env leaves the scale from its units to the relight's in env[0].w; f.water2.y: as much
@@ -1113,7 +1120,7 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     float3 viewT = exp(-WATER_ABSORB * thick);
     float3 S = litWaterTint(layer.rgb) * (WATER_SCATTER * (1.0 - viewT)) * surfE;
     float3 A = 0.0;
-    float3 seen = viewT * floorE;   // about what a white floor would add
+    float3 seen = viewT * floorE;   // what a white floor would add
     if (layer.a > 0.02 && layer.a < 0.98 && max(seen.r, max(seen.g, seen.b)) > 0.002) {
         // The floor as vanilla drew it (in vanilla's light, which water dims a sky light level a block) to ours.
         float3 floorV = skyDecode(litWaterVanilla(lightmap, lm, blockLevel, max(skyLevel - floor(D), 0.0)));
@@ -1122,8 +1129,13 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
         // No layer to take off (the LOD's deep water, drawn opaque; the far field's): a sandy floor.
         S += WATER_FLOOR * seen;
     }
-    out.write(float4(max(col, 0.0), thick), gid);
-    outAS.write(uint4(litWaterPack(A), litWaterPack(S), 0u, 0u), gid);
+    if (max(A.r, max(A.g, A.b)) <= 0.0) seen = 0.0;
+    // The visibility traced toward the sun (the moon at night) for the per-pixel glints, and the depth for the floor's
+    // bend (the per-pixel look-up, WATER_REFRACT).
+    float vGlint = p.vis.x > 0.0 ? float(vis.read(min(q / uint(p.vis.x), uint2(vis.get_width() - 1, vis.get_height() - 1))).r) * saturate(skyLevel / 2.0)
+                                 : saturate((skyLevel - 12.0) / 3.0);
+    out.write(float4(max(col, 0.0), vGlint), gid);
+    outAS.write(uint4(litWaterPack(A), litWaterPack(seen), litWaterPack(S), as_type<uint>(thick)), gid);
 }
 """
 
@@ -1150,7 +1162,7 @@ final class WaterTrace: @unchecked Sendable {
     var textureAS: MTLTexture? {
         if let currentAS { return currentAS }
         if standInAS == nil {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg32Uint, width: 1, height: 1, mipmapped: false)
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Uint, width: 1, height: 1, mipmapped: false)
             d.usage = .shaderRead
             standInAS = ctx.device.makeTexture(descriptor: d)
         }
@@ -1221,7 +1233,7 @@ final class WaterTrace: @unchecked Sendable {
             d.storageMode = .private
             out = ctx.device.makeTexture(descriptor: d)
             out?.label = "MetalMC water rays"
-            let d2 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg32Uint, width: tw, height: th, mipmapped: false)
+            let d2 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Uint, width: tw, height: th, mipmapped: false)
             d2.usage = [.shaderRead, .shaderWrite]
             d2.storageMode = .private
             outAS = ctx.device.makeTexture(descriptor: d2)
