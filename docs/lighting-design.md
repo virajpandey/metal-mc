@@ -2006,6 +2006,13 @@ against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only 
   rain), the aureole of real haze, whose phase has a diffraction peak one Cornette-Shanks lobe at g 0.8 misses (a degree
   or two from the sun it's about 15 times what it is 10 degrees out, against twice). The sun gets a warm glow at sunset
   and a bright halo by day. SEUS's much larger glow is mostly bloom: the grade's.
+- **In game**, session 8 (effbc93; `round3/before-round3-<scene>.jpg`, SEUS's twins in the private folder): rain a deck
+  with soft lighter and darker cells, thunder darker with faint ones, sunset_water with a large warm glow around the sun,
+  mountain_view and noon_overview scattered at the new default, the fast turn clean, the climb through the layer with
+  the speckle mostly gone but vertical streaks left at the nearest clouds' edges. Noon (8 frames, camera still): sky
+  light and shadow map 0.16 ms, march 0.50, shadows on the visibility 0.11, about 1.05 ms with the composite. Just over
+  the layer (y 2000) right after the climb, the camera still settling, the march took 1.93 ms: a view down onto the
+  whole deck, moving.
 
 ### Not done, and next
 
