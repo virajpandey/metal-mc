@@ -1528,8 +1528,9 @@ ours to style.
   ramp; a scene at 20 points is about a fifth of an L unit off on average. Night and caves score against a target of our
   own (`tools/bench/twinsum.py`): terrain luma 35-45 (ffmpeg's YAVG of the bottom 55%, as the census measures it; SEUS is
   near black at 29-33), half a point per level outside the band; torchlight as warm as SEUS's (the block-lit class's
-  OKLab a, b and chroma against SEUS's, 100 x share x distance); no crushed shadows (100 x share x how far the shade and
-  block-lit classes' 10th percentile of L is under 0.12).
+  OKLab hue against SEUS's, at SEUS's chroma, plus any chroma short of SEUS's, 100 x share x both: not its chroma
+  itself, which is small because SEUS's class is mostly near black); no crushed shadows (100 x share x how far the
+  shade and block-lit classes' 10th percentile of L is under 0.12).
 - **One command**: `bash tools/bench/twins.sh <label> [LAB_EXP]` runs a lab session, shoots the nine scenes with their
   masks, scores them and writes the boards (ours | SEUS over mask | the lightness difference) and `summary.md` to the
   main checkout's `bench_out/twins/<label>/`. After each `scene` it waits 300 ticks: `scene` settles the LOD and the
@@ -1538,24 +1539,31 @@ ours to style.
 
 ### The knobs
 
-All are `#define`s in the hot-reloaded shader files (docs/lab-mode.md), so a lab session can turn them live.
+All are `#define`s in the hot-reloaded shader files (docs/lab-mode.md), so a lab session can turn them live; post.metal's
+reload snaps the eye adaptation, so an edit shows at once. Default: the built-in value with post; before: the look
+before the grade (`bench_out/agents/grade/configs/base.json` in the main checkout sets them all).
 
-| Knob | File | What it does |
-|---|---|---|
-| `POST_EV` | post.metal | exposure compensation, stops, on top of the eye adaptation; `METALMC_POSTEV` |
-| `POST_GRADE_EV` | post.metal | the grade's exposure lift, stops (fades with the sun, `POST_DUSK`) |
-| `POST_DUSK` | post.metal | the share of the day's lift (`POST_GRADE_EV`, `POST_LOCAL_DARK`) kept with the sun 4 degrees up or lower; all of it from 30 degrees |
-| `POST_ADAPT_REF`, `POST_ADAPT_DARK_NEAR`, `POST_ADAPT_DARK` | post.metal | the eye adaptation's reference and how much of a darker scene's difference it makes up within 2.5 stops and past them (night and caves) |
-| `POST_LOCAL`, `POST_LOCAL_DARK` | post.metal | the local tone map: how much of the base's distance above mid-gray goes (the sky), and below it (the land in shade, lifted) |
-| `POST_LOCAL_EPS`, `POST_LOCAL_RADIUS`, `POST_LOCAL_RANGE` | post.metal | its guided filter's edge threshold (stops squared), box (grid texels of 16 pixels), and the most stops counted |
-| `POST_AGX_SAT`, `POST_AGX_POWER` | post.metal | AgX's look: saturation and power (contrast) on its sigmoid's output |
-| `POST_PURKINJE`, `_LO`, `_HI` | post.metal | night vision: how far dim pixels go toward the rods' picture, and the light levels it spans |
-| `LIT_SUN_GAIN`, `LIT_SKY_GAIN` | lit_relight_header.metal | the sun's light and the sky term's (the GI cache's sky and bounced light): their ratio is the sun-to-sky balance, the sky gain is what fills the shade |
-| `LIT_SHADE_WARM` | lit_relight_header.metal | the sky term's tint, at the same luminance (> 0 warmer, < 0 bluer) |
-| `LIT_BLOCK_GAIN`, `_WARM`, `_SAT`, `_FALLOFF` | lit_relight_header.metal | block light's gain, warmth, saturation, and falloff (times (level / 15)^falloff: pools of light around the sources) |
+| Knob | File | Default (before) | What it does |
+|---|---|---|---|
+| `POST_EV` | post.metal | 0 (0) | exposure compensation, stops, on top of the eye adaptation; `METALMC_POSTEV` |
+| `POST_GRADE_EV` | post.metal | 0.75 (0) | the grade's exposure lift, stops; the day's lift |
+| `POST_LOCAL_DARK` | post.metal | 0.38 (0) | the local tone map below mid-gray: the land in shade lifted; the day's lift |
+| `POST_LOCAL` | post.metal | 0 (0) | the local tone map above mid-gray: the sky compressed (lost in every autotune pass: our sky is darker than SEUS's already) |
+| `POST_LOCAL_EPS`, `_RADIUS`, `_RANGE` | post.metal | 0.5, 5, 4 | its guided filter's edge threshold (stops squared), box (grid texels of 16 pixels), and the most stops counted |
+| `POST_DUSK` | post.metal | 0.25 (1) | the share of the day's lift kept with the sun 4 degrees up or lower (all of it from 30 degrees) |
+| `POST_CAVE` | post.metal | 0.2 (1) | the share of the day's lift kept under cover (`post_outdoor`'s estimate) |
+| `POST_ADAPT_DARK` | post.metal | 0.4 (0.7) | how much of a darker scene's difference past 2.5 stops the eye adaptation makes up (night and caves) |
+| `POST_ADAPT_REF`, `POST_ADAPT_DARK_NEAR` | post.metal | -1.9, 0.2 | the adaptation's reference and its response within the knee (a weak exposure lever: 20-30% of a change shows) |
+| `POST_AGX_SAT`, `POST_AGX_POWER` | post.metal | 1.15 (1.3), 1 | AgX's look: saturation and power (contrast) on its sigmoid's output |
+| `POST_PURKINJE`, `_LO`, `_HI` | post.metal | 0, -9, -4.5 | night vision: how far dim pixels go toward the rods' picture, and the light levels (log2, scene units) it spans |
+| `LIT_SUN_GAIN`, `LIT_SKY_GAIN` | lit_relight_header.metal | 1.4, 2.0 (1, 1) | the sun's light and the sky term's (the GI cache's sky and bounced light): their ratio is the sun-to-sky balance, the sky gain fills the shade |
+| `LIT_SHADE_WARM` | lit_relight_header.metal | -0.15 (0) | the sky term's tint, at the same luminance (> 0 warmer, < 0 bluer) |
+| `LIT_SKY_OPEN` | lit_relight_header.metal | 3 (0) | the sky term fades out below this sky light level (0: never): keeps the GI cache's light out of enclosed caves |
+| `LIT_BLOCK_GAIN`, `_WARM`, `_SAT`, `_FALLOFF` | lit_relight_header.metal | 0.4, 0.35, 1.4, 2 (1, 0, 1, 0) | block light above vanilla's floor: gain, warmth, saturation, and falloff (times (level / 15)^falloff: pools of light around the sources) |
+| `LIT_BLOCK_FLOOR` | lit_relight_header.metal | 1 (1) | vanilla's floor (its lightmap at level 0, which keeps dark corners readable) |
 
-The relight's knobs are spliced in with their tuned values only with `post` (lit mode without post keeps its light: its
-8-bit frame has no tone curve to take a brighter sun).
+The relight's knobs take their tuned values only with `post` (lit mode without post keeps its light: its 8-bit frame
+has no tone curve to take a brighter sun).
 
 ### The local tone map
 
@@ -1599,6 +1607,18 @@ after the exposure, takes the mean of the sky's share and lit terrain's sky ligh
 and follows it with a time constant of 0.5 s (snapped with the exposure). The two caves are lit at noon, so without it
 the day's lift would open them up too and flatten their pools of light; with it, night and caves are set by the eye
 adaptation's own knobs (`POST_ADAPT_DARK`) and block light's.
+
+Two things the night tuning turned up:
+- **The GI cache's light reached enclosed caves.** The mineshaft's and the torch cave's walls and ceilings stayed a cold
+  blue-gray with block light turned down to a tenth: the sky term, which with the GI cache is the cache's light where it
+  has a sample, lit faces whose sky light level is 0 (no opening within 15 blocks), and the day's sky gain doubled it.
+  In the lab, with `LIT_SKY_GAIN` 0 the mineshaft turned torchlit and warm, like SEUS's. The sky term now fades out
+  below sky light 3 (`LIT_SKY_OPEN`). Where the cache's light comes from there (bounce rays leaving through geometry the
+  LOD's structures don't close off?) is the GI cache's to find; the guard is right on its own terms, since a face no sky
+  light reaches gets no sky.
+- **The falloff crushed dark corners.** Gain and falloff scaled all of block light, vanilla's floor too (its lightmap at
+  level 0: the 4% mix toward gray and the brightness setting's lift), so the torch cave's walls went to black (its shade
+  class's 10th percentile at OKLab L 0.03, SEUS's 0.14). They now shape only the light above the floor.
 
 **The Purkinje shift** (`POST_PURKINJE`, off by default): in dim light the rods take over, which see no color and favor
 blue-green. Per pixel, by its own light before the exposure (all rods below 2^-9 in scene units, none above 2^-4.5), the
