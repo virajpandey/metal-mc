@@ -44,6 +44,9 @@ let foliageSprites = nearChunksEnabled && (foliageLight || foliageWave)
 let foliageLeafTransmittance = min(max(Float(ProcessInfo.processInfo.environment["METALMC_LEAFT"] ?? "") ?? 0.3, 0.01), 1)
 /// Per block of leaves: the direct beam's extinction (-ln of the above).
 let foliageLeafSigma = -log(foliageLeafTransmittance)
+/// The walk through leaves as one traversal that reports every triangle along the ray (rtThroughLeaves);
+/// METALMC_LEAFQUERY=0: the closest hits one by one, as round 1 had it (offline A/B).
+let foliageLeafQuery = ProcessInfo.processInfo.environment["METALMC_LEAFQUERY"] != "0"
 /// The second channel of the traced texture: exp(-foliageLeafK x blocks of leaves crossed), so 8 bits hold up to about
 /// 27 blocks.
 let foliageLeafK: Float = 0.2
@@ -225,7 +228,7 @@ let foliageRelightHeader = """
 #define LEAF_SKY 0.8
 #endif
 #ifndef LEAF_SHEEN
-#define LEAF_SHEEN 0.5
+#define LEAF_SHEEN \(foliageSheenText)
 #endif
 #ifndef LEAF_ROUGH
 #define LEAF_ROUGH 0.4
@@ -296,7 +299,14 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
 """
 
 /// The relight's call (with leaflight only), after the light E is made: what leaves and plants pass on.
-let foliageRelightCall = "        E += litFoliageLight(litFoliageClass(g), fi, n, rel, q, vis, f, env, sky, ao, skyAmb, albedo) * (dayScale * f.misc.w);\n"
+/// METALMC_LEAFTERM=0 leaves it out (offline A/B: the relight's cost without the term, the rest of leaflight as it is).
+let foliageRelightCall = ProcessInfo.processInfo.environment["METALMC_LEAFTERM"] == "0" ? "" :
+    "        E += litFoliageLight(litFoliageClass(g), fi, n, rel, q, vis, f, env, sky, ao, skyAmb, albedo) * (dayScale * f.misc.w);\n"
+/// The sheen's strength (LEAF_SHEEN, 0.5; METALMC_LEAFSHEEN for an offline A/B: 0 drops its code).
+private let foliageSheenText: String = {
+    guard let v = ProcessInfo.processInfo.environment["METALMC_LEAFSHEEN"], let x = Double(v), x >= 0 else { return "0.5" }
+    return String(x)
+}()
 
 /// The relight's debug views (with leaflight only): 13 the foliage class (leaf green, plant yellow, anything else gray),
 /// 14 the traced texel (red: direct visibility, green: exp(-k x blocks of leaves toward the sun)).
@@ -320,6 +330,10 @@ let foliageRtHeader = """
 #define RT_LEAF_SIGMA \(foliageLeafSigma)
 #define RT_LEAF_K \(foliageLeafK)
 #define RT_LEAF_HITS 8
+#ifndef RT_LEAF_QUERY
+#define RT_LEAF_QUERY \(foliageLeafQuery ? 1 : 0)
+#endif
+#define RT_LEAF_EXP \(ProcessInfo.processInfo.environment["METALMC_LEAFEXP"] ?? "0")
 // Gi.swift's GiTile: per instance of the instance structure, its LOD node's quad buffer and the first quad of each of
 // its structure's geometries (the opaque faces, then the tile-edge skirts), two triangles a quad.
 struct RtTile { const device uint* quads; uint start[2]; };
@@ -330,6 +344,41 @@ static uint2 rtHitQuad(const device RtTile* tiles, uint instance, uint geometry,
     return uint2(t.quads[2u * q], t.quads[2u * q + 1u]);
 }
 static bool rtLeaf(uint m) { return \(foliageLodLeafTest); }
+#define RT_LEAF_FAR 3.0
+#if RT_LEAF_QUERY
+// The ray's walk through leaves: (direct transmittance, blocks of leaves crossed), or (0, -1) if something opaque is in
+// the way. One traversal over the whole ray with every triangle it crosses reported (forced non-opaque), in whatever order
+// the traversal finds them: anything that isn't a leaf ends it (no light); a leaf face the ray goes into adds -t, one it
+// comes out of +t, so on closed canopies the sum is the length inside leaves whatever the order (a ray that starts inside
+// leaves has one exit more: its start, at 0, is the entry; one that ends inside, one entry more: closed at its end). More
+// than RT_LEAF_CAND faces: deep in a forest, dark. (The walk before took the closest hits one by one, a traversal each, up
+// to 8 within 24 blocks and an any-hit query past that: 0.3 ms in a forest view.)
+// backLeaf: the ray leaves a leaf's face turned away from the sun, so it has to cross that leaf's own canopy; if there is
+// no surface at all, the canopy isn't in the structures (the far field's, a tile still building): a crown's typical
+// RT_LEAF_FAR blocks.
+#define RT_LEAF_CAND 24u
+static float2 rtThroughLeaves(instance_acceleration_structure accel, const device RtTile* tiles, ray r, bool backLeaf) {
+    intersection_params prm;
+    prm.assume_geometry_type(geometry_type::triangle);
+    prm.force_opacity(forced_opacity::non_opaque);
+    intersection_query<instancing> q(r, accel, 0xFF, prm);
+    float sum = 0.0;
+    int balance = 0;   // faces in minus faces out
+    uint n = 0u;
+    while (q.next()) {
+        uint2 w = rtHitQuad(tiles, q.get_candidate_instance_id(), q.get_candidate_geometry_id(), q.get_candidate_primitive_id());
+        if (!rtLeaf(w.y & 255u)) return float2(0.0, -1.0);
+        uint face = (w.x >> 25) & 7u;
+        float t = q.get_candidate_triangle_distance();
+        bool into = face < 6u && dot(kRtNormal[face], r.direction) < 0.0;
+        sum += into ? -t : t;
+        balance += into ? 1 : -1;
+        if (++n >= RT_LEAF_CAND) return float2(0.0, 30.0);
+    }
+    float blocks = n == 0u ? (backLeaf ? RT_LEAF_FAR : 0.0) : max(sum + float(max(balance, 0)) * r.max_distance, 0.0);
+    return float2(exp(-RT_LEAF_SIGMA * blocks), blocks);
+}
+#else
 // The ray's walk through leaves: (direct transmittance, blocks of leaves crossed), or (0, -1) if something opaque is in
 // the way. Near the surface (RT_LEAF_NEAR blocks: the canopy it's in or under), the hits in order (closest first: a short
 // ray's traversal is cheap); a hit into a canopy opens a stretch of leaves, one out of it closes it (the first hit out
@@ -340,7 +389,6 @@ static bool rtLeaf(uint m) { return \(foliageLodLeafTest); }
 // range has no surface at all, the canopy isn't in the structures (the far field's, a tile still building): a crown's
 // typical RT_LEAF_FAR blocks.
 #define RT_LEAF_NEAR 24.0
-#define RT_LEAF_FAR 3.0
 static float2 rtThroughLeaves(instance_acceleration_structure accel, const device RtTile* tiles, ray r, bool backLeaf) {
     intersector<instancing> closest;
     closest.assume_geometry_type(geometry_type::triangle);
@@ -384,6 +432,7 @@ static float2 rtThroughLeaves(instance_acceleration_structure accel, const devic
     }
     return float2(exp(-RT_LEAF_SIGMA * blocks), blocks);
 }
+#endif
 
 """
 
@@ -399,6 +448,13 @@ let foliageRtClassify = """
         if ((g.x >> 29) != 0u && (dk <= 1u || dk == 0xFFFFu)) cls = (g.x >> 16) & 3u;
         if (cls == 2u) n = float3(0.0, 1.0, 0.0);
     }
+#if RT_LEAF_EXP == 2
+    if (cls == 1u && dot(n, p.sun.xyz) < -0.05) {
+        float s0 = p.shade.x * (1.0 - smoothstep(p.shade.y, p.shade.z, length(pos)));
+        out.write(half4(shadeOf(p, pos, 0.0), half(1.0 - s0 * (1.0 - exp(-RT_LEAF_K * RT_LEAF_FAR))), 0.0h, 0.0h), gid);
+        return;
+    }
+#endif
 
 """
 
@@ -417,7 +473,11 @@ let foliageRtWrite = """
     if (hit.type == intersection_type::none) {
         tl = p.sample.w != 0u && cls == 1u && ndl < -0.05 ? float2(exp(-RT_LEAF_SIGMA * RT_LEAF_FAR), RT_LEAF_FAR) : float2(1.0, 0.0);
     } else if (p.sample.w != 0u && rtLeaf(rtHitQuad(tiles, hit.instance_id, hit.geometry_id, hit.primitive_id).y & 255u)) {
+#if RT_LEAF_EXP == 1
+        tl = float2(exp(-RT_LEAF_SIGMA * RT_LEAF_FAR), RT_LEAF_FAR);
+#else
         tl = rtThroughLeaves(accel, tiles, r, false);
+#endif
     }
     // Far away, where the haze takes over, toward the open sky's (1, 1), as shadeOf fades the visibility.
     float s = p.shade.x * (1.0 - smoothstep(p.shade.y, p.shade.z, length(pos)));
