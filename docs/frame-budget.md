@@ -296,3 +296,39 @@ resolve's 3.15.
 - The mip bias (the terrain's texture gradients scaled to the output's resolution) didn't change the forest's score:
   there the leaves' texels are magnified (2 rendered pixels each), so it's the reconstruction, not the mips. It matters
   for minified textures (distant terrain), where it keeps the native mip.
+
+### Flights (2026-10-10, vsync only, noisy)
+
+The real-terrain flight (`claudeworld-merged`, y 150, 20 blocks/s, LOD 32768, 60 s timed), 3456 x 2234 fullscreen at
+120 Hz, TAA on, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds` (before god rays and the
+grade), from a frozen copy of the branch at af7d06c. Other helpers built and ran in turns between the runs, and the
+system dialog above was on screen: **noisy**, one run each. Frames over 8.33 and 16.67 ms are the bench's
+`frames_over_8ms` and `frames_over_16ms`; own GPU time is each frame's (above), the span is the command buffers'.
+
+| Run (vsync on) | Frames | fps | ms p50 | ms p99 | Over 8.33 ms | Over 16.67 ms | Own GPU p50 / p99 | Span p50 |
+|---|---|---|---|---|---|---|---|---|
+| Native (1.0) | 3948 | 66.0 | 15.29 | 17.86 | 3947 | 344 | 15.08 / 17.12 | 24.01 |
+| 0.75 | 4901 | 81.9 | 12.39 | 15.01 | 4895 | 9 | 12.03 / 14.52 | 18.06 |
+| `auto` (0.6-1.0) | 2669 | 45.0 | 10.70 | 101.57 | 2586 | 362 | 10.46 / 21.00 | 14.33 |
+
+- **0.75 against native**: +24% fps, p99 -2.9 ms, frames over 16.67 ms 344 -> 9. Neither reaches 120 Hz (every frame
+  over 8.33 ms): the fixed costs above.
+- **`auto` is void**: about 35 s of it ran at about 10 fps (100 ms frames), the window throttled while the dialog had
+  focus. Before that the governor stepped 0.8 -> 0.65 -> 0.6 and quality 0 in the warm-up and stayed there: at 120 Hz
+  with this look no scale fits 8.33 ms, so a 120 Hz target sends it to its floor. Its own GPU p50 at 0.6 was 10.5 ms.
+- **Uncapped (vsync off): not run.** The dialog paces an uncapped fullscreen game at 120 Hz, so run_mc.sh holds those
+  runs until the screen is clear.
+
+To re-run on a quiet machine (no other runs, the dialog answered), from the repository's root, one flight each:
+
+```
+for s in 1 0.75 auto:0.7:1; do for vs in false true; do
+  BENCH_FIXTURE=claudeworld-merged BENCH_TIMEOUT=900 BENCH_VSYNC=$vs bash tools/bench/bench_lod.sh "fl-${s//:/_}-$vs" 32768 \
+    -PbenchY=150 -PbenchFly=20 -PbenchExtraWait=600 -PbenchHitches=1 -PbenchTrace=1 -Ptaa=true \
+    -PmetalExp=lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds,godrays -PrenderScale=$s
+done; done
+```
+
+Then read `fps_mean`, `ms_p50`, `ms_p99`, `frames_over_8ms`, `frames_over_16ms` and `metal_gpu_own_ms_p50`/`p99` from
+the `METALMC_BENCH` line of each `bench_out/run_fl-*.log`, and the governor's `render scale: now ...` lines for `auto`.
+Three runs of each, alternating, would make them more than one sample.
