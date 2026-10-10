@@ -247,6 +247,8 @@ let waterRefract = waterEnvFloat("METALMC_WATERREFRACT", 1, 0, 4)
 /// per traced texel along each axis (2, or 4 for a quarter of the rays).
 let waterRtEnabled = litWater && waterEnv("METALMC_WATERRT") != "0"
 let waterRtScale = Int(waterEnv("METALMC_WATERRTSCALE") ?? "") == 4 ? 4 : 2
+/// METALMC_WATERCHECKER=0: every texel traces its reflected ray each frame (default: half of them, a checkerboard).
+let waterChecker = waterEnv("METALMC_WATERCHECKER") != "0"
 /// METALMC_EXP=wet (with lit and water): in rain, lit terrain open to the sky gets wet: darker, with a film of water that
 /// reflects the sky (litWaterWet).
 let waterWet = litWater && experiments.contains("wet")
@@ -319,6 +321,10 @@ let waterCommonHeader: String = {
 // How far the water's own color goes toward a clear sea's teal from the biome's (vanilla's blue is saturated).
 #ifndef WATER_TEAL
 #define WATER_TEAL 0.5
+#endif
+// The reflected rays on a checkerboard at half resolution (half the rays; the anti-aliasing averages the frames).
+#ifndef WATER_CHECKER
+#define WATER_CHECKER \(waterChecker ? 1 : 0)
 #endif
 // Water's index of refraction.
 #define WATER_ETA 1.333
@@ -895,6 +901,73 @@ static float4 wtCellLight(constant GiParams& p, const device uint* check, const 
     return ws > 0.0 ? float4(sum / ws, sun / ws) : float4(0.0, 0.0, 0.0, -1.0);
 }
 
+// The reflection at camera-relative rel (dist from the camera, V toward it, the surface's normal nrm): the first surface
+// along the reflected ray, lit as the GI cache lights its bounce hits; the sky's map where it escapes.
+static float3 wtReflect(instance_acceleration_structure accel, constant WaterTraceParams& p, constant GiParams& gp,
+                        const device uint* check, const device half4* value, constant float4* mats, constant GiLight& L,
+                        constant float4* env, const device GiTile* tiles, constant SkyFrame& sf, texture2d<float> sky,
+                        texture2d<float> lightmap, texture3d<float> apScatter, texture3d<float> apTrans, float3 rel, float dist,
+                        float3 V, float3 nrm, bool lm) {
+    float3 R = reflect(-V, nrm);
+    if (R.y < 0.002) R = normalize(float3(R.x, 0.002, R.z));
+    // From just over the surface (further with distance: depth precision); not the first stretch (a coarse level's coast
+    // can reach over its own water).
+    float3 o = rel + float3(0.0, 0.03 + dist * 0.0004, 0.0);
+    intersector<triangle_data, instancing> isect;
+    isect.set_triangle_front_facing_winding(winding::clockwise);
+    ray r(o + p.camOffset.xyz, R, 0.02 + dist * 0.002, p.limits.x);
+    auto hit = isect.intersect(r, accel, 0xFF);
+    constexpr sampler ss(filter::linear, address::clamp_to_edge);
+    float3 col;
+    if (hit.type == intersection_type::none || !hit.triangle_front_facing) {
+        // Escaped; or the back of a surface: the ray started inside terrain (a coarse level's coast): the sky.
+        col = sky.sample(ss, litWaterSkyUV(R), level(0.0)).rgb;
+    } else {
+        uint pd = GI_HIT(hit);
+        uint m = pd & 255u, hf = min((pd >> 8) & 7u, 5u), bl = (pd >> 11) & 15u, cover = (pd >> 15) & 15u;
+        float3 hrel = o + R * hit.distance;
+        float3 hn = kGiNormal[hf];
+        float skyLv = float(15u - min(cover, 15u));
+        float skyFall = skyDecode(float3(litWaterBrightness(skyLv))).x;
+        // The cache's light at the hit: its irradiance (the sky as its openings let it in, and bounced light) and the
+        // share of the sun's disk its cells see; else the open sky's by the sky light level and a ray toward the sun.
+        float4 cl = p.sunDir.w > 0.5 ? wtCellLight(gp, check, value, gp.camFrac.xyz + hrel, hf) : float4(0.0, 0.0, 0.0, -1.0);
+        float ndl = dot(hn, p.sunDir.xyz);
+        float3 skyE;
+        float sunVis = 0.0;
+        if (cl.w >= 0.0) {
+            skyE = cl.rgb * L.scale.rgb;
+            sunVis = saturate(cl.w);
+        } else {
+            skyE = env[1u + hf].rgb * skyFall;
+            if (ndl > 0.0 && max(env[0].r, max(env[0].g, env[0].b)) > 0.0) {
+                intersector<instancing> shadow;
+                shadow.accept_any_intersection(true);
+                shadow.assume_geometry_type(geometry_type::triangle);
+                ray sr(hrel + hn * 0.03 + p.camOffset.xyz, p.sunDir.xyz, 0.0, 2000.0);
+                sunVis = shadow.intersect(sr, accel, 0xFF).type == intersection_type::none ? 1.0 : 0.0;
+            }
+        }
+        float3 blockE, moon = 0.0;
+        if (lm) {
+            float3 lm00 = skyDecode(litWaterLightmap(lightmap, 0.0, 0.0));
+            blockE = skyDecode(litWaterLightmap(lightmap, float(bl), 0.0));
+            float moonLum = dot(max(skyDecode(litWaterLightmap(lightmap, 0.0, 15.0)) - lm00, 0.0), float3(0.2126, 0.7152, 0.0722)) * p.moonDir.w;
+            moon = moonLum * float3(0.857, 1.006, 1.371) * (0.6 * max(dot(hn, p.moonDir.xyz), 0.0) / max(p.moonDir.y, 0.5) * saturate((skyLv - 12.0) / 3.0) + 0.4 * skyFall);
+        } else {
+            float b = litWaterBrightness(float(bl));
+            blockE = float3(b * b);
+        }
+        float3 E = (env[0].rgb * (max(ndl, 0.0) * sunVis) + skyE + moon + blockE) * p.limits.z;
+        if (bl >= 15u) E = max(E, float3(1.0));   // light sources: full bright, as the relight has them
+        col = mats[m * 4u + giFaceClass(hf)].rgb * E;
+        // The air along the reflected path.
+        SkyAerial ap = skyAerialPerspective(R * hit.distance, sf, apScatter, apTrans);
+        col = col * ap.transmittance + skyOvercast(sf, ap.inscatter) + skyNight(sf, R) * (1.0 - ap.transmittance);
+    }
+    return max(col, 0.0);
+}
+
 kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
                         constant WaterTraceParams& p [[buffer(1)]],
                         constant GiParams& gp [[buffer(2)]],
@@ -973,6 +1046,18 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
         float shared = simd_shuffle(thick, leader);
         if (!lead) thick = shared;
     }
+    // The reflected rays: at half resolution (WATER_CHECKER) half the texels trace each frame, a checkerboard that flips
+    // every frame, and the others take the reflection of the texel beside them in their row (the anti-aliasing averages
+    // the frames).
+    bool lm = p.limits.w > 0.5;
+    bool checker = WATER_CHECKER != 0 && sc == 2u;
+    bool traceR = !checker || ((gid.x + gid.y + p.sample.w) & 1u) == 0u;
+    float4 refl = float4(0.0, 0.0, 0.0, -1.0);
+    if (valid && traceR) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm), 1.0);
+    if (checker) {
+        float4 beside = simd_shuffle_xor(refl, ushort(1));
+        if (!traceR) refl = beside;
+    }
     if (!inside) return;
     if (!valid) {
         out.write(float4(0.0, 0.0, 0.0, -1.0), gid);
@@ -986,69 +1071,10 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
         auto th = floorRay.intersect(tray, accel, 0xFF);
         if (th.type != intersection_type::none) thick = th.distance;
     }
+    if (refl.w < 0.0) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm), 1.0);   // the texel beside had no water
+    float3 col = refl.rgb;
     float4 layer = litWaterLayer(g);
     float skyLevel = float((g.y >> 24) & 15u), blockLevel = float(g.y >> 28);
-    bool lm = p.limits.w > 0.5;
-
-    // The reflection: the first surface along the reflected ray, lit as the GI cache lights its bounce hits; the sky's map
-    // where it escapes.
-    float3 R = reflect(-V, nrm);
-    if (R.y < 0.002) R = normalize(float3(R.x, 0.002, R.z));
-    // From just over the surface (further with distance: depth precision); not the first stretch (a coarse level's coast
-    // can reach over its own water).
-    float3 o = rel + float3(0.0, 0.03 + dist * 0.0004, 0.0);
-    intersector<triangle_data, instancing> isect;
-    isect.set_triangle_front_facing_winding(winding::clockwise);
-    ray r(o + p.camOffset.xyz, R, 0.02 + dist * 0.002, p.limits.x);
-    auto hit = isect.intersect(r, accel, 0xFF);
-    constexpr sampler ss(filter::linear, address::clamp_to_edge);
-    float3 col;
-    if (hit.type == intersection_type::none || !hit.triangle_front_facing) {
-        // Escaped; or the back of a surface: the ray started inside terrain (a coarse level's coast): the sky.
-        col = sky.sample(ss, litWaterSkyUV(R), level(0.0)).rgb;
-    } else {
-        uint pd = GI_HIT(hit);
-        uint m = pd & 255u, hf = min((pd >> 8) & 7u, 5u), bl = (pd >> 11) & 15u, cover = (pd >> 15) & 15u;
-        float3 hrel = o + R * hit.distance;
-        float3 hn = kGiNormal[hf];
-        float skyLv = float(15u - min(cover, 15u));
-        float skyFall = skyDecode(float3(litWaterBrightness(skyLv))).x;
-        // The cache's light at the hit: its irradiance (the sky as its openings let it in, and bounced light) and the
-        // share of the sun's disk its cells see; else the open sky's by the sky light level and a ray toward the sun.
-        float4 cl = p.sunDir.w > 0.5 ? wtCellLight(gp, check, value, gp.camFrac.xyz + hrel, hf) : float4(0.0, 0.0, 0.0, -1.0);
-        float ndl = dot(hn, p.sunDir.xyz);
-        float3 skyE;
-        float sunVis = 0.0;
-        if (cl.w >= 0.0) {
-            skyE = cl.rgb * L.scale.rgb;
-            sunVis = saturate(cl.w);
-        } else {
-            skyE = env[1u + hf].rgb * skyFall;
-            if (ndl > 0.0 && max(env[0].r, max(env[0].g, env[0].b)) > 0.0) {
-                intersector<instancing> shadow;
-                shadow.accept_any_intersection(true);
-                shadow.assume_geometry_type(geometry_type::triangle);
-                ray sr(hrel + hn * 0.03 + p.camOffset.xyz, p.sunDir.xyz, 0.0, 2000.0);
-                sunVis = shadow.intersect(sr, accel, 0xFF).type == intersection_type::none ? 1.0 : 0.0;
-            }
-        }
-        float3 blockE, moon = 0.0;
-        if (lm) {
-            float3 lm00 = skyDecode(litWaterLightmap(lightmap, 0.0, 0.0));
-            blockE = skyDecode(litWaterLightmap(lightmap, float(bl), 0.0));
-            float moonLum = dot(max(skyDecode(litWaterLightmap(lightmap, 0.0, 15.0)) - lm00, 0.0), float3(0.2126, 0.7152, 0.0722)) * p.moonDir.w;
-            moon = moonLum * float3(0.857, 1.006, 1.371) * (0.6 * max(dot(hn, p.moonDir.xyz), 0.0) / max(p.moonDir.y, 0.5) * saturate((skyLv - 12.0) / 3.0) + 0.4 * skyFall);
-        } else {
-            float b = litWaterBrightness(float(bl));
-            blockE = float3(b * b);
-        }
-        float3 E = (env[0].rgb * (max(ndl, 0.0) * sunVis) + skyE + moon + blockE) * p.limits.z;
-        if (bl >= 15u) E = max(E, float3(1.0));   // light sources: full bright, as the relight has them
-        col = mats[m * 4u + giFaceClass(hf)].rgb * E;
-        // The air along the reflected path.
-        SkyAerial ap = skyAerialPerspective(R * hit.distance, sf, apScatter, apTrans);
-        col = col * ap.transmittance + skyOvercast(sf, ap.inscatter) + skyNight(sf, R) * (1.0 - ap.transmittance);
-    }
 
     // The light at the surface: the sun's visibility as the relight's sun term has it (traced where the shadow rays went
     // toward the sun, else the open sky), the GI cache's light where it has the pixel.
@@ -1096,6 +1122,8 @@ final class WaterTrace: @unchecked Sendable {
     private var colorStandIn: MTLTexture?
     private var frame: UInt32 = 0
     private var traces = 0
+    private var labScale: Int?
+    private var labChecks = 0
     /// This frame's outputs (set by trace, for the relight: Lit.bindDeferred, Lit's own pass).
     private(set) var current: MTLTexture?
     private(set) var currentAS: MTLTexture?
@@ -1158,7 +1186,17 @@ final class WaterTrace: @unchecked Sendable {
         let st = RtShadows.shared.takeWaterStructure()
         guard waterRtEnabled, ctx.device.supportsRaytracing, let st, let gi = st.gi, let cache = GiCache.shared,
               Sky.shared.ready, let apScatter = Sky.shared.apScatter, let apTrans = Sky.shared.apTrans, ensure(), let pipe else { return 0 }
-        let sc = waterRtScale
+        var sc = waterRtScale
+        if let dir = ShaderLab.dir {
+            // Lab mode: <shader dir>/water_rt.txt (2 or 4), read every 2 s, overrides the pixels per traced texel, to compare
+            // costs and looks in one session.
+            labChecks += 1
+            if labChecks % 240 == 1 {
+                let t = (try? String(contentsOfFile: dir + "/water_rt.txt", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+                labScale = t.flatMap { Int($0) }.flatMap { $0 == 2 || $0 == 4 ? $0 : nil }
+            }
+            if let labScale { sc = labScale }
+        }
         let w = depth.width, h = depth.height, tw = (w + sc - 1) / sc, th = (h + sc - 1) / sc
         if out == nil || out!.width != tw || out!.height != th {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: tw, height: th, mipmapped: false)
