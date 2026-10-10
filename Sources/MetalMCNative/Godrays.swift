@@ -259,8 +259,10 @@ using namespace raytracing;
 #define GODRAYS_MOON 0.3
 // Rays per traced texel per frame, the history's blend (the share of the new frame when still), the rays' length, and the
 // least sunlight a ray's fog can scatter toward the eye (scene units) that is worth rays: below it none (r 1), an error
-// of at most that much.
-#define GODRAYS_STEPS 2
+// of at most that much. One ray: the golden-ratio sequence walks it along the view ray from frame to frame and the history
+// gathers them; in game the trace took 0.45 ms in cave_mouth's mist with one and 0.85 with two, with no grain in a still
+// frame either way (lab session godrays3).
+#define GODRAYS_STEPS 1
 #define GODRAYS_BLEND 0.1
 #define GODRAYS_RAY 4000.0
 #define GODRAYS_MIN_LIGHT 0.0003

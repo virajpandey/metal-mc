@@ -2038,9 +2038,9 @@ scattering along the ray that the sun reaches (`integral of sigma T V / (1 - T)`
 3. `godrays_trace` runs after RtShadows' shadow rays, on its instance structure (the LOD's geometry out to its edge, near
    terrain included), depth and projection. It has one thread per 4 x 4 pixels, for the ray through the block's pixel
    (2, 2) to its depth.
-   - `GODRAYS_STEPS` (2) points along the ray are importance-sampled by `sigma T` (the closed-form inverse, so every point
-     carries the same weight) and stratified, with a new set each frame (interleaved gradient noise across the screen,
-     the golden ratio over frames).
+   - `GODRAYS_STEPS` points along the ray (1 since session 3; 2 before) are importance-sampled by `sigma T` (the
+     closed-form inverse, so every point carries the same weight) and stratified, with a new set each frame (interleaved
+     gradient noise across the screen, the golden ratio over frames: one point walks the ray from frame to frame).
    - From each point, one ray goes toward a point on the sun's disk (0.6 degrees, as the shadows'). If it gets out, the
      clouds' transmittance toward the sun at that point multiplies it (with `clouds`: their `cloudTransmittanceToSun`,
      the deep shadow map bound from `Clouds.shadowBinding`). Under a broken deck the beams come and go with its gaps, and
@@ -2133,6 +2133,25 @@ without the fog, with the light shafts) | ours with the fog | SEUS. `g1-*` is th
 - **After the tour** the tint went from (0.8, 1.0, 1.3) to (0.65, 1.0, 1.5) and the ground's bounce from 0.2 to 0.1, for
   a bluer haze nearer SEUS's (the g2 tour has the old two).
 
+### In game, session 3 (2026-10-10, lab session godrays3: the full look with `clouds,godrays`)
+
+`bench_out/agents/godrays/lab3/` in the main checkout.
+
+- **Under the clouds.** The fog's light follows the clouds' shadows now. With the clouds in its rays
+  (`g4s1-forest-t1200.png`), the morning mist under a cloud's shadow is lit only by the sky, as the terrain under it is.
+  Without them (`g4n-*`: the same build with the clouds left out of the rays in godrays.metal), the mist glowed in full
+  sun over terrain in cloud shadow (`board-clouds-forest-t1200.jpg`). The clouds drift between shots (a minute or two
+  apart), so the boards compare the look, not the same clouds.
+- **One ray a texel** (`board-rays-cave_mouth.jpg`, `board-rays-forest-t1200.jpg`, two rays left): the beams at the cave
+  mouth and the forest's mist look the same in still frames, with no grain either way. The trace's pass went from 0.85
+  to 0.45 ms at cave_mouth and from 0.57 to 0.47 ms in the forest. One ray is the default now.
+- **noon_overview and sunset_water** with the clouds and the fog: `board-g4-<scene>.jpg` (census 1's ours | now | SEUS).
+  The sunset keeps its dark shore under a dramatic deck, with no fans of rays. At noon the clouds' shadows make the
+  terrain darker than SEUS's (mean 68 against 117): that's the clouds' cover, not the fog.
+- **Not the fog's:** the first forest shot after the jump from mountain_view (`g4-forest-t1200.png`) has the distant mesa
+  missing and a flat golden quad near its place. As far as I can tell the LOD hadn't caught up yet: the next two visits
+  show the mesa.
+
 ### Costs
 
 - **Offline, whole frames** (`LITFLOW_POST=1 LITFLOW_GODRAYS=1 litflow ... sky time`, M3 Pro, 3456 x 2234, the default
@@ -2152,9 +2171,11 @@ without the fog, with the light shafts) | ours with the fog | SEUS. `g1-*` is th
   four elsewhere) and half precision: 1.78 -> 2.33 ms (+0.55). With the clouds on, 2.53 -> 2.58. What's left is about
   the floor for work per pixel at the panel's 7.7 M pixels: an inverse projection, two texture reads, and the sRGB decode
   and re-encode around the blend (the load's third pair, after the aerial perspective's and the clouds').
-- **In game** (`trace 5`, `passes.py`). In session 1, the "volumetric light (godrays)" pass took 0.41-0.51 ms at forest,
-  sunset_water and noon_overview. In session 2, with water's rays in the same frames (their spans overlapping), it took
-  0.5-1.6 ms, and 1-4 ms in cave_mouth's morning mist, where every texel traces both its rays.
+- **In game** (`trace 5`, the pass's median over each group's five frames). In session 1, the "volumetric light
+  (godrays)" pass took 0.41-0.51 ms at forest, sunset_water and noon_overview. In session 2, with water's rays in the
+  same frames (their spans overlapping), it took 0.5-1.6 ms, and 1-4 ms in cave_mouth's morning mist. In session 3 (with
+  the clouds), with two rays a texel: 0.44 ms at noon_overview, 0.57 in the forest's morning mist (1200 ticks) and 0.85 at
+  cave_mouth; with one: 0.47 and 0.45. One ray is the default since.
 - Memory: the 128-byte frame buffer, the 128 x 64 table (64 KB) and two 864 x 559 RGBA16Float textures (7.7 MB).
 
 ### Not done, and next
@@ -2171,12 +2192,14 @@ without the fog, with the light shafts) | ours with the fog | SEUS. `g1-*` is th
 - **Mist that follows the ground.** The layer is in world height (sea level), so morning mist fills the lowlands and leaves
   hills clear, but it can't lie in a valley that's above sea level. The LOD's height field could give each point its
   height over the ground.
-- **Cost.** About 1 ms in all at the panel's resolution, at the brief's limit at sunset. Two ways down:
+- **Cost.** About 1 ms in all at the panel's resolution with two rays a texel, at the brief's limit; one ray (now the
+  default) takes 0.1-0.4 ms off the trace. Further down:
   - The composite decodes and re-encodes each pixel (six powers), after the aerial perspective and the clouds have done
     the same. One linear chain (`skyLevelColor`'s linear light through `cloudsComposite` and `godraysApply`, one encode
     at the end, the inverse projection shared) would save two of the three pairs. Those functions are shared, and the
     main session was changing `skyLevelColor` tonight.
-  - The trace: `GODRAYS_STEPS` 1 halves its rays, for the history to make up over twice the frames.
+  - One ray a texel was judged in still frames only. Moving, the history takes 35% of each new frame: if beams' edges
+    shimmer in a flight, two rays (`GODRAYS_STEPS 2`) is the fix, at the cost above.
 - **The clouds' cascades far out.** In the traced share (view 2), the clouds' deep shadow map's coarser cascades show as
   steps along the horizon, tens of kilometres out, where the low layer adds little light. Not seen in the final picture.
 - **Under water, in the Nether and the End:** none (our sky isn't drawn there, so neither is the resolve's sky variant).
