@@ -28,7 +28,11 @@ import simd
 //    light the relight used the frame before, kept by EntityLight.keep and bound in the level's main pass), and leave the
 //    G-buffer as it was (they read it back: programmable blending).
 // 3. Rain (rain): the weather pipeline's streaks thin (the middle of each texel column of vanilla's rain texture),
-//    gray-white and fainter, lit like a translucent particle. Snow keeps its flakes and takes the same light.
+//    gray-white and fainter, lit like a translucent particle. Snow keeps its flakes and takes the same light. Streaks
+//    over the sky (a pixel without a texel) go into the G-buffer instead of the color and are put on at the end of the
+//    frame's light (litRainOverSky): with clouds, after their composite, which would cover them.
+// 4. The hand (hand, Java side): the first-person hand goes with the level's features (ExtHand), so the patched entity
+//    and item pipelines put it in the G-buffer too.
 //
 // Without the switches nothing here is compiled in or patched, and every shader is the same text as before.
 

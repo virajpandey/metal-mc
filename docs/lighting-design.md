@@ -2026,6 +2026,14 @@ saturated blue texture at its lightmap's light (census1's rain: bright blue stre
   from cloud, and the fifth of the sun our sky keeps in full rain turned the streaks yellow. Not over water's texels:
   the relight takes the water layer off what's drawn to see the floor, which turned streaks there olive. Snow's
   texels (white) keep their flakes and take the same light.
+- **Rain over the sky, with clouds**: the clouds' composite (in the anti-aliasing's resolve, after the relight) lays the
+  cloud layer over whatever a sky pixel holds, so it covered every streak drawn over the sky (rain falls below the
+  clouds). A rain streak over a pixel without a G-buffer texel (the sky) now goes into the G-buffer instead of the
+  color: its color (sRGB 8 bits a channel, x bits 24-31 clear) and alpha (y, 1-255: a texel no other writer makes),
+  over-composited with any streak there already (programmable blending), and `litRainOverSky` puts it on at the end of
+  the frame's light: in the relight without clouds, right after `cloudsComposite` in the resolve with them (one splice
+  in Taa.swift). Without TAA and with clouds (the relight's own pass, the clouds' own composite) streaks over the sky
+  are lost.
 - **Water drops** among the particles (rain's splashes, drips: blue in vanilla's particle atlas, blue dots over the
   grass in rain) go near white (water shows the sky's light; a gray albedo made the splashes dark specks on the sand),
   the albedo and the forward color alike (the latter with vanilla's light worked out from the color drawn, so the
