@@ -463,8 +463,22 @@ final class PipelineBox {
     let icbCapable: Bool
     /// ExtPipe hook (ExtPipe.swift, METALMC_EXTPIPE): uniform and vertex input names, for routing this pipeline's draws.
     var ext: ExtPipelineInfo?
+    /// Water hook (Water.swift, METALMC_EXP=lit,water): a translucent terrain pipeline's MSL, and the patched functions
+    /// its variant for the level's main pass takes (they write the G-buffer where the texel is water).
+    var waterSource: WaterPipelineSource?
+    private var waterFunctions: (vs: MTLFunction, fs: MTLFunction)?
     private var variants: [UInt64: MTLRenderPipelineState] = [:]
     private let lock = NSLock()
+
+    /// Water hook: the patched functions (compiled off the render thread, Water.swift); the variants with the G-buffer
+    /// are made again with them, the level pass's here and now (off the render thread too).
+    func installWater(vs: MTLFunction, fs: MTLFunction) {
+        lock.lock()
+        waterFunctions = (vs, fs)
+        variants = variants.filter { $0.key >> 20 & 0x3ff != UInt64(litGbufferFormat.rawValue & 0x3ff) }
+        lock.unlock()
+        _ = state(depthFormat: .depth32Float, colorFormats: [floatMainTarget ? hdrTargetFormat : .rgba8Unorm, litGbufferFormat])
+    }
 
     init(base: MTLRenderPipelineDescriptor, depthState: MTLDepthStencilState, cull: MTLCullMode, fill: MTLTriangleFillMode,
          prim: MTLPrimitiveType, fan: Bool, depthBias: Float, depthSlope: Float, vsMask: UInt32, fsMask: UInt32, name: String, icbCapable: Bool) {
@@ -515,6 +529,12 @@ final class PipelineBox {
         for (i, f) in unwritten {
             d.colorAttachments[i].pixelFormat = f
             d.colorAttachments[i].writeMask = []
+            // Water hook (Water.swift): vanilla's translucent terrain writes its water into the G-buffer.
+            if i == litGbufferIndex && f == litGbufferFormat, let w = waterFunctions {
+                d.vertexFunction = w.vs
+                d.fragmentFunction = w.fs
+                d.colorAttachments[i].writeMask = .all
+            }
         }
         do {
             let s = try ctx.device.makeRenderPipelineState(descriptor: d)
@@ -659,6 +679,13 @@ public func mmc_pipeline_create(_ name: UnsafePointer<CChar>, _ vsSrc: UnsafePoi
             // Lit hook (Lit.swift): the variant for the level's main pass, whose second target is the terrain G-buffer.
             if litEnabled && colorCount == 1 && d.colorAttachments[0].pixelFormat == .rgba8Unorm {
                 _ = box.state(depthFormat: .depth32Float, colorFormats: [floatMainTarget ? hdrTargetFormat : .rgba8Unorm, litGbufferFormat])
+            }
+            // Water hook (Water.swift): vanilla's translucent terrain gets a variant that writes its water into the G-buffer
+            // once the water sprites' rectangles are known.
+            if litWater && waterIsTranslucentTerrain(pipeName), let fsSrc, let fsEntry {
+                box.waterSource = WaterPipelineSource(vs: String(cString: vsSrc), vsEntry: String(cString: vsEntry),
+                                                      fs: String(cString: fsSrc), fsEntry: String(cString: fsEntry))
+                WaterNear.shared.register(box)
             }
             return makeHandle(box)
         } catch {
