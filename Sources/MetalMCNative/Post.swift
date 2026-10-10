@@ -579,6 +579,7 @@ static float3 postGt(float3 x) {
 static float3 postSkyBlue(float3 x, float3 d) {
     float w = smoothstep(0.05, 0.3, (x.b - max(x.r, x.g)) / max(x.b, 1e-6));
     if (POST_SKY_SAT <= 0.0 || w <= 0.0) return d;
+    d = min(d, 1.0);
     float yd = postLuma(d);
     float3 c = d + (x * (yd / max(postLuma(x), 1e-6)) - d) * (POST_SKY_SAT * w) - yd;
     float t = 1.0;
@@ -596,7 +597,7 @@ static float3 postToneMap(float3 x, float4 tone) {
     x = max(x, 0.0);
     if (curve == 0) return skyToneMap(x, float4(H, tone.y, 0.0, 0.0));
     float3 d = curve == 2 ? postAces(x * POST_ACES_EXPOSURE) : (curve == 3 ? postGt(x * POST_GT_EXPOSURE) : postAgx(x * POST_AGX_EXPOSURE));
-    if (POST_SKY_SAT > 0.0) d = postSkyBlue(x, min(d, 1.0));
+    if (POST_SKY_SAT > 0.0) d = postSkyBlue(x, d);
     if (H <= 1.0) return min(d, 1.0);
     float t = max(postLuma(x) - POST_EDR_KNEE, 0.0) / POST_EDR_SPAN;
     return min(d * (1.0 + (H - 1.0) * (1.0 - exp(-t * t))), H);
