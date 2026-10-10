@@ -59,7 +59,7 @@ kernel void taa_upscale(texture2d<float, access::read> color [[texture(0)]],
                         constant SkyFrame& sky [[buffer(1), function_constant(taaSky)]],
                         texture3d<float> apScatter [[texture(5), function_constant(taaSky)]],
                         texture3d<float> apTrans [[texture(6), function_constant(taaSky)]],
-                        texture2d<float> skyView [[texture(7), function_constant(taaSky)]],
+                        texture2d<float> skyView [[texture(7), function_constant(taaSky)]],\(cloudsEnabled ? "\n                        constant CloudFrame& clouds [[buffer(5), function_constant(taaSky)]],\n                        texture2d<float> cloudTex [[texture(21), function_constant(taaSky)]],\n                        texture2d<float> cloudDepth [[texture(22), function_constant(taaSky)]]," : "")
 #if LIT_MODE
                         constant LitFrame& litFrame [[buffer(2), function_constant(taaLit)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
@@ -86,7 +86,7 @@ kernel void taa_upscale(texture2d<float, access::read> color [[texture(0)]],
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
             float haze;
-            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);
+            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")
         }
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
         dtile[i] = d;
@@ -281,6 +281,8 @@ final class TaaUpscale: @unchecked Sendable {
             enc.setTexture(sky.apScatter, index: 5)
             enc.setTexture(sky.apTrans, index: 6)
             enc.setTexture(sky.skyView, index: 7)
+            // Clouds hook (Clouds.swift): their composite in the load, at the level's size (their march follows it).
+            if cloudsEnabled { Clouds.shared.bindTaa(enc, width: color.width, height: color.height) }
             skyDither = out.pixelFormat == .rgba16Float ? 0 : (out.pixelFormat == .rg11b10Float ? -1 : 1.0 / 255)
         }
         if relight { Lit.shared.bindDeferred(enc) }
