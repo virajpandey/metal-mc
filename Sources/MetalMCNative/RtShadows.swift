@@ -560,6 +560,13 @@ final class RtShadows: @unchecked Sendable {
             encodeGi(cb: cb, depth: depth, invViewProj: params.invViewProj, cam: cam, sunAngle: sunAngle, cloudHeight: cloudHeight, tlas: tlas,
                      width: w, height: h)
         }
+        // Volumetric light (Godrays.swift, METALMC_EXP=godrays): rays from the air toward the sun into the same structure, on
+        // the same depth and projection, when the anti-aliasing runs this frame (its resolve applies the fog).
+        if godraysEnabled && deferToTaa {
+            Godrays.shared.encode(cb: cb, depth: depth, invViewProj: params.invViewProj, cam: cam,
+                                  camOffset: SIMD3<Float>(Float(cam.x - origin.x), Float(cam.y - origin.y), Float(cam.z - origin.z)),
+                                  tlas: tlas, accels: tlasAccels, width: w, height: h)
+        }
         if frame % 240 == 0 {
             log(String(format: "rt shadows: %d tiles, %d instance-structure rebuilds in the last 240 frames, %.3f ms CPU", instances.count, rebuilds,
                        Double(DispatchTime.now().uptimeNanoseconds - cpuStart) / 1e6))
