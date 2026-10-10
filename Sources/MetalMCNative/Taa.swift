@@ -27,8 +27,8 @@ import simd
 // Lit hook (Lit.swift): the relight as the resolve loads each pixel; with water (METALMC_EXP=lit,water) its reflections
 // after it (this frame's waves' tile and sky map are textures 13 and 14, which Lit.bindDeferred binds; without our sky
 // litWaterPixel leaves water alone).
-private let taaRelightLoad = "        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));"
-private let taaWaterLoad = """
+let taaRelightLoad = "        if (taaLit) c.rgb = litRelightPixel(c.rgb, q, d, litGbuf.read(q).rg, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));"
+let taaWaterLoad = """
         if (taaLit) {
             uint2 g = litGbuf.read(q).rg;
             c.rgb = litRelightPixel(c.rgb, q, d, g, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));
@@ -40,7 +40,7 @@ private let taaWaterLoad = """
 
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
 // Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise.
-private let taaShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "") + """
+let taaShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "") + """
 
 // With the sky on (METALMC_EXP=sky), a second variant of the resolve applies the aerial perspective, the render
 // distance's fade into the sky and the tone curve to each pixel as it loads it (skyLevelColor), after the shadows'

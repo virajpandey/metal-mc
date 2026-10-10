@@ -173,11 +173,14 @@ kernel void post_bloom_first(texture2d<float, access::read> src [[texture(0)]],
     // cost), for blurs and a meter that are far wider than a block.
     threadgroup half2 blocks[(PB_A / 2) * (PB_A / 2)];
     if (lights) {
+        // Render scale (RenderScale.swift): the G-buffer and the depth are the level's, which can be smaller than the frame.
+        float2 gscale = float2(depth.get_width(), depth.get_height()) / float2(size);
         for (uint i = lid.y * PB_T + lid.x; i < (PB_A / 2) * (PB_A / 2); i += PB_T * PB_T) {
             uint2 q = uint2(clamp(base + 2 * int2(i % (PB_A / 2), i / (PB_A / 2)), int2(0), size - 1));
-            uint2 g = gbuf.read(q).rg;
+            uint2 qg = uint2((float2(q) + 0.5) * gscale);
+            uint2 g = gbuf.read(qg).rg;
             half2 v = half2(1.0h);
-            if ((g.x >> 29) != 0u && litDepthMatches(depth.read(q), g.y & 0xFFFFu)) {
+            if ((g.x >> 29) != 0u && litDepthMatches(depth.read(qg), g.y & 0xFFFFu)) {
                 float3 al = skyDecode(float3(float(g.x & 255u), float((g.x >> 8) & 255u), float((g.x >> 16) & 255u)) / 255.0);
                 v.x = half(max(postLuma(al), POST_METER_ALBEDO));
                 if ((g.y >> 24) >= POST_LIGHT_LEVEL) v.y = half(POST_BLOOM_LIGHTS);
@@ -343,7 +346,7 @@ kernel void post_shaft_mask(depth2d<float> depth [[texture(0)]], texture2d<float
                             constant PostFrame& f [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
-    float2 inv = 1.0 / float2(depth.get_width(), depth.get_height());
+    float2 inv = 1.0 / f.size.xy;   // the frame's pixels: the depth is the level's, smaller with a render scale (RenderScale.swift)
     float2 c = float2(gid) * 4.0 + 2.0;
     float4 a = depth.gather(s, (c + float2(-1.0, -1.0)) * inv), b = depth.gather(s, (c + float2(1.0, -1.0)) * inv);
     float4 d = depth.gather(s, (c + float2(-1.0, 1.0)) * inv), e = depth.gather(s, (c + float2(1.0, 1.0)) * inv);
@@ -706,7 +709,7 @@ final class Post: @unchecked Sendable {
 
     /// The frame's parameters: p is the projection the frame holds (unjittered with anti-aliasing) and the view rotation
     /// (32 floats), then vanilla's sun angle.
-    private func frameParams(color: MTLTexture, p: UnsafePointer<Float>, cam: SIMD3<Double>) -> PostFrameGPU {
+    private func frameParams(color: MTLTexture, depth: MTLTexture? = nil, p: UnsafePointer<Float>, cam: SIMD3<Double>) -> PostFrameGPU {
         func mat(_ o: Int) -> simd_float4x4 {
             simd_float4x4(SIMD4(p[o], p[o + 1], p[o + 2], p[o + 3]), SIMD4(p[o + 4], p[o + 5], p[o + 6], p[o + 7]),
                           SIMD4(p[o + 8], p[o + 9], p[o + 10], p[o + 11]), SIMD4(p[o + 12], p[o + 13], p[o + 14], p[o + 15]))
@@ -741,7 +744,9 @@ final class Post: @unchecked Sendable {
         let snap = snapNext || jump
         snapNext = false
         f.adapt = SIMD4(Float(min(max(dt, 0), 0.1)), snap ? 1 : 0, effectMask & 4 != 0 && postAdaptDefault ? 1 : 0, 0)
-        let lights = litEnabled && Lit.shared.gbuffer.map { $0.width == color.width && $0.height == color.height } == true
+        // The G-buffer is the level's: the depth's size (smaller than the frame's with a render scale, RenderScale.swift).
+        let level = depth ?? color
+        let lights = litEnabled && Lit.shared.gbuffer.map { $0.width == level.width && $0.height == level.height } == true
         f.effects = SIMD4(effectMask & 1 != 0 && postBloomDefault > 0 ? 1 : 0,
                           effectMask & 2 != 0 && postShaftsDefault > 0 && shafts > 0 && Sky.shared.skyView != nil ? 1 : 0,
                           lights ? 1 : 0, 0)
@@ -863,7 +868,7 @@ final class Post: @unchecked Sendable {
         if taa, taaCopy != nil, t.history.count == 2, t.history[t.current].width == color.width, t.history[t.current].height == color.height {
             input = t.history[t.current]
         }
-        let f = frameParams(color: color, p: p, cam: cam)
+        let f = frameParams(color: color, depth: depth, p: p, cam: cam)
         // Take the waiting copy first: making the command buffer would run it.
         if taaCopy != nil { ctx.pendingCopy = nil }
         ctx.endBlit()
@@ -934,7 +939,7 @@ final class Post: @unchecked Sendable {
         guard ensureLibrary(), ensureTargets(width: color.width, height: color.height) else { return false }
         let t = Taa.shared
         let input = t.history.count == 2 && t.history[t.current].width == color.width ? t.history[t.current] : color
-        var f = frameParams(color: color, p: p, cam: lastCam)
+        var f = frameParams(color: color, depth: depth, p: p, cam: lastCam)
         f.effects.x = 1
         f.effects.y = Sky.shared.skyView != nil ? 1 : 0
         if f.sun.w <= 0 { f.sun.w = 1 }

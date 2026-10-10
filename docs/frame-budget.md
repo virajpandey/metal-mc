@@ -149,3 +149,62 @@ the rays); the resolve with relight and aerial perspective 2.32 ms.
   the anti-aliasing resolve would save about 2 ms of the lit frame. MetalFX's temporal scaler cost 9 ms here (Taa.swift),
   so it would be our own resolve. It changes the image (softer in motion), so it's a fidelity trade to measure, not a
   given; and the hand and the HUD must stay at native resolution, which means splitting vanilla's main target.
+  (Built 2026-10-10: the next section.)
+
+## Render scale, temporal upscaling and the governor (2026-10-10)
+
+The level is drawn at a fraction of the panel's resolution on each axis and resolved to the panel's by our own
+anti-aliasing; the hand, the HUD, the screen effects and post-processing stay at the panel's resolution. A governor can
+steer the scale (and then per-feature quality) to hold the refresh rate.
+
+Switches: `METALMC_SCALE` (gradle `-PrenderScale`, config `renderScale`): a number from 0.5 to 1 (1, the default: off,
+the old path bit for bit), or `auto` for the governor (`auto:MIN:MAX`, default 0.6 to 1). Needs TAA (`-Ptaa=true`).
+In lab mode `<shader dir>/render_scale.txt` (same syntax, read every 2 s) overrides it, so one session compares scales.
+Tuning: `METALMC_TAAU_K` (the reconstruction's sharpness, 3), `METALMC_TAAU_SHARPEN` (the copy's sharpening, 0.5),
+`METALMC_GOVBUDGET` (the governor's frame time, 8.333 ms).
+
+**Splitting vanilla's main target** (`metalmc.render.RenderScale`, `GameRendererScaleMixin`). vanilla's level reaches
+the main target only through `GameRenderer.mainRenderTarget()`: LevelRenderer's frame graph imports it as "main", clears
+it, composites into it, and makes the sky renderer with it. The hand, the screen effects, the GUI and vanilla's post
+effects use GameRenderer's own field. So from `renderLevel` to the anti-aliasing (`render3dHud`'s head), the accessor
+answers a target of our own at the scaled size (same formats as the main target, HDR's float included), and our passes
+before the anti-aliasing take it too. Everything sized from it follows without a change of its own: the G-buffer (the
+level pass's second color target), the relight, the traced shadows, the GI cache's per-pixel request and resolve, the
+water's rays, the sky's quarter-resolution view and its aerial perspective, the far field's march and the LOD (whose
+quad culling tests the scaled pixel centers, so it culls more). The sky renderer keeps the target it was made with, so a
+redirect points its pass at the frame's level target. The frame's start clears the main target; with a scale the clear
+is left out (the upscaler's copy writes every pixel of its color, and vanilla clears its depth before the hand), since
+with pass folding it would otherwise run as a pass of its own. Frames that can't be scaled draw at full resolution as
+before: vanilla's post effects (spectating a creeper: they want the level's depth at full size), the external pipeline,
+no TAA.
+
+**The upscaler** (TAAU, `TaaUpscale.swift`, kernel `taa_upscale`): the anti-aliasing's resolve with two changes, after
+the published temporal upsamplers (Karis's TAA, "High Quality Temporal Supersampling", 2014; the survey by Yang, Liu and
+Salvi, 2020). Each output pixel takes this frame's samples near it, the 3 x 3 rendered texels around the nearest one,
+each weighted by exp(-k d^2) for its distance d from the output pixel's center in output pixels (a sample sits at its
+texel's center minus the frame's jitter); and the current frame's share is W / (W + (1 / b - 1) E[W]), W the weights'
+sum, E[W] its mean over all jitters (the samples per output pixel times pi / k) and b the anti-aliasing's blend (0.1
+still, up to 0.3 in motion): a pixel with a sample at its center takes more of this frame, one with none near takes
+little, and on average it's b as before. The history, its reprojection, the Catmull-Rom history sample, the variance clip
+(over the 3 x 3 texels) and the copy with contrast-adaptive sharpening are the anti-aliasing's, at the panel's
+resolution, sharing its history (post-processing reads it unchanged). The jitter covers 16 Halton positions instead of
+8. Each threadgroup loads a 32 x 32 tile of the rendered frame and its 1-texel border (the load's heavy part, the relight,
+the water, the shadows' shade and the aerial perspective, runs once per rendered texel, 13% border as before), then
+resolves every output pixel whose nearest sample this frame is one of the tile's texels: the tiles partition the output
+exactly at any scale.
+
+**The governor** (`RenderScale.swift`). Each frame's GPU time (its command buffer's, one submit per frame) is recorded
+with the scale it was drawn at; only frames at the current scale count, so a change is judged on frames drawn after it.
+Over the last 32: too slow is, uncapped, the GPU time's 90th percentile above 92% of the frame time; paced by the display
+(vsync), where the GPU slows its clock to fit the work and its time stretches toward the frame's whatever the load, it's
+the frame intervals' 90th percentile 4% past the refresh with the GPU over 80% busy. Then the scale drops to what would
+bring the GPU time to 85% if all of it scaled with the pixels, on a grid of 0.05 (at least one step). A step up (0.05)
+needs the same model to predict under 85% after it, held for 1 s: the model is the hysteresis, a step up never predicts a
+step down. At the lowest scale the per-feature quality drops in quarters (the GI cache's cell updates a frame: its light
+converges more slowly, nothing pops) and comes back before the scale does. Through the anti-aliasing a step of the scale
+is a slight change of sharpness over a few frames, not a pop: the history stays at the panel's resolution. Features merged
+later read `RenderScaleGovernor.shared.quality` (1 to 0) for their own steps (cloud and god-ray steps).
+
+**Offline check** (`tools/taautest.swift`): the real kernels on a test image (a zone plate whose frequency rises past what
+the rendered frame can hold, and a hard edge), a still view, scored against the image box-filtered over each output
+pixel.

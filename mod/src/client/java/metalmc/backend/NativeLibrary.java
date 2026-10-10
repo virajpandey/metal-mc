@@ -23,6 +23,7 @@ final class NativeLibrary {
     static synchronized Path path() {
         if (cached != null) return cached;
         passSettings();
+        passRenderScale();
         String dev = System.getProperty("metalmc.native");
         if (dev != null && !dev.isEmpty()) return cached = Path.of(dev);
         try (InputStream in = NativeLibrary.class.getResourceAsStream(RESOURCE)) {
@@ -64,6 +65,29 @@ final class NativeLibrary {
             }
         } catch (Throwable t) {
             System.err.println("[metalmc] couldn't pass the settings' switches to the native library: " + t);
+        }
+    }
+
+    /**
+     * The render scale (config renderScale: a number from 0.5 to 1, or "auto" for the governor; RenderScale.swift reads
+     * METALMC_SCALE), likewise; a METALMC_SCALE already in the environment wins.
+     */
+    private static void passRenderScale() {
+        String scale = metalmc.MetalMCConfig.renderScale();
+        if (scale.isEmpty() || System.getenv("METALMC_SCALE") != null) return;
+        try {
+            java.lang.foreign.Linker linker = java.lang.foreign.Linker.nativeLinker();
+            java.lang.invoke.MethodHandle setenv = linker.downcallHandle(
+                    linker.defaultLookup().find("setenv").orElseThrow(),
+                    java.lang.foreign.FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_INT,
+                            java.lang.foreign.ValueLayout.ADDRESS, java.lang.foreign.ValueLayout.ADDRESS,
+                            java.lang.foreign.ValueLayout.JAVA_INT));
+            try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+                int r = (int) setenv.invokeExact(arena.allocateFrom("METALMC_SCALE"), arena.allocateFrom(scale), 0);
+                System.out.println("[metalmc] render scale: " + scale + (r == 0 ? "" : " (setenv failed: " + r + ")"));
+            }
+        } catch (Throwable t) {
+            System.err.println("[metalmc] couldn't pass the render scale to the native library: " + t);
         }
     }
 }

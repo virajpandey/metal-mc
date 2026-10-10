@@ -32,7 +32,8 @@ abstract class SkyRendererMixin {
     /** Before the sky pass opens: the sky at a quarter of the resolution for this frame's view, which the pass filters up. */
     @Inject(method = "render", at = @At("HEAD"))
     private void metalmc$skyView(GpuBufferSlice skyFog, SkyRenderState state, CallbackInfo ci) {
-        if (Sky.frameActive) MetalSky.prepareView(renderTarget.getColorTexture(), Lod.LEVEL_PROJECTION, Sky.VIEW_ROTATION);
+        // Render scale (metalmc.render.RenderScale): the frame's level target, which this renderer's own may not be.
+        if (Sky.frameActive) MetalSky.prepareView(metalmc.render.RenderScale.level(renderTarget).getColorTexture(), Lod.LEVEL_PROJECTION, Sky.VIEW_ROTATION);
     }
 
     @Inject(method = "renderSkyDisc", at = @At("HEAD"), cancellable = true)
