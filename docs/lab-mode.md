@@ -151,7 +151,7 @@ has a twin in its frame. Three tools make "does it look like SEUS" a number (doc
   55% and the top 20%); a board: ours | SEUS over the mask | the lightness difference (red: ours brighter, blue: darker).
   About a second a scene.
 - `tools/bench/twins.sh <label> [LAB_EXP]`: one command for a census. A lab session (the Claude edition's switches by
-  default, `...,post,leaflight,wave,clouds`; a throwaway scene first, as a session's first scene can catch the LOD
+  default, `...,post,leaflight,wave,clouds,godrays`; a throwaway scene first, as a session's first scene can catch the LOD
   mid-build; 300 ticks after each scene to converge), `scene`, `shot` and `mask` for all nine scenes, each scored
   against `~/Projects/metal-mc-private/twins/census1/seus1-<scene>.png`, the boards and
   `summary.md` (tools/bench/twinsum.py) in the main checkout's `bench_out/twins/<label>/` (TWINS_OUT). TWINS_NOGAME=1

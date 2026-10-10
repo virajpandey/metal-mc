@@ -1,8 +1,8 @@
 #!/bin/bash
 # usage: tools/bench/twins.sh <label> [LAB_EXP]
 # The twin census in one command (docs/lab-mode.md, "Twins"): a lab session with the look's switches (LAB_EXP; default
-# the Claude edition's: lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds), every scene
-# shot with its class mask (`shot` + `mask`), each scored against its twin by SEUS (tools/twindiff.swift against
+# the Claude edition's: lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds,godrays), every
+# scene shot with its class mask (`shot` + `mask`), each scored against its twin by SEUS (tools/twindiff.swift against
 # TWINS_SEUS/<TWINS_PREFIX>-<scene>.png), and the boards (ours | SEUS over mask | the lightness difference) and a summary
 # table (tools/bench/twinsum.py) into TWINS_OUT.
 #   bash tools/bench/twins.sh census2                     -> bench_out/twins/census2/ of the main checkout
@@ -12,7 +12,7 @@
 #      TWINS_TRACE=1 (per-pass GPU times at the last scene into passes.txt), TWINS_NOGAME, LAB_MINUTES (20), and lab.sh's
 #      (LAB_FAR, LAB_FIXTURE, ...). Boards hold SEUS's pixels: TWINS_OUT stays out of the repository (bench_out is).
 LABEL=${1:?usage: twins.sh <label> [LAB_EXP]}
-EXP=${2:-${LAB_EXP:-lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds}}
+EXP=${2:-${LAB_EXP:-lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave,clouds,godrays}}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT" || exit 1
 MAIN=$(git worktree list --porcelain 2>/dev/null | awk 'NR==1{print $2}')
