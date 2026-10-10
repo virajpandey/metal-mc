@@ -1691,3 +1691,240 @@ near chunks' lookup and sway), against the brief's 0.15. Where it goes, and what
 - **Water's rays** (reflections, refraction) still stop at leaves; `rtThroughLeaves` (Foliage.swift) is what they would
   call to see through canopies.
 - In the game with `hdr`, the far field's canopy in a far view, and a long flight with `wave`: not looked at.
+
+## Volumetric clouds (prototype, `METALMC_EXP=clouds` with `sky`, 2026-10-10)
+
+`Sources/MetalMCNative/Clouds.swift`; `metalmc.backend.MetalClouds` and `metalmc.clouds.mixin.CloudRendererMixin` on the
+Java side, a call at the top of `GameRendererLodMixin`'s anti-aliasing hook; splices marked "Clouds hook" in Taa.swift
+(the composite), RtShadows.swift (the shadows), Post.swift (the light shafts), Lit.swift (the water's sky map) and
+ShaderLab.swift (the header file).
+Off by default; without the switch every shader is the same text as before (the splices are empty). In lab mode the
+clouds are `clouds.metal` and their shared part `clouds_header.metal`; every constant of the look is a `#define` at the
+top of `clouds.metal`.
+
+Vanilla's clouds were a blocky slab at y 192, gray at sunset, a ceiling flights hit. These are soft cumulus that run to
+the horizon on the planet's curve, lit by the sky's own tables, with cirrus above them, and their shadows fall on every
+pixel the relight lights out to the horizon.
+
+### The layer
+
+- **Where:** 650-1700 m above sea level (`METALMC_CLOUDBASE`, `METALMC_CLOUDTOP`): low fair-weather cumulus, whose bases
+  are 0.5-1.5 km in humid air. The textbook's 1.2-2.6 km made the clouds small and far from a world whose hills are
+  100-200 m (lens-shaped slivers low in the sky, offline); at 650 m they fill the sky as SEUS's do, and every flight stays
+  under them (the bench flies at y 150, the build limit is 320).
+- **On the planet's curve.** A camera-relative point's altitude is the camera's plus its height plus |xz|^2 / 2R, the
+  sky's flat-world/round-planet mapping (Sky.swift); a view ray's altitude is then a quadratic in its distance, and the
+  layer is where it lies between the base's and the top's roots: up to two stretches (a ray from inside or above the
+  layer can go down through it and, past the curve, back up through it far away), ending at the ground. A horizontal ray
+  from the ground meets the base about 90 km out, so the layer reaches the horizon.
+- **Shapes** (after Schneider and Vos, "The real-time volumetric cloudscapes of Horizon Zero Dawn", 2015, and Schneider's
+  "Nubis"): a weather map (1024 x 1024 over 131 km: coverage, a Perlin FBM clumped by Worley cells; cloud type, a slow
+  FBM) drifting with the wind (`METALMC_CLOUDWIND`, 8 m/s, from the west-southwest); a base shape (128^3 over 4 km,
+  Perlin-Worley eroded by a Worley FBM, precomputed into one 16-bit channel) that the coverage carves along a height
+  profile per type (a flat base, rounded tops: low for stratus, the layer's top for cumulus); a detail noise (32^3 over
+  512 m, a Worley FBM) eroding the edges, wispy toward the base and billowy toward the top. All made once on the GPU,
+  tileable: the camera's position and the wind's drift are wrapped modulo the weather tile, which every other tile
+  divides, so nothing leaves float precision and nothing jumps.
+- **Coverage** (`METALMC_CLOUDCOVER`): clear (0.3: a few puffs), scattered (0.43, the default), overcast (1.6), or a
+  number; the weather map moves it by about ±0.05 locally (`CLOUD_COVER_SPREAD` 0.3). The base shape's values bunch
+  up, so the sky goes from a few puffs (0.3) through scattered cumulus (0.4) and broken (0.5) to a closed deck (0.55 and
+  up) in a narrow band: with the first spread (1.8, ±0.3) most places were a deck or empty overhead (offline, 5 of 16
+  places in the weather map overcast at the zenith and 7 clear; in game, mountain_view and forest under a deck that
+  shaded all their terrain, where SEUS's twins have scattered cumulus); at 0.4 the second game session's noon_overview
+  had only a few small clouds. Rain takes it to overcast with the game's rain level (a thicker deck,
+  stratocumulus-like); thunder further, the deck towering to the layer's top (cumulonimbus) and denser (darker).
+- **Cirrus:** a thin ice sheet at 8 km: one crossing per view ray, fibrous streaks from the detail noise stretched 8:1
+  along the wind (in the integer frame (2, 1), (-1, 2), so it still tiles; 29 km by 3.7 km a tile), bent and spaced
+  unevenly by a slow field from the weather map (straight, they repeated every tile across: a barcode over a 15 km
+  patch), in patches from another part of the weather map, lit by a single scattering with a forward lobe, sampled at
+  its footprint's mip (level 0 sparkled into dots toward the horizon); behind the cumulus in the same buffer.
+
+### Rendering
+
+- **The march,** at half the resolution each way (1728 x 1117 at the panel's), each texel every 8th frame: one thread
+  per 4 x 2 block marches that frame's texel of it (in an order that spreads consecutive frames apart), a second pass
+  carries every other texel's history over. Marching texels spread through the screen (a Bayer pattern in one dispatch)
+  cost as much as marching all of them: every SIMD group waited on its few marched texels. 12-48 steps per stretch of the
+  layer (50 m and up; at 30, horizon rays' 100 km stretches broke distant small clouds up), jittered by a blue-noise mask
+  (64 x 64, Ulichney's void and cluster, made once in about 20 ms) offset by the golden ratio every time the texel is
+  marched (blue across texels, low-discrepancy in time); longer steps through clear air (up to 3 short ones), and back
+  to one short step past the last clear sample on meeting a cloud (the jitter spans a short step, not a long one: long
+  steps into the clouds' fronts at the same distances in every texel drew rings around a camera inside or over the
+  layer, in game); the base shape's mip and the weather map's following the step's length, the detail noise within 24
+  km (its mean erosion past that).
+- **Light:** the sun (the moon once the sun is under the layer's horizon) through Sky's transmittance table at the
+  sample's altitude and local sun height, so clouds stay lit after the ground's sunset (a cloud 1.5 km up sees the sun
+  1.2 degrees longer) and the low sun's long path through the air turns them gold, orange and pink; a dual-lobe
+  Henyey-Greenstein phase (0.78 forward, -0.25 back); Wrenninge's multiple-scattering octaves plus a diffusion term (in a
+  thick cloud most of the light has scattered many times: an isotropic source of 3/4π of the sunlight, falling with the
+  optical depth toward the sun like diffuse transmission and absorption; without it sunlit cumulus came out about five
+  times too dark, gray instead of white); Schneider's powder effect, away from the sun; the sky's ambient (its mean
+  radiance over the upper hemisphere and the ground's, from the sky view table, `clouds_env`) by height in the layer.
+- **The light's optical depth** comes from a deep shadow map: three cascades of 256 x 256 (16, 64 and 256 km across,
+  centered where the camera's column meets the layer along the light, snapped to whole texels in the world), each texel
+  the light's ray through the layer holding the optical depth from the layer's top to each quarter of it. A sample takes
+  two density samples along the light up to the next stored quarter, then that quarter's value exactly. One cascade is
+  made a frame: the near one every other frame, the middle and far ones every fourth (each keeps the center it was made
+  with; all three again when the light turns more than 0.8 degrees or switches between sun and moon).
+- **Aerial perspective** between the camera and the cloud from Sky's table at the cloud's transmittance-weighted depth:
+  `pixel = behind x T + light x T_air + (1 - T) x the haze in front`, so far clouds fade into the sky behind them.
+- **History:** reprojected by the cloud's own depth (the sky's at infinity), bilinear over last frame's texels that weren't
+  all terrain and whose depth agrees (35%), the texel itself under a hundredth of a texel of motion; a new sample weighs
+  0.3. Texels whose 2 x 2 pixels are all terrain nearer than the clouds aren't marched (-1 in the depth texture). With
+  nothing moved since the last frame (camera, view, buffer) the march blends its texels into the history in place: no
+  carry pass, no swap.
+- **The composite,** in the anti-aliasing's resolve as it loads each pixel, after the sky's aerial perspective, in
+  linear light: one gather of the four texels' depths and, for a sky pixel, the hardware's bilinear sample (texels that
+  were all terrain left out at silhouettes, so the clouds don't fringe them); terrain keeps its color where it's in front
+  of the clouds' depth and is covered where it's behind (the camera above the layer). Terrain whose segment from the
+  camera stays under the layer's base (the altitude is convex along a segment, so its highest point is an end) is left
+  alone before any fetch: nearly all terrain seen from under the layer. Without anti-aliasing a pass of its own does the
+  same (`clouds_composite_fs`).
+
+### Shadows on the ground
+
+`cloudTransmittanceToSun(rel, cf, shadow)` (clouds_header.metal; rel is camera-relative, blocks): the point projected
+along the light onto the layer's middle, the deep shadow map's optical depth down to the point's height, and
+`exp(-tau) + (1 - exp(-tau)) x 0.45 / (1 + 0.15 tau)`: the direct beam and part of what the cloud scatters, which comes
+out below as diffuse light (a thick cumulus still passes about a third). RtShadows' visibility (lit mode) is multiplied by
+it at the same rotating pixels it traced (`clouds_vis`), so the relight's sun and moon terms and the water's glint take
+it with no change to the relight. Every pixel the relight lights gets it: the near terrain, the LOD, the far field out
+to the horizon; past the far cascade (about 130 km along the light) none. The shadows drift with the wind (the map is
+made from the drifting clouds every frame).
+
+For other passes (the god rays): `Clouds.shared.shadowBinding()` gives the deep shadow map and this frame's CloudFrame
+(or a 1 x 1 stand-in and `misc.w` 0 when the clouds didn't run); bind them, include clouds_header (after sky_header),
+and call `cloudTransmittanceToSun(rel, cf, map)`. For reflections (the water): `Clouds.shared.reflectionBinding()`, a
+128 x 128 paraboloid map of the clouds from the camera (the water's sky map's mapping), and
+`cloudsReflected(dir, map)`: rgb what the clouds add over the sky behind them, a their transmittance (`reflected =
+sky(R) x a + rgb`). Since water's round 2 the clouds are also blended into the water's sky map itself right after Lit
+makes it each frame (`Clouds.intoWaterSky`, one hook in Lit.swift), so every reflection that escapes to the sky
+(Water.swift's rays that miss, open tops) shows them with no change to the water's shading.
+
+**The light shafts** (post's, screen-space): the clouds don't write depth, so the shaft mask's sky share is multiplied
+by their transmittance there: the shafts come through the gaps and the sky darkens in the clouds' shadows, instead of
+the shafts shining through the clouds.
+
+### Verified offline (2026-10-10, no game)
+
+- `swift build -c release`: clean (the two warnings in RtShadows.apply were there before). The Java compiles.
+  `litflow - - compile` with `LITFLOW_EXP=lit,rtshadows,sky,gi,water,coloredlight,post,clouds`: every variant of the
+  anti-aliasing's resolve, lit mode's pass, the far field and the post chain compiles; the clouds' own library compiles
+  at run time in every offline run.
+- `tools/cloudtest.swift`: the clouds as the game makes them (mmc_debug_clouds_render: the sky's tables, the clouds'
+  frames one after another with the camera still, then the sky or a flat grass plain at sea level lit through the
+  clouds' shadows, the clouds composited as the resolve does, AgX), 1152 x 745, 64 frames:
+  `bench_out/agents/clouds/offline10/` (and earlier rounds in `offline1-9`, the progression below).
+- What changed on the way (each found in those pictures):
+  - gray clouds: single scattering and three octaves give a thick cloud about a fifth of a Lambertian white's light;
+    the diffusion term brings sunlit tops to white and leaves bases gray;
+  - a uniform orange deck at sunset: the diffusion term needed absorption's falloff with the optical depth toward the
+    sun; now the clouds facing away from the sun glow and the backlit ones have dark undersides and bright edges;
+  - small lens-shaped clouds low in the sky: the 1.2-2.6 km layer; 650-1700 m;
+  - a regular lattice on flat tops seen from above: the detail noise's Worley cells (it wasn't the shadow map's texels:
+    taking the map out didn't change it; taking the detail out did); a second detail lookup turned 45 degrees and sqrt 2
+    finer;
+  - a denser flat deck beyond a line about 24 km out: the detail's erosion stopping there; its mean erosion now applies
+    past it;
+  - a seam in the clouds' lighting where the near shadow cascade hands over to the middle one at sunset: both cascades
+    at the same mip, blended over the outer fifth.
+- `tools/litflow.swift` with `LITFLOW_CLOUDS=1 LITFLOW_POST=1` (claudeworld-merged, the far field on, the game's call
+  sequence: the clouds before the shadows, the relight with the cloud shadows, the anti-aliasing's composite, post), from
+  (8, 165, 8) looking west-northwest: `bench_out/agents/clouds/litflow1/clouds-hill-<time>-{off,on}.png`. Noon: cumulus
+  along the horizon, cirrus above, the foreground in a cloud's shadow (terrain mean luma 84.6 -> 71.4); sunset and
+  morning: the clouds lit by the low sun.
+- After the first game session, `bench_out/agents/clouds/offline13/` (every view in `views/`):
+  - `coverage-0.3-0.4-0.5-0.6-0.7-no-spread.jpg`: the noon view at five coverages with the weather map's spread off: a
+    few puffs, scattered cumulus, nearly closed, closed, closed;
+  - `six-places-old-top-new-bottom.jpg`: noon at six places of the weather map (the wind's time 0-20000 s): with the
+    old spread three decks and two nearly empty skies; with the new one six cumulus skies, few to broken;
+  - `fly-down-before.png`, `-after.png`: looking 35 degrees down from 1650 m (just under the layer's top): the rings
+    around the camera, then none with the step back;
+  - `cirrus-before.png`, `-after.png`: the sunset's cirrus patch, a barcode, then bent streaks;
+  - the march in place with the camera still against the march and carry (a build with a switch for it): the same
+    pictures to the bit (PSNR infinite, noon, sunset, above).
+- After merging main (water round 2): `litflow - - compile` with every feature on compiles every variant (the clouds'
+  resolve textures moved to 21 and 22: water's took 18-20); `litflow` with `LITFLOW_CLOUDS=1 LITFLOW_POST=1
+  LITFLOW_WATER=1 LITFLOW_GI=1` at the sunset_water pose, `bench_out/agents/clouds/litflow2/`: the water reflects the
+  clouds (white at noon, gold at sunset) and the clear sky with them off.
+
+### Costs (offline, M3 Pro, 3456 x 2234)
+
+`cloudtest ... time`: the clouds' frame (sky light, shadow map, the march and the carry) at the panel's resolution,
+the last 8 of 16 frames, 30 runs per view. Another session's game had the GPU through all of these runs, so they lean
+high; the A/B pairs were run back to back.
+
+| | sky light and shadow map | march (march and carry) | the clouds' frame |
+|---|---|---|---|
+| first version (every texel, a 5-sample light march, 2 x 512^2 shadow cascades) | 0.9 | 1.6-2.6 | 2.5-3.6 |
+| the deep shadow map, every 4th texel a frame | 0.16-0.39 | 1.0-2.0 | 1.4-2.4 |
+| compacted march (one thread per block), every 8th texel | 0.14-0.36 | 0.85-1.06 | 1.0-1.3 |
+
+The carry alone (the march stubbed out) was about half of the march stage: bandwidth (the history read and written for 7
+of 8 texels, and the full-resolution depth for the terrain test, which the carry no longer does; the depths are now
+half floats in km). The cirrus and the light's own stretch cost 0.02-0.05 ms each (A/B). The composite's cost is in the
+anti-aliasing's resolve: see "In game".
+
+### In game (2026-10-10, lab mode: 3456 x 2234, TAA, LOD 8192, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,clouds`)
+
+Costs from `trace` (`tools/bench/passes.py`, medians; the composite's share of the resolve from A/B runs in the same
+session, the call commented out in `taa.metal` and back):
+
+| ms | session 1, noon / mountain_view | session 2, noon (camera still) |
+|---|---|---|
+| clouds: sky light, shadow map | 0.16 / 0.39 | 0.12-0.17 (one cascade a frame) |
+| clouds: march (march and carry; in place with the camera still) | 0.79 / 0.83 | 0.46 |
+| clouds: shadows on the visibility | 0.09 / 0.10 | 0.09 |
+| the composite, in the resolve (2.558 without it, 2.813 with it) | 0.34 / 0.36 | 0.25 |
+| the clouds' whole cost | 1.38 / 1.68 | 0.95 |
+
+With the camera moving the march and carry run as in session 1 (0.8 ms, then with the cloudier first coverage): about
+1.3 ms in all. The resolve was 2.6-2.9 ms either way and the command buffer 15-25 ms (the GI cache and the far field
+dominate it).
+
+The look (pictures in `bench_out/agents/clouds/`: `after-<scene>.png` and `before-after-<scene>.png` session 1 against
+census 1's vanilla clouds; `session2/final-<scene>.png` the final coverage, `session2/c1-final-<scene>.jpg` session 1
+against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only in the private twins folder,
+`boards-clouds/`):
+- Session 1 (the first coverage): noon_overview cumulus, cirrus and banks to the horizon; mountain_view and forest under
+  a deck that shaded all of their terrain (SEUS's twins: scattered cumulus); sunset_water a golden deck; rain a gray
+  overcast; night_torches a moonlit broken deck with stars between; a look up at spawn into a solid deck; flying up
+  through the layer: a flat base overhead at 700 m, a white sea at 1200, rings around the camera looking down from 1650,
+  the field of tops from 1900 and 3000. A strip of unhazed terrain along the horizon from altitude was main's far plane
+  (fixed in 968fe5e).
+- Session 2 (the narrower spread, the step back, the cirrus): the coverage tuned live to 0.43 and a spread of 0.3:
+  noon_overview, mountain_view, forest and sunset_water all scattered to broken cumulus with blue between (mountain_view
+  on the cloudy side of SEUS's twin), sunset_water golden cumulus over the sun's glare, the cloud shadows patches on the
+  terrain; no rings looking down from 1650 m; at 1200 m, inside the layer, the nearest clouds soft and streaky;
+  moonlit clouds a warm gray at night.
+- Session 3 (main merged: water round 2, the far plane at 6 x the LOD's reach; `session3/`): the water reflects the
+  clouds (noon_overview's river, water_closeup, sunset_water's gold), and the horizon from 1650 m has no unhazed strip.
+  Noon and sunset_water, 13 frames: sky light and shadow map 0.20 ms, march 0.69, shadows on the visibility 0.08 (water's
+  own rays 0.72 in the same frames).
+- Session 4 (main merged again: leaves; `leaflight,wave` on too; `session4/`): forest's canopy lit through its leaves
+  under broken cumulus, noon_overview's clouds in the river. Forest, 5 frames, camera still: sky light and shadow map
+  0.17 ms, march 1.17, shadows on the visibility 0.13: about 1.75 ms with the composite. Broken cumulus is the march's
+  worst case (rays cross clouds and gaps without turning opaque; a deck stops them early).
+
+### Not done, and next
+
+- **Haze and shafts under the clouds:** the god rays' volumetric light can take `cloudTransmittanceToSun` (bind
+  `Clouds.shared.shadowBinding()`): the air under a cloud's shadow then stops glowing. Post's screen-space shafts already
+  come through the gaps only.
+- **Inside the layer** the steps are even over the whole stretch (about 2 km looking along the layer), so the nearest
+  clouds are soft and streaky: steps growing with the distance from a camera inside the layer.
+- **Leaves under a cloud:** with leaflight the clouds multiply the visibility's r (the direct sun) and pass its g (the
+  leaves toward the sun) through, so the sun through leaves doesn't take their shadow and canopies keep their glow under a
+  cloud. The relight's leaf term needs the clouds' factor itself (a third channel, or `cloudTransmittanceToSun` in
+  `litFoliageLight`); scaling g would tint the light, since g stands for blocks of leaves.
+- **Storms** are a uniform dark deck from below: darker cells, ragged bases and a storm's edge need weather of their own.
+- **Moonlight** on the clouds is a warm gray against the night's blue: the moon's light could take the night's tint.
+- **The coverage knob** is steep (0.3 a few puffs, 0.55 a closed deck): equalizing the base shape's histogram would make
+  it read as the share of the sky covered. SEUS's cumulus are bigger (2-3 km cells against 0.5-2): a larger base tile.
+- **Motion** was only checked with teleports: a flight with the clouds on would show any ghosting at silhouettes.
+- **The composite** costs 0.25 ms of the resolve: it could skip pixels whose four texels have no cloud if the cirrus wrote
+  a depth too (now only the cumulus do).
+- **Broken cumulus** costs the march up to 1.2 ms (session 4's forest): over the 1.5 ms target with everything. The
+  knobs, untried in game: one light sample (`CLOUD_LIGHT_SAMPLES` 1: about a quarter of a cloudy step's fetches), 32
+  steps for long stretches (48 kept distant small clouds whole: +11%), or each texel every 16th frame
+  (`cloudUpdate`: half the march, slower to settle after a disocclusion).

@@ -566,7 +566,10 @@ final class RtShadows: @unchecked Sendable {
             rebuilds = 0
         }
         if litEnabled {
-            litVisibility = (lit, sc, towardMoon, w, h)
+            // Clouds hook (Clouds.swift, METALMC_EXP=clouds): the clouds' shadows multiplied into the visibility the relight takes.
+            let vis = cloudsEnabled ? Clouds.shared.shadeVisibility(cb: cb, depth: depth, vis: lit, invViewProj: params.invViewProj, towardMoon: towardMoon,
+                                                                    scale: sc, sample: SIMD2(params.sample.y, params.sample.z), width: w, height: h) ?? lit : lit
+            litVisibility = (vis, sc, towardMoon, w, h)
             return true
         }
         if deferToTaa {
