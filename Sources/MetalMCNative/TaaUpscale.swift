@@ -10,8 +10,8 @@ import simd
 // The resolve is the anti-aliasing's (Taa.swift: reprojected history, Catmull-Rom history sample, variance clip in YCoCg),
 // with two changes for samples that no longer sit on the output's pixel grid:
 // - Each output pixel takes this frame's samples near it: the 3 x 3 rendered texels around the nearest one, each weighted
-//   by exp(-k d^2) for its sample's distance d from the output pixel's center in output pixels (k: METALMC_TAAU_K, 3 by
-//   default, a Gaussian of 0.41 pixels). A sample's position is its texel's center minus the frame's jitter.
+//   by exp(-k d^2) for its sample's distance d from the output pixel's center in output pixels (k: METALMC_TAAU_K, 4.5 by
+//   default, a Gaussian of 0.33 pixels). A sample's position is its texel's center minus the frame's jitter.
 // - The history's share follows how much of this frame landed near the pixel: the current frame's weight is
 //   W / (W + (1 / b - 1) E[W]), W the sum of the weights, E[W] its mean over all jitters (the sample density times the
 //   Gaussian's integral) and b the anti-aliasing's blend (0.1 still, more in motion). An output pixel with a sample at its
@@ -24,11 +24,13 @@ import simd
 // nearest sample this frame is one of the tile's texels: the tiles partition the output exactly, whatever the scale.
 
 /// METALMC_TAAU_K: the current frame's reconstruction: each sample's weight is exp(-k d^2), d its distance from the output
-/// pixel's center in output pixels (default 3: a Gaussian of 0.41 pixels; larger is sharper and slower to converge).
-let taauSharpness: Float = Float(ProcessInfo.processInfo.environment["METALMC_TAAU_K"] ?? "") ?? 3.0
-/// METALMC_TAAU_SHARPEN: the copy's sharpening when upscaling, 0-1 (default: METALMC_TAASHARPEN's, 0.5).
-let taauSharpen: Float = Float(ProcessInfo.processInfo.environment["METALMC_TAAU_SHARPEN"] ?? "")
-    ?? Float(ProcessInfo.processInfo.environment["METALMC_TAASHARPEN"] ?? "") ?? 0.5
+/// pixel's center in output pixels. A still view converges to the scene blurred by that Gaussian (sigma 1 / sqrt(2k)):
+/// native TAA's box over a pixel is sigma 0.29, k 6. Default 4.5 (sigma 0.33): k 3 measured 0.70-0.82 of native's
+/// sharpness in game, k 4.5 0.81 where k 3 gave 0.76 (the forest); larger is sharper and blockier where the history is
+/// rejected (disocclusions, things that move without motion vectors).
+let taauSharpness: Float = Float(ProcessInfo.processInfo.environment["METALMC_TAAU_K"] ?? "") ?? 4.5
+/// METALMC_TAAU_SHARPEN: the copy's sharpening when upscaling, 0-1 (default 0.6; native TAA's is 0.5).
+let taauSharpen: Float = Float(ProcessInfo.processInfo.environment["METALMC_TAAU_SHARPEN"] ?? "") ?? 0.6
 /// METALMC_TAABLEND, as the anti-aliasing reads it (the current frame's weight when still, 0.1).
 private let taauBlend: Float = Float(ProcessInfo.processInfo.environment["METALMC_TAABLEND"] ?? "") ?? 0.1
 /// Debug: -1 flips the jitter's sign (a wrong sign shows as a softer, swimming image; METALMC_TAAU_JSIGN).

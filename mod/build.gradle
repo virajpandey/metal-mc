@@ -100,7 +100,7 @@ loom {
 			}
 			// Render scale (with -Ptaa=true; RenderScale.swift, TaaUpscale.swift): -PrenderScale=<0.5-1, or auto, or
 			// auto:MIN:MAX> draws the level at that scale and upscales it in the anti-aliasing (1, the default, for bench
-			// runs whatever the config says); -PtaauK=<the reconstruction's sharpness, 3>, -PtaauSharpen=<0-1, 0.5>,
+			// runs whatever the config says); -PtaauK=<the reconstruction's sharpness, 4.5>, -PtaauSharpen=<0-1, 0.6>,
 			// -PgovBudget=<the governor's frame time in ms, 8.333>.
 			property "metalmc.renderScale", (project.findProperty("renderScale") ?: "1").toString()
 			if (project.hasProperty("renderScale")) {

@@ -160,7 +160,7 @@ steer the scale (and then per-feature quality) to hold the refresh rate.
 Switches: `METALMC_SCALE` (gradle `-PrenderScale`, config `renderScale`): a number from 0.5 to 1 (1, the default: off,
 the old path bit for bit), or `auto` for the governor (`auto:MIN:MAX`, default 0.6 to 1). Needs TAA (`-Ptaa=true`).
 In lab mode `<shader dir>/render_scale.txt` (same syntax, read every 2 s) overrides it, so one session compares scales.
-Tuning: `METALMC_TAAU_K` (the reconstruction's sharpness, 3), `METALMC_TAAU_SHARPEN` (the copy's sharpening, 0.5),
+Tuning: `METALMC_TAAU_K` (the reconstruction's sharpness, 4.5), `METALMC_TAAU_SHARPEN` (the copy's sharpening, 0.6),
 `METALMC_GOVBUDGET` (the governor's frame time, 8.333 ms).
 
 **Splitting vanilla's main target** (`metalmc.render.RenderScale`, `GameRendererScaleMixin`). vanilla's level reaches
@@ -207,4 +207,81 @@ later read `RenderScaleGovernor.shared.quality` (1 to 0) for their own steps (cl
 
 **Offline check** (`tools/taautest.swift`): the real kernels on a test image (a zone plate whose frequency rises past what
 the rendered frame can hold, and a hard edge), a still view, scored against the image box-filtered over each output
-pixel.
+pixel (RMS error; `bench_out/agents/speed/taautest/` in the main checkout):
+
+| | all | where the drawn frame can hold the image | past it |
+|---|---|---|---|
+| TAA at the panel's resolution (8 jitters) | 0.122 | 0.071 | 0.132 |
+| bilinear upscale of 0.75, no jitter | 0.238 | 0.110 | 0.249 |
+| TAAU 0.75 (32 frames) | 0.103 | 0.033 | 0.109 |
+| TAAU 0.75, the jitter's sign flipped | 0.215 | 0.223 | 0.214 |
+| TAAU 0.667, 0.6 | 0.099, 0.100 | 0.037, 0.041 | 0.103, 0.104 |
+| TAAU 0.75 after 8 frames | 0.152 | 0.061 | 0.160 |
+
+The flipped sign doubling the error checks the sample positions; "past it" is mostly past the output's own Nyquist too
+(the plate's frequency reaches 1.4 cycles a pixel in the far corner), where every method aliases. Convergence takes the
+16 jitter positions (8 frames is half-way). The governor's rules are checked offline too (`tools/govsim.swift`: synthetic
+frames, GPU time = fixed + per-pixel x s^2 with noise, reported two frames late, uncapped or vsync with a GPU clock that
+stretches its time toward the frame): it settles where the load fits (0.75 for 3 + 7 s^2 ms) without oscillating
+uncapped, keeps late frames under 1% wherever the load can fit, and climbs back after heavy views also under vsync with
+the stretched clock (the GPU-time rule alone ratcheted down to 0.6 there and stayed).
+
+### The full look per pass, at the panel's resolution and scaled (2026-10-10, lab session 1)
+
+Lab mode, 3456 x 2234 fullscreen, uncapped, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave`
+(no clouds yet), LOD 8192, `trace 8` per row's scale at mountain_view (the heaviest of the nine: a high view over 30 km of
+LOD), medians. Other helpers were building and running games in turns, so these are noisy; compute passes' totals overlap
+their neighbors and don't add up (`bench_out/agents/speed/traces1/` in the main checkout, `passes.py`).
+
+| Pass | 1.0 | 0.75 | 0.6 |
+|---|---|---|---|
+| Sky (quarter resolution, then the full-resolution pass) | 0.04 + 0.24 | 0.07 + 0.47 | 0.04 + 0.33 |
+| **Main pass: vertex / fragment** | **3.15 / 5.78** | **3.14 / 2.58** | **3.90 / 2.00** |
+| Ray-traced shadows | 0.69 | 0.46 | 0.34 |
+| GI cache: light, begin, request and resolve | 1.52 | 1.28 | 1.04 |
+| GI cache: schedule and rays | 0.47 | 0.45 | 0.51 |
+| Water's rays | 0.77 | 0.47 | 0.33 |
+| Resolve with the relight, water and aerial perspective (TAA, then TAAU) | 2.92 | 2.32 | 1.85 |
+| Post: bloom, exposure, composite | 1.42 + 0.04 + 0.67 | 1.33 + 0.05 + 0.68 | 1.31 + 0.04 + 0.71 |
+| The copy into the frame (fragment) | 0.42 | 0.48 | 0.50 |
+| Present (fragment) | 0.37 | 0.41 | 0.42 |
+
+- What scales with the pixels does: the main pass's fragment stage -55% at 0.75 (-65% at 0.6), shadows, water, the GI
+  cache's per-pixel stage, the resolve's load. The upscaler's own per-output work (reconstruction, history, clip, at the
+  panel's 7.7 M pixels) is about 1.1 ms (from the resolve's two rows: 2.92 = L + 0.75 natively, 2.32 = 0.56 L + C).
+- **What doesn't**: the main pass's vertex stage (the LOD's quads, 3.1-3.9 ms in this view), post (2.1 ms, at the panel's
+  resolution by design), the copy and present (0.9), the upscaler's per-output work (1.1), the GI cache's rays (0.5).
+  That's about 8.5 ms: in this view 120 Hz can't be had by scaling alone, at any scale. In game, uncapped, the governor
+  (`auto`) went to 0.6 with GI quality 0 and held 88 fps at mountain_view, 93 at noon_overview, 111 at forest, 114 at
+  water_closeup.
+- Command buffers' GPU spans overlap: 19 ms spans at 12 ms frames (mountain_view at 0.6). A frame's own GPU time is
+  end - max(start, the previous frame's end); the governor uses that. The bench's `metal_gpu_ms` is the span and
+  overstates per-frame GPU time whenever frames overlap.
+- In 2-3 of 8 frames vanilla redraws its animated block atlas (a 2048 x 2048 texture and its four mips, render passes on
+  the game tick), and those passes' fragment spans reach 5 ms. That is most likely waiting for the frame before to stop
+  reading the atlas (the GPU busy with that frame meanwhile), not work; whether it costs a frame's overlap once a tick
+  is for the flights' frame times to show.
+
+**Lab session 2** (the same, with clouds; `bench_out/agents/speed/traces2/`, `boards2/`): mountain_view's main pass
+3.24 / 3.79 ms at 1.0 and 3.19 / 2.57 at 0.75; the clouds' march 0.56 -> 0.35 ms (their half-resolution buffers follow
+the level: 1728 x 1117 -> 1296 x 838); the upscaler with the clouds' composite in its load 2.62 ms against the plain
+resolve's 3.15.
+
+- **The LOD's quad culling at 0.75** (`quadcull`, exact): 70.9% of mountain_view's 1.34 M level-0 quads issued (67.5% in
+  the forest), the vertex stage 3.19 -> 2.91 ms, for a culling pass of 0.37 ms in a command buffer of its own (0.21 in
+  the forest); status 69 -> 71 fps in mountain_view, 84 -> 84 in the forest. Worth having on with a scale, not the lever
+  that makes 120 Hz.
+- **The governor** (uncapped, `auto`, with each frame's own GPU time now): agrees with the frame interval (13.9 ms GPU
+  at 13.8 ms frames) and goes straight to 0.6 and quality 0 in the heavy views: mountain_view 82 fps, noon_overview 82,
+  forest 103 (with clouds).
+- **The look, native against 0.75, back to back** (the same pose seconds apart; clouds drift and leaves wave between
+  them): sharpness (the scaled shot's gradient energy over native's) 0.70-0.82 with the reconstruction's k 3 and the
+  copy's sharpening 0.5 (forest 0.76, mountain_view 0.73, noon 0.80, torch_cave 0.82, water_closeup 0.70). At 100% the
+  0.75 frame is softer in fine texture (leaves, distant block faces), with no artifacts of its own: edges are clean,
+  water, clouds and the sky hold up. k 4.5 with sharpening 0.7 took the forest to 0.81; sharpening alone (0.8 at k 3)
+  didn't move it (0.755). In theory the still image converges to the scene convolved with the reconstruction's Gaussian
+  (sigma 0.41 output pixels at k 3), against native TAA's box over each pixel (sigma 0.29): k 6 would match it, at the
+  price of a blockier current frame where the history is rejected (disocclusions, waving leaves).
+- The mip bias (the terrain's texture gradients scaled to the output's resolution) didn't change the forest's score:
+  there the leaves' texels are magnified (2 rendered pixels each), so it's the reconstruction, not the mips. It matters
+  for minified textures (distant terrain), where it keeps the native mip.
