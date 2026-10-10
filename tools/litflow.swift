@@ -175,6 +175,10 @@ if mode == "compile" {
                       "post_shaft_blur", "post_shaft_color", "post_composite"] {
                 _ = try device.makeComputePipelineState(function: l.makeFunction(name: k)!)
             }
+            // The local tone map's kernels (a library from before them has none).
+            for k in ["post_local_stats", "post_local_box"] {
+                if let fn = l.makeFunction(name: k) { _ = try device.makeComputePipelineState(function: fn) }
+            }
             for format in [MTLPixelFormat.rg11b10Float, .rgba16Float] {
                 let d = MTLRenderPipelineDescriptor()
                 d.vertexFunction = l.makeFunction(name: "post_copy_vs")
@@ -183,6 +187,13 @@ if mode == "compile" {
                 d.depthAttachmentPixelFormat = .depth32Float
                 _ = try device.makeRenderPipelineState(descriptor: d)
             }
+        }
+    }
+    // Lab mode's class mask (LabMask.swift), with lit mode.
+    if litOn, let src = source("mmc_debug_lab_mask_shader_source") {
+        attempt("lab mode's class mask kernel") {
+            let l = try device.makeLibrary(source: src, options: nil)
+            _ = try device.makeComputePipelineState(function: l.makeFunction(name: "lab_mask")!)
         }
     }
     if let src = source("mmc_debug_cl_shader_source") {

@@ -171,6 +171,19 @@ private let litEmitterTerm = postEnabled ? """
 /// litShaderHeader (and with litGi, giUpsampleHeader), before it.
 let litRelightHeader = """
 
+// The grade's light balance (docs/lighting-design.md, "The grade"; litGrade below): gains on the sun, on the sky term (the
+// GI cache's sky and bounced light, or the open sky's: what fills the shade) and on block light; the sky term's tint
+// (LIT_SHADE_WARM > 0 warmer, < 0 bluer, at the same luminance); block light's warmth (the same way), saturation (1: as
+// the lightmap or the colored light volume gives it) and falloff (block light times (level / 15)^LIT_BLOCK_FALLOFF: 0 as
+// before, more for pools of light around the sources). 1, 0 and 1: the light as before.
+#define LIT_SUN_GAIN 1.0
+#define LIT_SKY_GAIN 1.0
+#define LIT_SHADE_WARM 0.0
+#define LIT_BLOCK_GAIN 1.0
+#define LIT_BLOCK_WARM 0.0
+#define LIT_BLOCK_SAT 1.0
+#define LIT_BLOCK_FALLOFF 0.0
+
 struct LitFrame {
     float4x4 invViewProj;   // clip space to camera-relative world (the projection the level was drawn with, jittered)
     float4 size;            // xy: target size, z: pixels per traced visibility sample (0: none this frame), w: largest value the target holds
@@ -191,6 +204,22 @@ constant float kLitHemi[7] = { 0.6, 0.6, 1.0, 0.2, 0.6, 0.6, 0.75 };
 constant float3 kLitMoonTint = float3(0.857, 1.006, 1.371);
 
 static float litLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// A tint toward warm (w > 0: more red, less blue) or cool (w < 0) at the same luminance.
+static float3 litWarmTint(float w) {
+    float3 t = float3(1.0 + w, 1.0, 1.0 - w);
+    return t / litLuma(t);
+}
+
+// The grade's light balance (the LIT_SUN_GAIN ... LIT_BLOCK_FALLOFF knobs above) on the relight's terms before they're
+// summed; level: the pixel's block light level (0-15).
+static void litGrade(thread float3& sun, thread float3& skyAmb, thread float3& blockLight, float level) {
+    sun *= LIT_SUN_GAIN;
+    skyAmb *= LIT_SKY_GAIN * litWarmTint(LIT_SHADE_WARM);
+    float l = litLuma(blockLight);
+    blockLight = max(l + LIT_BLOCK_SAT * (blockLight - l), 0.0) * (LIT_BLOCK_GAIN * litWarmTint(LIT_BLOCK_WARM))
+               * pow(clamp(level / 15.0, 1e-3, 1.0), LIT_BLOCK_FALLOFF);   // (not 0: fast math's pow(0, 0) is NaN)
+}
 
 // Vanilla's lightmap at fractional levels (texel centers at whole ones, linear between them).
 static float3 litLightmap(texture2d<float> lm, float block, float sky) {
@@ -285,6 +314,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         // from the moon itself, 40% from the glow of the night sky.
         float moonLum = litLuma(vanillaSky) * f.moonDir.w;
         float3 moon = moonLum * kLitMoonTint * (0.6 * ndlMoon / max(f.moonDir.y, 0.5) * vMoon + 0.4 * kLitHemi[fi] * skyFall * ao);
+        litGrade(sun, skyAmb, blockLight, block);
         E = ((sun + skyAmb) * dayScale + moon + blockLight * ao) * f.misc.w;
     }
 \(litEmitterTerm)    float3 lin = skyDecode(refl) * E;
@@ -898,6 +928,8 @@ final class Lit: @unchecked Sendable {
         let cb = ctx.ensureCB()
         // Colored block light's shadows (ColoredLightShadows.swift): rays toward the lights, for the relight below.
         if clEnabled { ClShadows.shared.trace(cb: cb, depth: depth, invViewProj: f.invViewProj, width: color.width, height: color.height) }
+        // Lab mode's `mask` (LabMask.swift): this frame's G-buffer, depth and sun visibility into the class mask it's making.
+        if LabMask.shared.pending { LabMask.shared.frame(cb: cb, gbuffer: gbuffer, depth: depth, vis: visTexture, visScale: f.size.z, moon: f.sunDir.w > 0.5, invViewProj: f.invViewProj, sun: sun) }
         var daylight: [SIMD4<Float>] = []
         var env = envBuffer
         if atmosphere, let giEnv = frameGiEnv {

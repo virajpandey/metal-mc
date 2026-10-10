@@ -47,6 +47,7 @@ commands would run at once).
 |---|---|
 | `scene NAME` | go to a scene of `tools/bench/scenes.json`: pose, time of day, weather, its setup commands; done once its `settle` ticks (100) have passed, the LOD is built and its quad count has held for 3 s (after a jump of more than 256 blocks, only once it has changed: the LOD updates every 2 s), and the terrain around has compiled (at most 60 s) |
 | `shot LABEL` | screenshot of the main target (the panel's resolution, no HUD) into `mod/run/screenshots/LABEL.png`; done when the file is written |
+| `mask LABEL` | the class mask of the same view into `mod/run/screenshots/LABEL-mask.png` (lit mode; see "The class mask" below); done when the file is written, and the result lists the classes' shares |
 | `reload` | recompile every shader file now, changed or not, and rebuild their pipelines (normally the watcher does it on save) |
 | `wait TICKS` | 20 ticks a second |
 | `tour [PREFIX]` | `scene` + `shot PREFIX-NAME` for every scene (PREFIX: tour) |
@@ -74,6 +75,7 @@ are files of their own, pulled in with `#include "name.metal"`, so one edit reac
 | `rt_shadows.metal` | `RtShadows.swift` | the traced sun shadows |
 | `lod.metal`, `far_field.metal`, `near_chunks.metal` | `Lod.swift`, `FarField.swift`, `NearChunks.swift` | the LOD's quads, the far field's march, our near terrain (with their G-buffer writes) |
 | `hdr.metal`, `util.metal` | `Hdr.swift`, `Backend.swift` | the HDR present; clears and the present blit |
+| `lab_mask.metal` | `LabMask.swift` | the `mask` command's classes (their rules are `#define`s at its top) |
 | `sky_header.metal`, `lit_header.metal`, `lit_relight_header.metal`, `gi_upsample_header.metal` | skyShaderHeader, litShaderHeader, litRelightHeader, giUpsampleHeader | shared: the atmosphere's functions; the G-buffer's packing; **the relight (litRelightPixel) and the water's shading**, in both lit.metal and taa.metal; the GI upsample |
 
 A watcher polls the files twice a second. A library whose files changed is recompiled off the render thread; if it
@@ -113,6 +115,46 @@ adjust, and copy the pose in (`status` prints it). Keep cameras out of y 190-198
 The nine on `claudeworld-merged`: noon_overview, night_torches (the plains village's own torches at midnight), rain (the
 same village), forest, torch_cave (a cavern, torches placed by its setup), mineshaft (a corridor lit by its own wall
 torches), sunset_water, water_closeup, mountain_view. The notes in the file say where each is and how it was found.
+
+## The class mask
+
+`mask LABEL` (`Sources/MetalMCNative/LabMask.swift`, lit mode only) writes `LABEL-mask.png`: the frame's size and view,
+every pixel one flat color for what it shows, from lit mode's G-buffer, the depth and the traced sun visibility of the
+next 16 frames (the visibility's samples rotate over each 4 x 4 block's pixels; their mean says sunlit or not). The camera
+holds still in lab mode, so a `shot` and a `mask` with the same label line up pixel for pixel (the G-buffer's sub-pixel
+jitter aside). It takes about half a second. The classes, first rule that holds:
+
+| Class | Color (RGB) | Rule |
+|---|---|---|
+| sky | 60 120 220 | nothing drawn (depth 0), or vanilla's cloud slab (the 4 blocks from the cloud height) |
+| water | 0 200 200 | the G-buffer's water flag (the LOD's and the far field's water), or a surface 8/9 of the way up a block (a source block's top) where no lit terrain shows: vanilla's water |
+| unlit | 220 30 90 | anything else that isn't lit terrain: entities, the hand, particles, glass |
+| far | 150 150 150 | lit terrain past 512 blocks |
+| blocklit | 255 120 20 | lit terrain with block light 8 or more where the sky light is under 10 or the sun is down; light sources (block light 15) |
+| vegetation | 40 170 40 | faces that aren't axis-aligned (cross plants: grass, flowers, ferns, crops) and green albedo (green the largest channel, above blue by 10%, saturation over 0.2: leaves, grass blocks' tops, vines). The albedo-hue rule stands in until the G-buffer flags foliage |
+| sunlit | 255 215 60 | lit terrain whose sun visibility is over 0.5 and whose face is turned to the sun, by day |
+| shade | 120 70 180 | the rest of lit terrain |
+
+The rules' constants are `#define`s at the top of `lab_mask.metal` (editable live like any shader file).
+
+## Twins
+
+SEUS PTGI renders inside our engine with our camera and geometry (the external pipeline), so every pixel of our frame
+has a twin in its frame. Three tools make "does it look like SEUS" a number (docs/lighting-design.md, "The grade"):
+
+- `tools/twindiff.swift` (`swiftc -O tools/twindiff.swift -o bench_out/twindiff`): `twindiff ours.png seus.png mask.png
+  [--json out.json] [--board out.jpg] [--name NAME] [--weights sky=0.25,...]`. Per class and frame: the share, OKLab
+  mean L, a, b and chroma, L at the 10th, 50th and 90th percentiles, local contrast; the deltas and a score (lower is
+  better; the formula is in lighting-design.md); the census's luma numbers (ffmpeg's YAVG, YLOW and SATAVG of the bottom
+  55% and the top 20%); a board: ours | SEUS over the mask | the lightness difference (red: ours brighter, blue: darker).
+  About a second a scene.
+- `tools/bench/twins.sh <label> [LAB_EXP]`: one command for a census. A lab session (the full look by default; a
+  throwaway scene first, as a session's first scene can catch the LOD mid-build), `scene`, `shot` and `mask` for all nine
+  scenes, each scored against `~/Projects/metal-mc-private/twins/census1/seus1-<scene>.png`, the boards and
+  `summary.md` (tools/bench/twinsum.py) in the main checkout's `bench_out/twins/<label>/` (TWINS_OUT). TWINS_NOGAME=1
+  scores the shots already there again. Boards hold SEUS's pixels: they stay in bench_out, out of the repository.
+- `tools/bench/autotune.py <label> --knobs ... --scenes ...`: a lab session that searches the look's knobs (the
+  `#define`s of post.metal and lit_relight_header.metal) against the twins; see its header and lighting-design.md.
 
 ## The run ledger
 
