@@ -1690,6 +1690,40 @@ LOD's sway). Session 2's traces had other work on the GPU in them (the clears to
 So about 0.5 ms in a forest with `leaflight` (the walk 0.3, the relight 0.15-0.2) and about 0.1 more with `wave` (the
 near chunks' lookup and sway), against the brief's 0.15. Where it goes, and what would take it down, is in "Not done".
 
+### Round 2: the cost (2026-10-10, offline, `leaftest` with `LEAFTEST_TIME=1`, 3456 x 2234)
+
+Where it went (forest; the shadows' pass "through" against "leaves opaque" in the same process, medians of 60, the
+relight's own pass across processes; A/B switches `METALMC_LEAFQUERY`, `LEAFTERM`, `LEAFSHEEN`, `LEAFCAND`):
+
+| | ms |
+|---|---|
+| the shadows' pass, leaves through against opaque (round 1's walk) | +0.26 to +0.35 (noise across batches) |
+| of that, the walk itself (rays that hit a leaf taking 3 blocks instead) | 0.11 |
+| of that, the rest: the hit's quad lookup on every ray that hits anything (2 dependent reads), the G-buffer read | 0.15 |
+| rays from leaves' faces turned away from the sun | 0 (no change without them) |
+| the relight's foliage term (`METALMC_LEAFTERM=0`: 1.183 -> 1.005) | 0.18 |
+| of that, the sheen (`METALMC_LEAFSHEEN=0`) | 0.04 |
+
+Changes:
+- **The walk as one traversal**: an intersection query over the whole ray with every triangle reported (forced
+  non-opaque); a leaf face the ray goes into adds -t, one it comes out of +t, so the sum is the length inside leaves
+  whatever order the traversal finds them in (closed canopies; a ray that starts inside has one exit more, one that ends
+  inside one entry more); anything that isn't a leaf ends it. Alone it cost the same as round 1's walk (closest hits one
+  by one within 24 blocks, then an any-hit query); as the shadow ray itself (one traversal instead of an any-hit ray
+  and then the walk) it takes 0.10 ms off: forest +0.248 against round 1's +0.350 in the same batch, mountain_view
+  +0.208 (round 1: +0.33). More than `RT_LEAF_CAND` (24) faces: deep, dark (8: +0.213; kept at 24).
+- **The relight's term trimmed**: the exp2s skipped where they give 1 or nothing (no leaves toward the sun, no cover),
+  Smith's visibility in Hammon's form (no square roots): within the noise (forest 1.201 against 1.183-1.190).
+
+So `leaflight` now costs about 0.44 ms in the forest view (0.25 in the shadows' pass, 0.19 in the relight) and 0.34 in
+mountain_view (0.21 + 0.13), from about 0.52 and 0.47: still well over the 0.15 asked for. What's left is structural:
+- the quad lookup on every hit: leaves as their own geometry (or instances, with a mask) in each tile's structure would
+  let the hardware take the opaque triangles and report only leaves (the GI cache's tile meshes and hit table would
+  need the third range);
+- the relight's term (0.18): evaluated once per traced sample in rt_shadow (it reads the sample's G-buffer texel
+  already) instead of at every leaf pixel; the visibility texture's free channel is one (with clouds, b is the clouds'
+  shadow), so the term would need a scalar form or a channel of its own.
+
 ### Not done, and next
 
 - **Cost.** The walk through leaves is near its minimum per ray (an any-hit query that stops at the first leaf, short
@@ -2321,3 +2355,25 @@ turning softens it rather than trailing it; not looked at in motion).
 - A rain shot taken right after `scene rain` showed the foreground's grass near black in one session and not in the
   other; the same view 200 ticks later was normal (debug views 6 and 8: sun visibility and the GI cache as elsewhere).
   Something settling after the jump (the GI cache's or the visibility's history), not the entities: not chased.
+
+### Costs
+
+- The relight's code-0 path (the entity texel's relight compiled into the relight and the anti-aliasing's resolve) costs
+  0.02-0.04 ms on frames with no entities on screen (offline, the relight's own pass: forest 1.181 -> 1.223 ms,
+  noon_overview 0.873 -> 0.896); an entity pixel costs about what a terrain pixel does. The patched pipelines' G-buffer
+  write and the forward light's 128-byte copy a frame are noise. The in-game traces of these sessions mixed scenes (the
+  pen, the cave, the forest) and weren't clean enough to give more than that.
+
+### Not done, and next
+
+- **Rain over terrain stays faint**: a faint streak changes the color drawn by less than the overlay test's tolerance,
+  so the relight relights it away; the stronger streaks show. Rain over terrain texels has no bit to say so.
+- **The hand** is behind `hand`: not looked at in motion (TAA), and it can dip into a wall right in front of the camera.
+- **Block models drawn as entities** (falling blocks, moving pistons, minecart contents, item frames' frames:
+  `solid_block`, `cutout_block`) keep vanilla's light: their vertex format has no normal (the face could come from the
+  position's derivatives) and their vertex color has vanilla's face shade in it.
+- **Entities cast no shadows** (they aren't in the ray structures), and translucent particles take no colored light and
+  no traced shadow (their light is the forward light's).
+- **Without TAA and with clouds**, streaks over the sky are lost (the relight's own pass and the clouds' own composite).
+- `entity_translucent_emissive`, `eyes`, `breeze_wind`, `energy_swirl` and the glint pipelines stay vanilla's (emissive
+  or additive layers; the overlay test keeps them over a relit entity).
