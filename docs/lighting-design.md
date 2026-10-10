@@ -2648,3 +2648,6 @@ turning softens it rather than trailing it; not looked at in motion).
 - **Without TAA and with clouds**, streaks over the sky are lost (the relight's own pass and the clouds' own composite).
 - `entity_translucent_emissive`, `eyes`, `breeze_wind`, `energy_swirl` and the glint pipelines stay vanilla's (emissive
   or additive layers; the overlay test keeps them over a relit entity).
+- **Checked last** (session `ent5`, on 14f98cd, with `clouds,godrays` too): all 17 pipelines patched; rain thin and gray
+  over the overcast with clouds; no streaks over water; mobs and the hand relit. After it, main's grade merged in and
+  entities call its `litGrade` like terrain (compile-checked, not seen in game).
