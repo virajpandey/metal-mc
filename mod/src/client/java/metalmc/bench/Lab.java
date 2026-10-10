@@ -31,6 +31,7 @@ import java.util.Map;
  *   scene NAME        go to a scene of tools/bench/scenes.json (pose, time of day, weather, setup commands) and wait until
  *                     the terrain around it has loaded and the LOD has settled
  *   shot LABEL        screenshot into run/screenshots/LABEL.png (done once the file is written)
+ *   mask LABEL        the class mask of the same view into run/screenshots/LABEL-mask.png (lit mode; done once written)
  *   reload            recompile every shader file now (-PshaderDir) and rebuild their pipelines
  *   wait TICKS        do nothing for TICKS ticks (20 a second)
  *   tour [PREFIX]     scene + shot for every scene: PREFIX-NAME.png (PREFIX: tour)
@@ -122,6 +123,7 @@ final class Lab {
         switch (verb) {
             case "scene": return scene(mc, arg);
             case "shot": return shot(mc, arg);
+            case "mask": return mask(mc, arg);
             case "reload": return metalmc.backend.MetalLab.reloadShaders();
             case "wait": {
                 int[] left = {Math.max(0, Integer.parseInt(arg))};
@@ -168,7 +170,7 @@ final class Lab {
             // Per-pass GPU timestamps of the next N frames (3) into the game log, for tools/bench/passes.py.
             case "trace": metalmc.backend.MetalStats.traceFrames(arg.isEmpty() ? 3 : Integer.parseInt(arg)); return "ok";
             case "quit": quit = true; mc.stop(); return "ok";
-            default: return "error: unknown command (scene, shot, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo, trace)";
+            default: return "error: unknown command (scene, shot, mask, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo, trace)";
         }
     }
 
@@ -239,6 +241,29 @@ final class Lab {
         current = m -> {
             if (message[0] != null) return (Files.exists(out) ? "ok: " + out.toAbsolutePath().normalize() : "error: " + message[0]);
             return ++t[0] > 400 ? "error: no screenshot after 20 s" : null;
+        };
+        return null;
+    }
+
+    /**
+     * The class mask of what the frame shows (Sources/MetalMCNative/LabMask.swift; docs/lab-mode.md, "The class mask"):
+     * run/screenshots/LABEL-mask.png, the same size and view as `shot LABEL` takes, from lit mode's G-buffer and the
+     * traced sun visibility of the next 16 frames. Done once the file is written.
+     */
+    private static String mask(Minecraft mc, String label) {
+        String name = label.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (name.endsWith(".png")) name = name.substring(0, name.length() - 4);
+        if (name.isEmpty()) return "error: mask LABEL";
+        Path out = mc.gameDirectory.toPath().resolve("screenshots").resolve(name + "-mask.png").toAbsolutePath().normalize();
+        String err = metalmc.backend.MetalLab.requestMask(out.toString(), 16, metalmc.lod.Lod.CLOUD_HEIGHT);
+        if (err != null) return "error: " + err;
+        int[] t = {0};
+        current = m -> {
+            Object[] s = metalmc.backend.MetalLab.maskStatus();
+            int state = (Integer) s[0];
+            if (state == 1) return "ok: " + s[1];
+            if (state < 0) return "error: " + s[1];
+            return ++t[0] > 400 ? "error: no mask after 20 s (" + s[1] + ")" : null;
         };
         return null;
     }

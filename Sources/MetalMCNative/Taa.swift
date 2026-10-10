@@ -41,7 +41,19 @@ private let taaWaterLoad = """
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
 // Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise. Clouds hook (Clouds.swift, METALMC_EXP=clouds only):
 // their composite, after the aerial perspective in the sky variant.
-private let taaShaderSource = skyShaderHeader + cloudsShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "") + """
+// Volumetric light (Godrays.swift, METALMC_EXP=godrays only; without it the resolve's text is as before): the fog, applied in
+// the sky variant's load after the aerial perspective and the clouds, in front of both (its traced texels at texture 24, its
+// transmittance table at texture 25, the frame's fog at buffer 7).
+private let taaGodraysArgs = godraysEnabled ? """
+                        texture2d<float> godraysFog [[texture(24), function_constant(taaSky)]],
+                        texture2d<float> godraysT [[texture(25), function_constant(taaSky)]],
+                        constant GodraysShared& godraysG [[buffer(7), function_constant(taaSky)]],
+
+""" : ""
+private let taaGodraysLoad = godraysEnabled ? "\n            c.rgb = godraysApply(c.rgb, q, d, sky, godraysFog, godraysT, &godraysG);" : ""
+
+private let taaShaderSource = skyShaderHeader + cloudsShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "")
+    + (godraysEnabled ? godraysHeader : "") + """
 
 // With the sky on (METALMC_EXP=sky), a second variant of the resolve applies the aerial perspective, the render
 // distance's fade into the sky and the tone curve to each pixel as it loads it (skyLevelColor), after the shadows'
@@ -137,7 +149,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
                         texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]],\n                        texture2d<float> litWaterTrace [[texture(18), function_constant(taaLit)]],\n                        texture2d<float> litWavesDetail [[texture(19), function_constant(taaLit)]],\n                        texture2d<uint> litWaterTraceAS [[texture(20), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
 #endif
-                        uint2 lid [[thread_position_in_threadgroup]],
+\(taaGodraysArgs)                        uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
     // The threadgroup's 32 x 32 pixels and a 1-pixel border, loaded once: color in YCoCg (alpha in w) and depth. The
     // border is loaded by both threadgroups beside it, and each load is the heavy part (in lit mode the relight, the
@@ -157,7 +169,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
             float haze;
-            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")
+            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")\(taaGodraysLoad)
         }
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
         dtile[i] = d;
@@ -466,6 +478,8 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setTexture(sky.skyView, index: 7)
         // Clouds hook (Clouds.swift): this frame's clouds for the composite (buffer 5, textures 21 and 22: 18-20 are water's), or stand-ins.
         if cloudsEnabled { Clouds.shared.bindTaa(enc, width: color.width, height: color.height) }
+        // Volumetric light (Godrays.swift): this frame's fog (textures 24 and 25, buffer 7), or stand-ins that leave the frame alone.
+        if godraysEnabled { Godrays.shared.bindTaa(enc, width: color.width, height: color.height) }
         skyDither = color.pixelFormat == .rgba16Float ? 0 : (color.pixelFormat == .rg11b10Float ? -1 : 1.0 / 255)
         tile = 32
     } else if relight, let litPipe = t.litResolve(sky: false) {

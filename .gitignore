@@ -8,3 +8,4 @@ fixtures/
 /fixtures
 .build-dev/
 .claude/worktrees/
+__pycache__/
