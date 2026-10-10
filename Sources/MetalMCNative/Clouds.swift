@@ -279,7 +279,7 @@ private let cloudsShaderSource = skyShaderHeader + cloudsShaderHeader + """
 // clear air (at most), the step under which the detail noise is used, how far away it's used (m), where a ray counts as
 // opaque, how far rays go (m).
 #define CLOUD_STEPS_MIN 12
-#define CLOUD_STEPS_MAX 30
+#define CLOUD_STEPS_MAX 48
 #define CLOUD_STEP_MIN 50.0
 #define CLOUD_SKIP_MAX 3.0
 #define CLOUD_FINE_STEP 160.0
@@ -689,8 +689,12 @@ static float4 cloudsCirrus(float3 dir, float tc, constant CloudFrame& cf, consta
     float cov = saturate((patch - 0.5) * 3.0 + CIRRUS_COVER) * (1.0 - cf.shape.z);
     if (cov <= 0.0) return float4(0.0, 0.0, 0.0, 1.0);
     float2 uv = float2((2.0 * xz.x + xz.y) / CIRRUS_ALONG, (2.0 * xz.y - xz.x) / CIRRUS_ACROSS);
-    float n = detail.sample(kCloudRepeat, float3(uv, 0.37), level(1.0)).r * 0.6
-            + detail.sample(kCloudRepeat, float3(uv * float2(2.0, 2.0), 0.61), level(0.0)).r * 0.4;
+    // The mip for the texel's footprint on the sheet (a half-resolution texel is about 1.1 mrad; long toward the horizon):
+    // level 0 at a distance sparkled into dots.
+    float foot = tc * 0.0011 / max(abs(dir.y), 0.05);
+    float lod = clamp(log2(foot * (32.0 * 2.236 / CIRRUS_ACROSS)), 0.0, 5.0);
+    float n = detail.sample(kCloudRepeat, float3(uv, 0.37), level(lod + 1.0)).r * 0.6
+            + detail.sample(kCloudRepeat, float3(uv * float2(2.0, 2.0), 0.61), level(lod + 1.0)).r * 0.4;
     float d = smoothstep(1.0 - 0.6 * cov, 1.25 - 0.6 * cov, n) * cov;
     if (d <= 0.0) return float4(0.0, 0.0, 0.0, 1.0);
     // The sheet's slant: its local vertical tilts by x / R across the planet.
