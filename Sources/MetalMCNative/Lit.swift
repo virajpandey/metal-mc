@@ -843,6 +843,8 @@ final class Lit: @unchecked Sendable {
             enc.setBytes(&frame, length: MemoryLayout<SkyFrameGPU>.stride, index: 0)
             enc.dispatchThreads(MTLSize(width: waterSkyTexels, height: waterSkyTexels, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
             enc.endEncoding()
+            // Clouds hook (Clouds.swift, METALMC_EXP=clouds): the clouds blended into the sky map, for the reflections that escape.
+            if cloudsEnabled { Clouds.shared.intoWaterSky(cb: cb, sky: waterSky) }
         }
         if litWater {
             // Water's second round (Water.swift): its rays (terrain in the reflections, the water's depth), the camera under

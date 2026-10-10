@@ -46,6 +46,10 @@
 			"environment": "client"
 		},
 		{
+			"config": "metalmc_clouds.client.mixins.json",
+			"environment": "client"
+		},
+		{
 			"config": "metalmc_extpipe.client.mixins.json",
 			"environment": "client"
 		}
