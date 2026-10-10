@@ -40,7 +40,7 @@ let rainLook = litEnabled && experiments.contains("rain")
 /// The rain's look (rain): its streaks' share of a texel column's width (METALMC_RAINWIDTH, 0.05-1), their alpha against
 /// vanilla's (METALMC_RAINALPHA, 0-1) and their reflectance (METALMC_RAINALBEDO: linear, of the light around them).
 let rainWidth = min(max(Float(ProcessInfo.processInfo.environment["METALMC_RAINWIDTH"] ?? "") ?? 0.35, 0.05), 1)
-let rainAlpha = min(max(Float(ProcessInfo.processInfo.environment["METALMC_RAINALPHA"] ?? "") ?? 0.55, 0), 1)
+let rainAlpha = min(max(Float(ProcessInfo.processInfo.environment["METALMC_RAINALPHA"] ?? "") ?? 0.7, 0), 1)
 let rainAlbedo = min(max(Float(ProcessInfo.processInfo.environment["METALMC_RAINALBEDO"] ?? "") ?? 0.6, 0), 4)
 /// The share of the sun's light (lit from all sides, as a particle) rain takes (METALMC_RAINSUN, 0-1): rain falls from
 /// cloud, lit by the sky; in full rain our sky leaves the sun a fifth of its light, which turned the streaks yellow.
@@ -282,10 +282,12 @@ func entityPatchFragment(_ src: String, _ kind: EntityPatchKind) -> String? {
         } else {
             // Rain's texels are blue, snow's white. A rain streak keeps the middle of its texel column (lf[3].y of its width;
             // where a texel is narrower than a pixel, that share of it), gray-white and fainter (lf[3].x), its light
-            // reflected (lf[3].z); snow keeps its texture's gray levels.
+            // reflected (lf[3].z); snow keeps its texture's gray levels. Not over water's texels: the relight takes the
+            // water layer off what's drawn to see the floor, which turned the streaks there olive.
             body = """
                     float4 mmcT = Sampler0.sample(Sampler0Smplr, in.texCoord0);
                     float mmcRain = saturate((mmcT.b - mmcT.r - 0.15) * 4.0);
+                    if (mmcRain > 0.0 && (mmcPrev.x >> 28) == 1u) mmcT.a = 0.0;
                     float mmcU = in.texCoord0.x * float(Sampler0.get_width());
                     float mmcF = fract(mmcU) - 0.5, mmcW = max(fwidth(mmcU), 1e-4), mmcH = 0.5 * mmcLf[3].y;
                     float mmcCover = max(min(mmcF + 0.5 * mmcW, mmcH) - max(mmcF - 0.5 * mmcW, -mmcH), 0.0) / min(mmcW, 1.0);
