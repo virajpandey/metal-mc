@@ -56,14 +56,16 @@ let renderScaleSetting = RenderScaleSetting.parse(ProcessInfo.processInfo.enviro
 final class RenderScaleGovernor: @unchecked Sendable {
     static let shared = RenderScaleGovernor()
 
-    let budgetMs: Double = Double(ProcessInfo.processInfo.environment["METALMC_GOVBUDGET"] ?? "") ?? 1000.0 / 120.0
+    let budgetMs: Double
     static let step: Float = 0.05
     static let window = 32
+    /// The offline simulation's instances don't log.
+    private let quiet: Bool
 
     private let lock = NSLock()
     /// The setting in force: METALMC_SCALE, or in lab mode <shader dir>/render_scale.txt (same syntax, read every 2 s), so
     /// one session can compare scales.
-    private(set) var setting = renderScaleSetting
+    private(set) var setting: RenderScaleSetting
     private var labChecks = 0
     private var labText: String?
     /// Completed frames' GPU times (ms) drawn at the current scale (completion handlers, any thread).
@@ -78,12 +80,16 @@ final class RenderScaleGovernor: @unchecked Sendable {
     private var lastFrame: UInt64 = 0
     private var frames = 0
     private var changes = 0
+    private(set) var totalChanges = 0
     /// Frames drawn at each scale step (index: scale / step), for the summary.
     private var histogram = [Int](repeating: 0, count: 21)
     private var lastLog: UInt64 = 0
 
-    init() {
-        let s = renderScaleSetting
+    init(setting s: RenderScaleSetting = renderScaleSetting,
+         budgetMs: Double = Double(ProcessInfo.processInfo.environment["METALMC_GOVBUDGET"] ?? "") ?? 1000.0 / 120.0, quiet: Bool = false) {
+        setting = s
+        self.budgetMs = budgetMs
+        self.quiet = quiet
         // The governor starts in the middle of its range: a heavy view at the panel's resolution would drop frames for
         // the half second its first step takes.
         scale = s.auto ? RenderScaleGovernor.quantize(Swift.min(s.max, Swift.max(s.min, 0.8))) : s.fixed
@@ -107,11 +113,15 @@ final class RenderScaleGovernor: @unchecked Sendable {
     /// Render thread, once a frame (mmc_render_scale): the scale to draw this frame's level at.
     func next() -> Float {
         labOverride()
+        return next(now: DispatchTime.now().uptimeNanoseconds)
+    }
+
+    /// next() at time `now` (nanoseconds; the offline simulation's clock).
+    func next(now: UInt64) -> Float {
         let s = setting
         frames += 1
         histogram[Swift.min(20, Int((scale / RenderScaleGovernor.step).rounded()))] += 1
         guard s.auto else { return scale }
-        let now = DispatchTime.now().uptimeNanoseconds
         if lastFrame != 0 {
             intervals.append(Double(now - lastFrame) / 1e6)
             if intervals.count > RenderScaleGovernor.window { intervals.removeFirst(intervals.count - RenderScaleGovernor.window) }
@@ -190,6 +200,8 @@ final class RenderScaleGovernor: @unchecked Sendable {
         lock.unlock()
         intervals.removeAll(keepingCapacity: true)
         changes += 1
+        totalChanges += 1
+        if quiet { return }
         if q != oldQ { applyQuality() }
         log(String(format: "render scale: %.2f -> %.2f, quality %.2f -> %.2f (%@; budget %.2f ms)", old, next, oldQ, q, why, budgetMs))
     }
@@ -202,6 +214,7 @@ final class RenderScaleGovernor: @unchecked Sendable {
     }
 
     private func logSummary(_ now: UInt64) {
+        if quiet { return }
         if lastLog == 0 { lastLog = now }
         guard now - lastLog >= 20_000_000_000 else { return }
         lastLog = now
@@ -213,6 +226,52 @@ final class RenderScaleGovernor: @unchecked Sendable {
         histogram = [Int](repeating: 0, count: 21)
         changes = 0
     }
+}
+
+/// Offline simulation of the governor (tools/govsim.swift), no GPU: a frame's GPU time is (fixed + perPixel x s^2) x
+/// (1 + noise x a normal deviate), s the scale it was drawn at, reported `latency` frames later as a completed command
+/// buffer would be. Uncapped (vsync 0) a frame takes its GPU time; with vsync (1) a whole number of refreshes, and with
+/// `dvfs` (vsync only) the GPU's reported time stretches toward the frame as a clock that follows the work would make it
+/// (to `dvfs` times the frames it fills, never less than the work). `phases`: per-pixel cost multipliers held for
+/// `phaseFrames` frames each (a heavy view, a light one, ...). Writes each frame's scale to `scales` and returns the share
+/// of frames late (over the refresh) in [0, 1]; out[0] the number of changes, out[1] the mean scale.
+@_cdecl("mmc_debug_governor_sim")
+public func mmc_debug_governor_sim(_ fixedMs: Double, _ perPixelMs: Double, _ noise: Double, _ vsync: Int32, _ dvfs: Double,
+                                   _ latency: Int32, _ phases: UnsafePointer<Double>, _ phaseCount: Int32, _ phaseFrames: Int32,
+                                   _ scales: UnsafeMutablePointer<Float>, _ out: UnsafeMutablePointer<Double>) -> Double {
+    let gov = RenderScaleGovernor(setting: RenderScaleSetting.parse("auto"), budgetMs: 1000.0 / 120.0, quiet: true)
+    var rng = SystemRandomNumberGenerator()
+    func gauss() -> Double {
+        let u1 = Double.random(in: 1e-12..<1, using: &rng), u2 = Double.random(in: 0..<1, using: &rng)
+        return (-2 * log(u1)).squareRoot() * cos(2 * Double.pi * u2)
+    }
+    let refresh = 1000.0 / 120.0
+    var now: UInt64 = 1_000_000_000
+    var pending: [(ms: Double, tag: Float)] = []
+    var late = 0, sum = 0.0
+    let total = Int(phaseCount) * Int(phaseFrames)
+    for i in 0..<total {
+        let s = gov.next(now: now)
+        scales[i] = s
+        sum += Double(s)
+        let work = max(0.5, (fixedMs + perPixelMs * phases[i / Int(phaseFrames)] * Double(s * s)) * (1 + noise * gauss()))
+        var frameMs = work, reported = work
+        if vsync != 0 {
+            let refreshes = max(1.0, (work / refresh).rounded(.up))
+            frameMs = refreshes * refresh
+            if dvfs > 0 { reported = max(work, min(dvfs * frameMs, frameMs)) }
+        }
+        if frameMs > refresh * 1.01 { late += 1 }
+        pending.append((reported, gov.tag))
+        if pending.count > Int(latency) {
+            let f = pending.removeFirst()
+            gov.gpuFrame(f.ms / 1000, tag: f.tag)
+        }
+        now += UInt64(frameMs * 1e6)
+    }
+    out[0] = Double(gov.totalChanges)
+    out[1] = sum / Double(max(1, total))
+    return Double(late) / Double(max(1, total))
 }
 
 /// The render scale for the frame that starts now (Java's metalmc.render.RenderScale, at the start of every frame): a

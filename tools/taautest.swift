@@ -62,7 +62,9 @@ let t75short = run("taau-0.75-8frames", scale: 0.75, frames: 8, mode: 0)
 check(t75[0] > 0 && t75[0] < bilinear[0], "TAAU at 0.75 beats a bilinear upscale (\(String(format: "%.4f against %.4f", t75[0], bilinear[0])))")
 check(t75[0] < flipped[0], "the jitter's sign matters: the right one scores better (\(String(format: "%.4f against %.4f", t75[0], flipped[0])))")
 check(t75[2] < bilinear[2], "TAAU holds detail past the drawn frame's Nyquist better than a bilinear upscale (\(String(format: "%.4f against %.4f", t75[2], bilinear[2])))")
-check(t60[0] >= t67[0] - 0.002 && t67[0] >= t75[0] - 0.002, "error grows as the scale drops (0.75 \(String(format: "%.4f", t75[0])), 0.667 \(String(format: "%.4f", t67[0])), 0.6 \(String(format: "%.4f", t60[0])))")
+// Where the drawn frame can hold the image (past it, the zone plate soon passes even the output's Nyquist, and every
+// method's error there is aliasing).
+check(t60[1] > t67[1] && t67[1] > t75[1], "error grows as the scale drops, where the drawn frame can hold the image (0.75 \(String(format: "%.4f", t75[1])), 0.667 \(String(format: "%.4f", t67[1])), 0.6 \(String(format: "%.4f", t60[1])))")
 print(String(format: "native TAA %.4f, TAAU 0.75 after 8 frames %.4f, after 32 %.4f", native[0], t75short[0], t75[0]))
 print(failures == 0 ? "done: all checks pass" : "FAIL  \(failures) checks failed")
 exit(failures == 0 ? 0 : 1)
