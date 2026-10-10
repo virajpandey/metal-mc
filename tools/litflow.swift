@@ -1057,12 +1057,12 @@ if clOn {
                 writePNG(r.color, Int(W), Int(H), "cl-bounce-\(v.name)-gain\(Int(gain)).png")
                 print(String(format: "      %@ gain %.0f: mean luma %.2f", v.name, gain, lum / Double(n)))
                 if gain > 0 {
-                    // The relight's debug view 13: the bounced light it adds, alone (16 times, on a mid-gray albedo).
-                    let b = capture(half, sunAngle: midnight, relight: true, view: 13, extras: false, frames: 4)
+                    // The relight's debug view 15: the bounced light it adds, alone (16 times, on a mid-gray albedo).
+                    let b = capture(half, sunAngle: midnight, relight: true, view: 15, extras: false, frames: 4)
                     var bl = 0.0
                     for i in stride(from: 0, to: n * 4, by: 4) { bl += lumOf(b.color, i) }
-                    writePNG(b.color, Int(W), Int(H), "cl-bounce-\(v.name)-view13.png")
-                    print(String(format: "      %@: the relight's bounced light (view 13), mean luma %.2f", v.name, bl / Double(n)))
+                    writePNG(b.color, Int(W), Int(H), "cl-bounce-\(v.name)-view15.png")
+                    print(String(format: "      %@: the relight's bounced light (view 15), mean luma %.2f", v.name, bl / Double(n)))
                 }
             }
         }

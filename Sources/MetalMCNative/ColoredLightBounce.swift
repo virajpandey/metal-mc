@@ -3,7 +3,7 @@ import Metal
 import simd
 
 // Colored block light bounced through the GI cache (with coloredlight and gi; gain METALMC_CLBOUNCE, default 0 = off; 1 to
-// try it). The relight's debug view 13 (METALMC_LITVIEW=13) shows what it adds; mmc_debug_cl_bounce_stats reads each stage
+// try it). The relight's debug view 15 (METALMC_LITVIEW=15) shows what it adds; mmc_debug_cl_bounce_stats reads each stage
 // back offline.
 // The cache's cells hold the sky's and the sun's light per unit of the frame's daylight, which block light doesn't
 // follow, so the block light has a channel of its own per cell (clBounce: half4 a slot, rgb in absolute light and the
