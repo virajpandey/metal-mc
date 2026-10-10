@@ -841,12 +841,51 @@ water writes its layer) and on the Java side `MetalLit.water` (each frame: the c
 - **Rain** (`METALMC_EXP=wet`, `litWaterWet`): lit terrain open to the sky (sky light 14 and up; tops, sides a third)
   gets wet as the rain strengthens: darker (to two thirds) and a film of water reflecting the sky map (water's Fresnel),
   a mirror where a world-space noise of about 3 blocks says puddles lie.
-- Switches: `METALMC_WATERRT=0` (no rays: the sky map's reflection, the water relit as drawn), `METALMC_WATERRTSCALE=4`
-  (a quarter of the rays), `METALMC_WATERCHECKER=0`, `METALMC_WATERABSORB=r,g,b` (0.35, 0.10, 0.07 per block),
-  `METALMC_WATERSCATTER` (0.035), `METALMC_WATERREFRACT` (1), `METALMC_WATERWAVES` (0.6), `METALMC_WIND` (18). Lab mode:
-  the defines at the top of `lit_relight_header.metal` and `water_trace.metal` (`WATER_ABSORB`, `WATER_SCATTER`,
-  `WATER_CAUSTICS`, `WATER_REFRACT`, `WATER_FLOOR`, `WATER_TEAL`, `WATER_CHECKER`) and `RIPPLE_GAIN` in
-  `water_ripples.metal`.
+- Switches: `METALMC_WATERRT=0` (no rays: the sky map's reflection, the water relit as drawn), `METALMC_WATERRTSCALE`
+  (pixels per traced texel along each axis: 4, the default, or 2), `METALMC_WATERCHECKER=0`, `METALMC_WATERABSORB=r,g,b`
+  (0.35, 0.10, 0.07 per block), `METALMC_WATERSCATTER` (0.035), `METALMC_WATERREFRACT` (0, off: 1 bends the floor by the
+  waves), `METALMC_WATERWAVES` (0.6), `METALMC_WATERRIPPLES` (0.5), `METALMC_WIND` (18). Lab mode: the defines at the top
+  of `lit_relight_header.metal` and `water_trace.metal` (`WATER_ABSORB`, `WATER_SCATTER`, `WATER_CAUSTICS`,
+  `WATER_REFRACT`, `WATER_FLOOR`, `WATER_TEAL`, `WATER_CHECKER`), `RIPPLE_GAIN` in `water_ripples.metal`, and
+  `<shader dir>/water_rt.txt` (2 or 4) for the rays' resolution live.
+
+### Verified offline (2026-10-10, no game)
+
+- `swift build -c release`: clean. `litflow - - compile` (every variant of the anti-aliasing's resolve, the far field and
+  lit mode's own pass, compiled with the device's compiler) passes under `lit,rtshadows,sky,gi,water,coloredlight,post,wet`,
+  `lit,rtshadows,sky,water,wet` and `lit,rtshadows,water`; `water_trace`'s library compiles (an offline check through
+  `mmc_debug_water_trace_source`); the patch of vanilla's translucent terrain MSL (`mmc_debug_water_patch`) applies to and
+  compiles from both the game's own MSL (dumped with `-PdumpMsl`) and SPIRV-Cross's output of vanilla's GLSL through
+  glslangValidator, multidraw and not.
+- Not done offline: litflow's water section (its G-buffer and frames) wasn't rerun: the GPU queue went to the game.
+
+### In game (2026-10-10, lab mode: 3456 x 2234 fullscreen, TAA, vsync, LOD 8192, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,wet`)
+
+- **It runs.** "water: minecraft:pipeline/translucent_terrain(_multidraw) writes vanilla's water into the G-buffer" 0.1 s
+  after the atlas arrives; "reflection and refraction rays at 864x559" (quarter) or "1728x1117" (half).
+- **The seam is gone.** Near and far water reflect alike to the horizon (sunset_water, water_closeup); the far
+  coast's reflection lies under it, broken at its foot by the waves. The face from derivatives (first try) drew a red
+  dash on every block edge in a debug view; the depth buffer's normal at the same pixels said "top".
+- Pictures (`bench_out/agents/water/`; boards before | after | SEUS in `boards/`): `w2-*` the first full version,
+  `w3-`/`w4-` tuning (absorption, scatter, waves), `w5-sunset-horizon-crop.png` the coast's reflection without the
+  glossy jitter (with it: salt-and-pepper, `w4-sunset-horizon-crop.png`), `w6-*` all scenes with half-resolution rays,
+  `w7-hq-*` half against quarter resolution, `w8-*` the defaults.
+
+### Costs (in game, lab mode, the frame against the same frame with water's round 2 switched off in its shaders)
+
+| water_closeup (85% of the frame water) | fps | the frame |
+|---|---|---|
+| round 2 off (litWaterPixel returns at once, water_trace writes "none") | 95 | 10.5 ms |
+| half-resolution rays, full per-pixel composite (first version) | 65 | 15.4 ms (+4.9) |
+| the shading moved into water_trace, refracted rays shared, checkerboard | 71 | 14.1 ms (+3.6) |
+| the same at quarter resolution | 80 | 12.5 ms (+2.0) |
+| ... without the floor's look-up (WATER_REFRACT 0) | 83 | 12.0 ms (+1.5) |
+
+Per pass in the same frames (lab `trace`; the GPU's timestamps): the anti-aliasing's resolve 1.47 ms with round 2 off,
+2.94 with it on (the composite's 1.47: the floor's look-up 0.5, the glints with their shadow-visibility read 0.29, the
+per-pixel waves 0.13, the rest 0.54); water_trace 0.22 (off: writing "none"), 0.80 at quarter resolution, 2.28 at half.
+
+## Colored block light (prototype, `METALMC_EXP=lit,coloredlight`, 2026-10-05)
 
 ## Colored block light (prototype, `METALMC_EXP=lit,coloredlight`, 2026-10-05)
 
