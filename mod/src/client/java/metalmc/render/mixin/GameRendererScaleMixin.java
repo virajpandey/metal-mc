@@ -46,6 +46,8 @@ abstract class GameRendererScaleMixin {
     @Inject(method = "renderLevel", at = @At("HEAD"))
     private void metalmc$levelStart(CallbackInfo ci) {
         RenderScale.beginLevel();
+        // Work the last frame left to run beside this frame's main pass (the GI cache's deferred update, gidefer).
+        metalmc.backend.MetalScale.frameStart();
     }
 
     /** While the level is drawn with a scale: the level's target (LevelRenderer reaches the main target only through here). */

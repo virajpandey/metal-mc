@@ -218,7 +218,10 @@ pixel (RMS error; `bench_out/agents/speed/taautest/` in the main checkout):
 | TAAU 0.667, 0.6 | 0.099, 0.100 | 0.037, 0.041 | 0.103, 0.104 |
 | TAAU 0.75 after 8 frames | 0.152 | 0.061 | 0.160 |
 
-The flipped sign doubling the error checks the sample positions; "past it" is mostly past the output's own Nyquist too
+(That table at k 3. At 0.75 with k 4.5: 0.109 / 0.041 / 0.114; k 6: 0.119 / 0.046 / 0.125. Against this box-filtered
+reference a smoother kernel always scores better, while in game a sharper one looks closer to native TAA, which keeps
+more of the frame's high frequencies (0.071 in band here): k 4.5, the default, keeps most of k 3's margin over native TAA
+and measured sharper in game.) The flipped sign doubling the error checks the sample positions; "past it" is mostly past the output's own Nyquist too
 (the plate's frequency reaches 1.4 cycles a pixel in the far corner), where every method aliases. Convergence takes the
 16 jitter positions (8 frames is half-way). The governor's rules are checked offline too (`tools/govsim.swift`: synthetic
 frames, GPU time = fixed + per-pixel x s^2 with noise, reported two frames late, uncapped or vsync with a GPU clock that

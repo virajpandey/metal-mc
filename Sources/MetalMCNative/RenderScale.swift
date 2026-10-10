@@ -254,6 +254,12 @@ final class RenderScaleGovernor: @unchecked Sendable {
             lodQuadCullOn = q == "1"
             log("render scale: lab override: the LOD's quad culling \(lodQuadCullOn ? "on" : "off")")
         }
+        // gidefer.txt (1 or 0): the GI cache's update deferred to the next frame's start (Gi.swift, deferUpdate).
+        if litGi, let q = (try? String(contentsOfFile: dir + "/gidefer.txt", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines),
+           q == "1" || q == "0", let gi = GiCache.shared, gi.deferUpdate != (q == "1") {
+            gi.deferUpdate = q == "1"
+            log("render scale: lab override: the GI cache's update \(gi.deferUpdate ? "deferred to the next frame's start" : "right after its request")")
+        }
         let text = (try? String(contentsOfFile: dir + "/render_scale.txt", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text != labText else { return }
         labText = text
@@ -369,6 +375,15 @@ public func mmc_debug_terrain_compile() -> Int32 {
     let n = mmc_debug_lod_pipelines()
     if n != 0 { failed += max(n, 1) }
     return failed
+}
+
+/// The start of a frame's level (Java's GameRendererScaleMixin, at renderLevel's head, before any of its passes): work left
+/// by the last frame that can run beside this frame's main pass: the GI cache's deferred update (METALMC_EXP=gidefer).
+@_cdecl("mmc_frame_start")
+public func mmc_frame_start() {
+    guard litGi, ctx.pass == nil, let gi = GiCache.shared else { return }
+    ctx.endBlit()
+    gi.encodeDeferredUpdate(ctx.ensureCBNoFlush())   // no flush: clears waiting to fold into this frame's passes stay waiting
 }
 
 /// The render scale for the frame that starts now (Java's metalmc.render.RenderScale, at the start of every frame): a

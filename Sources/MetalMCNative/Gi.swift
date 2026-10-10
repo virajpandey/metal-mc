@@ -1661,18 +1661,50 @@ final class GiCache: @unchecked Sendable {
             if let fence { e.updateFence(fence) }
             e.endEncoding()
         }
+        // A deferred update still waiting (no frame start since: gidefer, below) goes first, as it would have.
+        if pendingUpdate != nil { encodeDeferredUpdate(cb) }
         // (Every stage binds what it uses, so they don't need the same encoder.)
         guard let first = begin("GI cache: light, begin, request and resolve") else { return false }
         encodeLight(first, light)
         encodeBegin(first, params: &p)
         encodeRequest(first, depth: depth, out: out, params: &p)
         end(first)
+        // Deferred (gidefer): the schedule and the rays for these requests at the next frame's start instead.
+        if deferUpdate && fence == nil {
+            pendingUpdate = (p, accel, accels, tiles)
+            advance()
+            return true
+        }
         guard let second = begin("GI cache: schedule, update (rays)") else { return false }
         encodeSchedule(second, params: &p)
         encodeUpdate(second, accel: accel, accels: accels, params: &p)
         end(second)
         advance()
         return true
+    }
+
+    /// METALMC_EXP=gidefer (lab mode: <shader dir>/gidefer.txt, RenderScale.swift): the schedule and the update (the rays)
+    /// for a frame's requests are encoded at the start of the next frame (encodeDeferredUpdate, from mmc_frame_start, before
+    /// the level's main pass) instead of right after the request. The next frame's request and resolve see them as before,
+    /// so the light is the same; on the GPU they can run beside that main pass's vertex stage, which is bound by vertex
+    /// invocations with its ALUs mostly idle (docs/frame-budget.md). Holds what the update reads (the instance structure,
+    /// its tiles) until then.
+    var deferUpdate = experiments.contains("gidefer")
+    private var pendingUpdate: (p: GiParams, accel: MTLAccelerationStructure, accels: [MTLAccelerationStructure],
+                                tiles: (table: MTLBuffer, buffers: [MTLBuffer])?)?
+
+    /// The deferred schedule and update (gidefer) into `cb`, if one is waiting.
+    func encodeDeferredUpdate(_ cb: MTLCommandBuffer) {
+        guard var u = pendingUpdate else { return }
+        pendingUpdate = nil
+        guard let e = cb.makeComputeCommandEncoder(descriptor: profComputePass("GI cache: schedule, update (rays), deferred")) else { return }
+        e.label = "MetalMC GI cache: schedule, update (rays), deferred"
+        let current = tiles
+        tiles = u.tiles
+        encodeSchedule(e, params: &u.p)
+        encodeUpdate(e, accel: u.accel, accels: u.accels, params: &u.p)
+        tiles = current
+        e.endEncoding()
     }
 
     /// Offline test: recompiles the kernels from `body` (the upsample header and kernels, as mmc_debug_gi_shader_source

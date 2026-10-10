@@ -37,6 +37,7 @@ public final class MetalScale {
         }
 
         static final MethodHandle SCALE = h("mmc_render_scale", JAVA_FLOAT);
+        static final MethodHandle FRAME_START = h("mmc_frame_start", null);
         static final MethodHandle TAA_SCALED = h("mmc_taa_apply_scaled", JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG,
             JAVA_FLOAT, JAVA_FLOAT, JAVA_INT);
     }
@@ -52,6 +53,19 @@ public final class MetalScale {
         if (MetalDevice.current == null) return 1f;
         try {
             return (float) Native.SCALE.invokeExact();
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /**
+     * The start of the level, before any of its passes: work the last frame left that can run beside this frame's main pass
+     * (the GI cache's deferred update, METALMC_EXP=gidefer; nothing without it).
+     */
+    public static void frameStart() {
+        if (MetalDevice.current == null) return;
+        try {
+            Native.FRAME_START.invokeExact();
         } catch (Throwable t) {
             throw rethrow(t);
         }
