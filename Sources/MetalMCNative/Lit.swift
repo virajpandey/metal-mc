@@ -28,6 +28,11 @@ import simd
 //      x 16, vanilla's light coordinates as the shader has them: smooth lighting interpolates them across a face)
 // The exact depth would take 32 bits and the format to 16 bytes. A 16-bit key misses one depth change in 65,536 (a pixel
 // of something drawn over terrain then shows the relit terrain for a frame).
+// With leaflight (METALMC_EXP=leaflight, Foliage.swift) the two low bits of the albedo's blue byte (x bits 16-17) hold a
+// foliage class on lit terrain (face code 1-7): 0 anything else, 1 a leaf (the LOD's leaf materials; the near chunks'
+// leaf sprites), 2 a plant (grass, ferns, flowers, crops, saplings: the near chunks' sprites). litPack rounds blue to a
+// multiple of 4 (at most 2/255 off) so every writer leaves 0 there; read it as litFoliageClass(g), or
+// (g.x >> 29) != 0 ? (g.x >> 16) & 3 : 0. Without leaflight those bits are the albedo's, as before.
 //
 // Hooks: mmc_pass_begin adds the G-buffer to the pass the Java side marks (mmc_lit_level_pass, from LevelRenderer's main
 // pass); PipelineBox gives vanilla's pipelines a variant with the extra target and no writes; the LOD, far field and
@@ -84,12 +89,12 @@ static bool litDepthMatches(float z, uint key) {
 }
 static uint2 litPack(float3 albedo, float ao, uint face, float depth, float sky, float block) {
     if (face == LIT_NONE) return uint2(0u);
-    uint3 a = uint3(round(saturate(albedo) * 255.0));
+    uint3 a = uint3(round(saturate(albedo) * 255.0));\(foliageLight ? "\n    a.b = min((a.b + 2u) & ~3u, 252u);   // leaflight: blue's two low bits hold the foliage class (litPackFoliage)" : "")
     uint code = face < 6u ? face + 1u : 7u;
     return uint2(a.r | (a.g << 8) | (a.b << 16) | (uint(round(saturate(ao) * 31.0)) << 24) | (code << 29),
                  litDepthKey(depth) | (uint(round(clamp(sky, 0.0, 15.0) * 16.0)) << 16) | (uint(round(clamp(block, 0.0, 15.0) * 16.0)) << 24));
 }
-\(litWater ? litWaterPackHeader : "")#endif
+\(foliageLight ? foliagePackHeader : "")\(litWater ? litWaterPackHeader : "")#endif
 """
 
 /// With water (litWater only; spliced into litShaderHeader, so without it every shader is the same text as before): its
@@ -209,7 +214,7 @@ static float litFogValue(float d, float s, float e) {
     if (d >= e) return 1.0;
     return (d - s) / (e - s);
 }
-\(clEnabled ? clRelightHeader + "\n" : "")
+\(clEnabled ? clRelightHeader + "\n" : "")\(foliageLight ? foliageRelightHeader : "")
 // The relight of pixel q, whose color is dst (as the target holds it), depth d and G-buffer texel g: the color it gets.
 // Pixels that aren't lit terrain keep theirs. env: the sun's light (0), the sky's on each face direction (1-6, the LOD's
 // face order) and on faces that aren't axis-aligned (7), linear, per unit of albedo.\(litGiRelightArgsDoc)
@@ -286,7 +291,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         float moonLum = litLuma(vanillaSky) * f.moonDir.w;
         float3 moon = moonLum * kLitMoonTint * (0.6 * ndlMoon / max(f.moonDir.y, 0.5) * vMoon + 0.4 * kLitHemi[fi] * skyFall * ao);
         E = ((sun + skyAmb) * dayScale + moon + blockLight * ao) * f.misc.w;
-    }
+\(foliageLight ? foliageRelightCall : "")    }
 \(litEmitterTerm)    float3 lin = skyDecode(refl) * E;
     float3 o = skyEncode(lin);
     if (overlayBright) o = c0 + (o - fwd);
@@ -303,7 +308,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         else if (view == 4u) c = float3(ao);
         else if (view == 5u) c = skyEncode(skyDecode(float3(0.5)) * E);
         else if (view == 6u) c = float3(vSunOut);
-        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));\(litGi ? "\n        else if (view == 8u) c = giUsed ? float3(0.0, 0.8, 0.0) : (block >= 15.0 ? float3(0.0, 0.0, 0.9) : float3(0.9, 0.0, 0.0));" : "")\(clEnabled ? "\n        else if (view == 11u) c = skyEncode(skyDecode(float3(0.5)) * clBL * f.misc.w);\n        else if (view == 12u) c = clDbg.rgb;" : "")
+        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));\(litGi ? "\n        else if (view == 8u) c = giUsed ? float3(0.0, 0.8, 0.0) : (block >= 15.0 ? float3(0.0, 0.0, 0.9) : float3(0.9, 0.0, 0.0));" : "")\(clEnabled ? "\n        else if (view == 11u) c = skyEncode(skyDecode(float3(0.5)) * clBL * f.misc.w);\n        else if (view == 12u) c = clDbg.rgb;" : "")\(foliageLight ? foliageDebugViews : "")
         return saturate(c);
     }
     return o;

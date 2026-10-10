@@ -1326,3 +1326,84 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - Not seen in game with the final defaults: noon_overview (the first scene of session 3 caught the LOD still loading);
   sessions 1 and 2 put noon within 2% of before with each meter, and the defaults sit between them.
 - With the external pipeline (`METALMC_EXTPIPE`): not tried together.
+
+## Light through leaves, and waving foliage (prototype, `METALMC_EXP=leaflight` and `wave`, 2026-10-10)
+
+`Sources/MetalMCNative/Foliage.swift` (the shader parts, the sprite classes, the wind), splices marked "Foliage" or
+"leaflight" in Lit.swift (litPack, litShaderHeader, the relight), RtShadows.swift (the kernel), Lod.swift (lodShadeLit,
+lod_vs), NearChunks.swift (near_vs, near_fs, mmc_near_draw) and FarField.swift (the canopy); on the Java side
+`metalmc.backend.MetalFoliage` (the atlas's leaf and plant sprites), `metalmc.light.mixin.TextureAtlasAccessor` and a call
+in `MetalNearChunks.draw`. Off by default; without the switches every shader is the same text as before (each change
+sits in a Swift interpolation that is empty then). `leaflight` needs `lit` (and wants `rtshadows`, `nearchunks`); `wave`
+works on its own (the near chunks need `nearchunks`).
+
+Our forest was near black-green inside the canopy (census1: terrain 10th percentile 18 against SEUS's 53): the cutout
+leaves' holes show inner leaf faces in full shadow, and the crowns' sides away from the sun go dark. Leaves are thin:
+light that falls on them comes out of their other side, green.
+
+### The G-buffer's foliage class
+
+- Two bits of lit terrain's texel: the albedo's blue byte's two low bits, x bits 16-17: 0 anything else, 1 a leaf, 2 a
+  plant (grass, ferns, flowers, crops, saplings). `litPack` rounds the blue byte to a multiple of 4 with `leaflight` on
+  (at most 2/255 off), so every writer leaves 0 there unless it sets a class with `litPackFoliage`. Read it with
+  `litFoliageClass(g)` (litShaderHeader), or `(g.x >> 29) != 0 ? (g.x >> 16) & 3 : 0`. The G-buffer had no spare bit
+  (AO's 5 bits band at 4; the light levels and the depth key are read in several places); blue's low bits move the
+  albedo's luminance by at most 0.06%.
+- Writers: the LOD by material (every leaf tint, cherry, the poplars 160-162); the far field's canopy layer by its
+  material; the near chunks by the block atlas sprite their quad's texture comes from. Vanilla's mesh carries no block
+  identity, so the Java side sends the atlas's leaf and plant sprites (`MetalFoliage.code`: names ending in `_leaves`,
+  vines and azalea bushes as leaves; grass, ferns, flowers, saplings, crops, double plants, petals and the like as
+  plants) whenever the atlas the near chunks sample changes; the native side makes a class map of the atlas (a texel per
+  16-pixel cell, R8Uint: class | sway << 2), and `near_vs` reads it at the middle of its quad's texture (its vertex and
+  the opposite corner span it) and hands it to `near_fs` flat.
+
+### Light through leaves (`leaflight`)
+
+- **The sun's rays go on through leaves** (RtShadows' kernel). The LOD meshes a canopy as one closed surface (faces
+  between leaf blocks are culled), so a ray's closest hits come in pairs, into a canopy and out of it, and the distance
+  between them is the blocks of leaves it crossed. A hit's quad tells its material and face (the GI cache's zero-copy
+  table: with `leaflight` the tiles' structures carry their quad ranges and the instance structure its table even
+  without `gi`). Within 24 blocks of the surface the hits are taken in order (short closest-hit queries, cheap); past
+  that one any-hit query covers the rest of the ray, as the plain shadow ray did (anything opaque: no light; more
+  leaves: 3 blocks more). The direct sun gets through `exp(-1.2 x blocks)`, 0.3 a block (`METALMC_LEAFT`): a layer or
+  two let some through, a deep canopy none; it is the visibility as before, which the relight's sun term and the water's
+  glint read. A second channel (the texture is RG8 then) keeps `exp(-0.2 x blocks)` (0 for anything opaque), up to
+  about 27 blocks in 8 bits. The traced pixel's class comes from the G-buffer: a leaf's face turned away from the sun
+  gets a ray too (through its own canopy; if the near range has no surface at all the canopy isn't in the structures,
+  and it takes a crown's 3 blocks), a plant takes the vertical for the ray's offset and always gets one.
+- **The relight's foliage term** (`litFoliageLight`, spliced into lit_relight_header.metal; every constant a `#define`
+  there): for a leaf or plant pixel, added to the relight's light:
+  - the sun's light scattered through the leaves: `sun x exp(-LEAF_FALLOFF x blocks) x (back + LEAF_FWD x HG)`.
+    Scattered light falls off more slowly than the direct beam, and green more slowly than red and blue (a leaf
+    absorbs little green): `LEAF_FALLOFF` (0.8, 0.32, 1.0) a block. `back` goes from `LEAF_FRONT` (0.1) on a face
+    toward the sun to `LEAF_BACK` (0.7) on one turned away (plants, thin every way, `PLANT_TRANS` 0.5); `HG` is a
+    Henyey-Greenstein lobe (g `LEAF_G` 0.6, times 4 pi: 1 with no lobe, 10 looking into the sun) around the sun's
+    direction, `LEAF_FWD` 0.2: leaves between the camera and the sun glow.
+  - the sky through the leaves: a pixel under cover takes at least the sky's light from above through the blocks of
+    leaves its sky light level says are over it (vanilla's leaves dim sky light a level a block), with the same falloff,
+    `LEAF_SKY` 0.8, times AO, from the first block of cover in (a face out in the open sees the sky itself, which the
+    sky term has). With the GI cache, whose bounce rays stop at leaves, a canopy's inside would otherwise be black.
+  - a soft sheen: a leaf's or a blade's waxy surface reflects the sun, most at grazing angles: a broad GGX lobe
+    (`LEAF_ROUGH` 0.4) with Schlick's Fresnel (F0 0.04) on the face (on a plant, the vertical's), times the direct
+    sun's visibility, in the leaf's hue (the term is per unit of albedo, so the sheen goes in over the albedo's
+    luminance), `LEAF_SHEEN` 0.5.
+- **Debug views** (`METALMC_LITVIEW`): 13 the foliage class (leaves green, plants yellow, other terrain gray), 14 the
+  traced texel (red the direct sun, green `exp(-0.2 x blocks)`).
+
+### Waving (`wave`)
+
+- A world-space wind field (`foliageWindHeader`): gusts are two long waves running downwind (toward +x, a little +z) at
+  5-6 blocks a second, so a gust's front crosses the land; flutter is quicker small motion whose phase changes every
+  couple of blocks. Positions are world blocks with x and z modulo 1024 and the clock modulo 600 s, every wave a whole
+  number of cycles across both, so nothing jumps where they wrap.
+- Leaves sway by their vertices' world positions, about 0.04 blocks (`METALMC_WAVELEAF`): corners shared by neighboring
+  leaf blocks (fancy leaves draw the faces between them) move together, so no cracks open. A plant leans from its
+  root: the vertices at the top of its texture sway (0.12 blocks, `METALMC_WAVEPLANT`), the bottom ones stay put, the
+  upper half of a double plant twice as much at its top, all by the root block, so a plant's crossed quads and its two
+  halves move as one.
+- In `near_vs`, and in `lod_vs` for full-resolution leaves, fading out from 80 to 160 blocks (`METALMC_WAVELODFADE`;
+  past vanilla's render distance the sway is under a pixel anyway). The LOD's texture coordinates keep the leaf's own
+  place, so the texture moves with it.
+- The traced shadows' structures don't move; at 0.04 blocks the difference doesn't show (with `wave` and not
+  `leaflight` the shadow rays start 0.06 blocks off the surface instead of 0.03, so a leaf swaying into its own block
+  doesn't shadow itself).
