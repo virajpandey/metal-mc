@@ -134,10 +134,21 @@ final class RenderScaleGovernor: @unchecked Sendable {
     /// what it added after the frame before it ended: end - max(start, the previous end).
     func gpuFrame(start: Double, end: Double, tag: Float) {
         lock.lock()
-        let own = end - Swift.max(start, lastGpuEnd)
+        let own = Swift.max(end - Swift.max(start, lastGpuEnd), 0)
         lastGpuEnd = Swift.max(lastGpuEnd, end)
+        if ownTimes.count < 1_000_000 { ownTimes.append(own) }
         lock.unlock()
-        gpuFrame(Swift.max(own, 0), tag: tag)
+        gpuFrame(own, tag: tag)
+    }
+
+    /// Each submit's own GPU time (seconds) since the last take, for the benchmark (mmc_gpu_own_times_take).
+    private var ownTimes: [Double] = []
+    func takeOwnTimes(_ out: UnsafeMutablePointer<Double>, _ max: Int) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let n = Swift.min(max, ownTimes.count)
+        for i in 0..<n { out[i] = ownTimes[i] }
+        ownTimes.removeAll(keepingCapacity: true)
+        return n
     }
 
     /// A frame's own GPU time (seconds) and the scale it was drawn at (the offline simulation calls this directly).
@@ -375,6 +386,13 @@ public func mmc_debug_terrain_compile() -> Int32 {
     let n = mmc_debug_lod_pipelines()
     if n != 0 { failed += max(n, 1) }
     return failed
+}
+
+/// Copies up to `max` submits' own GPU times (seconds: what each added after the one before it ended; frames overlap on
+/// the GPU, so mmc_gpu_times_take's spans overstate a frame's GPU time) into `out`, clears them, returns how many.
+@_cdecl("mmc_gpu_own_times_take")
+public func mmc_gpu_own_times_take(_ out: UnsafeMutablePointer<Double>, _ max: Int32) -> Int32 {
+    Int32(RenderScaleGovernor.shared.takeOwnTimes(out, Int(max)))
 }
 
 /// The start of a frame's level (Java's GameRendererScaleMixin, at renderLevel's head, before any of its passes): work left

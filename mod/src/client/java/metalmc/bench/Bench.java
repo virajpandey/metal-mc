@@ -160,6 +160,7 @@ public final class Bench {
                     log("running for " + RUN_TICKS + " ticks; app active " + metalmc.backend.MetalLod.activateApp());
                     if (isMetal()) {
                         metalmc.backend.MetalStats.takeGpuMillis();
+                        metalmc.backend.MetalScale.takeGpuOwnMillis();
                         metalmc.backend.MetalStats.takeCounters();
                     }
                     screenshot(mc, "start");
@@ -290,6 +291,15 @@ public final class Bench {
             gm = g.length == 0 ? 0 : gm / g.length;
             long[] c = metalmc.backend.MetalStats.takeCounters();
             double sub = Math.max(1, c[4]);
+            // Each frame's own GPU time (what it added after the frame before it ended: the spans above overlap).
+            double[] own = metalmc.backend.MetalScale.takeGpuOwnMillis();
+            double[] os = own.clone();
+            Arrays.sort(os);
+            double om = 0;
+            for (double v : own) om += v;
+            om = own.length == 0 ? 0 : om / own.length;
+            String ownGpu = String.format(Locale.ROOT, " metal_gpu_own_ms_mean=%.3f metal_gpu_own_ms_p50=%.3f metal_gpu_own_ms_p95=%.3f metal_gpu_own_ms_p99=%.3f",
+                om, pctD(os, 50), pctD(os, 95), pctD(os, 99));
             metalGpu = String.format(Locale.ROOT, " metal_gpu_submits=%d metal_gpu_ms_mean=%.3f metal_gpu_ms_p50=%.3f metal_gpu_ms_p95=%.3f metal_gpu_ms_p99=%.3f"
                     + " per_frame_passes=%.1f per_frame_draws=%.1f per_frame_blits=%.1f per_frame_clears=%.1f per_frame_pass_mpix=%.1f"
                     + " per_frame_lod_draws=%.1f per_frame_lod_kquads=%.1f per_frame_lod_cpu_ms=%.3f"
@@ -297,7 +307,7 @@ public final class Bench {
                 g.length, gm, pctD(gs, 50), pctD(gs, 95), pctD(gs, 99),
                 c[0] / sub, c[1] / sub, c[2] / sub, c[3] / sub, c[5] / sub / 1e6,
                 c[6] / sub, c[7] / sub / 1e3, c[8] / sub / 1e6,
-                c[9] / sub, c[10] / sub, c[11] / sub / 1e6);
+                c[9] / sub, c[10] / sub, c[11] / sub / 1e6) + ownGpu;
         }
         String summary = String.format(Locale.ROOT,
             "METALMC_BENCH label=%s backend=%s gpu=\"%s\" driver=\"%s\" frames=%d seconds=%.1f fps_mean=%.1f "

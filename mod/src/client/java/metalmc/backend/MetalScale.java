@@ -38,6 +38,7 @@ public final class MetalScale {
 
         static final MethodHandle SCALE = h("mmc_render_scale", JAVA_FLOAT);
         static final MethodHandle FRAME_START = h("mmc_frame_start", null);
+        static final MethodHandle GPU_OWN_TAKE = h("mmc_gpu_own_times_take", JAVA_INT, JAVA_LONG, JAVA_INT);
         static final MethodHandle TAA_SCALED = h("mmc_taa_apply_scaled", JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG,
             JAVA_FLOAT, JAVA_FLOAT, JAVA_INT);
     }
@@ -55,6 +56,26 @@ public final class MetalScale {
             return (float) Native.SCALE.invokeExact();
         } catch (Throwable t) {
             throw rethrow(t);
+        }
+    }
+
+    /**
+     * Each submit's own GPU time in milliseconds since the last call: what it added after the submit before it ended. Frames
+     * overlap on the GPU, so MetalStats.takeGpuMillis' spans (start to end) overstate a frame's GPU time.
+     */
+    public static double[] takeGpuOwnMillis() {
+        if (MetalDevice.current == null) return new double[0];
+        int max = 400_000;
+        java.nio.DoubleBuffer buf = MemoryUtil.memAllocDouble(max);
+        try {
+            int n = (int) Native.GPU_OWN_TAKE.invokeExact(MemoryUtil.memAddress(buf), max);
+            double[] out = new double[n];
+            for (int i = 0; i < n; i++) out[i] = buf.get(i) * 1000.0;
+            return out;
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            MemoryUtil.memFree(buf);
         }
     }
 
