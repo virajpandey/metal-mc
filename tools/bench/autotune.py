@@ -49,27 +49,30 @@ PREFIX = os.environ.get("TWINS_PREFIX", "seus1")
 TWINDIFF = os.path.join(ROOT, "bench_out", "twindiff")
 FULL_LOOK = "lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post"
 
-# name: (file, default, low, high, step, log-scale step). The defaults are the built-in sources'.
+# name: (file, default, low, high, step, log-scale step). The defaults are the built-in sources' with post (the grade's
+# tuned look, 2026-10-10); the look before it is bench_out/agents/grade/configs/base.json's.
 KNOBS = {
     "POST_EV": ("post.metal", 0.0, -1.5, 2.5, 0.3, False),
-    "POST_GRADE_EV": ("post.metal", 0.0, -1.5, 2.5, 0.3, False),
-    "POST_DUSK": ("post.metal", 1.0, 0.0, 1.0, 0.25, False),
-    "POST_CAVE": ("post.metal", 1.0, 0.0, 1.0, 0.25, False),
+    "POST_GRADE_EV": ("post.metal", 0.75, -1.5, 2.5, 0.3, False),
+    "POST_DUSK": ("post.metal", 0.25, 0.0, 1.0, 0.25, False),
+    "POST_CAVE": ("post.metal", 0.2, 0.0, 1.0, 0.25, False),
     "POST_ADAPT_REF": ("post.metal", -1.9, -3.5, -0.5, 0.35, False),
     "POST_ADAPT_DARK_NEAR": ("post.metal", 0.2, 0.0, 0.7, 0.1, False),
-    "POST_ADAPT_DARK": ("post.metal", 0.7, 0.1, 1.0, 0.15, False),
+    "POST_ADAPT_DARK": ("post.metal", 0.4, 0.1, 1.0, 0.15, False),
     "POST_LOCAL": ("post.metal", 0.0, 0.0, 0.8, 0.15, False),
-    "POST_LOCAL_DARK": ("post.metal", 0.0, 0.0, 0.8, 0.15, False),
-    "POST_AGX_SAT": ("post.metal", 1.3, 0.9, 2.2, 0.15, False),
+    "POST_LOCAL_DARK": ("post.metal", 0.38, 0.0, 0.8, 0.15, False),
+    "POST_AGX_SAT": ("post.metal", 1.15, 0.9, 2.2, 0.15, False),
     "POST_AGX_POWER": ("post.metal", 1.0, 0.7, 1.4, 0.08, False),
     "POST_PURKINJE": ("post.metal", 0.0, 0.0, 1.0, 0.25, False),
-    "LIT_SUN_GAIN": ("lit_relight_header.metal", 1.0, 0.4, 2.5, 0.15, True),
-    "LIT_SKY_GAIN": ("lit_relight_header.metal", 1.0, 0.5, 5.0, 0.35, True),
-    "LIT_SHADE_WARM": ("lit_relight_header.metal", 0.0, -0.4, 0.4, 0.08, False),
-    "LIT_BLOCK_GAIN": ("lit_relight_header.metal", 1.0, 0.1, 2.0, 0.35, True),
-    "LIT_BLOCK_WARM": ("lit_relight_header.metal", 0.0, -0.2, 0.7, 0.12, False),
-    "LIT_BLOCK_SAT": ("lit_relight_header.metal", 1.0, 0.5, 3.0, 0.25, True),
-    "LIT_BLOCK_FALLOFF": ("lit_relight_header.metal", 0.0, 0.0, 6.0, 0.8, False),
+    "LIT_SUN_GAIN": ("lit_relight_header.metal", 1.4, 0.4, 2.5, 0.15, True),
+    "LIT_SKY_GAIN": ("lit_relight_header.metal", 2.0, 0.5, 5.0, 0.35, True),
+    "LIT_SHADE_WARM": ("lit_relight_header.metal", -0.15, -0.4, 0.4, 0.08, False),
+    "LIT_BLOCK_GAIN": ("lit_relight_header.metal", 0.4, 0.1, 2.0, 0.35, True),
+    "LIT_BLOCK_WARM": ("lit_relight_header.metal", 0.35, -0.2, 0.7, 0.12, False),
+    "LIT_BLOCK_SAT": ("lit_relight_header.metal", 1.4, 0.5, 3.0, 0.25, True),
+    "LIT_BLOCK_FALLOFF": ("lit_relight_header.metal", 2.0, 0.0, 6.0, 0.8, False),
+    "LIT_BLOCK_FLOOR": ("lit_relight_header.metal", 1.0, 0.0, 4.0, 0.35, False),
+    "LIT_SKY_OPEN": ("lit_relight_header.metal", 3.0, 0.0, 8.0, 1.0, False),
 }
 # The day's knobs. The exposure is POST_GRADE_EV (stops, on top of the eye adaptation, fading at dusk and under
 # cover), not POST_ADAPT_REF: within the adaptation's knee a change of the reference moves the exposure by only 20-30% of

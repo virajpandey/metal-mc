@@ -181,15 +181,20 @@ let litRelightHeader = """
 // GI cache's sky and bounced light, or the open sky's: what fills the shade) and on block light; the sky term's tint
 // (LIT_SHADE_WARM > 0 warmer, < 0 bluer, at the same luminance); block light's warmth (the same way), saturation (1: as
 // the lightmap or the colored light volume gives it) and falloff (block light times (level / 15)^LIT_BLOCK_FALLOFF: 0 as
-// before, more for pools of light around the sources). Tuned against the SEUS twins with post (its tone curve and
-// exposure take the brighter light); without post 1, 0, 1 and 0: lit mode's light as before.
+// before, more for pools of light around the sources); these act on the light above vanilla's floor (its lightmap at
+// level 0, which keeps dark corners readable), and LIT_BLOCK_FLOOR scales the floor. Tuned against the SEUS twins with
+// post (its tone curve and exposure take the brighter light; night and caves against our own target, docs); without
+// post 1, 0, 1, 0, 1: lit mode's light as before. The sky term fades out below sky light level LIT_SKY_OPEN, all of it
+// (0: no fade): the GI cache's light reached enclosed caves (sky light 0) as a cold gray, which the sky gain doubled.
 #define LIT_SUN_GAIN \(postEnabled ? "1.4" : "1.0")
 #define LIT_SKY_GAIN \(postEnabled ? "2.0" : "1.0")
 #define LIT_SHADE_WARM \(postEnabled ? "(-0.15)" : "0.0")
-#define LIT_BLOCK_GAIN 1.0
-#define LIT_BLOCK_WARM 0.0
-#define LIT_BLOCK_SAT 1.0
-#define LIT_BLOCK_FALLOFF 0.0
+#define LIT_BLOCK_GAIN \(postEnabled ? "0.4" : "1.0")
+#define LIT_BLOCK_WARM \(postEnabled ? "0.35" : "0.0")
+#define LIT_BLOCK_SAT \(postEnabled ? "1.4" : "1.0")
+#define LIT_BLOCK_FALLOFF \(postEnabled ? "2.0" : "0.0")
+#define LIT_BLOCK_FLOOR 1.0
+#define LIT_SKY_OPEN 3.0
 
 struct LitFrame {
     float4x4 invViewProj;   // clip space to camera-relative world (the projection the level was drawn with, jittered)
@@ -218,13 +223,15 @@ static float3 litWarmTint(float w) {
     return t / litLuma(t);
 }
 
-// The grade's light balance (the LIT_SUN_GAIN ... LIT_BLOCK_FALLOFF knobs above) on the relight's terms before they're
-// summed; level: the pixel's block light level (0-15).
-static void litGrade(thread float3& sun, thread float3& skyAmb, thread float3& blockLight, float level) {
+// The grade's light balance (the LIT_SUN_GAIN ... LIT_SKY_OPEN knobs above) on the relight's terms before they're
+// summed; level, skyLevel: the pixel's block and sky light levels (0-15); floorLight: vanilla's block light at level 0.
+static void litGrade(thread float3& sun, thread float3& skyAmb, thread float3& blockLight, float level, float skyLevel,
+                     float3 floorLight) {
     sun *= LIT_SUN_GAIN;
-    skyAmb *= LIT_SKY_GAIN * litWarmTint(LIT_SHADE_WARM);
-    float l = litLuma(blockLight);
-    blockLight = max(l + LIT_BLOCK_SAT * (blockLight - l), 0.0) * (LIT_BLOCK_GAIN * litWarmTint(LIT_BLOCK_WARM))
+    skyAmb *= LIT_SKY_GAIN * litWarmTint(LIT_SHADE_WARM) * (LIT_SKY_OPEN > 0.0 ? smoothstep(0.0, LIT_SKY_OPEN, skyLevel) : 1.0);
+    float3 base = min(floorLight, blockLight), b = blockLight - base;
+    float l = litLuma(b);
+    blockLight = base * LIT_BLOCK_FLOOR + max(l + LIT_BLOCK_SAT * (b - l), 0.0) * (LIT_BLOCK_GAIN * litWarmTint(LIT_BLOCK_WARM))
                * pow(clamp(level / 15.0, 1e-3, 1.0), LIT_BLOCK_FALLOFF);   // (not 0: fast math's pow(0, 0) is NaN)
 }
 
@@ -321,7 +328,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         // from the moon itself, 40% from the glow of the night sky.
         float moonLum = litLuma(vanillaSky) * f.moonDir.w;
         float3 moon = moonLum * kLitMoonTint * (0.6 * ndlMoon / max(f.moonDir.y, 0.5) * vMoon + 0.4 * kLitHemi[fi] * skyFall * ao);
-        litGrade(sun, skyAmb, blockLight, block);
+        litGrade(sun, skyAmb, blockLight, block, sky, lm00);
         E = ((sun + skyAmb) * dayScale + moon + blockLight * ao) * f.misc.w;
     }
 \(litEmitterTerm)    float3 lin = skyDecode(refl) * E;

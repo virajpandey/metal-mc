@@ -11,7 +11,7 @@ import simd
 // - Eye adaptation: a histogram of the frame's log luminance over the square root of lit terrain's albedo (halfway to
 //   metering light rather than color; a quarter of the resolution, a little below the screen's middle weighted 4 times
 //   its edges), its mean between two percentiles against the reference scene (noon outdoors); little of a darker scene's
-//   difference is made up within 2.5 stops (daylight's swings), most of it past that (night, caves), within limits;
+//   difference is made up within 2.5 stops (daylight's swings), 40% of it past that (night and caves stay dark), within limits;
 //   followed over time, faster into the light (the image overexposes for a moment and settles) than into the dark (it
 //   takes a couple of seconds to open up). In stops on top of the sky's own adaptation to the sun's height (Sky.swift),
 //   which stays: the units of docs/lighting-design.md are unchanged.
@@ -92,7 +92,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_ADAPT_REF (\(litEnabled ? "-1.9" : "-2.1"))
 #define POST_ADAPT_KNEE 2.5
 #define POST_ADAPT_DARK_NEAR 0.2
-#define POST_ADAPT_DARK 0.7
+#define POST_ADAPT_DARK 0.4
 #define POST_ADAPT_BRIGHT 0.3
 #define POST_EV_MIN (-2.0)
 #define POST_EV_MAX 2.0
@@ -140,7 +140,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // to 0.6): night and caves have the eye adaptation's own knobs and keep their pools of light.
 #define POST_GRADE_EV 0.75
 #define POST_DUSK 0.25
-#define POST_CAVE 1.0
+#define POST_CAVE 0.2
 
 // The Purkinje shift (night vision): in dim light the rods take over, which see no color and favor blue-green, so a
 // moonlit field turns blue-gray while a torch's pool keeps its warmth. Per pixel, by its own light before the exposure

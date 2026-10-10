@@ -42,17 +42,19 @@ def cls(j, name):
 
 def night_score(j):
     """Night and caves (points, lower is better): the terrain's mean luma (bottom 55%, 8-bit) outside 35-45, half a
-    point per level; the torchlight's color against SEUS's warm pools (the block-lit class's OKLab a, b and chroma, not
-    its lightness), 100 x share x distance; and crushed shadows (the shade and block-lit classes' 10th percentile of OKLab
-    L under 0.12), 100 x share x shortfall."""
+    point per level; the torchlight's color against SEUS's warm pools: the block-lit class's OKLab hue against SEUS's
+    (the angle between their mean a, b, at SEUS's chroma), and its chroma where it's less than SEUS's (not more: SEUS's
+    class is mostly near black, whose chroma is small, so its mean chroma is no target), 100 x share x both; and crushed
+    shadows (the shade and block-lit classes' 10th percentile of OKLab L under 0.12), 100 x share x shortfall."""
     y = j["regions"]["terrain_y_ours"]
     lo, hi = NIGHT_LUMA
     luma = 0.5 * max(0.0, lo - y, y - hi)
     warm = 0.0
     c = cls(j, "blocklit")
-    if c and c.get("delta"):
-        d = c["delta"]
-        warm = 100 * c["share"] * math.sqrt(d["a"] ** 2 + d["b"] ** 2 + d["C"] ** 2)
+    if c and c["share"] > 0:
+        o, t = c["ours"], c["twin"]
+        dh = abs((math.atan2(o["b"], o["a"]) - math.atan2(t["b"], t["a"]) + math.pi) % (2 * math.pi) - math.pi)
+        warm = 100 * c["share"] * (dh * t["C"] + max(0.0, t["C"] - o["C"]))
     dark = 0.0
     for name in ("shade", "blocklit"):
         c = cls(j, name)
