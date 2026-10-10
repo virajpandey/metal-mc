@@ -115,6 +115,9 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_AGX_EXPOSURE 1.0
 #define POST_AGX_POWER 1.0
 #define POST_AGX_SAT 1.15
+// The sky's blue (postSkyBlue): how far blue light's color is taken back from the curve's toward its own (0 off, 1 the
+// light's own saturation, more past it).
+#define POST_SKY_SAT 1.5
 #define POST_ACES_EXPOSURE 1.6
 #define POST_GT_EXPOSURE 1.0
 // HDR output: above this luminance (exposed) the highlights are carried on toward the headroom, over this span.
@@ -568,6 +571,21 @@ static float3 postGt(float3 x) {
     return T * w0 + L * w1 + S * w2;
 }
 
+// The sky's blue through the curve: AgX takes bright saturated light toward white, and the clear sky came out at about
+// 40 of ffmpeg's saturation where SEUS's is 60-63 with the same hue (the clouds helper's trace, 2026-10-10). For blue
+// light (by the light's own color, x: blue clearly above red and green; white clouds and grays are untouched) the curve's
+// output d is moved toward x's color at d's luminance by POST_SKY_SAT (past it above 1), then its chroma around that
+// luminance is scaled back until every channel is within the display (the hue kept).
+static float3 postSkyBlue(float3 x, float3 d) {
+    float w = smoothstep(0.05, 0.3, (x.b - max(x.r, x.g)) / max(x.b, 1e-6));
+    if (POST_SKY_SAT <= 0.0 || w <= 0.0) return d;
+    float yd = postLuma(d);
+    float3 c = d + (x * (yd / max(postLuma(x), 1e-6)) - d) * (POST_SKY_SAT * w) - yd;
+    float t = 1.0;
+    for (int k = 0; k < 3; k++) t = min(t, c[k] > 0.0 ? (1.0 - yd) / c[k] : (c[k] < 0.0 ? yd / -c[k] : 1.0));
+    return yd + c * max(t, 0.0);
+}
+
 // Scene-linear light (exposed) to display-linear light: 1 is the display's SDR white, tone.x its headroom. Legacy is
 // the sky's own curve (identity to the knee, a shoulder into the headroom: the look before post). The others are SDR
 // curves; with headroom, the light above POST_EDR_KNEE is carried on toward it (zero slope where it starts, the curve's
@@ -578,6 +596,7 @@ static float3 postToneMap(float3 x, float4 tone) {
     x = max(x, 0.0);
     if (curve == 0) return skyToneMap(x, float4(H, tone.y, 0.0, 0.0));
     float3 d = curve == 2 ? postAces(x * POST_ACES_EXPOSURE) : (curve == 3 ? postGt(x * POST_GT_EXPOSURE) : postAgx(x * POST_AGX_EXPOSURE));
+    if (POST_SKY_SAT > 0.0) d = postSkyBlue(x, min(d, 1.0));
     if (H <= 1.0) return min(d, 1.0);
     float t = max(postLuma(x) - POST_EDR_KNEE, 0.0) / POST_EDR_SPAN;
     return min(d * (1.0 + (H - 1.0) * (1.0 - exp(-t * t))), H);

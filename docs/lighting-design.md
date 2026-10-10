@@ -2020,6 +2020,7 @@ before the grade (`bench_out/agents/grade/configs/base.json` in the main checkou
 | `POST_ADAPT_DARK` | post.metal | 0.4 (0.7) | how much of a darker scene's difference past 2.5 stops the eye adaptation makes up (night and caves) |
 | `POST_ADAPT_REF`, `POST_ADAPT_DARK_NEAR` | post.metal | -1.9, 0.2 | the adaptation's reference and its response within the knee (a weak exposure lever: 20-30% of a change shows) |
 | `POST_AGX_SAT`, `POST_AGX_POWER` | post.metal | 1.15 (1.3), 1 | AgX's look: saturation and power (contrast) on its sigmoid's output |
+| `POST_SKY_SAT` | post.metal | 1.5 (0) | the sky's blue: blue light's color taken back from the curve's (AgX takes bright saturated light toward white) toward its own, at the curve's luminance and within the display; 1 its own saturation, more past it; white clouds and grays untouched |
 | `POST_PURKINJE`, `_LO`, `_HI` | post.metal | 0.6, -9, -4.5 (0) | night vision, with the sun 1 degree under the horizon and lower: how far dim pixels go toward the rods' picture, and the light levels (log2, scene units) it spans |
 | `LIT_SUN_GAIN`, `LIT_SKY_GAIN` | lit_relight_header.metal | 1.4, 2.0 (1, 1) | the sun's light and the sky term's (the GI cache's sky and bounced light): their ratio is the sun-to-sky balance, the sky gain fills the shade |
 | `LIT_SHADE_WARM` | lit_relight_header.metal | -0.15 (0) | the sky term's tint, at the same luminance (> 0 warmer, < 0 bluer) |
