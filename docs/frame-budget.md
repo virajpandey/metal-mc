@@ -218,7 +218,9 @@ pixel (RMS error; `bench_out/agents/speed/taautest/` in the main checkout):
 | TAAU 0.667, 0.6 | 0.099, 0.100 | 0.037, 0.041 | 0.103, 0.104 |
 | TAAU 0.75 after 8 frames | 0.152 | 0.061 | 0.160 |
 
-(That table at k 3. At 0.75 with k 4.5: 0.109 / 0.041 / 0.114; k 6: 0.119 / 0.046 / 0.125. Against this box-filtered
+A still view's frame-to-frame change once converged (the RMS between the last two frames, 32 frames in, k 4.5):
+native TAA 0.102, TAAU 0.75 0.127, 0.667 0.108, 0.6 0.087, over the whole plate (not split by band; its far corner is
+past even the output's Nyquist, where any resolve flickers). (That table at k 3. At 0.75 with k 4.5: 0.109 / 0.041 / 0.114; k 6: 0.119 / 0.046 / 0.125. Against this box-filtered
 reference a smoother kernel always scores better, while in game a sharper one looks closer to native TAA, which keeps
 more of the frame's high frequencies (0.071 in band here): k 4.5, the default, keeps most of k 3's margin over native TAA
 and measured sharper in game.) The flipped sign doubling the error checks the sample positions; "past it" is mostly past the output's own Nyquist too

@@ -383,7 +383,13 @@ public func mmc_debug_terrain_compile() -> Int32 {
         failed += 1
     }
     LodRenderer.shared.lastFormats = (litEnabled ? [.rg11b10Float, litGbufferFormat] : [.bgra8Unorm], .depth32Float)
-    let n = mmc_debug_lod_pipelines()
+    // The LOD compiles its variants in the background (nil until each is made): ask again until all are there, or 60 s.
+    var n = mmc_debug_lod_pipelines()
+    let t0 = Date()
+    while n > 0 && Date().timeIntervalSince(t0) < 60 {
+        Thread.sleep(forTimeInterval: 1)
+        n = mmc_debug_lod_pipelines()
+    }
     if n != 0 { failed += max(n, 1) }
     return failed
 }
