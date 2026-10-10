@@ -1970,17 +1970,60 @@ against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only 
   difference is the grade's: the exposure (the sky sits high in AgX's sigmoid), AgX's look (`POST_AGX_SAT` 1.3), or a
   saturation for bright blues.
 
+### Round 3 (2026-10-10, evening): motion, rain and storms, the coverage knob, the sun's glow, near clouds
+
+- **Motion**, game session 7 (lab, before this round's changes; `tp` a tick, and survival with levitation 29 for a
+  climb the camera makes every frame), shots in `bench_out/agents/clouds/round3/`:
+  - a 180-degree turn in half a second (18 degrees a tick, shots mid-turn and right after): clean, no holes or popping.
+    The carry marches a texel that has no history (turned in) at once;
+  - a straight flight at 30 blocks a second under the layer: clean;
+  - a climb through the layer at about 38 blocks a second: the clouds near the camera speckled and combed at their
+    edges. They're near, cross the screen fast, and their history, reprojected at one depth for a cloud's whole depth,
+    drifts and is dropped, leaving fresh single samples.
+  - cloudtest can now move the camera through its accumulated frames (`CLOUDTEST_VEL` x,y,z blocks a frame,
+    `CLOUDTEST_YAWRATE` degrees a frame). It reproduces the climb's speckle (`inside-up` with `CLOUDTEST_VEL
+    0,0.63,0`) and shows a 6-degree-a-frame turn as clean as a still frame.
+  - Changes: inside the layer the first kilometre is marched on its own with about 20 m steps (the stretch's one even
+    step was up to 2 km, the base shape at its 5th mip), and while the camera moves within 200 m of the layer each block
+    marches two texels a frame (`misc.w` 2; the carry leaves both). Offline the climb's speckle and comb are fainter, not
+    gone. A reprojection that refined its depth from last frame's depths (two rounds) and kept thin history made curtains
+    of ghosts: dropped.
+- **Near clouds inside the layer** were striped where they're thin: the clear-air steps grew by 1.5 after each skip,
+  moving a ray's samples off its jittered lattice by half and quarter steps, differently in neighboring texels. Steps now
+  grow by whole short steps (1, 2, 3), and the stripes are gone (offline `inside-level`, the game's fly-1200). A finer
+  detail octave within a kilometre made no visible difference and isn't in.
+- **Rain and storms:** rain takes the coverage to 0.75 (a deck closed but keeping its cells; 1.6 was a flat lid) and the
+  density up a fifth; thunder a little more coverage, density +0.6, the cells towering to 0.8 of the layer (to the top
+  the deck was one even lid from below). In a closed deck (coverage 0.55 to 1) the diffusion term takes a slab's falloff
+  (0.11) and almost no absorption (0.004): light can't leave through the sides. The sky's light diffuses down through it
+  the same way (its ambient falls as 1 / (1 + 0.11 tau)). Thickness shows as soft structure on the base, rain's base
+  rising over a third of the layer (rolls). The ground's light under it is Sky's overcast, as before.
+- **The coverage knob** (`METALMC_CLOUDCOVER`) is about the share of the sky overhead covered: 0.03 clear, 0.5 scattered
+  (the default, in the middle), 0.8 broken, 1 overcast, mapped through the shader coverage's measured curve (offline,
+  the share of a 110-degree look up with transmittance under a half, six places in the weather map, its spread off: 0.25
+  covers 1%, 0.3 2%, 0.35 22%, 0.4 56%, 0.45 86%, 0.5 98%). The default's shader coverage moves from 0.43 to 0.39.
+- **The sun's glow** (Sky.swift): a fifth of the Mie phase is now a sharp forward lobe (Henyey-Greenstein, g 0.96; none in
+  rain), the aureole of real haze, whose phase has a diffraction peak one Cornette-Shanks lobe at g 0.8 misses (a degree
+  or two from the sun it's about 15 times what it is 10 degrees out, against twice). The sun gets a warm glow at sunset
+  and a bright halo by day. SEUS's much larger glow is mostly bloom: the grade's.
+- **In game**, session 8 (effbc93; `round3/before-round3-<scene>.jpg`, SEUS's twins in the private folder): rain a deck
+  with soft lighter and darker cells, thunder darker with faint ones, sunset_water with a large warm glow around the sun,
+  mountain_view and noon_overview scattered at the new default, the fast turn clean, the climb through the layer with
+  the speckle mostly gone but vertical streaks left at the nearest clouds' edges. Noon (8 frames, camera still): sky
+  light and shadow map 0.16 ms, march 0.50, shadows on the visibility 0.11, about 1.05 ms with the composite. Just over
+  the layer (y 2000) right after the climb, the camera still settling, the march took 1.93 ms: a view down onto the
+  whole deck, moving.
+
 ### Not done, and next
 
 - **Haze and shafts under the clouds:** done in the volumetric light (`godrays`, below): its rays take
   `cloudTransmittanceToSun`, so the air under a cloud's shadow stops glowing. Post's screen-space shafts (off with
   `godrays`) come through the gaps only.
-- **Inside the layer** the steps are even over the whole stretch (about 2 km looking along the layer), so the nearest
-  clouds are soft and streaky: steps growing with the distance from a camera inside the layer.
-- **Storms** are a uniform dark deck from below: darker cells, ragged bases and a storm's edge need weather of their own.
-- **The coverage knob** is steep (0.3 a few puffs, 0.55 a closed deck): equalizing the base shape's histogram would make
-  it read as the share of the sky covered. SEUS's cumulus are bigger (2-3 km cells against 0.5-2): a larger base tile.
-- **Motion** was only checked with teleports: a flight with the clouds on would show any ghosting at silhouettes.
+- **Moving through the layer** still smears the nearest clouds' edges into vertical streaks some (round 3, session 8:
+  the speckle is mostly gone, the comb is fainter): their history needs a reprojection that knows a cloud's depth range,
+  or a spatial fill for the samples that lose it.
+- **Storms** have only faint cells from below: ragged bases and a storm's edge need weather of their own.
+- **SEUS's cumulus are bigger** (2-3 km cells against 0.5-2): a larger base tile.
 - **The composite** costs 0.25 ms of the resolve: it could skip pixels whose four texels have no cloud if the cirrus wrote
   a depth too (now only the cumulus do).
 - **The sky's saturation** is the grade's (above): the clouds' own colors follow whatever it settles on.
