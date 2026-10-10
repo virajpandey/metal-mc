@@ -57,12 +57,16 @@ let waterOn = ProcessInfo.processInfo.environment["LITFLOW_WATER"] == "1" && mod
 // post section (pictures of each effect at several times of day, the exposure's numbers; with "time" each stage's cost).
 let postOn = ProcessInfo.processInfo.environment["LITFLOW_POST"] == "1" && (mode == "sky" || mode == "hdr")
 let clOn = ProcessInfo.processInfo.environment["LITFLOW_CL"] == "1" && mode != "off" && mode != "compile"
+// LITFLOW_GODRAYS=1 (with LITFLOW_POST=1): volumetric light (METALMC_EXP=...,godrays, Godrays.swift); runs only its section
+// (pictures with it off and on and its debug views at several times of day; with "time" its cost).
+let godraysOn = ProcessInfo.processInfo.environment["LITFLOW_GODRAYS"] == "1" && postOn
 // LITFLOW_CLOUDS=1 (with sky or hdr): the volumetric clouds (METALMC_EXP=...,clouds, Clouds.swift) before the shadows; runs
 // only the clouds section (with LITFLOW_POST=1 too, through the post chain as in the game).
 let cloudsOn = ProcessInfo.processInfo.environment["LITFLOW_CLOUDS"] == "1" && (mode == "sky" || mode == "hdr")
 let exp = mode == "compile" ? (ProcessInfo.processInfo.environment["LITFLOW_EXP"] ?? "lit,rtshadows,sky,water")
     : (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
         + (giOn ? ",gi" : "") + (waterOn ? ",water" : "") + (clOn ? ",coloredlight" : "") + (postOn ? ",post" : "") + (cloudsOn ? ",clouds" : "")
+        + (godraysOn ? ",godrays" : "")
 setenv("METALMC_EXP", exp, 1)
 let lit = mode != "off", sky = mode == "sky" || mode == "hdr", hdr = mode == "hdr"
 guard let lib = dlopen(args[1], RTLD_NOW) else { print("dlopen failed"); exit(1) }
@@ -185,6 +189,23 @@ if mode == "compile" {
                 d.colorAttachments[0].pixelFormat = format
                 d.depthAttachmentPixelFormat = .depth32Float
                 _ = try device.makeRenderPipelineState(descriptor: d)
+            }
+        }
+    }
+    // Volumetric light (METALMC_EXP=...,godrays, with sky and post): its kernels (the resolve's part is in its variants above).
+    if exp.split(separator: ",").contains("godrays"), let src = source("mmc_debug_godrays_shader_source") {
+        attempt("volumetric light: setup, table and trace kernels") {
+            let l = try device.makeLibrary(source: src, options: nil)
+            for k in ["godrays_setup", "godrays_table", "godrays_trace"] { _ = try device.makeComputePipelineState(function: l.makeFunction(name: k)!) }
+        }
+    }
+    // Colored light's shadow kernel and, with gi, the GI cache's kernels with the bounce's splices (built in the library;
+    // errors in its log).
+    if exp.split(separator: ",").contains("coloredlight") {
+        for (name, what) in [("mmc_debug_cl_shadow_compile", "colored light's shadow kernel"), ("mmc_debug_cl_gi_compile", "the GI cache's kernels with colored light's bounce")]
+        where name != "mmc_debug_cl_gi_compile" || exp.split(separator: ",").contains("gi") {
+            if let f = dlsym(lib, name).map({ unsafeBitCast($0, to: (@convention(c) () -> Int32).self) }) {
+                if f() == 1 { print("ok    \(what)") } else { print("FAIL  \(what)"); failures += 1 }
             }
         }
     }
@@ -402,7 +423,9 @@ func frame(_ t: Targets, sunAngle: Float, relight: Bool, extras: Bool = true, ta
         var cp = mats + [sunAngle, cloudsRainBrightness, 0, 63]
         _ = cloudsFrame(t.color, t.depth, &cp, &c)
     }
-    let traced = shadowsApply(t.color, t.depth, &mats, &c, sunAngle, 0.42, 192, 0) == 1
+    // The anti-aliasing's switch as the game passes it (TemporalAA.ENABLED): in lit mode it only gates the volumetric
+    // light's rays (their resolve applies them); without lit mode the shade is left for the resolve, as in the game.
+    let traced = shadowsApply(t.color, t.depth, &mats, &c, sunAngle, 0.42, 192, taa ? 1 : 0) == 1
     var ran = false
     // Water: the reflections on or off, the waves 1/120 s on from the last frame (as at 120 Hz).
     if let litWaterSwitch { _ = litWaterSwitch(reflectWater ? 1 : 0, 100 + Double(framesDrawn) / 120) }
@@ -779,6 +802,88 @@ func depthMatches(_ depth: Float, _ key: UInt32) -> Bool {
 }
 func lumOf(_ px: [UInt8], _ i: Int) -> Double { 0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2]) }
 
+// Volumetric light (LITFLOW_GODRAYS=1, with LITFLOW_POST=1): per time of day (LITFLOW_GODRAYSTIMES, default
+// morning,noon,dusk,sunset), the relit frame through the anti-aliasing and the post chain with the fog off and on in the same
+// process (mmc_debug_godrays), and its debug views: the fog's light alone, the traced share of its scattering the sun
+// reaches, the transmittance; the mean 8-bit luma of each. The exposure snaps at each picture's first frame. With "time":
+// whole frames at the panel's resolution with it on, traced but not applied, and off, alternating (the morning and the
+// sunset), and a traced frame's passes (the library's "profile" lines). Then exits.
+if godraysOn {
+    setbuf(stdout, nil)
+    let godrays = fn("mmc_debug_godrays", (@convention(c) (Int32, Int32) -> Int32).self)
+    let postDebug = fn("mmc_debug_post", (@convention(c) (Int32, Int32, Double, Int32) -> Int32).self)
+    check(godrays(1, -1) == 1, "volumetric light is on (\(exp))")
+    check(postDebug(7, 1, 1.0 / 60, 1) == 1, "the post chain is on")
+    let n = Int(W) * Int(H)
+    func meanLuma(_ px: [UInt8]) -> Double {
+        var s = 0.0
+        for i in stride(from: 0, to: n * 4, by: 4) { s += lumOf(px, i) }
+        return s / Double(n)
+    }
+    let name = ProcessInfo.processInfo.environment["LITFLOW_NAME"] ?? "view"
+    let suns: [String: (Float, Float)] = ["noon": (noon, 1), "morning": (morning, 1), "low": (-1.45, 0.6), "dusk": (dusk, 0.55),
+                                          "sunset": (1.53, 0.4), "midnight": (midnight, 0.2)]
+    let list = (ProcessInfo.processInfo.environment["LITFLOW_GODRAYSTIMES"] ?? "morning,noon,dusk,sunset").split(separator: ",").map(String.init)
+    if ProcessInfo.processInfo.environment["LITFLOW_TIMEONLY"] != "1" {
+        for t in list {
+            guard let (angle, skyFactor) = suns[t] else { print("      unknown time \(t)"); continue }
+            setLightmap(skyFactor: skyFactor)
+            for _ in 0..<16 { frame(small, sunAngle: angle, relight: true, extras: false) }   // the sky's tables for this sun
+            for (label, on, view) in [("off", Int32(0), Int32(-1)), ("on", 1, -1), ("light", 1, 1), ("share", 1, 2), ("transmittance", 1, 3)] {
+                _ = godrays(on, view)
+                _ = postDebug(-1, -1, 1.0 / 60, 1)
+                // The anti-aliasing's and the fog's histories settle on this picture first.
+                for _ in 0..<20 { frame(half, sunAngle: angle, relight: true, extras: false, taa: true) }
+                let r = capture(half, sunAngle: angle, relight: true, extras: false, frames: 24, taa: true)
+                writePNG(r.color, Int(W), Int(H), "godrays-\(name)-\(t)-\(label).png")
+                print(String(format: "      %@ %@ %@: mean luma %.1f", name, t, label, meanLuma(r.color)))
+            }
+        }
+        _ = godrays(1, -1)
+    }
+    if timing {
+        let full = targets(3456, 2234)
+        // Frames alternate three ways (mmc_debug_godrays_mode, the history kept): the fog on, traced but not applied (the
+        // resolve leaves the frame alone), and off. The differences of the medians: the whole, the trace, the composite.
+        let mode = fn("mmc_debug_godrays_mode", (@convention(c) (Int32) -> Int32).self)
+        for (t, angle, sf) in [("morning", morning, Float(1)), ("sunset", Float(1.53), Float(0.4))] {
+            setLightmap(skyFactor: sf)
+            _ = godrays(1, -1)
+            for _ in 0..<12 { frame(full, sunAngle: angle, relight: true, extras: false, taa: true) }
+            var times = [Double](repeating: 0, count: 4096)
+            var runs: [[Double]] = [[], [], []]
+            for k in 0..<240 {
+                let m = 2 - k % 3
+                _ = mode(Int32(m))
+                _ = gpuTimesTake(&times, 4096)
+                frame(full, sunAngle: angle, relight: true, extras: false, taa: true)
+                let c = Int(gpuTimesTake(&times, 4096))
+                if c > 0 && k >= 30 { runs[m].append(times[c - 1] * 1000) }
+            }
+            let s = runs.map { $0.sorted() }
+            if s.allSatisfy({ !$0.isEmpty }) {
+                let med = s.map { $0[$0.count / 2] }
+                print(String(format: "      frame at 3456 x 2234 (%@): with the fog %.3f ms (fastest %.3f), traced only %.3f (fastest %.3f), without %.3f (fastest %.3f): +%.3f in all (fastest +%.3f), the trace +%.3f, the composite +%.3f, %d each",
+                             t, med[2], s[2][0], med[1], s[1][0], med[0], s[0][0], med[2] - med[0], s[2][0] - s[0][0], med[1] - med[0], med[2] - med[1], s[0].count))
+            }
+        }
+        _ = mode(2)
+        // A traced frame with it on and one with it off (per-pass GPU times: the library's "profile" lines).
+        let traceFrames = fn("mmc_trace_frames", (@convention(c) (Int32) -> Void).self)
+        for on in [Int32(1), 0] {
+            _ = godrays(on, -1)
+            for _ in 0..<12 { frame(full, sunAngle: morning, relight: true, extras: false, taa: true) }
+            print("      traced frame, the fog \(on == 1 ? "on" : "off"):")
+            traceFrames(1)
+            frame(full, sunAngle: morning, relight: true, extras: false, taa: true)
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        _ = godrays(1, -1)
+    }
+    print("done")
+    exit(0)
+}
+
 // Clouds (LITFLOW_CLOUDS=1): per time of day (LITFLOW_CLOUDTIMES, default noon,sunset,morning) the relit frame with the
 // anti-aliasing (and post with LITFLOW_POST=1) without and with the clouds, 48 frames each (the clouds' history and the
 // anti-aliasing's settle; METALMC_CLOUDVIEW=4 in the environment shows the cloud shadows alone), the mean luma of the sky
@@ -998,6 +1103,81 @@ if clOn {
         print("      \(what): flood fill against the CPU's: \(out[1]) of \(out[0]) cells differ (largest \(out[4]) levels), \(out[5]) brighter than the CPU's; \(out[3]) cells lit; \(out[2]) cells' codes differ from the store's")
         // Reported, not fatal: the pictures still come.
         print((out[1] == 0 && out[2] == 0 ? "ok    " : "FAIL  ") + "the volume's light is vanilla's flood fill per color, exactly (\(what))")
+    }
+    // LITFLOW_CLBOUNCE=1 (with LITFLOW_GI=1): only the block light bounced through the GI cache (ColoredLightBounce.swift):
+    // per view at midnight, with its gain 0 and then 1 (mmc_debug_cl_bounce_gain), after 240 frames for the cache to fill,
+    // where its light gets to (the cells' channel, the half-resolution texture the relight reads; mmc_debug_cl_bounce_stats)
+    // and the relit frame (cl-bounce-<view>-gain<g>.png, its mean luma). Then exits.
+    if ProcessInfo.processInfo.environment["LITFLOW_CLBOUNCE"] == "1" {
+        let gainF = fn("mmc_debug_cl_bounce_gain", (@convention(c) (Float) -> Int32).self)
+        let statsF = fn("mmc_debug_cl_bounce_stats", (@convention(c) (UnsafeMutablePointer<Double>) -> Int32).self)
+        let n = Int(W) * Int(H)
+        for v in views {
+            use(v)
+            print("      view \(v.name): (\(v.pos.x), \(v.pos.y), \(v.pos.z)) yaw \(v.yaw) pitch \(v.pitch); volume settled in \(settle()) frames")
+            setLightmap(skyFactor: 0.2)
+            for gain: Float in [0, 1] {
+                check(gainF(gain) == 1, "the bounce's gain set to \(gain)")
+                for _ in 0..<240 { frame(half, sunAngle: midnight, relight: true, extras: false) }
+                var s = [Double](repeating: 0, count: 10)
+                if statsF(&s) == 1 {
+                    print(String(format: "      %@ gain %.0f: cells' channel: %.0f slots owned, %.0f with light (mean luminance %.4f, largest %.3f); the relight's texture: %.0f of %.0f texels with light (mean %.4f, largest %.3f); light volume for the update: %@",
+                                 v.name, gain, s[0], s[1], s[2], s[3], s[4], s[7], s[5], s[6], s[8] > 0.5 ? "yes" : "NO"))
+                } else { print("FAIL  no bounce channel to read") }
+                let r = capture(half, sunAngle: midnight, relight: true, extras: false)
+                var lum = 0.0
+                for i in stride(from: 0, to: n * 4, by: 4) { lum += lumOf(r.color, i) }
+                writePNG(r.color, Int(W), Int(H), "cl-bounce-\(v.name)-gain\(Int(gain)).png")
+                print(String(format: "      %@ gain %.0f: mean luma %.2f", v.name, gain, lum / Double(n)))
+                if gain > 0 {
+                    // The relight's debug view 15: the bounced light it adds, alone (16 times, on a mid-gray albedo).
+                    let b = capture(half, sunAngle: midnight, relight: true, view: 15, extras: false, frames: 4)
+                    var bl = 0.0
+                    for i in stride(from: 0, to: n * 4, by: 4) { bl += lumOf(b.color, i) }
+                    writePNG(b.color, Int(W), Int(H), "cl-bounce-\(v.name)-view15.png")
+                    print(String(format: "      %@: the relight's bounced light (view 15), mean luma %.2f", v.name, bl / Double(n)))
+                }
+            }
+        }
+        print("done")
+        exit(0)
+    }
+    // LITFLOW_CLSHADOWTEST=1 (with METALMC_CLSHADOW set, say 0.75): only the block lights' shadows' grain
+    // (ColoredLightShadows.swift): per view at midnight, with their history off and then on (mmc_debug_cl_shadow_history),
+    // nine single frames after 60 to settle (no anti-aliasing): the mean change of a pixel's 8-bit luma from one frame to the
+    // next, over the whole frame and over the pixels whose luma changes by 3 or more in either run (the grain), and the last
+    // frame's picture (cl-shadow-<view>-history<0|1>.png). Then exits.
+    if ProcessInfo.processInfo.environment["LITFLOW_CLSHADOWTEST"] == "1" {
+        let histF = fn("mmc_debug_cl_shadow_history", (@convention(c) (Int32) -> Int32).self)
+        let n = Int(W) * Int(H)
+        for v in views {
+            use(v)
+            print("      view \(v.name): volume settled in \(settle()) frames")
+            setLightmap(skyFactor: 0.2)
+            var runs: [[Double]] = []
+            for on in [Int32(0), 1] {
+                check(histF(on) == 1, "the shadows' history \(on == 1 ? "on" : "off")")
+                for _ in 0..<60 { frame(half, sunAngle: midnight, relight: true, extras: false) }
+                var prev: [UInt8] = [], last: [UInt8] = []
+                var change = [Double](repeating: 0, count: n)
+                for _ in 0..<9 {
+                    let r = capture(half, sunAngle: midnight, relight: true, extras: false, frames: 1)
+                    if !prev.isEmpty { for k in 0..<n { change[k] += abs(lumOf(r.color, 4 * k) - lumOf(prev, 4 * k)) / 8 } }
+                    prev = r.color
+                    last = r.color
+                }
+                runs.append(change)
+                writePNG(last, Int(W), Int(H), "cl-shadow-\(v.name)-history\(on).png")
+            }
+            let grainy = (0..<n).filter { runs[0][$0] >= 3 || runs[1][$0] >= 3 }
+            for (i, label) in ["off", "on"].enumerated() {
+                let all = runs[i].reduce(0, +) / Double(n)
+                let g = grainy.isEmpty ? 0 : grainy.reduce(0.0) { $0 + runs[i][$1] } / Double(grainy.count)
+                print(String(format: "      %@ history %@: mean frame-to-frame luma change %.3f; over the %d grainy pixels %.2f", v.name, label, all, grainy.count, g))
+            }
+        }
+        print("done")
+        exit(0)
     }
     // Natural scenes in the loaded area: light sources next to open cells, by 32 x 32 column cell and kind (warm and fire
     // lights: villages; lava; others), the top few of each with their mean height, to point a view or the tour at.

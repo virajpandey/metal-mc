@@ -69,7 +69,7 @@ kernel void taa_upscale(texture2d<float, access::read> color [[texture(0)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
                         texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]],\n                        texture2d<float> litWaterTrace [[texture(18), function_constant(taaLit)]],\n                        texture2d<float> litWavesDetail [[texture(19), function_constant(taaLit)]],\n                        texture2d<uint> litWaterTraceAS [[texture(20), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
 #endif
-                        uint2 lid [[thread_position_in_threadgroup]],
+\(taaGodraysArgs)                        uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
     // The tile: the rendered frame's 32 x 32 texels and a 1-texel border, loaded once (as taa_resolve loads its pixels:
     // the relight, the water, the shadows' shade, the aerial perspective), in YCoCg with depth.
@@ -88,7 +88,7 @@ kernel void taa_upscale(texture2d<float, access::read> color [[texture(0)]],
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
             float haze;
-            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")
+            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")\(taaGodraysLoad)
         }
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
         dtile[i] = d;
@@ -285,6 +285,8 @@ final class TaaUpscale: @unchecked Sendable {
             enc.setTexture(sky.skyView, index: 7)
             // Clouds hook (Clouds.swift): their composite in the load, at the level's size (their march follows it).
             if cloudsEnabled { Clouds.shared.bindTaa(enc, width: color.width, height: color.height) }
+            // God rays hook (Godrays.swift): their fog in the load after the clouds, at the level's size, as in taa_resolve.
+            if godraysEnabled { Godrays.shared.bindTaa(enc, width: color.width, height: color.height) }
             skyDither = out.pixelFormat == .rgba16Float ? 0 : (out.pixelFormat == .rg11b10Float ? -1 : 1.0 / 255)
         }
         if relight { Lit.shared.bindDeferred(enc) }

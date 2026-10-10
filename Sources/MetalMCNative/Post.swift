@@ -747,8 +747,9 @@ final class Post: @unchecked Sendable {
         // The G-buffer is the level's: the depth's size (smaller than the frame's with a render scale, RenderScale.swift).
         let level = depth ?? color
         let lights = litEnabled && Lit.shared.gbuffer.map { $0.width == level.width && $0.height == level.height } == true
+        // Volumetric light (Godrays.swift, METALMC_EXP=godrays) replaces the light shafts: the lit air they add is its own, in 3D.
         f.effects = SIMD4(effectMask & 1 != 0 && postBloomDefault > 0 ? 1 : 0,
-                          effectMask & 2 != 0 && postShaftsDefault > 0 && shafts > 0 && Sky.shared.skyView != nil ? 1 : 0,
+                          effectMask & 2 != 0 && postShaftsDefault > 0 && shafts > 0 && Sky.shared.skyView != nil && !godraysReplacesShafts ? 1 : 0,
                           lights ? 1 : 0, 0)
         return f
     }
