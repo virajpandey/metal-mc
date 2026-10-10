@@ -71,6 +71,13 @@ let all: [View] = [
     View(name: "above", elev: 40, pos: (8, 3600, 8), yaw: 100, pitch: 25),
     View(name: "inside", elev: 40, pos: (8, 1900, 8), yaw: 100, pitch: 0),
     View(name: "mountain", elev: 60, pos: (1064, 174, 230), yaw: 90, pitch: -4),
+    // Flying up through the layer (650-1700 m above sea level, y 713-1763): under it, at its base, inside, at its top, over it.
+    View(name: "fly-600", elev: 45, pos: (8, 663, 8), yaw: 100, pitch: -10),
+    View(name: "fly-720", elev: 45, pos: (8, 783, 8), yaw: 100, pitch: -10),
+    View(name: "fly-1100", elev: 45, pos: (8, 1163, 8), yaw: 100, pitch: -10),
+    View(name: "fly-1600", elev: 45, pos: (8, 1663, 8), yaw: 100, pitch: -10),
+    View(name: "fly-1800", elev: 45, pos: (8, 1863, 8), yaw: 100, pitch: 10),
+    View(name: "fly-3000", elev: 45, pos: (8, 3063, 8), yaw: 100, pitch: 20),
 ]
 let wanted = Set(args.dropFirst(3))
 let timing = wanted.contains("time")

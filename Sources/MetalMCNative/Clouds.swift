@@ -573,11 +573,12 @@ static float cloudsHG(float g, float c) {
     return (1.0 - g2) / (4.0 * SKY_PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
 }
 
-// The march's jitter: each texel steps along its own golden-ratio sequence (low-discrepancy in time, so its history converges
-// evenly; hashed across texels, so neighbors don't step together and draw bands at grazing angles).
-static float cloudsJitter(uint2 p, float k) {
-    float h = float(cloudHash(uint3(p, 7u), 0x51ed270bu) >> 8) / 16777216.0;
-    return fract(h + 0.6180339887 * fmod(k, 4096.0));
+// The march's jitter: a blue-noise mask (void and cluster, 64 x 64, Clouds.swift) offset by the golden ratio every time
+// the texel is marched (blue across texels, low-discrepancy in time, so the history converges evenly). Interleaved
+// gradient noise across the 2 x 2 blocks drew bands at grazing angles; a hash across texels, white noise, converged
+// to blotches.
+static float cloudsJitter(uint2 p, float k, texture2d<float> bn) {
+    return fract(bn.read(p % 64u).r + 0.6180339887 * fmod(k, 4096.0));
 }
 
 // A view ray through the layer: its light (scene units, before the air in front), transmittance and the
@@ -914,6 +915,7 @@ kernel void clouds_march(texture2d<float, access::write> outColor [[texture(0)]]
                          texture3d<float> apScatter [[texture(9)]],
                          texture3d<float> apTrans [[texture(10)]],
                          texture2d<float> shadow [[texture(11)]],
+                         texture2d<float> bn [[texture(12)]],
                          constant CloudFrame& cf [[buffer(0)]],
                          constant SkyFrame& sky [[buffer(1)]],
                          device const float4* env [[buffer(2)]],
@@ -928,7 +930,7 @@ kernel void clouds_march(texture2d<float, access::write> outColor [[texture(0)]]
         return;
     }
     float curDepth;
-    float4 cur = cloudsMarchTexel(x, cloudsJitter(gid, float(frame / uint(CLOUD_UPDATE))), cf, sky, env, weather, base, detail, trans,
+    float4 cur = cloudsMarchTexel(x, cloudsJitter(gid, float(frame / uint(CLOUD_UPDATE)), bn), cf, sky, env, weather, base, detail, trans,
                                   shadow, apScatter, apTrans, curDepth);
     float4 hist = 0.0;
     float histDepthV = 0.0;
@@ -960,6 +962,7 @@ kernel void clouds_carry(texture2d<float, access::write> outColor [[texture(0)]]
                          texture3d<float> apScatter [[texture(9)]],
                          texture3d<float> apTrans [[texture(10)]],
                          texture2d<float> shadow [[texture(11)]],
+                         texture2d<float> bn [[texture(12)]],
                          constant CloudFrame& cf [[buffer(0)]],
                          constant SkyFrame& sky [[buffer(1)]],
                          device const float4* env [[buffer(2)]],
@@ -984,7 +987,7 @@ kernel void clouds_carry(texture2d<float, access::write> outColor [[texture(0)]]
         return;
     }
     float curDepth;
-    float4 cur = cloudsMarchTexel(x, cloudsJitter(gid, float(frame)), cf, sky, env, weather, base, detail, trans, shadow, apScatter,
+    float4 cur = cloudsMarchTexel(x, cloudsJitter(gid, float(frame), bn), cf, sky, env, weather, base, detail, trans, shadow, apScatter,
                                   apTrans, curDepth);
     outColor.write(cur, gid);
     outDepth.write(float4(curDepth * 0.001), gid);
@@ -1001,6 +1004,7 @@ kernel void clouds_reflection(texture2d<float, access::read_write> map [[texture
                               texture3d<float> apScatter [[texture(9)]],
                               texture3d<float> apTrans [[texture(10)]],
                               texture2d<float> shadow [[texture(11)]],
+                              texture2d<float> bn [[texture(12)]],
                               constant CloudFrame& cf [[buffer(0)]],
                               constant SkyFrame& sky [[buffer(1)]],
                               device const float4* env [[buffer(2)]],
@@ -1020,7 +1024,7 @@ kernel void clouds_reflection(texture2d<float, access::read_write> map [[texture
     float4 cur = float4(0.0, 0.0, 0.0, 1.0);
     if (x.segs > 0 || x.tc > 0.0) {
         float dd;
-        cur = cloudsMarchTexel(x, cloudsJitter(gid, cf.misc.x), cf, sky, env, weather, base, detail, trans, shadow, apScatter, apTrans, dd);
+        cur = cloudsMarchTexel(x, cloudsJitter(gid, cf.misc.x, bn), cf, sky, env, weather, base, detail, trans, shadow, apScatter, apTrans, dd);
     }
     map.write(blend.x >= 1.0 ? cur : mix(map.read(gid), cur, blend.x), gid);
 }
@@ -1170,6 +1174,8 @@ final class Clouds: @unchecked Sendable {
     private var dummyColor: MTLTexture?
     private var dummyDepth: MTLTexture?
     private var dummyShadow: MTLTexture?
+    /// The march's jitter: a 64 x 64 blue-noise mask (void and cluster), R16Unorm ranks.
+    private var blueNoise: MTLTexture?
     /// This frame's parameters (frame()), and whether they and the buffer are valid for this frame's composite (taken by
     /// the anti-aliasing's binding or the composite pass, so a frame that skips frame() can't composite stale clouds).
     private(set) var cf = CloudFrameGPU()
@@ -1250,8 +1256,15 @@ final class Clouds: @unchecked Sendable {
             dummyColor = one(.rgba16Float, [0, 0, 0, 0, 0, 0, 0x00, 0x3c])
             dummyDepth = one(.r16Float, [0, 0])
             dummyShadow = one(.rgba16Float, [0, 0, 0, 0, 0, 0, 0, 0])
+            let ranks = cloudBlueNoise(64)
+            let bd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Unorm, width: 64, height: 64, mipmapped: false)
+            bd.usage = .shaderRead
+            bd.storageMode = .shared
+            blueNoise = dev.makeTexture(descriptor: bd)
+            let scaled = ranks.map { UInt16((UInt32($0) * 65535 + 2047) / 4095) }
+            scaled.withUnsafeBytes { blueNoise?.replace(region: MTLRegionMake2D(0, 0, 64, 64), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: 128) }
         }
-        if baseNoise == nil || detailNoise == nil || weather == nil || shadow == nil || env == nil || dummyColor == nil {
+        if baseNoise == nil || detailNoise == nil || weather == nil || shadow == nil || env == nil || dummyColor == nil || blueNoise == nil {
             log("clouds: textures failed")
             failed = true
             return false
@@ -1438,6 +1451,7 @@ final class Clouds: @unchecked Sendable {
         menc.setTexture(apScatter, index: 9)
         menc.setTexture(apTrans, index: 10)
         menc.setTexture(shadow, index: 11)
+        menc.setTexture(blueNoise, index: 12)
         menc.setBytes(&f, length: MemoryLayout<CloudFrameGPU>.stride, index: 0)
         menc.setBytes(&skyFrame, length: MemoryLayout<SkyFrameGPU>.stride, index: 1)
         menc.setBuffer(env, offset: 0, index: 2)
@@ -1715,6 +1729,64 @@ final class Clouds: @unchecked Sendable {
         frameReady = nil
         return true
     }
+}
+
+/// A blue-noise dither mask (Ulichney's void and cluster, 1993) on an n x n torus: every pixel's rank, 0 ..< n^2. A
+/// Gaussian energy (sigma 1.5) marks clusters and voids; an initial tenth of the pixels is relaxed (the tightest cluster's
+/// point moved to the largest void until it stays), ranked downward as it's taken out tightest first, then the voids are
+/// filled largest first, ranked upward. 64 x 64 takes about 20 ms (once); its 3 x 3 averages vary a fifth as much as white
+/// noise's.
+func cloudBlueNoise(_ n: Int, sigma: Double = 1.5) -> [UInt16] {
+    let count = n * n
+    let r = Int((sigma * 4).rounded(.up))
+    let kw = 2 * r + 1
+    var kernel = [Double](repeating: 0, count: kw * kw)
+    for dy in -r...r { for dx in -r...r { kernel[(dy + r) * kw + dx + r] = exp(-Double(dx * dx + dy * dy) / (2 * sigma * sigma)) } }
+    var energy = [Double](repeating: 0, count: count)
+    var on = [Bool](repeating: false, count: count)
+    func splat(_ i: Int, _ sign: Double) {
+        let x = i % n, y = i / n
+        for dy in -r...r {
+            let yy = (y + dy + n) % n
+            for dx in -r...r { energy[yy * n + (x + dx + n) % n] += sign * kernel[(dy + r) * kw + dx + r] }
+        }
+    }
+    var s: UInt64 = 0x51ed270b
+    func rnd() -> UInt64 { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s }
+    let initial = count / 10
+    var placed = 0
+    while placed < initial {
+        let i = Int(rnd() % UInt64(count))
+        if !on[i] { on[i] = true; splat(i, 1); placed += 1 }
+    }
+    func tightest() -> Int { var b = 0, e = -Double.infinity; for i in 0..<count where on[i] && energy[i] > e { e = energy[i]; b = i }; return b }
+    func largestVoid() -> Int { var b = 0, e = Double.infinity; for i in 0..<count where !on[i] && energy[i] < e { e = energy[i]; b = i }; return b }
+    while true {
+        let c = tightest()
+        on[c] = false; splat(c, -1)
+        let v = largestVoid()
+        on[v] = true; splat(v, 1)
+        if v == c { break }
+    }
+    var rank = [UInt16](repeating: 0, count: count)
+    let keepOn = on, keepEnergy = energy
+    var k = initial
+    while k > 0 {
+        let c = tightest()
+        on[c] = false; splat(c, -1)
+        k -= 1
+        rank[c] = UInt16(k)
+    }
+    on = keepOn
+    energy = keepEnergy
+    k = initial
+    while k < count {
+        let v = largestVoid()
+        on[v] = true; splat(v, 1)
+        rank[v] = UInt16(k)
+        k += 1
+    }
+    return rank
 }
 
 private func smoothstepF(_ e0: Float, _ e1: Float, _ x: Float) -> Float {
