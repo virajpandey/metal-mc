@@ -1756,12 +1756,14 @@ pixel the relight lights out to the horizon.
   Henyey-Greenstein phase (0.78 forward, -0.25 back); Wrenninge's multiple-scattering octaves plus a diffusion term (in a
   thick cloud most of the light has scattered many times: an isotropic source of 3/4π of the sunlight, falling with the
   optical depth toward the sun like diffuse transmission and absorption; without it sunlit cumulus came out about five
-  times too dark, gray instead of white); Schneider's powder effect, away from the sun; the sky's ambient (its mean
-  radiance over the upper hemisphere and the ground's, from the sky view table, `clouds_env`) by height in the layer.
+  times too dark, gray instead of white); Schneider's powder effect, away from the sun; the sky's ambient (its radiance
+  over the upper hemisphere weighted by height, and the ground's, from the sky view table, `clouds_env`) by height in the
+  layer. Per sample (round 2): the light's color at the sample, the moon's tinted like the relight's.
 - **The light's optical depth** comes from a deep shadow map: three cascades of 256 x 256 (16, 64 and 256 km across,
   centered where the camera's column meets the layer along the light, snapped to whole texels in the world), each texel
   the light's ray through the layer holding the optical depth from the layer's top to each quarter of it. A sample takes
-  two density samples along the light up to the next stored quarter, then that quarter's value exactly. One cascade is
+  one density sample (two before round 2) along the light up to the next stored quarter, then that quarter's value
+  exactly. One cascade is
   made a frame: the near one every other frame, the middle and far ones every fourth (each keeps the center it was made
   with; all three again when the light turns more than 0.8 degrees or switches between sun and moon).
 - **Aerial perspective** between the camera and the cloud from Sky's table at the cloud's transmittance-weighted depth:
@@ -1904,6 +1906,44 @@ against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only 
   0.17 ms, march 1.17, shadows on the visibility 0.13: about 1.75 ms with the composite. Broken cumulus is the march's
   worst case (rays cross clouds and gaps without turning opaque; a deck stops them early).
 
+### Round 2 (2026-10-10 afternoon): sunsets, night, leaves, cost, the sky's blue
+
+- **Sunsets came out cream all over** where SEUS's twin has gold rims and dark undersides. Offline at the sunset view,
+  by elimination: without the ambient nothing changed, without the air in front of the clouds little, without the
+  diffusion term the bodies went dark with golden rims. A debug view of the light's optical depth showed why: under 2.5
+  at noon's bases and 10-20 through sunset's bodies. The coverage's remap leaves densities of about 0.1-0.4 in a cloud,
+  and at 0.07 /m a cumulus had 5-20 of optical depth across a km (real ones 30-100), so light diffused through
+  everything. Now `CLOUD_SIGMA` 0.3, and the diffusion term's falloff 0.3 and absorption 0.03 (were 0.12, 0.02):
+  backlit bodies dark with bright rims at sunset and golden hour, frontlit clouds orange with blue-gray shaded sides, gray
+  bases at noon, dark purple silhouettes at dusk, a darker rain deck. Rays turn opaque sooner, so the march got cheaper.
+  The sky's ambient for the clouds is weighted by height (the sky's irradiance over pi): the even hemisphere mean took
+  its color at a low sun from the glow around the sun. The sun's light is now worked out per sample, reddened at each
+  sample's altitude and local sun height (it was once per stretch). In game, sunset_water's undersides are cool
+  gray-blue under gold tops and rims; the scene stays higher-key than SEUS's, which is darker overall (the grade).
+- **Night:** the moon's light on the clouds (and the cirrus) takes the relight's moon tint (Lit's `kLitMoonTint`,
+  luminance 1) and is 0.05 instead of 0.12 (`METALMC_CLOUDMOON`): at night_torches the clouds are faint and cool, a
+  few times the night sky's glow, with stars between them. Before, they were a light warm gray at nearly ten times it.
+- **Leaves under clouds** (leaflight): with leaflight the visibility the relight takes is RGBA8, b holding 1 - the clouds'
+  transmittance toward the sun (`clouds_vis`); Foliage.swift's light through leaves multiplies by it (`litFoliageCloud`,
+  spliced in only with clouds; 1 without rays this frame). The direct beam (r) had it already.
+- **Cost:** one light sample per step (`CLOUD_LIGHT_SAMPLES` 1): against two, PSNR 38 dB at mountain and sunset offline,
+  the same pictures within the noise; 32 steps for long stretches instead of 48 gave 27 dB (far clouds' shapes changed)
+  and stays at 48. Offline at 3456 x 2234 with the GPU lock free and the camera still, the clouds' frame is 0.47-0.84 ms
+  (0.5-0.93 before the knob). In game at forest (broken cumulus, leaflight on), 8 frames each: with the camera still,
+  sky light and shadow map 0.12-0.15 ms, march 0.46-0.47, shadows on the visibility 0.13-0.14: about 1.0 ms with the
+  composite (session 4's: 1.75). With it moving (survival and levitation lift the camera every frame, the march and the
+  carry): 0.11, 0.80, 0.13: about 1.35 ms with the composite. The carry is 0.34 ms.
+- **The sky's blue** isn't the model. Its coefficients are the standard Earth ones (Hillaire's Rayleigh and ozone, Mie at
+  1x in clear weather, ground albedo 0.3), and `skyOvercast` is off in clear weather. Measured at the top of the frame
+  (mountain_view, noon_overview), SEUS's clear sky is sRGB (88, 154, 221) and (77, 143, 208): HSV saturation 60-63. Ours
+  is (122, 158, 201) and (119, 156, 198): 39-40, with the same hue (210-213). Through the post chain's AgX
+  (`mmc_debug_post_curve`), ours matches a scene-linear sky of about 0.20 : 0.45 : 1 (linear Rec.709) at an exposed
+  luminance near 0.4. That's a deep blue, still physical: an average clear sky (x 0.26, y 0.28) is 0.41 : 0.66 : 1. At
+  that brightness AgX takes the sky from about 52% saturation to 39%; at 0.2 it keeps 48%. SEUS's 60% at value 87 is
+  more than AgX gives even for 0.13 : 0.45 : 1 (47%); the legacy curve (the sky's shoulder) keeps it (60%). So the
+  difference is the grade's: the exposure (the sky sits high in AgX's sigmoid), AgX's look (`POST_AGX_SAT` 1.3), or a
+  saturation for bright blues.
+
 ### Not done, and next
 
 - **Haze and shafts under the clouds:** the god rays' volumetric light can take `cloudTransmittanceToSun` (bind
@@ -1911,21 +1951,15 @@ against it, `session2/c1-c2-fly-*-day.jpg` the flights; SEUS side-by-sides only 
   come through the gaps only.
 - **Inside the layer** the steps are even over the whole stretch (about 2 km looking along the layer), so the nearest
   clouds are soft and streaky: steps growing with the distance from a camera inside the layer.
-- **Leaves under a cloud:** with leaflight the clouds multiply the visibility's r (the direct sun) and pass its g (the
-  leaves toward the sun) through, so the sun through leaves doesn't take their shadow and canopies keep their glow under a
-  cloud. The relight's leaf term needs the clouds' factor itself (a third channel, or `cloudTransmittanceToSun` in
-  `litFoliageLight`); scaling g would tint the light, since g stands for blocks of leaves.
 - **Storms** are a uniform dark deck from below: darker cells, ragged bases and a storm's edge need weather of their own.
-- **Moonlight** on the clouds is a warm gray against the night's blue: the moon's light could take the night's tint.
 - **The coverage knob** is steep (0.3 a few puffs, 0.55 a closed deck): equalizing the base shape's histogram would make
   it read as the share of the sky covered. SEUS's cumulus are bigger (2-3 km cells against 0.5-2): a larger base tile.
 - **Motion** was only checked with teleports: a flight with the clouds on would show any ghosting at silhouettes.
 - **The composite** costs 0.25 ms of the resolve: it could skip pixels whose four texels have no cloud if the cirrus wrote
   a depth too (now only the cumulus do).
-- **Broken cumulus** costs the march up to 1.2 ms (session 4's forest): over the 1.5 ms target with everything. The
-  knobs, untried in game: one light sample (`CLOUD_LIGHT_SAMPLES` 1: about a quarter of a cloudy step's fetches), 32
-  steps for long stretches (48 kept distant small clouds whole: +11%), or each texel every 16th frame
-  (`cloudUpdate`: half the march, slower to settle after a disocclusion).
+- **The sky's saturation** is the grade's (above): the clouds' own colors follow whatever it settles on.
+- **Cost knobs left:** 32 steps for long stretches, or each texel every 16th frame (`cloudUpdate`: half the march,
+  slower to settle after a disocclusion), if a later scene needs them.
 
 ## The grade (2026-10-10, with `post`)
 
