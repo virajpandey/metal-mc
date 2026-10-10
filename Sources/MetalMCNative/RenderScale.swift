@@ -15,14 +15,18 @@ import Foundation
 // The governor. Each frame's GPU time (its command buffer's gpuStartTime..gpuEndTime; one submit per frame) is recorded
 // with the scale the frame was drawn at, and only frames drawn at the current scale count; so are the frame intervals
 // (between its calls, once a frame). Over the last 32 of them:
-//   - over budget: uncapped, the GPU time's 90th percentile above 92% of the frame time (7.67 ms at 120 Hz); paced by
-//     the display (vsync, the intervals' median at the refresh), where the GPU slows its clock to fit the work and its
-//     time stretches toward the frame's, the intervals' 90th percentile past the refresh by 4% (frames actually late)
-//     with the GPU busy (over 80%; else the CPU is late, which the scale can't help). The scale drops to what would bring
-//     the GPU time to 85% (7.08 ms) if all of it scaled with the pixels (it doesn't, so this overshoots less than it seems
-//     and a second step follows if needed), on a grid of 0.05;
+//   - over budget, uncapped: the GPU time's 90th percentile above 92% of the frame time (7.67 ms at 120 Hz); the scale
+//     drops to what would bring it to 85% (7.08 ms) if all of it scaled with the pixels (it doesn't, so this overshoots
+//     less than it seems and a second step follows if needed), on a grid of 0.05;
+//   - over budget, paced by the display (vsync: the intervals' median at the refresh), where the GPU slows its clock to fit
+//     the work and its time stretches toward the frame's whatever the load: two of the last 32 frames late (4% past the
+//     refresh) with the GPU busy (over 80%; else it's the CPU, which the scale can't help): one step down (two when a
+//     quarter are late);
 //   - under budget, the 90th percentile low enough that one step up (0.05) would still keep it under 85% by the same
-//     rule, for 1 s without a break: one step up. That rule is the hysteresis: a step up never predicts a step down.
+//     model, for 1 s without a break: one step up. That rule is the hysteresis: a step up never predicts a step down.
+//     Paced, the stretched GPU time may never allow that, so after a quiet spell (no late frame for 3 s) the governor
+//     tries a step up and comes back if frames come late, waiting twice as long before the next try (up to 32 s), and 3 s
+//     again after a try that held (the offline simulation, tools/govsim.swift, shows the ratchet without it).
 //   - at the lowest scale and still over budget, the per-feature quality (`quality`, 1 to 0 in quarters) drops: the GI
 //     cache's updates a frame first (its light converges more slowly; nothing pops). It comes back before the scale does.
 // A change waits for 32 frames drawn at the new scale before the next. Through the anti-aliasing a step of the scale is
@@ -78,6 +82,11 @@ final class RenderScaleGovernor: @unchecked Sendable {
     /// Frame intervals (ms, render thread: from one call of next() to the next) since the last change.
     private var intervals: [Double] = []
     private var lastFrame: UInt64 = 0
+    /// The last late frame, the last change, and the paced mode's probes: a step up tried after `probeWait` seconds without
+    /// a late frame (3, doubling to 32 after each that brought late frames, back to 3 after one that held).
+    private var lastLate: UInt64 = 0, lastChange: UInt64 = 0
+    private var probing = false
+    private var probeWait = 3.0
     private var frames = 0
     private var changes = 0
     private(set) var totalChanges = 0
@@ -122,9 +131,12 @@ final class RenderScaleGovernor: @unchecked Sendable {
         frames += 1
         histogram[Swift.min(20, Int((scale / RenderScaleGovernor.step).rounded()))] += 1
         guard s.auto else { return scale }
+        let lateMs = 1.04 * budgetMs
         if lastFrame != 0 {
-            intervals.append(Double(now - lastFrame) / 1e6)
+            let iv = Double(now - lastFrame) / 1e6
+            intervals.append(iv)
             if intervals.count > RenderScaleGovernor.window { intervals.removeFirst(intervals.count - RenderScaleGovernor.window) }
+            if iv > lateMs { lastLate = now }
         }
         lastFrame = now
         lock.lock()
@@ -135,41 +147,68 @@ final class RenderScaleGovernor: @unchecked Sendable {
         let p90 = window.sorted()[Int(0.9 * Double(window.count - 1))]
         let high = 0.92 * budgetMs, target = 0.85 * budgetMs
         // Paced by the display (vsync: most frames take one refresh), the GPU slows its clock to the work and its time
-        // stretches toward the frame's, so it says little about overload: there, too much is frames actually late (the
-        // 90th percentile past the refresh) while the GPU is busy (not the CPU's hitches). Uncapped, the GPU runs flat
-        // out and its time is the measure.
+        // stretches toward the frame's, so it says little about overload: there, too much is frames actually late (two of
+        // the last 32 past the refresh) while the GPU is busy (not the CPU's hitches). Uncapped, the GPU runs flat out and
+        // its time is the measure.
         let iv = intervals.sorted()
         let intP50 = iv[iv.count / 2], intP90 = iv[Int(0.9 * Double(iv.count - 1))]
         let paced = abs(intP50 - budgetMs) < 0.03 * budgetMs
-        let over = paced ? intP90 > 1.04 * budgetMs && p90 > 0.8 * budgetMs : p90 > high
-        let why = String(format: "GPU p90 %.2f ms, frame interval p50 %.2f p90 %.2f ms, %@", p90, intP50, intP90, paced ? "paced" : "not paced")
+        let late = intervals.reduce(0) { $0 + ($1 > lateMs ? 1 : 0) }
+        let over = paced ? late >= 2 && p90 > 0.8 * budgetMs : p90 > high
+        let why = String(format: "GPU p90 %.2f ms, frame interval p50 %.2f p90 %.2f ms, %d late, %@", p90, intP50, intP90, late,
+                         paced ? "paced" : "not paced")
         if over {
             underSince = 0
+            // A probe that brought late frames: back down, and twice as long before the next.
+            if probing { probeWait = Swift.min(probeWait * 2, 32) }
+            probing = false
             if scale > s.min + 1e-3 {
-                // All of the GPU's time scaling with the pixels: the scale that brings p90 to the target.
-                let want = scale * Float((target / p90).squareRoot())
-                let next = Swift.max(s.min, Swift.min(scale - RenderScaleGovernor.step,
-                                                      (want / RenderScaleGovernor.step).rounded(.down) * RenderScaleGovernor.step))
-                change(scale: RenderScaleGovernor.quantize(next), quality: quality, why: why)
+                let next: Float
+                if paced {
+                    // The GPU's time is stretched by its clock here: one step, two when a quarter of the frames are late.
+                    next = scale - RenderScaleGovernor.step * (late >= 8 ? 2 : 1)
+                } else {
+                    // All of the GPU's time scaling with the pixels: the scale that brings p90 to the target.
+                    let want = scale * Float((target / p90).squareRoot())
+                    next = Swift.min(scale - RenderScaleGovernor.step, (want / RenderScaleGovernor.step).rounded(.down) * RenderScaleGovernor.step)
+                }
+                change(scale: RenderScaleGovernor.quantize(Swift.max(s.min, next)), quality: quality, why: why, now: now)
             } else if quality > 0 {
-                change(scale: scale, quality: Swift.max(0, quality - 0.25), why: why)
+                change(scale: scale, quality: Swift.max(0, quality - 0.25), why: why, now: now)
             }
             return scale
         }
-        // One step up (quality first): would p90 stay under the target if all of it scaled with the pixels?
+        // A probe that held for a second: back to the short wait.
+        if probing && now - lastChange >= 1_000_000_000 {
+            probing = false
+            probeWait = 3
+        }
+        guard quality < 1 || scale < s.max - 1e-3 else { underSince = 0; return scale }
+        // One step up (quality first): would p90 stay under the target if all of it scaled with the pixels? After 1 s of it.
         let up = Swift.min(s.max, scale + RenderScaleGovernor.step)
         let grow = quality < 1 ? 1.25 : Double((up / scale) * (up / scale))
-        if (quality < 1 || up > scale + 1e-3) && p90 * grow < target {
+        if p90 * grow < target {
             if underSince == 0 { underSince = now }
             if now - underSince >= 1_000_000_000 {
                 underSince = 0
-                if quality < 1 { change(scale: scale, quality: Swift.min(1, quality + 0.25), why: why) }
-                else { change(scale: RenderScaleGovernor.quantize(up), quality: quality, why: why) }
+                stepUp(up, why: why, now: now)
             }
-        } else {
-            underSince = 0
+            return scale
+        }
+        underSince = 0
+        // Paced, the GPU's time says little (its clock follows the work), so the model may never let it up: after a while
+        // with no late frame, try a step up, and come back if frames come late (twice as long a wait before the next try).
+        let wait = UInt64(probeWait * 1e9)
+        if paced && !probing && now - lastLate >= wait && now - lastChange >= wait {
+            probing = true
+            stepUp(up, why: why + ", a probe", now: now)
         }
         return scale
+    }
+
+    private func stepUp(_ up: Float, why: String, now: UInt64) {
+        if quality < 1 { change(scale: scale, quality: Swift.min(1, quality + 0.25), why: why, now: now) }
+        else { change(scale: RenderScaleGovernor.quantize(up), quality: quality, why: why, now: now) }
     }
 
     /// Lab mode: <shader dir>/render_scale.txt, read every 240 frames, overrides METALMC_SCALE while it's there.
@@ -191,8 +230,9 @@ final class RenderScaleGovernor: @unchecked Sendable {
         log(String(format: "render scale: lab override %@ (%@), scale %.2f -> %.2f", text ?? "removed", next.auto ? "the governor" : "fixed", old, scale))
     }
 
-    private func change(scale next: Float, quality q: Float, why: String) {
+    private func change(scale next: Float, quality q: Float, why: String, now: UInt64) {
         let old = scale, oldQ = quality
+        lastChange = now
         lock.lock()
         scale = next
         quality = q
