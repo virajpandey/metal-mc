@@ -144,7 +144,7 @@ private let litGiSkyTerm = litGi ? """
         if (gi.get_width() > 1u) {
             float4 cl = giUpsample(gi, giOwn, q, fi < 6u ? fi : 2u, rel);
             if (cl.w > 0.0) { skyAmb = cl.rgb * ao; giUsed = true; }
-        }\(clEnabled ? "\n        // Colored block light bounced through the cache (ColoredLightBounce.swift), where vanilla's level isn't 0.\n        if (giStandIn.get_width() > 1u) blockLight += float3(giStandIn.read(giOwn).rgb) * saturate(block);" : "")
+        }\(clEnabled ? "\n        // Colored block light bounced through the cache (ColoredLightBounce.swift), where vanilla's level isn't 0: its\n        // half-resolution sample for the pixel (gi_request writes sample s from the pixels 2 s; giOwn is the cache's texel's\n        // contents, not its place).\n        if (giStandIn.get_width() > 1u) {\n            clBounce = float3(giStandIn.read(min(q / 2u, uint2(giStandIn.get_width() - 1u, giStandIn.get_height() - 1u))).rgb) * saturate(block);\n            blockLight += clBounce;\n        }" : "")
 """ : ""
 
 /// With the post chain (postEnabled only, Post.swift; empty otherwise, so lit mode's text is unchanged without it): light
@@ -252,7 +252,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
 
     // The new light, linear, per unit of albedo.
     float3 E;
-    float vSunOut = 0.0;\(litGi ? "\n    bool giUsed = false;" : "")\(clEnabled ? "\n    float4 clDbg = float4(0.0);\n    float3 clBL = float3(0.0);" : "")
+    float vSunOut = 0.0;\(litGi ? "\n    bool giUsed = false;" : "")\(clEnabled ? "\n    float4 clDbg = float4(0.0);\n    float3 clBL = float3(0.0), clBounce = float3(0.0);" : "")
     if (block >= 15.0) {
         // Light sources (vanilla gives emissive faces full block light): full bright, like vanilla.
         E = float3(1.0);
@@ -303,7 +303,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         else if (view == 4u) c = float3(ao);
         else if (view == 5u) c = skyEncode(skyDecode(float3(0.5)) * E);
         else if (view == 6u) c = float3(vSunOut);
-        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));\(litGi ? "\n        else if (view == 8u) c = giUsed ? float3(0.0, 0.8, 0.0) : (block >= 15.0 ? float3(0.0, 0.0, 0.9) : float3(0.9, 0.0, 0.0));" : "")\(clEnabled ? "\n        else if (view == 11u) c = skyEncode(skyDecode(float3(0.5)) * clBL * f.misc.w);\n        else if (view == 12u) c = clDbg.rgb;" : "")
+        else if (view == 7u) c = plain ? float3(0.0, 0.8, 0.0) : (overlayBright ? float3(0.9, 0.0, 0.9) : float3(0.9, 0.0, 0.0));\(litGi ? "\n        else if (view == 8u) c = giUsed ? float3(0.0, 0.8, 0.0) : (block >= 15.0 ? float3(0.0, 0.0, 0.9) : float3(0.9, 0.0, 0.0));" : "")\(clEnabled ? "\n        else if (view == 11u) c = skyEncode(skyDecode(float3(0.5)) * clBL * f.misc.w);\n        else if (view == 12u) c = clDbg.rgb;\n        else if (view == 13u) c = skyEncode(skyDecode(float3(0.5)) * clBounce * (16.0 * f.misc.w));" : "")
         return saturate(c);
     }
     return o;

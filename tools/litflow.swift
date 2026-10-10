@@ -1031,6 +1031,81 @@ if clOn {
         // Reported, not fatal: the pictures still come.
         print((out[1] == 0 && out[2] == 0 ? "ok    " : "FAIL  ") + "the volume's light is vanilla's flood fill per color, exactly (\(what))")
     }
+    // LITFLOW_CLBOUNCE=1 (with LITFLOW_GI=1): only the block light bounced through the GI cache (ColoredLightBounce.swift):
+    // per view at midnight, with its gain 0 and then 1 (mmc_debug_cl_bounce_gain), after 240 frames for the cache to fill,
+    // where its light gets to (the cells' channel, the half-resolution texture the relight reads; mmc_debug_cl_bounce_stats)
+    // and the relit frame (cl-bounce-<view>-gain<g>.png, its mean luma). Then exits.
+    if ProcessInfo.processInfo.environment["LITFLOW_CLBOUNCE"] == "1" {
+        let gainF = fn("mmc_debug_cl_bounce_gain", (@convention(c) (Float) -> Int32).self)
+        let statsF = fn("mmc_debug_cl_bounce_stats", (@convention(c) (UnsafeMutablePointer<Double>) -> Int32).self)
+        let n = Int(W) * Int(H)
+        for v in views {
+            use(v)
+            print("      view \(v.name): (\(v.pos.x), \(v.pos.y), \(v.pos.z)) yaw \(v.yaw) pitch \(v.pitch); volume settled in \(settle()) frames")
+            setLightmap(skyFactor: 0.2)
+            for gain: Float in [0, 1] {
+                check(gainF(gain) == 1, "the bounce's gain set to \(gain)")
+                for _ in 0..<240 { frame(half, sunAngle: midnight, relight: true, extras: false) }
+                var s = [Double](repeating: 0, count: 10)
+                if statsF(&s) == 1 {
+                    print(String(format: "      %@ gain %.0f: cells' channel: %.0f slots owned, %.0f with light (mean luminance %.4f, largest %.3f); the relight's texture: %.0f of %.0f texels with light (mean %.4f, largest %.3f); light volume for the update: %@",
+                                 v.name, gain, s[0], s[1], s[2], s[3], s[4], s[7], s[5], s[6], s[8] > 0.5 ? "yes" : "NO"))
+                } else { print("FAIL  no bounce channel to read") }
+                let r = capture(half, sunAngle: midnight, relight: true, extras: false)
+                var lum = 0.0
+                for i in stride(from: 0, to: n * 4, by: 4) { lum += lumOf(r.color, i) }
+                writePNG(r.color, Int(W), Int(H), "cl-bounce-\(v.name)-gain\(Int(gain)).png")
+                print(String(format: "      %@ gain %.0f: mean luma %.2f", v.name, gain, lum / Double(n)))
+                if gain > 0 {
+                    // The relight's debug view 13: the bounced light it adds, alone (16 times, on a mid-gray albedo).
+                    let b = capture(half, sunAngle: midnight, relight: true, view: 13, extras: false, frames: 4)
+                    var bl = 0.0
+                    for i in stride(from: 0, to: n * 4, by: 4) { bl += lumOf(b.color, i) }
+                    writePNG(b.color, Int(W), Int(H), "cl-bounce-\(v.name)-view13.png")
+                    print(String(format: "      %@: the relight's bounced light (view 13), mean luma %.2f", v.name, bl / Double(n)))
+                }
+            }
+        }
+        print("done")
+        exit(0)
+    }
+    // LITFLOW_CLSHADOWTEST=1 (with METALMC_CLSHADOW set, say 0.75): only the block lights' shadows' grain
+    // (ColoredLightShadows.swift): per view at midnight, with their history off and then on (mmc_debug_cl_shadow_history),
+    // nine single frames after 60 to settle (no anti-aliasing): the mean change of a pixel's 8-bit luma from one frame to the
+    // next, over the whole frame and over the pixels whose luma changes by 3 or more in either run (the grain), and the last
+    // frame's picture (cl-shadow-<view>-history<0|1>.png). Then exits.
+    if ProcessInfo.processInfo.environment["LITFLOW_CLSHADOWTEST"] == "1" {
+        let histF = fn("mmc_debug_cl_shadow_history", (@convention(c) (Int32) -> Int32).self)
+        let n = Int(W) * Int(H)
+        for v in views {
+            use(v)
+            print("      view \(v.name): volume settled in \(settle()) frames")
+            setLightmap(skyFactor: 0.2)
+            var runs: [[Double]] = []
+            for on in [Int32(0), 1] {
+                check(histF(on) == 1, "the shadows' history \(on == 1 ? "on" : "off")")
+                for _ in 0..<60 { frame(half, sunAngle: midnight, relight: true, extras: false) }
+                var prev: [UInt8] = [], last: [UInt8] = []
+                var change = [Double](repeating: 0, count: n)
+                for _ in 0..<9 {
+                    let r = capture(half, sunAngle: midnight, relight: true, extras: false, frames: 1)
+                    if !prev.isEmpty { for k in 0..<n { change[k] += abs(lumOf(r.color, 4 * k) - lumOf(prev, 4 * k)) / 8 } }
+                    prev = r.color
+                    last = r.color
+                }
+                runs.append(change)
+                writePNG(last, Int(W), Int(H), "cl-shadow-\(v.name)-history\(on).png")
+            }
+            let grainy = (0..<n).filter { runs[0][$0] >= 3 || runs[1][$0] >= 3 }
+            for (i, label) in ["off", "on"].enumerated() {
+                let all = runs[i].reduce(0, +) / Double(n)
+                let g = grainy.isEmpty ? 0 : grainy.reduce(0.0) { $0 + runs[i][$1] } / Double(grainy.count)
+                print(String(format: "      %@ history %@: mean frame-to-frame luma change %.3f; over the %d grainy pixels %.2f", v.name, label, all, grainy.count, g))
+            }
+        }
+        print("done")
+        exit(0)
+    }
     // Natural scenes in the loaded area: light sources next to open cells, by 32 x 32 column cell and kind (warm and fire
     // lights: villages; lava; others), the top few of each with their mean height, to point a view or the tour at.
     if let emittersC = dlsym(lib, "mmc_debug_cl_emitters").map({ unsafeBitCast($0, to: (@convention(c) (Int32, Int32, Int32, Int32, Int32, Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, Int32) -> Int32).self) }) {

@@ -1061,11 +1061,35 @@ placed and with the showcase swaps, the mineshaft and the village at midnight; p
 
 ### Not done, and next
 
-- **Bounce through the GI cache:** built (above) but with no visible effect in the lab scenes yet: find out whether it
-  reaches the image (a debug view of its channel) before tuning it. Then: it doesn't follow the fire's flicker, a
-  cell's block channel changes only as fast as the cache updates it, and far cells (past the volume) get none.
-- **Shadows from lights:** built (above), off by default for their grain on walls next to their lights: a few frames of
-  history of their own (the sun's visibility gets by on the anti-aliasing's), or two rays a sample. Entities, fences
+- **Bounce through the GI cache: it reaches the image now** (2026-10-10). The channel was filled all along, but the
+  relight read it at `giOwn`, which holds the GI texel's contents (giUpsampleTexel returns its light bits and code word,
+  not its place). That put every read far outside the texture, where Metal returns zero. The relight now reads the pixel's
+  own half-resolution sample (`q / 2`, where gi_request writes it). Found with a readback of each stage
+  (`mmc_debug_cl_bounce_stats`; `LITFLOW_GI=1 LITFLOW_CL=1 LITFLOW_CLBOUNCE=1 litflow ... sky`, the gallery at midnight,
+  gain 0 and then 1 through `mmc_debug_cl_bounce_gain`):
+  - with gain 1, 6.3-8.0 K cells had bounced light (mean luminance 0.006, up to 0.12), and the relight's texture 212-355
+    K of its 483 K texels (mean 0.003, up to 0.057);
+  - yet the relit frame didn't change: mean luma 34.63 with gain 0 and with gain 1, 0.0003 levels apart per pixel on
+    average, 1 at most.
+  - With the fix: 34.63 -> 34.82 above the gallery and 42.33 -> 42.65 low over it. Debug view 13
+    (`METALMC_LITVIEW=13`: the bounced light the relight adds, alone, 16 times, on a mid-gray albedo) shows each booth's
+    walls lit in its light's color by its floor, with a few blocky holes where cells had no samples yet
+    (`bench_out/agents/godrays/clbounce2/` in the main checkout: `board-low-gain0-gain1-view13.jpg`).
+
+  It's still off by default (`METALMC_CLBOUNCE=1` to try it): its light is a few percent of the direct light in the
+  gallery, and it hasn't been seen in the game's caves yet, where it should matter most. Then: it doesn't follow the
+  fire's flicker, a cell's block channel changes only as fast as the cache updates it, far cells (past the volume) get
+  none, and the read takes the pixel's 2 x 2 sample without giUpsample's face and plane match (a 2-pixel seam at edges
+  is possible).
+- **Shadows from lights: a history of their own** (2026-10-10, ColoredLightShadows.swift). Each frame's sample (one ray
+  per 4 x 4 pixels, as before) is blended into the history, `CLS_BLEND` (0.3) of it, about three frames' worth: the
+  surface's place last frame from the camera's motion (the instance structure's camera offset), its texels checked by
+  distance, bilinear; a ping-ponged RGBA16Float pair (the visibility, the last sample's distance). The relight reads it
+  as before. It starts over after a jump, a gap or a new size; `mmc_debug_cl_shadow_history` switches it off offline
+  (`LITFLOW_CL=1 LITFLOW_CLSHADOWTEST=1 METALMC_CLSHADOW=0.75 litflow ... sky` measures the grain both ways).
+  Still off by default (`-PclShadow=0.75` to try them) until that's been seen in game.
+- **Shadows from lights:** built (above), off by default for their grain on walls next to their lights, now with a
+  history of their own (just above); two rays a sample would be the next step if that isn't enough. Entities, fences
   and slabs cast none (not in the structures, or as the LOD has them); one light per ray (the anti-aliasing mixes the
   picks where colors overlap). With them on, scenes are 8-16% darker: light that went around corners comes only as
   bounce, so they want the bounce working.
