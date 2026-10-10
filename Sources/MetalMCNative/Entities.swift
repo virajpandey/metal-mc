@@ -156,11 +156,12 @@ static float3 mmcForwardLight(constant float4* env, constant float4* lf, texture
 
 """
 
-/// Water drops among the particles (rain's splashes, drips: blue in vanilla's particle atlas) gray-white, as water looks;
-/// `blue`: how much a texel is one (blue well over red), not for full-bright particles (soul fire's flames).
+/// Water drops among the particles (rain's splashes, drips: blue in vanilla's particle atlas) near white, as water looks
+/// (it shows the sky's light: a gray albedo made the splashes dark specks on the sand); `blue`: how much a texel is one
+/// (blue well over red), not for full-bright particles (soul fire's flames).
 private let entityDropHelper = """
 static inline float mmcDropBlue(float3 c) { return saturate((c.b - c.r - 0.2) * 5.0); }
-static inline float3 mmcDropGray(float3 c) { return float3(dot(c, float3(0.2126, 0.7152, 0.0722)) * 1.25) * float3(0.95, 0.98, 1.0); }
+static inline float3 mmcDropGray(float3 c) { return float3(0.84, 0.88, 0.94) * saturate(0.6 + dot(c, float3(0.2126, 0.7152, 0.0722))); }
 
 """
 
@@ -253,12 +254,17 @@ func entityPatchFragment(_ src: String, _ kind: EntityPatchKind) -> String? {
         // The normal as vanilla lights it: a back face (two-sided parts) takes the light from behind.
         let n = normal ? "(dot(in.mmcNormal, in.mmcNormal) > 1e-8 ? normalize(in.mmcNormal) : float3(0.0, 1.0, 0.0))\(front ? " * (gl_FrontFacing ? 1.0 : -1.0)" : "")" : "float3(0.0)"
         let texel = "mmcEntityGbuffer(mmcA, \(n), in.mmcLight, in.\(coord!).z, \(kind == .particle ? "true" : "false"))"
-        // Water drops gray-white (particles): the albedo and the forward color alike, so the overlay test finds it plain.
+        // Water drops near white (particles): the albedo, and the forward color with the same light (vanilla's, the color
+        // drawn over the albedo), so the overlay test finds the particle plain.
         let drops = kind != .particle ? "" : """
 
                 float mmcB = mmcDropBlue(mmcA) * step(in.mmcLight.x, 14.5);
-                mmcA = mix(mmcA, mmcDropGray(mmcA), mmcB);
-                out.\(colorName).rgb = mix(out.\(colorName).rgb, mmcDropGray(out.\(colorName).rgb), mmcB);
+                if (mmcB > 0.0) {
+                    float3 mmcG = mmcDropGray(mmcA);
+                    float mmcV = dot(out.\(colorName).rgb, float3(0.2126, 0.7152, 0.0722)) / max(dot(mmcA, float3(0.2126, 0.7152, 0.0722)), 1e-3);
+                    out.\(colorName).rgb = mix(out.\(colorName).rgb, mmcG * mmcV, mmcB);
+                    mmcA = mix(mmcA, mmcG, mmcB);
+                }
         """
         return waterBeforeLastReturn(s, """
             {

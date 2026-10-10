@@ -2020,6 +2020,51 @@ saturated blue texture at its lightmap's light (census1's rain: bright blue stre
   binds it (buffers 12 and 13 in both stages); without our sky's atmosphere they keep vanilla's light.
 - **Rain** (`rain`): vanilla's rain texture is a column of 1-texel streaks across a block-wide quad, blue (0.3, 0.42,
   0.78); magnified near the camera a streak was 9 pixels wide. Its texels (blue) are drawn gray-white, at
-  `METALMC_RAINALBEDO` (0.6) of the light around them, fainter (`METALMC_RAINALPHA` 0.55 of vanilla's alpha) and thin:
+  `METALMC_RAINALBEDO` (0.6) of the light around them, fainter (`METALMC_RAINALPHA` 0.7 of vanilla's alpha) and thin:
   only the middle `METALMC_RAINWIDTH` (0.35) of each texel column, its coverage of the pixel kept where a texel is
-  narrower than a pixel. Snow's texels (white) keep their flakes and take the same light.
+  narrower than a pixel. The light is the forward light with only `METALMC_RAINSUN` (0.15) of the sun's: rain falls
+  from cloud, and the fifth of the sun our sky keeps in full rain turned the streaks yellow. Not over water's texels:
+  the relight takes the water layer off what's drawn to see the floor, which turned streaks there olive. Snow's
+  texels (white) keep their flakes and take the same light.
+- **Water drops** among the particles (rain's splashes, drips: blue in vanilla's particle atlas, blue dots over the
+  grass in rain) go near white (water shows the sky's light; a gray albedo made the splashes dark specks on the sand),
+  the albedo and the forward color alike (the latter with vanilla's light worked out from the color drawn, so the
+  overlay test finds them plain), except full-bright ones.
+
+### The hand (`hand`, with `entities`)
+
+`METALMC_EXP=lit,entities,hand` sends the first-person hand and held items with the level's features
+(`metalmc.extpipe.ExtHand`, as the external pipeline's hand goes; `MetalLit.HAND`, overworld only) instead of vanilla's
+hand pass after the post chain: the translucent entity pipeline (the arm) and the item pipelines put them in the
+G-buffer, and the relight lights them like everything around (the sun's traced visibility at the hand, the torch's
+colored light in a cave, the night). Off by default: the hand is then drawn with the level's depth (it can dip into a
+wall right in front of the camera), and goes through the anti-aliasing (its history is clipped to the neighborhood, so
+turning softens it rather than trailing it; not looked at in motion).
+
+### In game (2026-10-10, lab mode: 3456 x 2234, TAA, the full look `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,leaflight,wave`)
+
+- Sessions `ent0` (without `entities,rain`), `ent1` (with), `ent2` (with `hand`, the rain's sun share and water drops):
+  the rain scene and a close view of its pen (`tp 21 67 171 146 30`), night_torches and the same pen at midnight,
+  torch_cave and a close view of a torch (`tp 122.5 13 -49.5 135 61`). All 17 pipelines patched at load (item_cutout is
+  three pipelines of one name), none failed.
+- **Mobs**: by day in rain the horses and pigs were vanilla's flat bright colors over the relit, darker world (the
+  census's pigs glowed pink); now they take the overcast's light: tops lighter than sides, the same level as the grass
+  around them. At midnight the horses by the pen's torches were a bright gray (vanilla's lightmap is near daylight next
+  to a torch); now they're lit warm by the torches' colored light, dark away from them, and the village's iron golem
+  and villagers sit in the night instead of glowing. Debug views on the pen: the normals (2) as on terrain, the overlay
+  test (7) green on the mobs (plain), red where a horse's markings layer is half see-through (relit from the color
+  drawn, as designed), rain's streaks magenta.
+- **Particles**: the torch's flame glows (the emitter rule: a white-yellow core that blooms) where it was a dim orange
+  under a gray smoke blob; its smoke is lit warm and dark by the torch.
+- **Rain**: the saturated blue bars are gone: thin gray streaks against the overcast, fainter over terrain (a faint
+  streak changes the color drawn by less than the overlay test's tolerance, 6% plus 2.5 levels, so the relight takes it
+  for plain terrain and relights it away: only the stronger streaks show over the ground).
+- **The hand** (`ent2`): in the G-buffer (debug view 2 shows its normals), lit by the night and the pen's torches, warm
+  in the cave by the torch.
+- Boards (ours only, before | after) in `bench_out/agents/leaves/boards/ent1-<shot>.jpg` (rain, pen, night, nightpen,
+  cave, cavetorch) and crops `ent1-crop-*.jpg`; with SEUS's census twin (rain, night_torches, torch_cave: its rain twin
+  shows no rain) in `~/Projects/metal-mc-private/twins/census1/boards-leaves/`; the shots in
+  `bench_out/agents/leaves/game5/`.
+- A rain shot taken right after `scene rain` showed the foreground's grass near black in one session and not in the
+  other; the same view 200 ticks later was normal (debug views 6 and 8: sun visibility and the GI cache as elsewhere).
+  Something settling after the jump (the GI cache's or the visibility's history), not the entities: not chased.
