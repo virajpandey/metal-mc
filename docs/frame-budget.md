@@ -285,6 +285,12 @@ resolve's 3.15.
   didn't move it (0.755). In theory the still image converges to the scene convolved with the reconstruction's Gaussian
   (sigma 0.41 output pixels at k 3), against native TAA's box over each pixel (sigma 0.29): k 6 would match it, at the
   price of a blockier current frame where the history is rejected (disocclusions, waving leaves).
+- **A system dialog blocked the timed flights** from at least 12:15: macOS's "“claude” would like to access data from
+  other apps" (UserNotificationCenter, Don't Allow / Allow), which no helper may answer. run_mc.sh holds timed runs
+  until the screen is clear, since a dialog over the fullscreen game paces it at 120 Hz and voids uncapped numbers. The
+  vsync flights below ran anyway (a run paced at 120 Hz by vsync isn't changed by that), flagged in the ledger; the
+  uncapped flights wait for the dialog to go. The lab sessions' uncapped fps may have run under it too (when it appeared
+  isn't known).
 - The mip bias (the terrain's texture gradients scaled to the output's resolution) didn't change the forest's score:
   there the leaves' texels are magnified (2 rendered pixels each), so it's the reconstruction, not the mips. It matters
   for minified textures (distant terrain), where it keeps the native mip.
