@@ -129,7 +129,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         constant SkyFrame& sky [[buffer(1), function_constant(taaSky)]],
                         texture3d<float> apScatter [[texture(5), function_constant(taaSky)]],
                         texture3d<float> apTrans [[texture(6), function_constant(taaSky)]],
-                        texture2d<float> skyView [[texture(7), function_constant(taaSky)]],\(cloudsEnabled ? "\n                        constant CloudFrame& clouds [[buffer(5), function_constant(taaSky)]],\n                        texture2d<float> cloudTex [[texture(18), function_constant(taaSky)]],\n                        texture2d<float> cloudDepth [[texture(19), function_constant(taaSky)]]," : "")
+                        texture2d<float> skyView [[texture(7), function_constant(taaSky)]],\(cloudsEnabled ? "\n                        constant CloudFrame& clouds [[buffer(5), function_constant(taaSky)]],\n                        texture2d<float> cloudTex [[texture(21), function_constant(taaSky)]],\n                        texture2d<float> cloudDepth [[texture(22), function_constant(taaSky)]]," : "")
 #if LIT_MODE
                         constant LitFrame& litFrame [[buffer(2), function_constant(taaLit)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
@@ -464,7 +464,7 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setTexture(sky.apScatter, index: 5)
         enc.setTexture(sky.apTrans, index: 6)
         enc.setTexture(sky.skyView, index: 7)
-        // Clouds hook (Clouds.swift): this frame's clouds for the composite (buffer 5, textures 18 and 19), or stand-ins.
+        // Clouds hook (Clouds.swift): this frame's clouds for the composite (buffer 5, textures 21 and 22: 18-20 are water's), or stand-ins.
         if cloudsEnabled { Clouds.shared.bindTaa(enc, width: color.width, height: color.height) }
         skyDither = color.pixelFormat == .rgba16Float ? 0 : (color.pixelFormat == .rg11b10Float ? -1 : 1.0 / 255)
         tile = 32

@@ -1063,6 +1063,18 @@ kernel void clouds_march_still(texture2d<float, access::read_write> hist [[textu
     histDepth.write(float4(resDepth * 0.001), gid);
 }
 
+// The clouds into the water's sky map (Lit.swift's lit_water_sky: the same paraboloid mapping as the reflection map, scene
+// units), after it's made each frame: every reflection that escapes to the sky (Water.swift's rays that miss, open tops)
+// then shows them, with no change to the water's shading.
+kernel void clouds_water_sky(texture2d<float, access::read_write> sky [[texture(0)]], texture2d<float> map [[texture(1)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= sky.get_width() || gid.y >= sky.get_height()) return;
+    constexpr sampler sm(filter::linear, address::clamp_to_edge);
+    float4 c = map.sample(sm, (float2(gid) + 0.5) / float2(sky.get_width(), sky.get_height()), level(0.0));
+    float4 s = sky.read(gid);
+    sky.write(float4(s.rgb * c.a + c.rgb, s.a), gid);
+}
+
 // The clouds over the upper hemisphere from the camera, for reflections (cloudsReflected): each texel a direction of the
 // paraboloid map, marched with a new jitter every frame and blended into what it held (directions are fixed in the world,
 // and the clouds are far: no reprojection).
@@ -1279,7 +1291,8 @@ final class Clouds: @unchecked Sendable {
                 library = nil; pipes = [:]; compositePipes = [:]; noiseMade = false; failed = false
             }
             for name in ["clouds_noise_base", "clouds_noise_detail", "clouds_noise_weather", "clouds_env", "clouds_shadow",
-                         "clouds_march", "clouds_carry", "clouds_march_still", "clouds_vis", "clouds_reflection", "clouds_debug_view"] {
+                         "clouds_march", "clouds_carry", "clouds_march_still", "clouds_vis", "clouds_reflection", "clouds_water_sky",
+                         "clouds_debug_view"] {
                 guard let f = lib.makeFunction(name: name) else { throw NSError(domain: "clouds", code: 1, userInfo: [NSLocalizedDescriptionKey: "no \(name)"]) }
                 pipes[name] = try ctx.device.makeComputePipelineState(function: f)
             }
@@ -1580,19 +1593,19 @@ final class Clouds: @unchecked Sendable {
     private var debugSplit = false
     private var debugStageMs: [Double] = [0, 0]
 
-    /// For the anti-aliasing's resolve (Taa.swift, its sky variant): buffer 5 and textures 18 and 19, this frame's clouds or
-    /// stand-ins that turn the composite off.
+    /// For the anti-aliasing's resolve (Taa.swift, its sky variant): buffer 5 and textures 21 and 22 (18-20 are water's in
+    /// the lit variant), this frame's clouds or stand-ins that turn the composite off.
     func bindTaa(_ enc: MTLComputeCommandEncoder, width: Int, height: Int) {
         var f = cf
         defer { frameReady = nil }
         if let r = frameReady, r.width == width, r.height == height, history.count == 2 {
-            enc.setTexture(history[current], index: 18)
-            enc.setTexture(historyDepth[current], index: 19)
+            enc.setTexture(history[current], index: 21)
+            enc.setTexture(historyDepth[current], index: 22)
         } else {
             f.misc.w = 0
             _ = ensure()
-            enc.setTexture(dummyColor, index: 18)
-            enc.setTexture(dummyDepth, index: 19)
+            enc.setTexture(dummyColor, index: 21)
+            enc.setTexture(dummyDepth, index: 22)
         }
         enc.setBytes(&f, length: MemoryLayout<CloudFrameGPU>.stride, index: 5)
     }
@@ -1602,6 +1615,19 @@ final class Clouds: @unchecked Sendable {
     func reflectionBinding() -> MTLTexture? {
         guard cloudsEnabled, ensure() else { return nil }
         return shadowMade || reflectionFrames > 0 ? (reflection ?? dummyColor) : dummyColor
+    }
+
+    /// The water's sky map (Lit.swift, made this frame in `cb`): the clouds' reflection map blended in (sky x a + rgb), so the
+    /// water's reflections that escape to the sky show the clouds. Nothing when the clouds didn't run this frame.
+    func intoWaterSky(cb: MTLCommandBuffer, sky: MTLTexture) {
+        guard cloudsEnabled, madeThisFrame, reflectionFrames > 0, let reflection, let p = pipes["clouds_water_sky"],
+              let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = "MetalMC clouds into the water's sky map"
+        enc.setComputePipelineState(p)
+        enc.setTexture(sky, index: 0)
+        enc.setTexture(reflection, index: 1)
+        enc.dispatchThreads(MTLSize(width: sky.width, height: sky.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        enc.endEncoding()
     }
 
     /// The clouds as the composite took them this frame (RGBA16Float at half the resolution each way: rgb their light, a their
