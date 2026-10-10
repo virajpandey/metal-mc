@@ -32,7 +32,9 @@ private let taaWaterLoad = """
         if (taaLit) {
             uint2 g = litGbuf.read(q).rg;
             c.rgb = litRelightPixel(c.rgb, q, d, g, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));
-            c.rgb = litWaterPixel(c.rgb, q, d, g, litVis, litFrame, litEnv, litWaves, litWaterSky);
+            c.rgb = litWaterWet(c.rgb, q, d, g, litFrame, litWaterSky);
+            c.rgb = litWaterPixel(c.rgb, q, d, g, litVis, litFrame, litEnv, litWaves, litWavesDetail, litWaterSky, litLm, litWaterTrace, litWaterTraceAS, color, litGbuf, depth\(litGi ? ", litGiCode" : ""));
+            c.rgb = litWaterFog(c.rgb, q, d, litFrame, litEnv, litLm);
         }
 """
 
@@ -132,7 +134,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
                         texture2d<uint, access::read> litGbuf [[texture(8), function_constant(taaLit)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
-                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
+                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]],\n                        texture2d<float> litWaterTrace [[texture(18), function_constant(taaLit)]],\n                        texture2d<float> litWavesDetail [[texture(19), function_constant(taaLit)]],\n                        texture2d<uint> litWaterTraceAS [[texture(20), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
 #endif
                         uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {

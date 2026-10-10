@@ -67,6 +67,8 @@ abstract class GameRendererLodMixin {
             // Colored block light (METALMC_EXP=coloredlight, metalmc.light.ColoredLight): the light volume's work, which the
             // relight samples.
             if (metalmc.backend.MetalColoredLight.ENABLED) metalmc.light.ColoredLight.frame(cameraState.pos.x, cameraState.pos.y, cameraState.pos.z);
+            // Water (METALMC_EXP=water): the camera's fluid, and vanilla's water sprites for the G-buffer.
+            metalmc.backend.MetalLit.water(cameraState.fogType == net.minecraft.world.level.material.FogType.WATER);
             metalmc.backend.MetalLit.relight(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, Lod.SUN_ANGLE, cameraState.fogData,
                 net.minecraft.client.Minecraft.getInstance().gameRenderer.levelLightmap(), metalmc.sky.Sky.frameActive, TemporalAA.ENABLED);
