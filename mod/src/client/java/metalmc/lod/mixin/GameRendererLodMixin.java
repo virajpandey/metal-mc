@@ -54,6 +54,16 @@ abstract class GameRendererLodMixin {
     private void metalmc$temporalAA(CameraRenderState cameraState, PlayerRenderState playerState, OptionsRenderState optionsState,
                                     boolean consistentDepthRequired, CallbackInfo ci) {
         if (mainRenderTarget.getColorTexture() == null || mainRenderTarget.getDepthTexture() == null) return;
+        // Clouds hook (METALMC_EXP=clouds, metalmc.backend.MetalClouds): ours replace vanilla's slab, so nothing below takes
+        // terrain in its height for a cloud; then this frame's clouds, before the shadows (they take the clouds' shadows).
+        if (metalmc.backend.MetalClouds.active()) {
+            Lod.CLOUD_HEIGHT = 1e9f;
+            var mc = net.minecraft.client.Minecraft.getInstance();
+            metalmc.backend.MetalClouds.frame(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(),
+                TemporalAA.ENABLED ? TemporalAA.UNJITTERED : Lod.LEVEL_PROJECTION, cameraState.viewRotationMatrix,
+                cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, Lod.SUN_ANGLE, Lod.SUN_CLEAR,
+                mc.level == null ? 0f : mc.level.getThunderLevel(1f), mc.level == null ? 63f : mc.level.getSeaLevel());
+        }
         if (Lod.active() && Lod.SUN_SKY) {
             // Full strength while the sun is more than about 6 degrees up, fading out as it sets; weaker in rain.
             float strength = 0.42f * Math.clamp((float) Math.cos(Lod.SUN_ANGLE) * 10f, 0f, 1f) * Lod.SUN_CLEAR;
@@ -78,6 +88,9 @@ abstract class GameRendererLodMixin {
             if (metalmc.backend.MetalPost.ENABLED) metalmc.backend.MetalPost.clouds(Lod.CLOUD_HEIGHT - (float) cameraState.pos.y);
             metalmc.backend.MetalSky.aerial(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), Lod.LEVEL_PROJECTION,
                 cameraState.viewRotationMatrix, TemporalAA.ENABLED);
+            // Clouds hook: without anti-aliasing, their composite as a pass of its own (with it, its resolve does it).
+            if (!TemporalAA.ENABLED) metalmc.backend.MetalClouds.composite(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(),
+                Lod.LEVEL_PROJECTION, cameraState.viewRotationMatrix);
         }
         if (TemporalAA.ENABLED) {
             metalmc.backend.MetalTaa.apply(mainRenderTarget.getColorTexture(), mainRenderTarget.getDepthTexture(), TemporalAA.UNJITTERED,

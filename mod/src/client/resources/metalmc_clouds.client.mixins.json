@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "metalmc.clouds.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"CloudRendererMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

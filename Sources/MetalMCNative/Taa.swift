@@ -37,8 +37,9 @@ private let taaWaterLoad = """
 """
 
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
-// Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise.
-private let taaShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "") + """
+// Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise. Clouds hook (Clouds.swift, METALMC_EXP=clouds only):
+// their composite, after the aerial perspective in the sky variant.
+private let taaShaderSource = skyShaderHeader + cloudsShaderHeader + (litEnabled ? "\n#define LIT_MODE 1\n" + litShaderHeader + (litGi ? giUpsampleHeader : "") + litRelightHeader : "") + """
 
 // With the sky on (METALMC_EXP=sky), a second variant of the resolve applies the aerial perspective, the render
 // distance's fade into the sky and the tone curve to each pixel as it loads it (skyLevelColor), after the shadows'
@@ -126,7 +127,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         constant SkyFrame& sky [[buffer(1), function_constant(taaSky)]],
                         texture3d<float> apScatter [[texture(5), function_constant(taaSky)]],
                         texture3d<float> apTrans [[texture(6), function_constant(taaSky)]],
-                        texture2d<float> skyView [[texture(7), function_constant(taaSky)]],
+                        texture2d<float> skyView [[texture(7), function_constant(taaSky)]],\(cloudsEnabled ? "\n                        constant CloudFrame& clouds [[buffer(5), function_constant(taaSky)]],\n                        texture2d<float> cloudTex [[texture(18), function_constant(taaSky)]],\n                        texture2d<float> cloudDepth [[texture(19), function_constant(taaSky)]]," : "")
 #if LIT_MODE
                         constant LitFrame& litFrame [[buffer(2), function_constant(taaLit)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
@@ -154,7 +155,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
             float haze;
-            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);
+            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")
         }
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
         dtile[i] = d;
@@ -461,6 +462,8 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setTexture(sky.apScatter, index: 5)
         enc.setTexture(sky.apTrans, index: 6)
         enc.setTexture(sky.skyView, index: 7)
+        // Clouds hook (Clouds.swift): this frame's clouds for the composite (buffer 5, textures 18 and 19), or stand-ins.
+        if cloudsEnabled { Clouds.shared.bindTaa(enc, width: color.width, height: color.height) }
         skyDither = color.pixelFormat == .rgba16Float ? 0 : (color.pixelFormat == .rg11b10Float ? -1 : 1.0 / 255)
         tile = 32
     } else if relight, let litPipe = t.litResolve(sky: false) {
