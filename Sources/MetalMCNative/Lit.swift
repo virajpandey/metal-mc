@@ -316,7 +316,8 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
 }\(litWater ? "\n" + waterShadeHeader : "")
 """
 
-/// Water's look (litWater): METALMC_WATERWAVES scales the waves' slopes (0: a flat surface), METALMC_WATERROUGH is the
+/// Water's look (litWater): METALMC_WATERWAVES scales the waves' slopes (0.6 since round 2, Water.swift: calmer; 0: a flat
+/// surface), METALMC_WATERROUGH is the
 /// surface's own roughness under them (GGX alpha: the ripples finer than the waves), which keeps a sun glint on the
 /// flattest water.
 let waterWaveScale = max(0, Double(ProcessInfo.processInfo.environment["METALMC_WATERWAVES"] ?? "") ?? 0.6)
