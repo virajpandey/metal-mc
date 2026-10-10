@@ -149,8 +149,9 @@ static float4 giUpsample(texture2d<uint> gi, uint2 own, uint2 gid, uint face, fl
 
 /// The cache's kernels. `zeroCopy`: a bounce hit finds its quad in the LOD node's buffer through giTiles (the game's
 /// route, structures without per-triangle data); otherwise it reads the structure's primitive data (giTileGeometry,
-/// +54% structure memory; offline comparisons only).
-private func giShaderSource(zeroCopy: Bool) -> String {
+/// +54% structure memory; offline comparisons only). Water's reflection rays (Water.swift) build on the same source, so
+/// their hits are read and lit as the cache's bounce hits are.
+func giShaderSource(zeroCopy: Bool) -> String {
     "#define GI_ZERO_COPY \(zeroCopy ? 1 : 0)\n" + skyShaderHeader + giUpsampleHeader + "\n" + giKernelSource
 }
 
