@@ -131,7 +131,7 @@ jitter aside). It takes about half a second. The classes, first rule that holds:
 | unlit | 220 30 90 | anything else that isn't lit terrain: entities, the hand, particles, glass |
 | far | 150 150 150 | lit terrain past 512 blocks |
 | blocklit | 255 120 20 | lit terrain with block light 8 or more where the sky light is under 10 or the sun is down; light sources (block light 15) |
-| vegetation | 40 170 40 | faces that aren't axis-aligned (cross plants: grass, flowers, ferns, crops) and green albedo (green the largest channel, above blue by 10%, saturation over 0.2: leaves, grass blocks' tops, vines). The albedo-hue rule stands in until the G-buffer flags foliage |
+| vegetation | 40 170 40 | with `leaflight` the G-buffer's foliage class (`litFoliageClass`: leaves and plants; grass blocks' tops are ground and go to sunlit or shade); without it an albedo-hue rule: faces that aren't axis-aligned (cross plants: grass, flowers, ferns, crops) and green albedo (green the largest channel, above blue by 10%, saturation over 0.2: leaves, grass blocks' tops, vines) |
 | sunlit | 255 215 60 | lit terrain whose sun visibility is over 0.5 and whose face is turned to the sun, by day |
 | shade | 120 70 180 | the rest of lit terrain |
 

@@ -23,8 +23,8 @@ import simd
 //   far         lit terrain past 512 blocks
 //   blocklit    lit terrain with block light 8 or more where the sky light is under 10 or the sun is down, and light
 //               sources (block light 15)
-//   vegetation  faces that aren't axis-aligned (cross plants) and green albedo (leaves, grass, vines): the albedo-hue rule,
-//               until the G-buffer flags foliage
+//   vegetation  with leaflight the G-buffer's foliage class (leaves and plants); without it faces that aren't axis-aligned
+//               (cross plants) and green albedo (leaves, grass, vines): an albedo-hue rule
 //   sunlit      lit terrain whose sun visibility (the mean of the frames' samples) is over 0.5 and whose face is turned to
 //               the sun, by day
 //   shade       the rest of lit terrain
@@ -68,12 +68,15 @@ struct MaskFrame {
 
 constant float3 kMaskNormal[6] = { float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1) };
 
-// Vegetation until the G-buffer flags foliage: faces that aren't axis-aligned (cross plants: grass, flowers, ferns, crops)
+// Vegetation: with leaflight the G-buffer's foliage class (Foliage.swift: leaves and plants; grass blocks' tops are
+// ground). Without it an albedo-hue rule: faces that aren't axis-aligned (cross plants: grass, flowers, ferns, crops)
 // and green albedo (leaves, grass blocks' tops, vines): green the largest channel, clearly above blue, and saturated.
-static bool maskVegetation(uint code, float3 a) {
+static bool maskVegetation(uint code, float3 a, uint2 g) {
+\(foliageLight ? "    return litFoliageClass(g) != 0u;" : """
     if (code == 7u) return true;
     float mx = max(a.r, max(a.g, a.b)), mn = min(a.r, min(a.g, a.b));
     return a.g >= a.r && a.g > a.b * 1.1 && mx > 0.0 && (mx - mn) / mx > 0.2;
+""")
 }
 
 kernel void lab_mask(depth2d<float, access::read> depth [[texture(0)]], texture2d<uint, access::read> gbuf [[texture(1)]],
@@ -116,7 +119,7 @@ kernel void lab_mask(depth2d<float, access::read> depth [[texture(0)]], texture2
                 cls = MASK_FAR;
             } else if (block >= 14.97 || (block >= MASK_BLOCK_LEVEL && (sky < MASK_SKY_LOW || f.sun.y < 0.0))) {
                 cls = MASK_BLOCKLIT;
-            } else if (maskVegetation(code, albedo)) {
+            } else if (maskVegetation(code, albedo, g)) {
                 cls = MASK_VEGETATION;
             } else {
                 // The sun's visibility as the relight has it: the traced samples' mean, or without rays the open sky.
