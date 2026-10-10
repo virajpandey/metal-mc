@@ -742,7 +742,8 @@ static float4 cloudsCirrus(float3 dir, float tc, constant CloudFrame& cf, consta
     if (cf.light.w > 0.0) {
         float r = sky.atmo.planet.x + CIRRUS_ALT * 0.001;
         float lmu = clamp(cf.light.y + dot(p.xz, cf.light.xz) * 2.0 * cf.layer.w, -1.0, 1.0);
-        E = skyTransmittanceToSpace(trans, sky.atmo, r, lmu) * skySunVisible(sky.atmo, r, lmu, sky.sunHoriz.z) * cf.light.w * ph;
+        E = skyTransmittanceToSpace(trans, sky.atmo, r, lmu) * skySunVisible(sky.atmo, r, lmu, sky.sunHoriz.z) * cf.light.w * ph
+          * (dot(cf.light.xyz, cf.sun.xyz) < 0.0 ? kCloudMoonTint : float3(1.0));
     }
     float3 L = (E + env[0].rgb * 0.5) * (1.0 - T);
     SkyAerial ap = skyAerialPerspective(p, sky, apScatter, apTrans);
