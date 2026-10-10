@@ -735,6 +735,9 @@ third of the screen water puts it past 8.33 ms; something else has to give for 1
 
 ### Not done, and next
 
+Round 2 (below, "Water, round 2") did the LOD's and vanilla's water, terrain in the reflections, the water's own color in
+our light, the moon's glint and water under cover (the rays see what covers it). What follows is as round 1 left it.
+
 - **The LOD's water** (192-768 blocks): flagged by the code above once its builder adds it. Until then a seam at 768
   blocks between unreflective and reflective water.
 - **Vanilla's water** (the near chunks' range): not flagged. Its translucent layer (water, stained glass and ice share
@@ -769,6 +772,174 @@ third of the screen water puts it past 8.33 ms; something else has to give for 1
   night (dark water, no glint); a lake under an overhang (sky light under 15 dims its reflection) and a river in a
   canyon (the sky where the walls should be); the seams at the LOD's start (vanilla's water) and at 768 blocks (until the
   LOD writes the flag); `METALMC_WATERWAVES=0` (a mirror) and `2`.
+
+## Water, round 2: near water, terrain in the reflections, the floor (`METALMC_EXP=lit,water`, 2026-10-10)
+
+Round 1 left near water (vanilla's, inside the render distance) as vanilla drew it: no reflections, a seam where the
+LOD's water began, and at night a saturated blue glow. Round 2 brings it into the lit pass and gives all water
+reflections of the terrain, the floor seen through it, ripples and caustics. `Sources/MetalMCNative/Water.swift` (new),
+with hooks in Backend.swift (PipelineBox), Lit.swift (the relight's call, its bindings), Taa.swift (the resolve's
+water load), RtShadows.swift (`takeWaterStructure`), Gi.swift (`giShaderSource` no longer private), Lod.swift (the LOD's
+water writes its layer) and on the Java side `MetalLit.water` (each frame: the camera's fluid, the water sprites) and
+`FogRendererMixin.metalmc$waterFog`.
+
+- **Vanilla's water in the G-buffer.** Vanilla draws it with `translucent_terrain` and `translucent_terrain_multidraw`
+  (classic transparency: in the level's main pass, after the opaque terrain). In that pass they now get a variant whose
+  MSL (SPIRV-Cross's, as the Java side translated it) is patched on the native side: the vertex shader passes its light
+  coordinates on (`mmcWaterLight`), and the fragment shader writes the G-buffer as a second output, the water texel
+  where its texture coordinate lies in the atlas rectangle of `block/water_still` or `block/water_flow` (sent by
+  `MetalLit.water` when the block atlas changes; the variant compiles then, off the render thread, about 0.1 s for both)
+  and 0 elsewhere. 0 leaves the relight's result for glass, ice and the rest as it was: what they cover already failed
+  its depth test. The water texel (`litPackWaterLayer`): the layer as it was blended (its color, sRGB-encoded 8 bits a
+  channel, and alpha: vanilla's water texture's 180/255), the face, the depth key, the light levels (whole levels, 4 bits
+  each). Still water is a top; flowing water is a top or a side, which the shading finds from the depth buffer
+  (`litWaterIsTop`, as rt_shadow finds a surface's normal). The face from the fragment's position derivatives was the
+  first try: on the M3 it came out wrong along every block's edge and over much of the far water (a lab debug view:
+  red dashes on every block edge), so it isn't used. The LOD's water writes its layer too (`out.color`); its deep water
+  is opaque (alpha 1) and the far field's has none: those get a sandy floor (below).
+- **Terrain in the reflections, the water's depth** (`water_trace`, a compute pass after the relight's sun and sky
+  light, before the anti-aliasing's resolve): per 4 x 4 pixels of water by default (`METALMC_WATERRTSCALE=2`: per 2 x 2;
+  a different pixel each frame, Bayer order; at a shore the first that is water) the waves' normal at its footprint,
+  then
+  - one ray along the reflected direction through RtShadows' instance structure (the LOD's blocks, near terrain
+    included; water isn't in it). A hit is lit as the GI cache lights its bounce hits: the quad it hit read from the
+    LOD node's buffer (`GI_HIT`, zero copy: material, face, block light, sky cover), its albedo times the sun (the share
+    of the sun's disk its cells see), plus the cells' irradiance (sky and bounce), plus vanilla's block light and the
+    moon, in the relight's units; then the air along the reflected path (the aerial perspective's for that distance in
+    that direction). Escaping rays take the sky map. At half resolution the reflected rays run on a checkerboard that
+    flips every frame (half of them; the other texels take the reflection of the one beside them, and the anti-aliasing
+    averages the frames). Glossy reflections from a random tilt of the normal (the waves finer than the pixel) were
+    tried: far reflections of a coast turned into salt-and-pepper noise the anti-aliasing couldn't settle; dropped (the
+    LEAN roughness still widens the glints);
+  - one ray along the refracted direction, the water's depth along it (at half resolution shared by 2 x 2 texels: one
+    traces each frame);
+  - the body's terms: `A` takes the floor as vanilla drew it to our light seen through the water (vanilla's light at
+    the floor off: its sky light dimmed a level a block of water; ours on: the sun through the water above it along its
+    refracted path, focused by the waves into caustics, and the sky's light through the water straight above; then
+    Beer-Lambert along the refracted ray), `S` is the light the water scatters toward the camera (its tint, from the
+    layer's color: the biome's water color without its brightness or the texture's streaks, half way to a clear sea's
+    teal, times `WATER_SCATTER` of the light on the surface). With `seen`, what a white floor would add (`viewT x
+    floorE`), the floor's reflectance is clamped to 1: `min(floor x A, seen)` (at night vanilla's light under water is
+    so dim that dividing by it lifted the floor above the land around it).
+  Out: the reflection and the visibility traced toward the sun or the moon (RGBA16Float); `A`, `seen`, `S` (three
+  RG11B10Float's bits) and the depth (RGBA32Uint).
+- **Per pixel** (`litWaterPixel`, in the anti-aliasing's resolve as it loads each pixel, after the relight): the waves at
+  the pixel's footprint (so Fresnel and the glints keep the full resolution), the layer taken off what was drawn
+  (`(c - a W) / (1 - a)`), then `(min(floor x A, seen) + S) x (1 - F) + reflection x F + the sun's glint + the moon's
+  glint`. With `METALMC_WATERREFRACT=1` the floor is taken where the refracted ray meets it (the pixel whose own ray
+  reaches that point shows it through the water too; the waves bend it, the flat surface's own bend is left as vanilla
+  drew it): 0.5 ms more at 85% water, off by default. Water seen from the side (falls) or
+  from below, and anything without rays: relit as it was drawn (its color over vanilla's light, times ours), with the
+  sky map's reflection on tops.
+- **Waves.** Round 1's tile at 0.6 of its slopes (calmer: the sunset sea read as a breezy one), and a second tile of
+  ripples (`water_ripples`: 8 blocks, 32 texels a block, eight waves from 1.6 down to 0.3 blocks, running with the wind
+  at 18 degrees, `worldWindDegrees`, and 80 either side; LEAN-mipmapped the same way), so up close the surface breaks
+  the reflections up and far away it turns into roughness. `METALMC_WATERRIPPLES` scales them (0.5).
+- **Caustics** (in `A`): the light the waves focus on the floor, to first order `1 / (1 + D (1 - 1/1.33) div s)` with
+  the divergence of the slopes (both tiles, by central differences) where the sun's refracted ray from the floor crosses
+  the surface, squared for contrast, each tile's level following the depth (deeper, the ripples' focus blurs out), faded
+  out by 24 blocks. `METALMC_WATERCAUSTICS` (1; 0 off).
+- **Under water** (the camera's fluid, `mmc_water_camera`): vanilla's water fog goes (`FogRendererMixin`), and every
+  pixel is seen through the water between (`litWaterFog`: Beer-Lambert over the distance up to 96 blocks, the sky
+  through 32, plus the water's scattered light), with or without our sky (our sky doesn't run under water). Sunlit tops
+  down there get the caustics and the sun's absorption on its way down, on their sunlit share (their depth under the
+  surface from their sky light: water dims it a level a block).
+- **Rain** (`METALMC_EXP=wet`, `litWaterWet`): lit terrain open to the sky (sky light 14 and up; tops, sides a third)
+  gets wet as the rain strengthens: darker (to two thirds) and a film of water reflecting the sky map (water's Fresnel),
+  a mirror where a world-space noise of about 3 blocks says puddles lie.
+- Switches: `METALMC_WATERRT=0` (no rays: the sky map's reflection, the water relit as drawn), `METALMC_WATERRTSCALE`
+  (pixels per traced texel along each axis: 4, the default, or 2), `METALMC_WATERCHECKER=0`, `METALMC_WATERABSORB=r,g,b`
+  (0.35, 0.10, 0.07 per block), `METALMC_WATERSCATTER` (0.035), `METALMC_WATERREFRACT` (0, off: 1 bends the floor by the
+  waves), `METALMC_WATERWAVES` (0.6), `METALMC_WATERRIPPLES` (0.5), `METALMC_WIND` (18). Lab mode: the defines at the top
+  of `lit_relight_header.metal` and `water_trace.metal` (`WATER_ABSORB`, `WATER_SCATTER`, `WATER_CAUSTICS`,
+  `WATER_REFRACT`, `WATER_FLOOR`, `WATER_TEAL`, `WATER_CHECKER`), `RIPPLE_GAIN` in `water_ripples.metal`, and
+  `<shader dir>/water_rt.txt` (2 or 4) for the rays' resolution live.
+
+### Verified offline (2026-10-10, no game)
+
+- `swift build -c release`: clean. `litflow - - compile` (every variant of the anti-aliasing's resolve, the far field and
+  lit mode's own pass, compiled with the device's compiler) passes under `lit,rtshadows,sky,gi,water,coloredlight,post,wet`,
+  `lit,rtshadows,sky,water,wet` and `lit,rtshadows,water`; `water_trace`'s library compiles (an offline check through
+  `mmc_debug_water_trace_source`); the patch of vanilla's translucent terrain MSL (`mmc_debug_water_patch`) applies to and
+  compiles from both the game's own MSL (dumped with `-PdumpMsl`) and SPIRV-Cross's output of vanilla's GLSL through
+  glslangValidator, multidraw and not.
+- Not done offline: litflow's water section (its G-buffer and frames) wasn't rerun: the GPU queue went to the game.
+
+### In game (2026-10-10, lab mode: 3456 x 2234 fullscreen, TAA, vsync, LOD 8192, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post,wet`)
+
+- **It runs.** "water: minecraft:pipeline/translucent_terrain(_multidraw) writes vanilla's water into the G-buffer" 0.1 s
+  after the atlas arrives; "reflection and refraction rays at 864x559" (quarter) or "1728x1117" (half).
+- **The seam is gone.** Near and far water reflect alike to the horizon (sunset_water, water_closeup); the far
+  coast's reflection lies under it, broken at its foot by the waves. The face from derivatives (first try) drew a red
+  dash on every block edge in a debug view; the depth buffer's normal at the same pixels said "top".
+- Pictures (`bench_out/agents/water/`; boards before | after | SEUS in `boards/`, the shots in `shots/`): `w2-*` the
+  first full version, `w3-`/`w4-` tuning (absorption, scatter, waves), `w5-sunset-horizon-crop.png` the coast's
+  reflection without the glossy jitter (with it: salt-and-pepper, `w4-sunset-horizon-crop.png`), `w6-*` all scenes with
+  half-resolution rays, `w7-hq-*` half against quarter resolution, `w8-*` the defaults (`w8h-water_closeup` with
+  half-resolution rays), `w8-underwater` (the camera 7 blocks under the surface).
+- **Against SEUS** (the census twins, scene by scene):
+  - water_closeup: much closer. Clear water: the sand and seagrass near, teal in the shallows, deep blue past 8-10
+    blocks; the sky's reflection taking over toward the horizon; the far islands reflected; no vanilla streaks. SEUS's
+    floor keeps more contrast at mid depth and its sky reflection near the horizon is brighter (its sky is). Ours has the
+    sun's glitter in the middle of the view (the sun is behind it at 30 degrees: physically there; SEUS's tilted sun path
+    puts its glint out of view): a large soft bright patch, the most un-SEUS thing left.
+  - sunset_water: the flat deep-blue sheet is gone. A calm sea with the sun's path, the far coast mirrored under itself,
+    dark water near. SEUS's sea mirrors its golden sky and clouds; ours mirrors our sky (paler, bluer at mid height) and
+    no clouds (vanilla's aren't in the sky map or the rays).
+  - noon_overview: the river teal where shallow (its floor showing), sky-blue where it reflects at a distance; SEUS's
+    deep parts are darker navy, its shallows cyan glitter (its quirk, not copied).
+  - night_torches: the river no longer glows blue. Its floor still shows faintly teal near the village (lit by the
+    torches' block light through the water); SEUS's river is near black.
+  - rain: the river takes the overcast sky with rain-rippled waves; the terrain darkens a little where wet (`wet`);
+    SEUS's twin has no rain (invalid).
+  - under water: vanilla's flat blue fog is replaced by Beer-Lambert: the sand floor teal nearby, fading to deep blue,
+    seagrass and kelp in silhouette.
+
+### Costs (in game, lab mode, the frame against the same frame with water's round 2 switched off in its shaders)
+
+| water_closeup (85% of the frame water) | fps | the frame |
+|---|---|---|
+| round 2 off (litWaterPixel returns at once, water_trace writes "none") | 95 | 10.5 ms |
+| half-resolution rays, full per-pixel composite (first version) | 65 | 15.4 ms (+4.9) |
+| the shading moved into water_trace, refracted rays shared, checkerboard | 71 | 14.1 ms (+3.6) |
+| the same at quarter resolution | 80 | 12.5 ms (+2.0) |
+| ... without the floor's look-up (WATER_REFRACT 0) | 83 | 12.0 ms (+1.5) |
+| **the defaults** (quarter resolution, no floor look-up, the glints' visibility from water_trace; session 4) | 84 (off: 96) | 11.9 ms (**+1.5**) |
+| the defaults with half-resolution rays (session 4) | 72-74 | +3.2 |
+
+| sunset_water (about 45% of the frame water), the defaults | 88 (off: 96) | 11.4 ms (**+0.95**) |
+|---|---|---|
+
+Per pass (lab `trace`; GPU timestamps, noisy: water_trace runs beside the GI cache's update): the anti-aliasing's resolve
+1.47 ms with round 2 off at water_closeup, 2.94 with the first full composite (its 1.47: the floor's look-up 0.5, the
+glints with their shadow-visibility read 0.29, the per-pixel waves 0.13, the rest 0.54), 2.27 with the defaults
+(+0.80); water_trace 0.08 off (writing "none" at quarter resolution), 0.84 with the defaults (+0.77), 2.28 at half
+resolution. At sunset_water: the resolve +0.38, water_trace +0.65. So with a lot of water on screen round 2 costs about
+1 ms (sunset_water) to 1.5 ms (water_closeup, the frame nearly all water), over the 1 ms asked for in the second; the
+half-resolution rays (sharper reflections of the shore) another 1.7 ms there.
+
+### Not done, and next
+
+- **Cost at water_closeup** (1.5 ms, the frame nearly all water). The composite in the anti-aliasing's resolve is 0.8 ms
+  of it, about half for things it reads (two of water_trace's texels, the waves) in a loop whose occupancy is low (its
+  tile in threadgroup memory, the relight's registers); a pass of its own at full occupancy writing the water's color
+  for the resolve to read once is the next try. water_trace at quarter resolution is 0.77 ms: two rays and the light per
+  texel; the refracted ray could be skipped where vanilla's light says the water is deep (its floor's sky light).
+- **The floor's bend by the waves** is off by default (0.5 ms at 85% water): with it, the floor is looked up where the
+  refracted ray meets it. A cheaper bend (one color read, the layer taken from the pixel itself) would cost about half.
+- **Glitter.** The sun's path near the camera is a large soft patch (the anti-aliasing blurs the ripples' moving
+  sparkles); sharper sparkles need the glint out of the temporal blend, or calmer ripples where the sun is.
+- **Clouds in the reflections**: the sky map and the rays have none (vanilla's clouds; the volumetric clouds, once in,
+  could be reflected through the sky map).
+- **Night**: the floor near a lit village still shows (vanilla's block light at the surface lights it); the colored
+  light volume could light it instead.
+- Shores at quarter resolution: the far coast's reflection breaks into small dashes at 4 x 4 pixels (half resolution:
+  smoother streaks).
+- Water seen through glass or ice, and improved transparency (`oit_*` pipelines), aren't patched (classic transparency,
+  the game's setting here, is).
+- Not measured: a flight over water (the history's behaviour with the rays' 16-frame rotation while moving).
+
+## Colored block light (prototype, `METALMC_EXP=lit,coloredlight`, 2026-10-05)
 
 ## Colored block light (prototype, `METALMC_EXP=lit,coloredlight`, 2026-10-05)
 

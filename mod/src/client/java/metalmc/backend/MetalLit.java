@@ -9,7 +9,12 @@ import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.nio.FloatBuffer;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.fog.FogData;
+import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.resources.Identifier;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -45,6 +50,13 @@ public final class MetalLit {
         return ENABLED && MetalDevice.current != null;
     }
 
+    /** METALMC_EXP=lit,water: water's surfaces in the G-buffer, and under water the relight's water in place of vanilla's fog. */
+    public static final boolean WATER = ENABLED && experiment("water");
+
+    public static boolean waterEnabled() {
+        return WATER && MetalDevice.current != null;
+    }
+
     /** Resolved on first use, so nothing loads the library unless the Metal backend is running. */
     private static final class Native {
         private static final Linker LINKER = Linker.nativeLinker();
@@ -58,12 +70,44 @@ public final class MetalLit {
 
         static final MethodHandle LEVEL_PASS = h("mmc_lit_level_pass", true, null);
         static final MethodHandle RELIGHT = h("mmc_lit_relight", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
+        static final MethodHandle WATER_SPRITES = h("mmc_water_sprites", false, null, JAVA_LONG);
+        static final MethodHandle WATER_CAMERA = h("mmc_water_camera", true, null, JAVA_INT);
     }
 
     private static RuntimeException rethrow(Throwable t) {
         if (t instanceof RuntimeException r) return r;
         if (t instanceof Error e) throw e;
         return new IllegalStateException(t);
+    }
+
+    private static GpuTextureView waterAtlasSent;
+
+    /**
+     * Water (METALMC_EXP=lit,water; Sources/MetalMCNative/Water.swift), each frame before the relight: whether the camera is
+     * in water, and when the block atlas changes, where the water sprites sit in it (vanilla's translucent terrain then
+     * writes its water texels into the G-buffer). The native side ignores both without water.
+     */
+    public static void water(boolean cameraInWater) {
+        if (!enabled()) return;
+        try {
+            Native.WATER_CAMERA.invokeExact(cameraInWater ? 1 : 0);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+        AbstractTexture tex = Minecraft.getInstance().getTextureManager().getTexture(TextureAtlas.LOCATION_BLOCKS);
+        if (!(tex instanceof TextureAtlas atlas)) return;
+        GpuTextureView view = atlas.getTextureView();
+        if (view == null || view == waterAtlasSent) return;
+        TextureAtlasSprite still = atlas.getSprite(Identifier.withDefaultNamespace("block/water_still"));
+        TextureAtlasSprite flow = atlas.getSprite(Identifier.withDefaultNamespace("block/water_flow"));
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            FloatBuffer r = stack.floats(still.getU0(), still.getV0(), still.getU1(), still.getV1(),
+                flow.getU0(), flow.getV0(), flow.getU1(), flow.getV1());
+            Native.WATER_SPRITES.invokeExact(MemoryUtil.memAddress(r));
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+        waterAtlasSent = view;
     }
 
     /** The next render pass is the level's main pass (LevelRenderer's, where the terrain is drawn): it gets the G-buffer. */

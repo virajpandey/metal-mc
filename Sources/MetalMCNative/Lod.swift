@@ -493,8 +493,8 @@ static LodOut lodShadeLit(VOut in, constant LodUniforms& u, constant LodSpriteGP
     out.gbuf = litPack(albedo, ao, (in.matFace >> 8) & 7, in.pos.z, sky, block);
 #if LIT_WATER
     // Water (METALMC_EXP=water, Lit.swift): its surface flagged for the relight's reflections (the water pipelines write
-    // the G-buffer with water on).
-    if ((in.matFace & 255u) == MAT_WATER) out.gbuf = litPackWater((in.matFace >> 8) & 7u, in.pos.z, sky, block);
+    // the G-buffer with water on), with the layer as it's blended (Water.swift: the relight takes it off to see the floor).
+    if ((in.matFace & 255u) == MAT_WATER) out.gbuf = litPackWaterLayer((in.matFace >> 8) & 7u, in.pos.z, sky, block, out.color);
 #endif
     return out;
 }

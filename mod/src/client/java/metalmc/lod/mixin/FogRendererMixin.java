@@ -8,6 +8,10 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.world.level.material.FogType;
 
 /**
  * With LOD active, the render-distance fog moves from vanilla's chunk edge to the LOD's edge, so vanilla
@@ -24,6 +28,19 @@ abstract class FogRendererMixin {
     @ModifyVariable(method = "setupFog", at = @At("HEAD"), argsOnly = true, ordinal = 0)
     private int metalmc$fidelityRenderDistance(int renderDistanceInChunks) {
         return FIDELITY ? 32 : renderDistanceInChunks;
+    }
+
+    /**
+     * Water (METALMC_EXP=lit,water; Sources/MetalMCNative/Water.swift): with the camera in water the relight draws the water
+     * between the camera and what it sees (Beer-Lambert over the distance, the light the water scatters toward it), so
+     * vanilla's water fog, which the terrain, the entities and the water's surface would otherwise carry too, goes.
+     */
+    @Inject(method = "setupFog", at = @At("RETURN"))
+    private void metalmc$waterFog(Camera camera, int renderDistance, DeltaTracker deltaTracker, float darkness, ClientLevel level,
+                                  CallbackInfoReturnable<FogData> cir) {
+        if (FIDELITY || !metalmc.backend.MetalLit.waterEnabled() || camera.getFluidInCamera() != FogType.WATER) return;
+        FogData fog = cir.getReturnValue();
+        fog.environmentalStart = fog.environmentalEnd = 1e6f;
     }
 
     @Inject(method = "setupFog", at = @At("RETURN"))
