@@ -53,6 +53,11 @@
       "note": "2.6 blocks over the sea just off the same shore (water 12 deep here), looking down at it toward the late-afternoon sun in the west: the sky's reflection and the sun's glint, waves, the shore's edge at the right."
     },
     {
+      "name": "cave_mouth",
+      "pos": [60.5, 69, 0.5], "yaw": 270, "pitch": 4, "time": 1500, "weather": "clear",
+      "note": "Under the rock of a shallow cave 60 blocks east of spawn (floor 69, the terrain above it 89), looking east out of its mouth at a hill, the morning sun about 35 degrees up in the east above the frame: with the volumetric light (godrays) the morning mist outside shows the sun's beams and the hill's shadow in the air. Found by scanning the fixture's region files for air under rock whose row reaches open sky 3-14 blocks east or west (the sun's plane) and runs on 4 or more blocks under rock (the god rays helper's cavescan); the higher candidate at 156 94 -290 is above the morning mist."
+    },
+    {
       "name": "mountain_view",
       "pos": [1064, 172, 230], "yaw": 90, "pitch": 6, "time": 7000, "weather": "clear",
       "note": "On the west shoulder of the frozen peaks 1.1 km east of spawn (ground 165 here, the summit 184 at 1108 232), looking west across the whole fixture toward the horizon: a long view for the LOD, the far field and the aerial perspective. Higher up the cloud layer (192-196) fills the top of the frame as a ceiling."
