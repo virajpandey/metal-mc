@@ -835,7 +835,9 @@ water writes its layer) and on the Java side `MetalLit.water` (each frame: the c
   out by 24 blocks. `METALMC_WATERCAUSTICS` (1; 0 off).
 - **Under water** (the camera's fluid, `mmc_water_camera`): vanilla's water fog goes (`FogRendererMixin`), and every
   pixel is seen through the water between (`litWaterFog`: Beer-Lambert over the distance up to 96 blocks, the sky
-  through 32, plus the water's scattered light), with or without our sky (our sky doesn't run under water).
+  through 32, plus the water's scattered light), with or without our sky (our sky doesn't run under water). Sunlit tops
+  down there get the caustics and the sun's absorption on its way down, on their sunlit share (their depth under the
+  surface from their sky light: water dims it a level a block).
 - **Rain** (`METALMC_EXP=wet`, `litWaterWet`): lit terrain open to the sky (sky light 14 and up; tops, sides a third)
   gets wet as the rain strengthens: darker (to two thirds) and a film of water reflecting the sky map (water's Fresnel),
   a mirror where a world-space noise of about 3 blocks says puddles lie.

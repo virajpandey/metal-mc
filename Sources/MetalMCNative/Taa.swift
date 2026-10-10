@@ -34,7 +34,7 @@ private let taaWaterLoad = """
             c.rgb = litRelightPixel(c.rgb, q, d, g, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));
             c.rgb = litWaterWet(c.rgb, q, d, g, litFrame, litWaterSky);
             c.rgb = litWaterPixel(c.rgb, q, d, g, litVis, litFrame, litEnv, litWaves, litWavesDetail, litWaterSky, litLm, litWaterTrace, litWaterTraceAS, color, litGbuf, depth\(litGi ? ", litGiCode" : ""));
-            c.rgb = litWaterFog(c.rgb, q, d, litFrame, litEnv, litLm);
+            c.rgb = litWaterFog(c.rgb, q, d, g, litFrame, litEnv, litLm, litVis, litWaves, litWavesDetail);
         }
 """
 

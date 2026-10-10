@@ -360,7 +360,7 @@ private let litRelightFsWater = """
     float3 c = litRelightPixel(dst.rgb, q, d, g, vis, lightmap, f, env\(litGi ? ", giStandIn, gi" : "")\(clEnabled ? ", clRGB, clAux, clf, clSh" : ""));
     c = litWaterWet(c, q, d, g, f, waterSky);
     c = litWaterPixel(c, q, d, g, vis, f, env, waves, wavesDetail, waterSky, lightmap, waterTrace, waterTraceAS, waterColor, gbuf, depth\(litGi ? ", gi" : ""));
-    return float4(litWaterFog(c, q, d, f, env, lightmap), dst.a);
+    return float4(litWaterFog(c, q, d, g, f, env, lightmap, vis, waves, wavesDetail), dst.a);
 """
 
 /// With water: the kernels that make its waves' tile and sky map each frame (litWaterPixel samples them), appended to lit

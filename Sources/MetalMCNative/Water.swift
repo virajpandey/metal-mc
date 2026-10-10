@@ -284,7 +284,7 @@ struct WaterFrameGPU {
 
 /// LitFrame's fields for water's second round (spliced after water2, with litWater only).
 let waterFrameFields = """
-    float4 water3;          // water: x pixels per traced texel along each axis (0: none this frame), y 1 with the camera in water, z the frame (for the waves' jitter)
+    float4 water3;          // water: x pixels per traced texel along each axis (0: none this frame), y 1 with the camera in water, z the frame number
     float4x4 viewProj;      // water: the projection the level was drawn with (jittered) times the view rotation: camera-relative to clip
 
 """
@@ -603,7 +603,8 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
         float F = litWaterFresnel(max(dot(n, V), 1e-3));
         float3 A = litWaterUnpack(tas.x), S = litWaterUnpack(tas.y);
         float3 body = S;
-        if (any(A > 0.0)) {
+        // (Where the water is deep enough that the floor adds nothing that shows, no floor to look up.)
+        if (max(A.r, max(A.g, A.b)) > 0.0) {
             // The floor where the refracted ray meets it (tr.w blocks along it), on the screen. The waves bend it; the flat
             // surface's own bend (the floor raised toward the camera) is left as vanilla drew it.
             float4 layer = litWaterLayer(g);
@@ -691,15 +692,35 @@ static float3 litWaterWet(float3 c, uint2 q, float d, uint2 g, constant LitFrame
 }
 
 // The camera under water: everything it sees is seen through the water between (Beer-Lambert over the distance, up to
-// 96 blocks; the sky through 32), with the light the water scatters toward it, which is the light under the surface
-// tinted by the water. c: the pixel's color as the relight left it, sRGB-encoded.
-static float3 litWaterFog(float3 c, uint2 q, float d, constant LitFrame& f, constant float4* env, texture2d<float> lightmap) {
+// 96 blocks; the sky through 32), with the light the water scatters toward it (the light a few blocks under the surface,
+// tinted by the water). Sunlit terrain down there (lit terrain whose sky light says it lies D = 15 - sky light blocks
+// under the surface: water dims sky light a level a block) gets the sun as the water lets it through, the waves'
+// caustics and the absorption along the sun's way down, on its sunlit share. c: the pixel's color as the relight left it,
+// sRGB-encoded; g: its G-buffer texel.
+static float3 litWaterFog(float3 c, uint2 q, float d, uint2 g, constant LitFrame& f, constant float4* env, texture2d<float> lightmap,
+                          texture2d<half, access::read> vis, texture2d<float> waves, texture2d<float> detail) {
     if (f.water3.y < 0.5 || f.water.w <= 0.0) return c;
     float dist = 32.0;
+    float3 lin = skyDecode(max(c, 0.0));
     if (d > 0.0) {
-        float2 ndc = (float2(q) + 0.5) / f.size.xy * 2.0 - 1.0;
-        float4 h = f.invViewProj * float4(ndc, d, 1.0);
-        dist = min(length(h.xyz / h.w), 96.0);
+        float3 rel = litWaterRelAt(f.invViewProj, f.size.xy, q, d);
+        dist = min(length(rel), 96.0);
+        uint code = g.x >> 29;
+        if (code == 3u && f.sunDir.y > 0.0 && WATER_CAUSTICS > 0.0 && litDepthMatches(d, g.y & 0xFFFFu)) {
+            float D = max(15.0 - float((g.y >> 16) & 255u) / 16.0, 0.0);
+            float vSun = 1.0;
+            if (f.size.z > 0.0 && f.sunDir.w < 0.5) {
+                uint s = uint(f.size.z);
+                vSun = float(vis.read(min(q / s, uint2(vis.get_width() - 1, vis.get_height() - 1))).r);
+            }
+            float sinSun2 = 1.0 - f.sunDir.y * f.sunDir.y;
+            float3 sunUp = normalize(float3(f.sunDir.x, sqrt(max(WATER_ETA * WATER_ETA - sinSun2, 0.0)), f.sunDir.z));
+            float caustic = litWaterCaustic(waves, detail, f.water.yz, rel, D, sunUp);
+            float3 sunT = exp(-WATER_ABSORB * (D / max(sunUp.y, 0.2)));
+            // The sunlit share of a top's light, about: the sun's against the sun's and the sky's.
+            float share = vSun * saturate(f.sunDir.y) * 0.8;
+            lin *= 1.0 - share + share * caustic * sunT;
+        }
     }
     float3 T = exp(-WATER_ABSORB * dist);
     // The light a few blocks under the surface: the sun's and the sky's (without our sky, the daylight curve's, scaled
@@ -710,7 +731,7 @@ static float3 litWaterFog(float3 c, uint2 q, float d, constant LitFrame& f, cons
         dayScale = litLuma(max(skyDecode(litLightmap(lightmap, 0.0, 15.0)) - lm00, 0.0));
     }
     float3 E = (env[0].rgb * saturate(f.sunDir.y) + env[3].rgb) * (dayScale * f.misc.w) * exp(-WATER_ABSORB * 4.0);
-    float3 lin = skyDecode(max(c, 0.0)) * T + float3(0.26, 0.92, 3.9) * (WATER_SCATTER * E) * (1.0 - T);
+    lin = lin * T + litWaterTint(float3(0.0)) * (WATER_SCATTER * E) * (1.0 - T);
     float3 o = skyEncode(lin);
     return f.size.w <= 1.0 ? saturate(o) : max(o, 0.0);
 }
@@ -859,11 +880,6 @@ static float3 wtLightmap(texture2d<float> lm, float block, float sky) {
 static float wtBrightness(float level) {
     float x = saturate(level / 15.0);
     return x / (4.0 - 3.0 * x);
-}
-static uint wtHash(uint2 q, uint f) {
-    uint h = (q.x * 0x8da6b343u) ^ (q.y * 0xd8163841u) ^ (f * 0xcb1ab31fu);
-    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
-    return h;
 }
 
 // The GI cache's light on a face at f (relative to the camera's block), as gi_resolve finds it: bilinear over the 2 x 2
@@ -1097,13 +1113,14 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     float3 viewT = exp(-WATER_ABSORB * thick);
     float3 S = litWaterTint(layer.rgb) * (WATER_SCATTER * (1.0 - viewT)) * surfE;
     float3 A = 0.0;
-    if (layer.a > 0.02 && layer.a < 0.98) {
+    float3 seen = viewT * floorE;   // about what a white floor would add
+    if (layer.a > 0.02 && layer.a < 0.98 && max(seen.r, max(seen.g, seen.b)) > 0.002) {
         // The floor as vanilla drew it (in vanilla's light, which water dims a sky light level a block) to ours.
         float3 floorV = skyDecode(litWaterVanilla(lightmap, lm, blockLevel, max(skyLevel - floor(D), 0.0)));
         A = viewT * floorE / max(floorV, float3(1e-4));
-    } else {
+    } else if (!(layer.a > 0.02 && layer.a < 0.98)) {
         // No layer to take off (the LOD's deep water, drawn opaque; the far field's): a sandy floor.
-        S += WATER_FLOOR * floorE * viewT;
+        S += WATER_FLOOR * seen;
     }
     out.write(float4(max(col, 0.0), thick), gid);
     outAS.write(uint4(litWaterPack(A), litWaterPack(S), 0u, 0u), gid);
