@@ -3,7 +3,8 @@
 	"package": "metalmc.light.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
-		"ClientLevelLightMixin"
+		"ClientLevelLightMixin",
+		"TextureAtlasAccessor"
 	],
 	"injectors": {
 		"defaultRequire": 1

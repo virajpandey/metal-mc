@@ -1118,17 +1118,19 @@ kernel void clouds_vis(texture2d<half, access::read> vis [[texture(0)]], texture
                        constant CloudFrame& cf [[buffer(0)]], constant float4x4& inv [[buffer(1)]],
                        constant uint4& sp [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-    half v = vis.read(gid).r;
+    // r the direct visibility, which the clouds' transmittance multiplies; the other channels as they were (with leaflight,
+    // g: the leaves toward the sun, Foliage.swift).
+    half4 v = vis.read(gid);
     uint2 full = uint2(depth.get_width(), depth.get_height());
     uint2 fp = min(gid * sp.x + sp.yz, full - 1u);
     float d = depth.read(fp);
-    if (d <= 0.0 || sp.w == 0u || (v <= 0.0h && uint(cf.misc.y) != 4u)) { out.write(half4(v), gid); return; }
+    if (d <= 0.0 || sp.w == 0u || (v.r <= 0.0h && uint(cf.misc.y) != 4u)) { out.write(v, gid); return; }
     float2 uv = (float2(fp) + 0.5) / float2(full);
     float4 h = inv * float4(uv * 2.0 - 1.0, d, 1.0);
     float T = cloudTransmittanceToSun(h.xyz / h.w, cf, shadow);
     // Debug view 4: the clouds' shadows alone.
-    if (uint(cf.misc.y) == 4u) { out.write(half4(half(T)), gid); return; }
-    out.write(half4(v * half(T)), gid);
+    if (uint(cf.misc.y) == 4u) { out.write(half4(half(T), v.gba), gid); return; }
+    out.write(half4(v.r * half(T), v.gba), gid);
 }
 
 // Without anti-aliasing: the clouds over the frame as a pass of its own, after the sky's aerial perspective (programmable
@@ -1663,8 +1665,9 @@ final class Clouds: @unchecked Sendable {
         // The shadow map was made toward the clouds' light; the rays toward the moon only match it at night.
         let mapMoon = cf.light != cf.sun
         let matches = mapMoon == towardMoon && shadowMade
-        if visOut == nil || visOut!.width != vis.width || visOut!.height != vis.height {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: vis.width, height: vis.height, mipmapped: false)
+        // The visibility's own format (with leaflight two channels: Foliage.swift's leaves toward the sun in g, kept).
+        if visOut == nil || visOut!.width != vis.width || visOut!.height != vis.height || visOut!.pixelFormat != vis.pixelFormat {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: vis.pixelFormat, width: vis.width, height: vis.height, mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
             d.storageMode = .private
             visOut = ctx.device.makeTexture(descriptor: d)
