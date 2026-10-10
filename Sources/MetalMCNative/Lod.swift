@@ -15,7 +15,7 @@ using namespace metal;
 // Lit mode (METALMC_EXP=lit, Lit.swift): the opaque quads also write the terrain G-buffer.
 #define LIT_MODE \(litEnabled ? 1 : 0)
 \(litShaderHeader)
-\(foliageLight || foliageWave ? foliageLodHeader : "")\(foliageWave ? "#define LOD_WAVE 1\n" + foliageWindHeader : "")
+\(foliageLight || foliageWaveLod ? foliageLodHeader : "")\(foliageWaveLod ? "#define LOD_WAVE 1\n" + foliageWindHeader : "")
 struct LodUniforms {
     float4x4 proj;
     float4x4 view;
@@ -124,7 +124,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
                    constant LodUniforms& u [[buffer(19)]],
                    const device Xform* xforms [[buffer(20)]],
                    constant float4* colors [[buffer(21)]],
-                   const device uint* aoOffsets [[buffer(22)]],\(foliageWave ? "\n                   constant FoliageWind& wind [[buffer(26)]]," : "")
+                   const device uint* aoOffsets [[buffer(22)]],\(foliageWaveLod ? "\n                   constant FoliageWind& wind [[buffer(26)]]," : "")
                    texture2d<float> lightmap [[texture(29)]], sampler lightSampler [[sampler(14)]]) {
     uint2 q = quads[vid >> 2];
     uint corner = vid & 3;
@@ -151,7 +151,7 @@ vertex VOut lod_vs(uint vid [[vertex_id]], uint draw [[base_instance]],
         o.ao = 0xFFFFFFFFu;
         return o;
     }
-\(foliageWave ? lodWaveSway : "")    float4 clip = u.proj * (u.view * float4(\(foliageWave ? "swayed" : "rel"), 1.0));
+\(foliageWaveLod ? lodWaveSway : "")    float4 clip = u.proj * (u.view * float4(\(foliageWaveLod ? "swayed" : "rel"), 1.0));
     clip.y = -clip.y;   // same vertical flip as every translated Minecraft shader (flip_vert_y)
     o.pos = clip;
     uint faceClass = face == 2 ? 0u : (face == 3 ? 2u : 1u);   // top, side, bottom
@@ -1838,7 +1838,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
     enc.setFragmentBuffer(r.spriteBuffer ?? r.colorBuffer, offset: 0, index: 20)
     enc.setVertexBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
     enc.setFragmentBytes(&u, length: MemoryLayout<LodUniforms>.stride, index: 19)
-    if foliageWave { Foliage.shared.bindLod(enc, cam: SIMD3(cx, cy, cz)) }   // wave (Foliage.swift): the wind, buffer 26
+    if foliageWaveLod { Foliage.shared.bindLod(enc, cam: SIMD3(cx, cy, cz)) }   // wave,wavelod (Foliage.swift): the wind, buffer 26
     if xforms.count * 16 <= 4096 {
         enc.setVertexBytes(xforms, length: xforms.count * 16, index: 20)
         if useMesh { enc.setMeshBytes(xforms, length: xforms.count * 16, index: 20) }

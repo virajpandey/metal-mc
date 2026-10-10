@@ -31,8 +31,12 @@ import simd
 
 /// METALMC_EXP=leaflight (with lit): sunlight and sky light through leaves and plants.
 let foliageLight = litEnabled && experiments.contains("leaflight")
-/// METALMC_EXP=wave: leaves and plants sway in the wind.
+/// METALMC_EXP=wave: leaves and plants sway in the wind (the near chunks).
 let foliageWave = experiments.contains("wave")
+/// METALMC_EXP=wave,wavelod: the LOD's full-resolution leaves sway too, near the camera. Off unless asked: past vanilla's
+/// render distance the sway is under a pixel, and the test on every LOD vertex cost 0.12-0.16 ms (offline, forest and
+/// mountain_view at 3456 x 2234). It matters only at a short render distance, where the LOD's level 0 comes close.
+let foliageWaveLod = foliageWave && experiments.contains("wavelod")
 /// The near chunks look up each quad's foliage class in the atlas sprites' class map (with either switch).
 let foliageSprites = nearChunksEnabled && (foliageLight || foliageWave)
 
@@ -518,9 +522,9 @@ final class Foliage: @unchecked Sendable {
     }
 }
 
-/// 1 with leaflight (with lit) on, 2 with wave on, 3 with both (bits); the near chunks want the sprites' classes then.
+/// Bits: 1 leaflight (with lit) on, 2 wave on, 4 wavelod on; the near chunks want the sprites' classes with 1 or 2.
 @_cdecl("mmc_foliage_enabled")
-public func mmc_foliage_enabled() -> Int32 { (foliageLight ? 1 : 0) | (foliageWave ? 2 : 0) }
+public func mmc_foliage_enabled() -> Int32 { (foliageLight ? 1 : 0) | (foliageWave ? 2 : 0) | (foliageWaveLod ? 4 : 0) }
 
 /// The block atlas's foliage sprites, from the Java side (FoliageSprites): `view` the atlas's texture view handle (0 for
 /// none), its size in pixels, and `count` x 5 ints: x, y, width, height (pixels), code (class | sway << 2). Render thread.
