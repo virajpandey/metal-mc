@@ -129,7 +129,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // + 1 grid texels (16 pixels each) wide, and POST_LOCAL_EPS (stops squared) sets how strong an edge has to be for the
 // base to follow it rather than smooth over it (the skyline does; the leaves' and the blocks' texture doesn't).
 #define POST_LOCAL 0.0
-#define POST_LOCAL_DARK 0.38
+#define POST_LOCAL_DARK 0.28
 #define POST_LOCAL_RANGE 4.0
 #define POST_LOCAL_RADIUS 5
 #define POST_LOCAL_EPS 0.5
@@ -138,15 +138,16 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // degrees up or lower (dusk keeps its backlit mood: the sky's own adaptation already opens it up as the sun sets), and
 // POST_CAVE of it where the view is under cover (the share of sky and of sky light in a 64 x 64 grid of the G-buffer, 0.2
 // to 0.6): night and caves have the eye adaptation's own knobs and keep their pools of light.
-#define POST_GRADE_EV 0.75
-#define POST_DUSK 0.25
+#define POST_GRADE_EV 0.5
+#define POST_DUSK 0.1
 #define POST_CAVE 0.2
 
 // The Purkinje shift (night vision): in dim light the rods take over, which see no color and favor blue-green, so a
-// moonlit field turns blue-gray while a torch's pool keeps its warmth. Per pixel, by its own light before the exposure
-// (scene units: vanilla's sunlit white is about 1): all rods below 2^POST_PURKINJE_LO, none above 2^POST_PURKINJE_HI;
+// moonlit field turns blue-gray while a torch's pool keeps its warmth. At night (from the sun 1 degree under the horizon,
+// all of it at 6; none by day, when the eye is adapted to daylight even in deep shade), per pixel by its own light before the exposure (scene
+// units: vanilla's sunlit white is about 1): all rods below 2^POST_PURKINJE_LO, none above 2^POST_PURKINJE_HI;
 // POST_PURKINJE how far toward the rods' picture (0 off).
-#define POST_PURKINJE 0.0
+#define POST_PURKINJE 0.6
 #define POST_PURKINJE_LO (-9.0)
 #define POST_PURKINJE_HI (-4.5)
 
@@ -449,8 +450,8 @@ static float postLocalShift(texture2d<float> coef, uint2 gid, float l, float ev,
 // luminance from CIE XYZ (Thompson, Shirley and Ferwerda, "A Spatial Post-Processing Algorithm for Images of Night
 // Scenes", 2002), divided by white's (2.573) so a gray keeps its brightness while reds darken and blue-greens brighten,
 // shown as a gray tinted toward blue (the tint's luminance 1).
-static float3 postPurkinje(float3 c, float lum) {
-    float w = POST_PURKINJE * (1.0 - smoothstep(POST_PURKINJE_LO, POST_PURKINJE_HI, log2(max(lum, 1e-8))));
+static float3 postPurkinje(float3 c, float lum, float night) {
+    float w = POST_PURKINJE * night * (1.0 - smoothstep(POST_PURKINJE_LO, POST_PURKINJE_HI, log2(max(lum, 1e-8))));
     if (w <= 0.0) return c;
     float X = dot(c, float3(0.4124, 0.3576, 0.1805)), Y = dot(c, float3(0.2126, 0.7152, 0.0722)), Z = dot(c, float3(0.0193, 0.1192, 0.9505));
     float V = max(Y * (1.33 * (1.0 + (Y + Z) / max(X, 1e-8)) - 1.68), 0.0) * (1.0 / 2.573);
@@ -609,8 +610,8 @@ kernel void post_composite(texture2d<float, access::read> scene [[texture(0)]], 
     // of it under cover (post_outdoor's estimate).
     float lift = mix(POST_DUSK, 1.0, smoothstep(0.07, 0.5, f.sun.y)) * mix(POST_CAVE, 1.0, smoothstep(0.2, 0.6, expo[1].w));
     float ev = expo[0].x + POST_EV + POST_GRADE_EV * lift;
-    // Night vision, by the pixel's own light (before the exposure).
-    if (POST_PURKINJE > 0.0) c = postPurkinje(c, lum);
+    // Night vision, at night, by the pixel's own light (before the exposure).
+    if (POST_PURKINJE > 0.0) c = postPurkinje(c, lum, 1.0 - smoothstep(-0.1, -0.02, f.sun.y));
     // The local tone map: the pixel's own light against the edge-aware base (the frame's light before the bloom, as the
     // base's statistics have it).
     if (f.effects.w > 0.5 && (POST_LOCAL > 0.0 || POST_LOCAL_DARK > 0.0)) c *= exp2(postLocalShift(local, gid, log2(max(lum, 1e-6)), ev, lift));

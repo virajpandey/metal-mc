@@ -1975,16 +1975,16 @@ before the grade (`bench_out/agents/grade/configs/base.json` in the main checkou
 | Knob | File | Default (before) | What it does |
 |---|---|---|---|
 | `POST_EV` | post.metal | 0 (0) | exposure compensation, stops, on top of the eye adaptation; `METALMC_POSTEV` |
-| `POST_GRADE_EV` | post.metal | 0.75 (0) | the grade's exposure lift, stops; the day's lift |
-| `POST_LOCAL_DARK` | post.metal | 0.38 (0) | the local tone map below mid-gray: the land in shade lifted; the day's lift |
+| `POST_GRADE_EV` | post.metal | 0.5 (0) | the grade's exposure lift, stops; the day's lift |
+| `POST_LOCAL_DARK` | post.metal | 0.28 (0) | the local tone map below mid-gray: the land in shade lifted; the day's lift |
 | `POST_LOCAL` | post.metal | 0 (0) | the local tone map above mid-gray: the sky compressed (lost in every autotune pass: our sky is darker than SEUS's already) |
 | `POST_LOCAL_EPS`, `_RADIUS`, `_RANGE` | post.metal | 0.5, 5, 4 | its guided filter's edge threshold (stops squared), box (grid texels of 16 pixels), and the most stops counted |
-| `POST_DUSK` | post.metal | 0.25 (1) | the share of the day's lift kept with the sun 4 degrees up or lower (all of it from 30 degrees) |
+| `POST_DUSK` | post.metal | 0.1 (1) | the share of the day's lift kept with the sun 4 degrees up or lower (all of it from 30 degrees) |
 | `POST_CAVE` | post.metal | 0.2 (1) | the share of the day's lift kept under cover (`post_outdoor`'s estimate) |
 | `POST_ADAPT_DARK` | post.metal | 0.4 (0.7) | how much of a darker scene's difference past 2.5 stops the eye adaptation makes up (night and caves) |
 | `POST_ADAPT_REF`, `POST_ADAPT_DARK_NEAR` | post.metal | -1.9, 0.2 | the adaptation's reference and its response within the knee (a weak exposure lever: 20-30% of a change shows) |
 | `POST_AGX_SAT`, `POST_AGX_POWER` | post.metal | 1.15 (1.3), 1 | AgX's look: saturation and power (contrast) on its sigmoid's output |
-| `POST_PURKINJE`, `_LO`, `_HI` | post.metal | 0, -9, -4.5 | night vision: how far dim pixels go toward the rods' picture, and the light levels (log2, scene units) it spans |
+| `POST_PURKINJE`, `_LO`, `_HI` | post.metal | 0.6, -9, -4.5 (0) | night vision, with the sun 1 degree under the horizon and lower: how far dim pixels go toward the rods' picture, and the light levels (log2, scene units) it spans |
 | `LIT_SUN_GAIN`, `LIT_SKY_GAIN` | lit_relight_header.metal | 1.4, 2.0 (1, 1) | the sun's light and the sky term's (the GI cache's sky and bounced light): their ratio is the sun-to-sky balance, the sky gain fills the shade |
 | `LIT_SHADE_WARM` | lit_relight_header.metal | -0.15 (0) | the sky term's tint, at the same luminance (> 0 warmer, < 0 bluer) |
 | `LIT_SKY_OPEN` | lit_relight_header.metal | 3 (0) | the sky term fades out below this sky light level (0: never): keeps the GI cache's light out of enclosed caves |
@@ -2049,8 +2049,79 @@ Two things the night tuning turned up:
   level 0: the 4% mix toward gray and the brightness setting's lift), so the torch cave's walls went to black (its shade
   class's 10th percentile at OKLab L 0.03, SEUS's 0.14). They now shape only the light above the floor.
 
-**The Purkinje shift** (`POST_PURKINJE`, off by default): in dim light the rods take over, which see no color and favor
+**The Purkinje shift** (`POST_PURKINJE` 0.6, at night only): in dim light the rods take over, which see no color and favor
 blue-green. Per pixel, by its own light before the exposure (all rods below 2^-9 in scene units, none above 2^-4.5), the
 composite mixes toward the rods' picture: their luminance from CIE XYZ (Thompson, Shirley and Ferwerda 2002), divided by
 white's so a gray keeps its brightness while reds darken and blue-greens brighten, as a gray tinted toward blue. A
-moonlit field turns blue-gray; a torch's pool, far brighter, keeps its warmth.
+moonlit field turns blue-gray; a torch's pool, far brighter, keeps its warmth. Only at night (from the sun 1 degree under the horizon, all of
+it at 6): by day the eye is adapted to daylight even in deep shade, and the first try, per pixel alone, greyed the
+forest's shade under the trees. In the village at night it turns the moonlit field blue-gray around the warm houses
+(night points 1.11 -> 0.59; the mineshaft 2.64 -> 0.49).
+
+### In game (2026-10-10, lab mode: 3456 x 2234 fullscreen, TAA, vsync, LOD 8192)
+
+Five lab sessions of autotune and three of compares (`bench_out/agents/grade/` in the main checkout: `autotune-*/`
+with every shot's settings and scores in `evals.jsonl`, `twins-base1/`, `autotune-cmpL/boards/`).
+
+- **Day, our main look then** (`lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post`): two sessions took the
+  objective (five day scenes, water and sky at a quarter) from 69.8 to 31.3; terrain luma against SEUS's: noon 82 -> 113
+  (117), forest 49 -> 82 (88), mountain_view 47 -> 85 (93), sunset 84 -> 92 (92).
+- **Night and caves**: 63.0 -> 9.6 night points, with the GI cache's leak into caves found and guarded on the way.
+- **The Claude edition's set** (`...,post,leaflight,wave,clouds`, after the water, leaves and clouds merges; scores with
+  twindiff's own weights, sky and unlit a quarter, so they compare with census 1's), before the grade, the first
+  defaults (exposure lift 0.75, shadow lift 0.38, dusk 0.25) and those with the Purkinje shift:
+
+  | scene | before | grade | + Purkinje | terrain Y / p10 / sat: before, grade | SEUS |
+  |---|---|---|---|---|---|
+  | noon_overview | 18.98 | 11.21 | 11.13 | 78.6 / 40 / 16.4, 111.1 / 78 / 16.9 | 116.6 / 64 / 26.2 |
+  | forest | 18.16 | 7.98 | 7.57 | 55.8 / 26 / 23.3, 91.0 / 58 / 28.9 | 88.2 / 53 / 24.6 |
+  | mountain_view | 15.60 | 8.58 | 8.79 | 60.4 / 22 / 9.7, 96.9 / 61 / 12.1 | 93.2 / 46 / 15.8 |
+  | sunset_water | 8.04 | 9.76 | 9.78 | 101.9 / 33 / 18.2, 111.4 / 49 / 17.8 | 92.4 / 41 / 14.2 |
+  | water_closeup | 10.28 | 18.32 | 18.37 | 95.0 / 57 / 18.7, 117.4 / 90 / 19.6 | 68.0 / 40 / 26.4 |
+  | night_torches (night points) | 4.25 | 1.11 | 0.59 | 53.3 / 26 / 19.7, 47.1 / 28 / 15.2 | 29.5 / 23 / 4.2 |
+  | torch_cave (night points) | 7.50 | 0.11 | 0.09 | 53.8 / 18 / 11.0, 42.8 / 22 / 11.7 | 32.4 / 24 / 4.2 |
+  | mineshaft (night points) | 19.61 | 2.64 | 0.49 | 82.0 / 53 / 26.0, 49.2 / 30 / 23.4 | 31.0 / 18 / 8.0 |
+
+  Day total 71.1 -> 55.9, night 31.4 -> 3.9 (1.2 with the Purkinje shift). With leaves, clouds and the new water in,
+  the first defaults overshoot: sunset_water and water_closeup got brighter than SEUS's and worse (the water reflects
+  the lifted sky; the sunset's land was already brighter than SEUS's before the grade), and a short re-tune in the same
+  set scored a smaller exposure lift (0.45) and shadow lift (0.23) two points better over the five day scenes. The
+  defaults now: exposure lift 0.5, shadow lift 0.28, dusk 0.1, and the Purkinje shift on at night (0.6).
+- **By eye**: noon and the forest come up to SEUS's brightness with their greens (the forest's cast shadows under the
+  trees stay lighter than SEUS's); mountain_view's snowy spruce reads white instead of gray; the sunset keeps its
+  backlit land; the village at night has warm pools on the houses and a blue-gray moonlit field (with the Purkinje
+  shift) instead of a lit green lawn; the torch cave is dark blue-gray rock with warm pools on its floor instead of a flash
+  photograph; the mineshaft is torchlit and warm, falling off along the corridor, instead of floodlit gray.
+
+### Costs (in game, traced: mountain_view, the Claude edition's set, 3456 x 2234)
+
+- The local tone map (`post_local_stats` and the two `post_local_box` passes on the 216 x 140 grid): 0.070 ms.
+- `post_outdoor` (in the exposure's pass: 0.082 ms against 0.04 before).
+- The composite with the local tone map, the lift and the Purkinje shift: 0.70 ms (0.66 before).
+- The relight's grade (a few multiplies per pixel in the anti-aliasing's resolve) doesn't show in its 3.35 ms.
+- About 0.15 ms a frame in all. The mask runs only in lab mode, on a request (16 frames of one compute pass).
+
+### Not done, and next
+
+- **Far terrain** is the largest day class left at noon and mountain_view: 0.1-0.2 OKLab L darker than SEUS's and half
+  its chroma at every distance (the aerial perspective's haze and the far LOD's light; partly the unhazed horizon strip
+  that was fixed in main tonight). A far-field knob (the haze's in-scattering, the far terrain's sky term) is the next
+  lever, and it isn't the grade's alone.
+- **The GI cache's light in enclosed caves**: `LIT_SKY_OPEN` keeps it out of faces with sky light 0, but where it comes
+  from (bounce rays leaving through what the LOD's structures don't close off) is for the GI cache to find.
+- **The leaves' light** (Foliage.swift, `litFoliageLight`) is added after `litGrade`: it takes the graded sky term, but
+  its sunlight doesn't take `LIT_SUN_GAIN`. The defaults were tuned with leaflight on, so the balance is the measured
+  one; folding the gain into its sun term would make the knob mean the same everywhere.
+- **The forest's cast shadows** under the trees are lighter than SEUS's: the shadow lift (`POST_LOCAL_DARK`) and the sky
+  gain fill them evenly. A lift that spares cast shadows (the traced visibility is in the G-buffer's frame) would keep
+  their shape.
+- **Saturation** is one number for every scene: the sunset wants less than noon and the mountains (autotune pulled it
+  toward 1.0 for the sunset alone). A saturation that follows the light's color or the sun's height would let both win.
+- **The search**: exposure, the shadow lift and the two gains all brighten, so the objective is flat along that ridge
+  to a point or two and single probes are near the noise; repeated probes, or a model fitted over a pass's shots,
+  would converge faster than per-knob parabolas.
+- **The mask**: the sun visibility is the traced samples' mean over 16 frames (4 x 4 blocks at shadow edges); vanilla's
+  near water by height is a fallback now that the G-buffer flags it; classes from before leaflight (the hue rule, grass
+  tops as vegetation) don't compare one to one with classes from after (totals do).
+- **Night and caves** are scored against a target of our own (luma 35-45, SEUS's warmth, no crushed shadows); nobody's
+  frames are the answer there, so the defaults were judged by eye as much as by the number.
