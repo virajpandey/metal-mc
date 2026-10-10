@@ -24,7 +24,7 @@ forest-a"` prints the two result lines once the shot is written (`-n 19 "tour x"
 
 Measured (2026-10-05, M3 Pro): the world is ready about 50 s after the session gets the GPU lock (the first LOD build
 from a cold cache takes a minute or two more); a save to rebuilt pipelines is about a second (lit and taa compile in
-about 0.5 s each); `tour` visits all nine scenes and writes nine screenshots in 74 s once the LOD is built.
+about 0.5 s each); `tour` visits all nine scenes and writes nine screenshots in 74 s once the LOD is built (ten since cave_mouth joined).
 
 `lab.sh [label] [gradle args]` is `bench_lod.sh` with `-PbenchLab=1 -PshaderDir=mod/run/shaders -Ptaa=true` and the full
 look (`LAB_EXP`, default `lit,nearchunks,rtshadows,sky,gi,water`), on `claudeworld-merged` (`LAB_FIXTURE`), LOD to 8192
@@ -112,9 +112,11 @@ higher), `yaw` and `pitch` (Minecraft's: yaw 0 faces south, 90 west, 180 north, 
 every session), `settle` (ticks), `note`. To add one: `tp X Y Z YAW PITCH`, `wait 100` (the chunks load), `shot`, look,
 adjust, and copy the pose in (`status` prints it). Keep cameras out of y 190-198: the clouds are a slab there.
 
-The nine on `claudeworld-merged`: noon_overview, night_torches (the plains village's own torches at midnight), rain (the
+The ten on `claudeworld-merged`: noon_overview, night_torches (the plains village's own torches at midnight), rain (the
 same village), forest, torch_cave (a cavern, torches placed by its setup), mineshaft (a corridor lit by its own wall
-torches), sunset_water, water_closeup, mountain_view. The notes in the file say where each is and how it was found.
+torches), sunset_water, water_closeup, cave_mouth (out of a shallow cave at the morning sun: the volumetric light's beams,
+2026-10-10), mountain_view. The notes in the file say where each is and how it was found. The SEUS twins (census 1) cover
+all but cave_mouth.
 
 ## The class mask
 

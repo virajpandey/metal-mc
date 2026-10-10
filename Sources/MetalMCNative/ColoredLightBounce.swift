@@ -2,8 +2,9 @@ import Foundation
 import Metal
 import simd
 
-// Colored block light bounced through the GI cache (with coloredlight and gi; gain METALMC_CLBOUNCE, default 0 = off
-// until a debug view shows the channel reaching the image; 1 to try it).
+// Colored block light bounced through the GI cache (with coloredlight and gi; gain METALMC_CLBOUNCE, default 0 = off; 1 to
+// try it). The relight's debug view 15 (METALMC_LITVIEW=15) shows what it adds; mmc_debug_cl_bounce_stats reads each stage
+// back offline.
 // The cache's cells hold the sky's and the sun's light per unit of the frame's daylight, which block light doesn't
 // follow, so the block light has a channel of its own per cell (clBounce: half4 a slot, rgb in absolute light and the
 // cell's fingerprint in a, so a slot taken over by another cell reads as empty), filled by the same update: where a
@@ -12,8 +13,8 @@ import simd
 // light. The request resolves it beside the sky light into a half-resolution RG11B10Float texture (in the slot the
 // relight's giStandIn had kept free), and the relight adds it to the block light where vanilla's level isn't 0.
 
-/// The bounce's gain (METALMC_CLBOUNCE, default 0: off; 1 to try it).
-let clBounceGain: Float = max(0, Float(ProcessInfo.processInfo.environment["METALMC_CLBOUNCE"] ?? "") ?? 0)
+/// The bounce's gain (METALMC_CLBOUNCE, default 0: off; 1 to try it; offline, mmc_debug_cl_bounce_gain sets it).
+nonisolated(unsafe) var clBounceGain: Float = max(0, Float(ProcessInfo.processInfo.environment["METALMC_CLBOUNCE"] ?? "") ?? 0)
 
 /// The cache kernels' part (spliced into Gi.swift's giKernelSource with clEnabled only).
 let giClBounceHeader = """
@@ -142,6 +143,61 @@ func giClBindOut(_ enc: MTLComputeCommandEncoder, _ out: MTLTexture?) {
         giClDummyOut = ctx.device.makeTexture(descriptor: d)
     }
     enc.setTexture(giClDummyOut, index: 5)
+}
+
+/// Offline (tools/litflow.swift, LITFLOW_CLBOUNCE=1): the bounce's gain from the next frame. Returns 1 with coloredlight.
+@_cdecl("mmc_debug_cl_bounce_gain")
+public func mmc_debug_cl_bounce_gain(_ gain: Float) -> Int32 {
+    guard clEnabled else { return 0 }
+    clBounceGain = max(0, gain)
+    return 1
+}
+
+/// Offline check (tools/litflow.swift, LITFLOW_CLBOUNCE=1): where the bounce's light gets to, after the work submitted so
+/// far. out, 10 doubles: the cells' block channel (slots holding a fingerprint, those with light, their mean and largest
+/// luminance), the half-resolution texture the relight reads (texels with light, their mean and largest luminance, the
+/// texel count), whether the light volume is there for the cache's update (bounceInputs), the gain. Returns 1 if there was
+/// a channel to read (coloredlight with gi, after a frame).
+@_cdecl("mmc_debug_cl_bounce_stats")
+public func mmc_debug_cl_bounce_stats(_ out: UnsafeMutablePointer<Double>) -> Int32 {
+    guard clEnabled, let cache = GiCache.shared, let channel = cache.clBounce, let tex = RtShadows.shared.giBlockOut else { return 0 }
+    let dev = ctx.device
+    let row = tex.width * 4
+    guard let a = dev.makeBuffer(length: channel.length, options: .storageModeShared),
+          let b = dev.makeBuffer(length: row * tex.height, options: .storageModeShared),
+          let cmd = ctx.queue.makeCommandBuffer(), let blit = cmd.makeBlitCommandEncoder() else { return 0 }
+    blit.copy(from: channel, sourceOffset: 0, to: a, destinationOffset: 0, size: channel.length)
+    blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(), sourceSize: MTLSize(width: tex.width, height: tex.height, depth: 1),
+              to: b, destinationOffset: 0, destinationBytesPerRow: row, destinationBytesPerImage: row * tex.height)
+    blit.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    func luma(_ r: Double, _ g: Double, _ bl: Double) -> Double { 0.2126 * r + 0.7152 * g + 0.0722 * bl }
+    // The channel: half4 a slot (rgb, the fingerprint in a).
+    let h = a.contents().bindMemory(to: Float16.self, capacity: channel.length / 2)
+    var owned = 0, lit = 0, sum = 0.0, top = 0.0
+    for i in 0..<(channel.length / 8) {
+        if h[4 * i + 3] != 0 { owned += 1 }
+        let l = luma(Double(h[4 * i]), Double(h[4 * i + 1]), Double(h[4 * i + 2]))
+        if l > 0 { lit += 1; sum += l; top = max(top, l) }
+    }
+    // The texture: RG11B10Float (5-bit exponents; 6-bit mantissas in red and green, 5 in blue).
+    func small(_ v: UInt32, _ bits: Int) -> Double {
+        let e = Int((v >> UInt32(bits)) & 31), m = Double(v & ((1 << UInt32(bits)) - 1)), scale = Double(1 << bits)
+        return e == 0 ? m / scale * pow(2, -14) : (e == 31 ? .infinity : (1 + m / scale) * pow(2, Double(e - 15)))
+    }
+    let u = b.contents().bindMemory(to: UInt32.self, capacity: tex.width * tex.height)
+    var texLit = 0, texSum = 0.0, texTop = 0.0
+    for i in 0..<(tex.width * tex.height) {
+        let v = u[i]
+        let l = luma(small(v & 0x7FF, 6), small((v >> 11) & 0x7FF, 6), small(v >> 22, 5))
+        if l > 0 && l.isFinite { texLit += 1; texSum += l; texTop = max(texTop, l) }
+    }
+    out[0] = Double(owned); out[1] = Double(lit); out[2] = lit > 0 ? sum / Double(lit) : 0; out[3] = top
+    out[4] = Double(texLit); out[5] = texLit > 0 ? texSum / Double(texLit) : 0; out[6] = texTop; out[7] = Double(tex.width * tex.height)
+    out[8] = ColoredLight.shared.bounceInputs != nil ? 1 : 0
+    out[9] = Double(clBounceGain)
+    return 1
 }
 
 /// Offline compile check of the GI cache's kernels as this session's switches make them (with coloredlight: the bounce's
