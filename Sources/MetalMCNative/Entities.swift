@@ -512,6 +512,8 @@ static float3 litEntityPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<ha
         float hemi = particle ? 0.75 : mix(0.6, n.y >= 0.0 ? 1.0 : 0.2, abs(n.y));
         float moonLum = litLuma(vanillaSky) * f.moonDir.w;
         float3 moon = moonLum * kLitMoonTint * (0.6 * ndlMoon / max(f.moonDir.y, 0.5) * vMoon + 0.4 * hemi * skyFall);
+        // The grade's light balance, as on terrain (Lit.swift's litGrade).
+        litGrade(sun, skyAmb, blockLight, block, sky, lm00);
         E = ((sun + skyAmb) * dayScale + moon + blockLight) * f.misc.w;
     }
     float3 lin = skyDecode(refl) * E;

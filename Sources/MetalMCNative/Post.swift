@@ -11,7 +11,7 @@ import simd
 // - Eye adaptation: a histogram of the frame's log luminance over the square root of lit terrain's albedo (halfway to
 //   metering light rather than color; a quarter of the resolution, a little below the screen's middle weighted 4 times
 //   its edges), its mean between two percentiles against the reference scene (noon outdoors); little of a darker scene's
-//   difference is made up within 2.5 stops (daylight's swings), most of it past that (night, caves), within limits;
+//   difference is made up within 2.5 stops (daylight's swings), 40% of it past that (night and caves stay dark), within limits;
 //   followed over time, faster into the light (the image overexposes for a moment and settles) than into the dark (it
 //   takes a couple of seconds to open up). In stops on top of the sky's own adaptation to the sun's height (Sky.swift),
 //   which stays: the units of docs/lighting-design.md are unchanged.
@@ -92,7 +92,7 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 #define POST_ADAPT_REF (\(litEnabled ? "-1.9" : "-2.1"))
 #define POST_ADAPT_KNEE 2.5
 #define POST_ADAPT_DARK_NEAR 0.2
-#define POST_ADAPT_DARK 0.7
+#define POST_ADAPT_DARK 0.4
 #define POST_ADAPT_BRIGHT 0.3
 #define POST_EV_MIN (-2.0)
 #define POST_EV_MAX 2.0
@@ -114,12 +114,45 @@ private let postShaderSource = skyShaderHeader + (litEnabled ? "\n#define LIT_MO
 // contrast, which crushed dark scenes).
 #define POST_AGX_EXPOSURE 1.0
 #define POST_AGX_POWER 1.0
-#define POST_AGX_SAT 1.3
+#define POST_AGX_SAT 1.15
+// The sky's blue (postSkyBlue): how far blue light's color is taken back from the curve's toward its own (0 off, 1 the
+// light's own saturation, more past it).
+#define POST_SKY_SAT 1.5
 #define POST_ACES_EXPOSURE 1.6
 #define POST_GT_EXPOSURE 1.0
 // HDR output: above this luminance (exposed) the highlights are carried on toward the headroom, over this span.
 #define POST_EDR_KNEE 0.8
 #define POST_EDR_SPAN 4.0
+
+// The local tone map (docs/lighting-design.md, "The grade"): a large-scale base of log2 luminance, edge-aware (a guided
+// filter on a grid at 1/16 of the resolution), compressed toward the exposure's mid-gray while each pixel keeps its own
+// detail around it: the sky and the land each get an exposure of their own, as in a photo of a backlit subject.
+// POST_LOCAL: how much of the base's distance above mid-gray goes (the sky, bright light; 0 off), POST_LOCAL_DARK below
+// it (the land in shade, lifted), at most POST_LOCAL_RANGE stops of it counted. The filter's box is 2 POST_LOCAL_RADIUS
+// + 1 grid texels (16 pixels each) wide, and POST_LOCAL_EPS (stops squared) sets how strong an edge has to be for the
+// base to follow it rather than smooth over it (the skyline does; the leaves' and the blocks' texture doesn't).
+#define POST_LOCAL 0.0
+#define POST_LOCAL_DARK 0.28
+#define POST_LOCAL_RANGE 4.0
+#define POST_LOCAL_RADIUS 5
+#define POST_LOCAL_EPS 0.5
+// The grade's exposure lift, stops (the tuned look; POST_EV stays the user's compensation, METALMC_POSTEV). It and
+// POST_LOCAL_DARK are the day's lift: all of it with the sun 30 degrees up and outdoors; POST_DUSK of it with the sun 4
+// degrees up or lower (dusk keeps its backlit mood: the sky's own adaptation already opens it up as the sun sets), and
+// POST_CAVE of it where the view is under cover (the share of sky and of sky light in a 64 x 64 grid of the G-buffer, 0.2
+// to 0.6): night and caves have the eye adaptation's own knobs and keep their pools of light.
+#define POST_GRADE_EV 0.5
+#define POST_DUSK 0.1
+#define POST_CAVE 0.2
+
+// The Purkinje shift (night vision): in dim light the rods take over, which see no color and favor blue-green, so a
+// moonlit field turns blue-gray while a torch's pool keeps its warmth. At night (from the sun 1 degree under the horizon,
+// all of it at 6; none by day, when the eye is adapted to daylight even in deep shade), per pixel by its own light before the exposure (scene
+// units: vanilla's sunlit white is about 1): all rods below 2^POST_PURKINJE_LO, none above 2^POST_PURKINJE_HI;
+// POST_PURKINJE how far toward the rods' picture (0 off).
+#define POST_PURKINJE 0.6
+#define POST_PURKINJE_LO (-9.0)
+#define POST_PURKINJE_HI (-4.5)
 
 // Debug view (METALMC_POSTVIEW): 1 the bloom alone, 2 the light shafts alone, 3 the exposure meter, 4 no tone curve.
 #define POST_VIEW \(postViewDefault)
@@ -131,7 +164,7 @@ struct PostFrame {
     float4 sunUV;           // xy: the sun's position in texture coordinates (off the screen too), zw: unused
     float4 tone;            // x: display headroom (1: SDR), y: the legacy curve's knee, z: unused, w: the tone curve (0-3)
     float4 adapt;           // x: seconds since the last frame (0.1 at most), y: 1 to snap to the target, z: 1 for eye adaptation, w: unused
-    float4 effects;         // x: bloom on, y: light shafts on, z: light sources in the G-buffer (lit mode), w: unused
+    float4 effects;         // x: bloom on, y: light shafts on, z: light sources in the G-buffer (lit mode), w: 1 if the local tone map's base was made
 };
 
 constant float3 kPostLuma = float3(0.2126, 0.7152, 0.0722);
@@ -317,6 +350,7 @@ kernel void post_exposure(device atomic_uint* hist [[buffer(0)]], device float4*
         wsum += w;
     }
     float metered = wsum > 0.0 ? sum / wsum : POST_ADAPT_REF;
+    float outdoor = expo[1].w;   // post_outdoor's, kept
     float d = POST_ADAPT_REF - metered;   // > 0: darker than the reference
     // Darker: little within POST_ADAPT_KNEE stops of the reference (daylight's own swings, which the sky's adaptation to
     // the sun's height already covers: dusk, shade, a forest), more past it (night, caves, interiors).
@@ -330,7 +364,102 @@ kernel void post_exposure(device atomic_uint* hist [[buffer(0)]], device float4*
         ev = e.x + (target - e.x) * (1.0 - exp(-f.adapt.x / tau));
     }
     expo[0] = float4(ev, target, metered, 1.0);
-    expo[1] = float4(total, lo, hi, 0.0);
+    expo[1] = float4(total, lo, hi, outdoor);
+}
+
+// How much of the view is outdoors, for the day's lift (POST_CAVE): over a 64 x 64 grid of the frame, the sky (depth 0)
+// counts 1 and lit terrain its sky light level / 15; followed over time with a time constant of 0.5 s (snapped with the
+// exposure). One threadgroup of 256 threads; expo[1].w.
+kernel void post_outdoor(texture2d<uint, access::read> gbuf [[texture(0)]], depth2d<float, access::read> depth [[texture(1)]],
+                         device float4* expo [[buffer(0)]], constant PostFrame& f [[buffer(1)]],
+                         uint li [[thread_index_in_threadgroup]]) {
+    threadgroup float2 acc[256];
+    float2 sn = 0.0;
+    float2 size = float2(depth.get_width(), depth.get_height());
+    bool lit = gbuf.get_width() > 1u;
+    for (uint k = li; k < 4096u; k += 256u) {
+        uint2 q = uint2((float2(k % 64u, k / 64u) + 0.5) / 64.0 * size);
+        if (depth.read(q) <= 0.0) { sn += float2(1.0); continue; }
+        uint2 g = lit ? gbuf.read(q).rg : uint2(0u);
+        if ((g.x >> 29) != 0u) sn += float2(saturate(float((g.y >> 16) & 255u) / 240.0), 1.0);
+    }
+    acc[li] = sn;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (li < s) acc[li] += acc[li + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (li != 0u) return;
+    float o = lit && acc[0].y > 0.0 ? acc[0].x / acc[0].y : 1.0;
+    float prev = expo[1].w;
+    bool keep = f.adapt.y < 0.5 && prev >= 0.0 && prev <= 1.0 && expo[0].w > 0.5;
+    expo[1].w = keep ? prev + (o - prev) * (1.0 - exp(-f.adapt.x / 0.5)) : o;
+}
+
+// ---------------------------------------------------------------------------------------------------- local tone map
+
+// The base's statistics: per texel of a grid at 1/16 of the frame's resolution, the mean of log2 luminance and of its
+// square over the 4 x 4 texels of the bloom's second level (a quarter of the resolution, linear light) under it.
+kernel void post_local_stats(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    uint2 last = uint2(src.get_width() - 1, src.get_height() - 1);
+    float s = 0.0, s2 = 0.0;
+    for (uint y = 0; y < 4u; y++) {
+        for (uint x = 0; x < 4u; x++) {
+            float l = log2(max(postLuma(src.read(min(gid * 4u + uint2(x, y), last)).rgb), 1e-6));
+            s += l;
+            s2 += l * l;
+        }
+    }
+    dst.write(float4(s * 0.0625, s2 * 0.0625, 0.0, 0.0), gid);
+}
+
+// The guided filter (He, Sun and Tang, with log luminance as its own guide: edge-aware smoothing) over boxes of
+// (2 POST_LOCAL_RADIUS + 1)^2 grid texels, smaller at the frame's edges. pass.x 0: the statistics into the coefficients,
+// a = var / (var + POST_LOCAL_EPS) and b = mean (1 - a); 1: their box mean, which the composite applies to each pixel's own
+// log luminance (base = a log2 L + b: where a window held an edge, a is near 1 and the base follows the pixel across it;
+// where it was flat, a is near 0 and the base is the window's mean).
+kernel void post_local_box(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
+                           constant float4& pass [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    int2 size = int2(src.get_width(), src.get_height());
+    int2 lo = max(int2(gid) - POST_LOCAL_RADIUS, int2(0)), hi = min(int2(gid) + POST_LOCAL_RADIUS, size - 1);
+    float2 m = 0.0;
+    for (int y = lo.y; y <= hi.y; y++) {
+        for (int x = lo.x; x <= hi.x; x++) m += src.read(uint2(x, y)).rg;
+    }
+    m /= float((hi.x - lo.x + 1) * (hi.y - lo.y + 1));
+    if (pass.x < 0.5) {
+        float a = max(m.y - m.x * m.x, 0.0);
+        a = a / (a + POST_LOCAL_EPS);
+        dst.write(float4(a, m.x * (1.0 - a), 0.0, 0.0), gid);
+    } else {
+        dst.write(float4(m, 0.0, 0.0), gid);
+    }
+}
+
+// The stops the local tone map moves pixel gid by: its base (from the coefficients' grid, bilinear, and its own log2
+// luminance l) toward mid-gray at exposure ev, by POST_LOCAL above it and POST_LOCAL_DARK (times lift, the day's share)
+// below.
+static float postLocalShift(texture2d<float> coef, uint2 gid, float l, float ev, float lift) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float2 ab = coef.sample(s, (float2(gid) + 0.5) / (16.0 * float2(coef.get_width(), coef.get_height())), level(0.0)).rg;
+    float d = clamp(ab.x * l + ab.y - (log2(0.18) - ev), -POST_LOCAL_RANGE, POST_LOCAL_RANGE);
+    return -d * (d > 0.0 ? POST_LOCAL : POST_LOCAL_DARK * lift);
+}
+
+// The Purkinje shift: the rods' picture mixed in by how dim the pixel's own light (lum, scene units) is. The rods'
+// luminance from CIE XYZ (Thompson, Shirley and Ferwerda, "A Spatial Post-Processing Algorithm for Images of Night
+// Scenes", 2002), divided by white's (2.573) so a gray keeps its brightness while reds darken and blue-greens brighten,
+// shown as a gray tinted toward blue (the tint's luminance 1).
+static float3 postPurkinje(float3 c, float lum, float night) {
+    float w = POST_PURKINJE * night * (1.0 - smoothstep(POST_PURKINJE_LO, POST_PURKINJE_HI, log2(max(lum, 1e-8))));
+    if (w <= 0.0) return c;
+    float X = dot(c, float3(0.4124, 0.3576, 0.1805)), Y = dot(c, float3(0.2126, 0.7152, 0.0722)), Z = dot(c, float3(0.0193, 0.1192, 0.9505));
+    float V = max(Y * (1.33 * (1.0 + (Y + Z) / max(X, 1e-8)) - 1.68), 0.0) * (1.0 / 2.573);
+    const float3 tint = float3(0.86, 1.0, 1.32) / dot(float3(0.86, 1.0, 1.32), kPostLuma);
+    return mix(c, V * tint, saturate(w));
 }
 
 // --------------------------------------------------------------------------------------------------------- light shafts
@@ -442,6 +571,22 @@ static float3 postGt(float3 x) {
     return T * w0 + L * w1 + S * w2;
 }
 
+// The sky's blue through the curve: AgX takes bright saturated light toward white, and the clear sky came out at about
+// 40 of ffmpeg's saturation where SEUS's is 60-63 with the same hue (the clouds helper's trace, 2026-10-10). For blue
+// light (by the light's own color, x: blue clearly above red and green; white clouds and grays are untouched) the curve's
+// output d is moved toward x's color at d's luminance by POST_SKY_SAT (past it above 1), then its chroma around that
+// luminance is scaled back until every channel is within the display (the hue kept).
+static float3 postSkyBlue(float3 x, float3 d) {
+    float w = smoothstep(0.05, 0.3, (x.b - max(x.r, x.g)) / max(x.b, 1e-6));
+    if (POST_SKY_SAT <= 0.0 || w <= 0.0) return d;
+    d = min(d, 1.0);
+    float yd = postLuma(d);
+    float3 c = d + (x * (yd / max(postLuma(x), 1e-6)) - d) * (POST_SKY_SAT * w) - yd;
+    float t = 1.0;
+    for (int k = 0; k < 3; k++) t = min(t, c[k] > 0.0 ? (1.0 - yd) / c[k] : (c[k] < 0.0 ? yd / -c[k] : 1.0));
+    return yd + c * max(t, 0.0);
+}
+
 // Scene-linear light (exposed) to display-linear light: 1 is the display's SDR white, tone.x its headroom. Legacy is
 // the sky's own curve (identity to the knee, a shoulder into the headroom: the look before post). The others are SDR
 // curves; with headroom, the light above POST_EDR_KNEE is carried on toward it (zero slope where it starts, the curve's
@@ -452,6 +597,7 @@ static float3 postToneMap(float3 x, float4 tone) {
     x = max(x, 0.0);
     if (curve == 0) return skyToneMap(x, float4(H, tone.y, 0.0, 0.0));
     float3 d = curve == 2 ? postAces(x * POST_ACES_EXPOSURE) : (curve == 3 ? postGt(x * POST_GT_EXPOSURE) : postAgx(x * POST_AGX_EXPOSURE));
+    if (POST_SKY_SAT > 0.0) d = postSkyBlue(x, d);
     if (H <= 1.0) return min(d, 1.0);
     float t = max(postLuma(x) - POST_EDR_KNEE, 0.0) / POST_EDR_SPAN;
     return min(d * (1.0 + (H - 1.0) * (1.0 - exp(-t * t))), H);
@@ -469,16 +615,26 @@ kernel void post_debug_curve(device const float4* in [[buffer(0)]], device float
 // display light into `out` (the copy puts it in the frame).
 kernel void post_composite(texture2d<float, access::read> scene [[texture(0)]], texture2d<float> bloom [[texture(1)]],
                            texture2d<float> shafts [[texture(2)]], texture2d<float, access::write> out [[texture(3)]],
+                           texture2d<float> local [[texture(4)]],
                            constant PostFrame& f [[buffer(0)]], device const float4* expo [[buffer(1)]],
                            uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float2 uv = (float2(gid) + 0.5) * f.size.zw;
     float3 c = max(skyDecode(scene.read(gid).rgb), 0.0);
+    float lum = postLuma(c);
     float3 b = f.effects.x > 0.5 ? bloom.sample(s, uv, level(0.0)).rgb : c;
     float3 sh = f.effects.y > 0.5 ? shafts.sample(s, uv, level(0.0)).rgb : float3(0.0);
     c = max(mix(c, b, POST_BLOOM) + sh, 0.0);
-    float ev = expo[0].x + POST_EV;
+    // The day's lift: all of it with the sun 30 degrees up and outdoors, POST_DUSK of it from 4 degrees down, POST_CAVE
+    // of it under cover (post_outdoor's estimate).
+    float lift = mix(POST_DUSK, 1.0, smoothstep(0.07, 0.5, f.sun.y)) * mix(POST_CAVE, 1.0, smoothstep(0.2, 0.6, expo[1].w));
+    float ev = expo[0].x + POST_EV + POST_GRADE_EV * lift;
+    // Night vision, at night, by the pixel's own light (before the exposure).
+    if (POST_PURKINJE > 0.0) c = postPurkinje(c, lum, 1.0 - smoothstep(-0.1, -0.02, f.sun.y));
+    // The local tone map: the pixel's own light against the edge-aware base (the frame's light before the bloom, as the
+    // base's statistics have it).
+    if (f.effects.w > 0.5 && (POST_LOCAL > 0.0 || POST_LOCAL_DARK > 0.0)) c *= exp2(postLocalShift(local, gid, log2(max(lum, 1e-6)), ev, lift));
 #if POST_VIEW == 1
     c = b;
 #elif POST_VIEW == 2
@@ -571,6 +727,9 @@ final class Post: @unchecked Sendable {
     private var blurPipe: MTLComputePipelineState?
     private var shaftPipe: MTLComputePipelineState?
     private var compositePipe: MTLComputePipelineState?
+    private var localStatsPipe: MTLComputePipelineState?
+    private var localBoxPipe: MTLComputePipelineState?
+    private var outdoorPipe: MTLComputePipelineState?
     private var copyPipes: [String: MTLRenderPipelineState] = [:]   // by the pass's color, depth and stencil formats
 
     /// The bloom's levels: down[0] is half the frame's resolution, each next half the one before; up[i] holds levels
@@ -581,6 +740,10 @@ final class Post: @unchecked Sendable {
     private var shaftTemp: MTLTexture?
     private var shaftBlur: MTLTexture?
     private var shaftColor: MTLTexture?
+    /// The local tone map's grid (1/16 of the resolution): the statistics, the guided filter's coefficients, their mean.
+    private var localStats: MTLTexture?
+    private var localCoef: MTLTexture?
+    private var localMean: MTLTexture?
     /// The composite's display light, sRGB-encoded (the copy sharpens it into the frame).
     private(set) var output: MTLTexture?
     private var histogram: MTLBuffer?
@@ -607,9 +770,9 @@ final class Post: @unchecked Sendable {
         if library != nil { return true }
         do {
             // Lab mode (ShaderLab.swift): after an edit, forget the library and its pipelines; the next frame builds them
-            // again (the bloom's levels and the exposure's state stay).
+            // again (the bloom's levels stay), and the exposure snaps to its new target, so the edit shows at once.
             let lib = try ShaderLab.library("post", postShaderSource) { [self] _ in
-                library = nil; copyPipes = [:]; failed = false
+                library = nil; copyPipes = [:]; failed = false; snapNext = true
             }
             func pipe(_ name: String) throws -> MTLComputePipelineState {
                 guard let f = lib.makeFunction(name: name) else { throw NSError(domain: "metalmc", code: 1, userInfo: [NSLocalizedDescriptionKey: "no \(name)"]) }
@@ -624,6 +787,9 @@ final class Post: @unchecked Sendable {
             blurPipe = try pipe("post_shaft_blur")
             shaftPipe = try pipe("post_shaft_color")
             compositePipe = try pipe("post_composite")
+            localStatsPipe = try pipe("post_local_stats")
+            localBoxPipe = try pipe("post_local_box")
+            outdoorPipe = try pipe("post_outdoor")
             library = lib
         } catch {
             log("post: shaders failed: \(error)")
@@ -672,8 +838,13 @@ final class Post: @unchecked Sendable {
         guard let m = tex(.rg16Float, qw, qh, "MetalMC post shaft mask"), let t = tex(.r16Float, qw, qh, "MetalMC post shaft blur 1"),
               let b = tex(.r16Float, qw, qh, "MetalMC post shaft blur 2"), let c = tex(.rgba16Float, qw, qh, "MetalMC post shafts"),
               let o = tex(hdrOutput ? .rgba16Float : .rgb10a2Unorm, width, height, "MetalMC post output") else { return false }
+        // The local tone map's grid: 4 x 4 texels of the bloom's second level (a quarter of the resolution) each.
+        let lw = (downs[1].width + 3) / 4, lh = (downs[1].height + 3) / 4
+        guard let ls = tex(.rg32Float, lw, lh, "MetalMC post local stats"), let lc = tex(.rg32Float, lw, lh, "MetalMC post local coefficients"),
+              let lm = tex(.rg32Float, lw, lh, "MetalMC post local base") else { return false }
         down = downs; up = ups
         shaftMask = m; shaftTemp = t; shaftBlur = b; shaftColor = c
+        localStats = ls; localCoef = lc; localMean = lm
         output = o
         sizeKey = key
         log("post: \(key), bloom \(postBloomLevels) levels down to \(w)x\(h), light shafts at \(qw)x\(qh), tone curve \(postToneCurves[toneCurve])")
@@ -804,7 +975,39 @@ final class Post: @unchecked Sendable {
             enc.setBuffer(exposure, offset: 0, index: 1)
             enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 2)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            // How much of the view is outdoors (the day's lift fades under cover), after the exposure: it keeps its value
+            // beside the exposure's state.
+            if let outdoorPipe {
+                enc.setComputePipelineState(outdoorPipe)
+                enc.setTexture(f.effects.z > 0.5 ? Lit.shared.gbuffer : dummyGbuf, index: 0)
+                enc.setTexture(depth, index: 1)
+                enc.setBuffer(exposure, offset: 0, index: 0)
+                enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 1)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            }
             enc.endEncoding()
+            // The local tone map's base (the offline timing counts it with the exposure): the statistics of the bloom's
+            // second level on the grid, the guided filter's coefficients, their mean.
+            if let localStatsPipe, let localBoxPipe, let localStats, let localCoef, let localMean,
+               let lenc = cb.makeComputeCommandEncoder(descriptor: profComputePass("post local tone map (guided filter at 1/16)")) {
+                lenc.label = "MetalMC post local tone map"
+                lenc.setComputePipelineState(localStatsPipe)
+                lenc.setTexture(down[1], index: 0)
+                lenc.setTexture(localStats, index: 1)
+                lenc.dispatchThreads(grid(localStats), threadsPerThreadgroup: tg)
+                lenc.setComputePipelineState(localBoxPipe)
+                var p0 = SIMD4<Float>(0, 0, 0, 0), p1 = SIMD4<Float>(1, 0, 0, 0)
+                lenc.setTexture(localStats, index: 0)
+                lenc.setTexture(localCoef, index: 1)
+                lenc.setBytes(&p0, length: 16, index: 0)
+                lenc.dispatchThreads(grid(localCoef), threadsPerThreadgroup: tg)
+                lenc.setTexture(localCoef, index: 0)
+                lenc.setTexture(localMean, index: 1)
+                lenc.setBytes(&p1, length: 16, index: 0)
+                lenc.dispatchThreads(grid(localMean), threadsPerThreadgroup: tg)
+                lenc.endEncoding()
+                f.effects.w = 1
+            }
         }
         // Light shafts: the sky mask, two passes of the radial blur, the light.
         if stages.contains(.shafts) && f.effects.y > 0.5, let skyView = Sky.shared.skyView {
@@ -845,6 +1048,7 @@ final class Post: @unchecked Sendable {
             enc.setTexture(up[0], index: 1)
             enc.setTexture(shaftColor, index: 2)
             enc.setTexture(output, index: 3)
+            enc.setTexture(localMean ?? shaftColor, index: 4)
             enc.setBytes(&f, length: MemoryLayout<PostFrameGPU>.stride, index: 0)
             enc.setBuffer(exposure, offset: 0, index: 1)
             enc.dispatchThreads(grid(output), threadsPerThreadgroup: tg)
@@ -895,8 +1099,8 @@ final class Post: @unchecked Sendable {
         frames += 1
         if frames % 1200 == 1, let e = exposure {
             let v = e.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2)
-            log(String(format: "post: %d frames; exposure %+.2f stops (target %+.2f, metered log2 light %.2f), from %@, tone curve %@%@",
-                       frames, v[0].x, v[0].y, v[0].z, input === color ? "the frame" : "the anti-aliasing's history",
+            log(String(format: "post: %d frames; exposure %+.2f stops (target %+.2f, metered log2 light %.2f), outdoors %.2f, from %@, tone curve %@%@",
+                       frames, v[0].x, v[0].y, v[0].z, v[1].w, input === color ? "the frame" : "the anti-aliasing's history",
                        postToneCurves[toneCurve], headroom > 1 ? String(format: ", headroom %.2f", headroom) : ""))
         }
         return true
@@ -939,6 +1143,7 @@ final class Post: @unchecked Sendable {
         var f = frameParams(color: color, p: p, cam: lastCam)
         f.effects.x = 1
         f.effects.y = Sky.shared.skyView != nil ? 1 : 0
+        f.effects.w = 1   // the composite alone applies the local tone map's last base
         if f.sun.w <= 0 { f.sun.w = 1 }
         var times = [[Double]](repeating: [], count: 5)
         let stages: [Stages] = [.bloom, .exposure, .shafts, .composite]

@@ -83,6 +83,14 @@ let all: [View] = [
     View(name: "fly-down", elev: 45, pos: (8, 1650, 8), yaw: 100, pitch: 35),
     // A wide look up, for the share of the sky the clouds cover (with CLOUDTEST_VIEW=2, their transmittance).
     View(name: "sky-share", elev: 70, pos: (8, 166, 8), yaw: 0, pitch: -89, fov: 110),
+    // Inside the layer at its middle, looking along it (the clouds around a camera flying through them), and a little
+    // down at broken cloud from inside it.
+    View(name: "inside-mid", elev: 50, pos: (8, 1200, 8), yaw: 100, pitch: 0, cover: 0.55),
+    View(name: "inside-down", elev: 50, pos: (8, 1200, 8), yaw: 100, pitch: 25, cover: 0.55),
+    // The game's fly-1200 (session 2): level, at the default coverage, thin cloud between the camera and the ground.
+    View(name: "inside-level", elev: 60, pos: (8, 1200, 8), yaw: 100, pitch: 8),
+    // Low in the layer looking up into the clouds around (the game's climb through it: with CLOUDTEST_VEL).
+    View(name: "inside-up", elev: 60, pos: (8, 960, 8), yaw: 0, pitch: -20, cover: 0.45),
 ]
 let wanted = Set(args.dropFirst(3))
 let timing = wanted.contains("time")

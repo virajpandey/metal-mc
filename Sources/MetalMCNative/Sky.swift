@@ -126,10 +126,17 @@ static SkyMedium skyMediumAt(constant SkyAtmosphere& a, float h) {
 
 static float skyRayleighPhase(float c) { return 3.0 / (16.0 * SKY_PI) * (1.0 + c * c); }
 
-// Cornette-Shanks: Henyey-Greenstein with a Rayleigh-like back lobe, as Hillaire uses.
+// Cornette-Shanks: Henyey-Greenstein with a Rayleigh-like back lobe, as Hillaire uses; a fifth of it in a sharp forward
+// lobe (Henyey-Greenstein, g 0.96): real haze's phase has a diffraction peak a single lobe misses (its radiance a degree
+// or two from the sun about 15 times that 10 degrees out, against twice with g 0.8 alone), the aureole: the sun's glow
+// was a faint wide halo, at sunset a small disk with little glow around it. Each lobe integrates to 1. Rain's haze (g
+// down to 0.3: bigger, wetter particles scatter more evenly) drops the aureole.
 static float skyMiePhase(float g, float c) {
     float k = 3.0 / (8.0 * SKY_PI) * (1.0 - g * g) / (2.0 + g * g);
-    return k * (1.0 + c * c) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
+    float cs = k * (1.0 + c * c) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
+    const float ga = 0.96;
+    float aureole = (1.0 - ga * ga) / (4.0 * SKY_PI * pow(max(1.0 + ga * ga - 2.0 * ga * c, 1e-6), 1.5));
+    return mix(cs, aureole, 0.2 * smoothstep(0.5, 0.8, g));
 }
 
 // The transmittance table's coordinates (Bruneton 2017): the distance to the top of the atmosphere, relative to its
