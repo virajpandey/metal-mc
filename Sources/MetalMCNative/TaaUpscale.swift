@@ -362,8 +362,9 @@ private func taauHalton(_ index: Int, _ base: Int) -> Float {
 /// drawn once at `scale` without jitter and filtered up bilinearly (mode 2: no temporal upscaling), or mode 3: compile
 /// every variant of the resolve and return. jsign -1 tells the resolve the jitter's sign is the other way (a wrong sign
 /// should score worse). Writes the result's luminance (w x h floats) to `out` and returns its RMS error against the image
-/// box-filtered over each output pixel (8 x 8 samples); errors in `stats`: [all, the band the drawn frame can hold (its
-/// Nyquist), the band past it]. Negative on failure.
+/// box-filtered over each output pixel (8 x 8 samples); errors in `stats` (4 doubles): [all, the band the drawn frame can
+/// hold (its Nyquist), the band past it, the RMS change from the frame before the last to the last: a still view's
+/// shimmer (0 in mode 2)]. Negative on failure.
 @_cdecl("mmc_debug_taau_test")
 public func mmc_debug_taau_test(_ w: Int32, _ h: Int32, _ scale: Float, _ frames: Int32, _ jsign: Float, _ mode: Int32,
                                 _ out: UnsafeMutablePointer<Float>, _ stats: UnsafeMutablePointer<Double>) -> Double {
@@ -402,7 +403,8 @@ public func mmc_debug_taau_test(_ w: Int32, _ h: Int32, _ scale: Float, _ frames
         guard let color = tex(.rgba8Unorm, inW, inH, [.shaderRead, .renderTarget], .shared),
               let depth = tex(.depth32Float, inW, inH, [.shaderRead, .renderTarget], .private),
               let outT = mode == 1 ? color : tex(.rgba8Unorm, W, H, [.shaderRead, .renderTarget], .private),
-              let readback = dev.makeBuffer(length: W * H * 4, options: .storageModeShared) else { return -1 }
+              let readback = dev.makeBuffer(length: W * H * 4, options: .storageModeShared),
+              let previous = dev.makeBuffer(length: W * H * 4, options: .storageModeShared) else { return -1 }
         // A plane at depth 0.5 under identity matrices: every pixel reprojects onto itself (a still view).
         if let cb = ctx.queue.makeCommandBuffer() {
             let d = MTLRenderPassDescriptor()
@@ -447,9 +449,11 @@ public func mmc_debug_taau_test(_ w: Int32, _ h: Int32, _ scale: Float, _ frames
             let cb = ctx.ensureCBNoFlush()
             ctx.runPending(cb)
             ctx.endBlit()
-            if frame == Int(frames) - 1, let blit = cb.makeBlitCommandEncoder() {
+            // The last frame, and the one before it (the still view's frame-to-frame change: shimmer).
+            if frame >= Int(frames) - 2, let blit = cb.makeBlitCommandEncoder() {
                 blit.copy(from: outT, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: W, height: H, depth: 1),
-                          to: readback, destinationOffset: 0, destinationBytesPerRow: W * 4, destinationBytesPerImage: W * H * 4)
+                          to: frame == Int(frames) - 1 ? readback : previous, destinationOffset: 0, destinationBytesPerRow: W * 4,
+                          destinationBytesPerImage: W * H * 4)
                 blit.endEncoding()
             }
             cb.commit()
@@ -458,6 +462,12 @@ public func mmc_debug_taau_test(_ w: Int32, _ h: Int32, _ scale: Float, _ frames
         }
         let bytes = readback.contents().bindMemory(to: UInt8.self, capacity: W * H * 4)
         for k in 0..<(W * H) { result[k] = Float(bytes[k * 4]) / 255 }
+        if frames >= 2 {
+            let before = previous.contents().bindMemory(to: UInt8.self, capacity: W * H * 4)
+            var s = 0.0
+            for k in 0..<(W * H) { let d = Double(bytes[k * 4]) - Double(before[k * 4]); s += d * d }
+            stats[3] = (s / Double(W * H)).squareRoot() / 255
+        }
     }
     // The reference: the image box-filtered over each output pixel (8 x 8 samples); errors over all, under the drawn
     // frame's Nyquist (the zone plate's frequency radius / w under half the scale) and past it.

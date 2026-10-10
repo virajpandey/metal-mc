@@ -41,7 +41,7 @@ func check(_ ok: Bool, _ what: String) {
 }
 
 var buf = [Float](repeating: 0, count: size * size)
-var stats = [Double](repeating: 0, count: 3)
+var stats = [Double](repeating: 0, count: 4)
 let compileFailed = test(Int32(size), Int32(size), 1, 0, 1, 3, &buf, &stats)
 check(compileFailed == 0, "every variant of the upscaling resolve compiles under METALMC_EXP=\(ProcessInfo.processInfo.environment["METALMC_EXP"] ?? "") (\(Int(compileFailed)) failed)")
 // The terrain shaders the render scale's mip bias is in (the near chunks, every LOD pipeline).
@@ -51,10 +51,11 @@ if let tsym = dlsym(lib, "mmc_debug_terrain_compile") {
 }
 
 func run(_ label: String, scale: Float, frames: Int, jsign: Float = 1, mode: Int32) -> [Double] {
+    stats = [0, 0, 0, 0]
     let rms = test(Int32(size), Int32(size), scale, Int32(frames), jsign, mode, &buf, &stats)
-    print(String(format: "%-34@ RMS error %.4f   (where the drawn frame can hold the image: %.4f, past it: %.4f)", label as NSString, rms, stats[1], stats[2]))
+    print(String(format: "%-34@ RMS error %.4f   (where the drawn frame can hold the image: %.4f, past it: %.4f); shimmer %.4f", label as NSString, rms, stats[1], stats[2], stats[3]))
     writePNG(buf, size, size, "taau-\(label).png")
-    return [rms, stats[1], stats[2]]
+    return [rms, stats[1], stats[2], stats[3]]
 }
 
 let native = run("native-taa", scale: 1, frames: 32, mode: 1)
@@ -71,5 +72,7 @@ check(t75[2] < bilinear[2], "TAAU holds detail past the drawn frame's Nyquist be
 // method's error there is aliasing).
 check(t60[1] > t67[1] && t67[1] > t75[1], "error grows as the scale drops, where the drawn frame can hold the image (0.75 \(String(format: "%.4f", t75[1])), 0.667 \(String(format: "%.4f", t67[1])), 0.6 \(String(format: "%.4f", t60[1])))")
 print(String(format: "native TAA %.4f, TAAU 0.75 after 8 frames %.4f, after 32 %.4f", native[0], t75short[0], t75[0]))
+// A still view's frame-to-frame change (shimmer) once converged: the upscaler's no worse than native TAA's.
+check(t75[3] <= native[3] * 1.5 + 0.002, String(format: "a still view is as steady at 0.75 as at the panel's resolution (frame to frame RMS %.4f against native TAA's %.4f)", t75[3], native[3]))
 print(failures == 0 ? "done: all checks pass" : "FAIL  \(failures) checks failed")
 exit(failures == 0 ? 0 : 1)
