@@ -742,8 +742,9 @@ final class Post: @unchecked Sendable {
         snapNext = false
         f.adapt = SIMD4(Float(min(max(dt, 0), 0.1)), snap ? 1 : 0, effectMask & 4 != 0 && postAdaptDefault ? 1 : 0, 0)
         let lights = litEnabled && Lit.shared.gbuffer.map { $0.width == color.width && $0.height == color.height } == true
+        // Volumetric light (Godrays.swift, METALMC_EXP=godrays) replaces the light shafts: the lit air they add is its own, in 3D.
         f.effects = SIMD4(effectMask & 1 != 0 && postBloomDefault > 0 ? 1 : 0,
-                          effectMask & 2 != 0 && postShaftsDefault > 0 && shafts > 0 && Sky.shared.skyView != nil ? 1 : 0,
+                          effectMask & 2 != 0 && postShaftsDefault > 0 && shafts > 0 && Sky.shared.skyView != nil && !godraysReplacesShafts ? 1 : 0,
                           lights ? 1 : 0, 0)
         return f
     }

@@ -57,9 +57,12 @@ let waterOn = ProcessInfo.processInfo.environment["LITFLOW_WATER"] == "1" && mod
 // post section (pictures of each effect at several times of day, the exposure's numbers; with "time" each stage's cost).
 let postOn = ProcessInfo.processInfo.environment["LITFLOW_POST"] == "1" && (mode == "sky" || mode == "hdr")
 let clOn = ProcessInfo.processInfo.environment["LITFLOW_CL"] == "1" && mode != "off" && mode != "compile"
+// LITFLOW_GODRAYS=1 (with LITFLOW_POST=1): volumetric light (METALMC_EXP=...,godrays, Godrays.swift); runs only its section
+// (pictures with it off and on and its debug views at several times of day; with "time" its cost).
+let godraysOn = ProcessInfo.processInfo.environment["LITFLOW_GODRAYS"] == "1" && postOn
 let exp = mode == "compile" ? (ProcessInfo.processInfo.environment["LITFLOW_EXP"] ?? "lit,rtshadows,sky,water")
     : (mode == "off" ? "rtshadows" : (mode == "sky" ? "lit,rtshadows,sky" : (mode == "hdr" ? "lit,rtshadows,sky,hdr" : "lit,rtshadows")))
-        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "") + (clOn ? ",coloredlight" : "") + (postOn ? ",post" : "")
+        + (giOn ? ",gi" : "") + (waterOn ? ",water" : "") + (clOn ? ",coloredlight" : "") + (postOn ? ",post" : "") + (godraysOn ? ",godrays" : "")
 setenv("METALMC_EXP", exp, 1)
 let lit = mode != "off", sky = mode == "sky" || mode == "hdr", hdr = mode == "hdr"
 guard let lib = dlopen(args[1], RTLD_NOW) else { print("dlopen failed"); exit(1) }
@@ -182,6 +185,23 @@ if mode == "compile" {
                 d.colorAttachments[0].pixelFormat = format
                 d.depthAttachmentPixelFormat = .depth32Float
                 _ = try device.makeRenderPipelineState(descriptor: d)
+            }
+        }
+    }
+    // Volumetric light (METALMC_EXP=...,godrays, with sky and post): its kernels (the resolve's part is in its variants above).
+    if exp.split(separator: ",").contains("godrays"), let src = source("mmc_debug_godrays_shader_source") {
+        attempt("volumetric light: setup and trace kernels") {
+            let l = try device.makeLibrary(source: src, options: nil)
+            for k in ["godrays_setup", "godrays_trace"] { _ = try device.makeComputePipelineState(function: l.makeFunction(name: k)!) }
+        }
+    }
+    // Colored light's shadow kernel and, with gi, the GI cache's kernels with the bounce's splices (built in the library;
+    // errors in its log).
+    if exp.split(separator: ",").contains("coloredlight") {
+        for (name, what) in [("mmc_debug_cl_shadow_compile", "colored light's shadow kernel"), ("mmc_debug_cl_gi_compile", "the GI cache's kernels with colored light's bounce")]
+        where name != "mmc_debug_cl_gi_compile" || exp.split(separator: ",").contains("gi") {
+            if let f = dlsym(lib, name).map({ unsafeBitCast($0, to: (@convention(c) () -> Int32).self) }) {
+                if f() == 1 { print("ok    \(what)") } else { print("FAIL  \(what)"); failures += 1 }
             }
         }
     }
@@ -391,7 +411,9 @@ func frame(_ t: Targets, sunAngle: Float, relight: Bool, extras: Bool = true, ta
         _ = setPipeline(bandPipe); draw(6, 1, 0, 0)
     }
     passEnd()
-    let traced = shadowsApply(t.color, t.depth, &mats, &c, sunAngle, 0.42, 192, 0) == 1
+    // The anti-aliasing's switch as the game passes it (TemporalAA.ENABLED): in lit mode it only gates the volumetric
+    // light's rays (their resolve applies them); without lit mode the shade is left for the resolve, as in the game.
+    let traced = shadowsApply(t.color, t.depth, &mats, &c, sunAngle, 0.42, 192, taa ? 1 : 0) == 1
     var ran = false
     // Water: the reflections on or off, the waves 1/120 s on from the last frame (as at 120 Hz).
     if let litWaterSwitch { _ = litWaterSwitch(reflectWater ? 1 : 0, 100 + Double(framesDrawn) / 120) }
@@ -767,6 +789,83 @@ func depthMatches(_ depth: Float, _ key: UInt32) -> Bool {
     return d <= 1 || d == 0xFFFF
 }
 func lumOf(_ px: [UInt8], _ i: Int) -> Double { 0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2]) }
+
+// Volumetric light (LITFLOW_GODRAYS=1, with LITFLOW_POST=1): per time of day (LITFLOW_GODRAYSTIMES, default
+// morning,noon,dusk,sunset), the relit frame through the anti-aliasing and the post chain with the fog off and on in the same
+// process (mmc_debug_godrays), and its debug views: the fog's light alone, the traced share of its scattering the sun
+// reaches, the transmittance; the mean 8-bit luma of each. The exposure snaps at each picture's first frame. With "time":
+// whole frames at the panel's resolution with it on and off, alternating (the morning and the sunset), and a traced frame's
+// passes (the library's "profile" lines). Then exits.
+if godraysOn {
+    setbuf(stdout, nil)
+    let godrays = fn("mmc_debug_godrays", (@convention(c) (Int32, Int32) -> Int32).self)
+    let postDebug = fn("mmc_debug_post", (@convention(c) (Int32, Int32, Double, Int32) -> Int32).self)
+    check(godrays(1, -1) == 1, "volumetric light is on (\(exp))")
+    check(postDebug(7, 1, 1.0 / 60, 1) == 1, "the post chain is on")
+    let n = Int(W) * Int(H)
+    func meanLuma(_ px: [UInt8]) -> Double {
+        var s = 0.0
+        for i in stride(from: 0, to: n * 4, by: 4) { s += lumOf(px, i) }
+        return s / Double(n)
+    }
+    let name = ProcessInfo.processInfo.environment["LITFLOW_NAME"] ?? "view"
+    let suns: [String: (Float, Float)] = ["noon": (noon, 1), "morning": (morning, 1), "low": (-1.45, 0.6), "dusk": (dusk, 0.55),
+                                          "sunset": (1.53, 0.4), "midnight": (midnight, 0.2)]
+    let list = (ProcessInfo.processInfo.environment["LITFLOW_GODRAYSTIMES"] ?? "morning,noon,dusk,sunset").split(separator: ",").map(String.init)
+    if ProcessInfo.processInfo.environment["LITFLOW_TIMEONLY"] != "1" {
+        for t in list {
+            guard let (angle, skyFactor) = suns[t] else { print("      unknown time \(t)"); continue }
+            setLightmap(skyFactor: skyFactor)
+            for _ in 0..<16 { frame(small, sunAngle: angle, relight: true, extras: false) }   // the sky's tables for this sun
+            for (label, on, view) in [("off", Int32(0), Int32(-1)), ("on", 1, -1), ("light", 1, 1), ("share", 1, 2), ("transmittance", 1, 3)] {
+                _ = godrays(on, view)
+                _ = postDebug(-1, -1, 1.0 / 60, 1)
+                // The anti-aliasing's and the fog's histories settle on this picture first.
+                for _ in 0..<20 { frame(half, sunAngle: angle, relight: true, extras: false, taa: true) }
+                let r = capture(half, sunAngle: angle, relight: true, extras: false, frames: 24, taa: true)
+                writePNG(r.color, Int(W), Int(H), "godrays-\(name)-\(t)-\(label).png")
+                print(String(format: "      %@ %@ %@: mean luma %.1f", name, t, label, meanLuma(r.color)))
+            }
+        }
+        _ = godrays(1, -1)
+    }
+    if timing {
+        let full = targets(3456, 2234)
+        for (t, angle, sf) in [("morning", morning, Float(1)), ("sunset", Float(1.53), Float(0.4))] {
+            setLightmap(skyFactor: sf)
+            _ = godrays(1, -1)
+            for _ in 0..<12 { frame(full, sunAngle: angle, relight: true, extras: false, taa: true) }
+            var times = [Double](repeating: 0, count: 4096)
+            var with: [Double] = [], without: [Double] = []
+            for k in 0..<160 {
+                let on = k % 2 == 0
+                _ = godrays(on ? 1 : 0, -1)
+                _ = gpuTimesTake(&times, 4096)
+                frame(full, sunAngle: angle, relight: true, extras: false, taa: true)
+                let c = Int(gpuTimesTake(&times, 4096))
+                if c > 0 && k >= 20 { if on { with.append(times[c - 1] * 1000) } else { without.append(times[c - 1] * 1000) } }
+            }
+            let ws = with.sorted(), os = without.sorted()
+            if !ws.isEmpty && !os.isEmpty {
+                print(String(format: "      frame at 3456 x 2234 (%@): with the fog %.3f ms (fastest %.3f), without %.3f (fastest %.3f): +%.3f (fastest +%.3f), %d each",
+                             t, ws[ws.count / 2], ws[0], os[os.count / 2], os[0], ws[ws.count / 2] - os[os.count / 2], ws[0] - os[0], ws.count))
+            }
+        }
+        // A traced frame with it on and one with it off (per-pass GPU times: the library's "profile" lines).
+        let traceFrames = fn("mmc_trace_frames", (@convention(c) (Int32) -> Void).self)
+        for on in [Int32(1), 0] {
+            _ = godrays(on, -1)
+            for _ in 0..<12 { frame(full, sunAngle: morning, relight: true, extras: false, taa: true) }
+            print("      traced frame, the fog \(on == 1 ? "on" : "off"):")
+            traceFrames(1)
+            frame(full, sunAngle: morning, relight: true, extras: false, taa: true)
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        _ = godrays(1, -1)
+    }
+    print("done")
+    exit(0)
+}
 
 // Post (LITFLOW_POST=1): per time of day (LITFLOW_POSTTIMES, default noon,dusk,sunset,midnight), the relit frame through the
 // post chain with the anti-aliasing, each effect added in turn in the same process (mmc_debug_post): "before" (the legacy

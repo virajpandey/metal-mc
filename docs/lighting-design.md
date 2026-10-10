@@ -1307,14 +1307,8 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 
 ### Not done, and next
 
-- **Volumetric light from the traced shadows.** The shafts are screen-space: they need the sun on or near the screen, and
-  they can't show beams in the air when the sun is behind the camera (under a canopy, looking away from the sun). The
-  better version marches each quarter-resolution pixel's view ray through a thin fog (8 steps, jittered per frame and
-  accumulated like the shadows' rays), tests each step's visibility toward the sun with one ray into RtShadows'
-  instance structure (it has `tlas`, `tlasAccels` and `origin`; an accessor and `useResources` are all it needs), and
-  adds `sigma x phase(theta) x sun x visibility x transmittance` in the composite. At the shadows' measured rate (about
-  0.3 ms per half-million rays) that's 1-2 ms at 4-8 rays per quarter-resolution pixel; temporal reuse would bring it
-  down.
+- **Volumetric light from the traced shadows:** built (`METALMC_EXP=godrays`, "Volumetric light" below), and it replaces
+  the light shafts when on.
 - Water keeps vanilla's light; clouds get a gain, not lighting (their undersides and the sunset's color on them would
   need the sun's direction and color in `skyLevelColor`).
 - Cheaper: the composite and the copy could be one pass if the sharpening read its neighbors' tone-mapped values from
@@ -1326,3 +1320,156 @@ Speed wasn't the goal tonight; these are the measurements to start from.
 - Not seen in game with the final defaults: noon_overview (the first scene of session 3 caught the LOD still loading);
   sessions 1 and 2 put noon within 2% of before with each meter, and the defaults sit between them.
 - With the external pipeline (`METALMC_EXTPIPE`): not tried together.
+
+## Volumetric light (prototype, `METALMC_EXP=godrays`, 2026-10-10)
+
+`Sources/MetalMCNative/Godrays.swift`; hooks in RtShadows.swift (after the sun's shadow rays), Taa.swift (the sky
+variant's load) and Post.swift (the light shafts step aside); `godrays.metal` and `godrays_header.metal` in lab mode. Off
+by default. It needs `sky` and `post` (the frame in scene-linear light) and the anti-aliasing (its resolve applies it), and
+it's meant for the full look, `lit,nearchunks,rtshadows,sky,gi,water,coloredlight,post`. Without the switch every shader
+is the text it was.
+
+A thin height fog lit by the sun through the traced shadows: beams under the canopy, through cave mouths and between
+hills, with the sun anywhere (behind the camera too), and a haze that lies thicker in the morning, at dusk and in rain.
+
+### The fog
+
+- **Density.** A layer over the land: `s x (L((y - top) / h) - L((y - floor) / hf))` with `L(x) = 1 / (1 + e^x)`. That is
+  the inside's density below the top (half of it at the top, y 68), falling off by e every `h` blocks above it, and gone
+  below a floor (y 30: no fog in deep caves). Each term integrates in closed form along a straight ray (the integral of
+  `L` is `-softplus(-x)`), so the optical depth to any point is exact and cheap, and so is its inverse.
+- **Time of day and weather** (per frame, on the GPU): noon's density at the top is `GODRAYS_DENSITY` (6e-5 per block:
+  visibility about 65 km). With the sun low in the east (vanilla's sun rises at +x) it's up to `GODRAYS_MORNING` (60)
+  times that in a low layer (fall-off 10 blocks instead of 40): a mist that fills the lowlands at sunrise and lifts as the
+  sun climbs (its sine from 0.3 to 1), where the beams show. Low in the west it's up to `GODRAYS_EVENING` (1.5) times,
+  so a sunset's far shore stays a silhouette. At night `GODRAYS_NIGHT` (6) times, a moonlit mist; in rain `GODRAYS_RAIN`
+  (25) times, in a layer that fills the air (fall-off 120).
+- **Color.** Single scattering with albedo 0.9. Extinction per channel is (0.65, 1.0, 1.5) times green's: small particles
+  take more blue, so the haze in the middle distance is bluish and what's behind it warmer. The light is the sun's
+  illuminance through the atmosphere's transmittance table at the camera's altitude: lit mode's sun, in the sky's units,
+  so the fog sits with the sky and the aerial perspective, reddened at sunset. At night it's the moon's. The sky's light
+  comes from the sky view table over the upper hemisphere (256 directions), plus the ground's bounce (albedo 0.1: about
+  what the relit terrain shows, darker than the sky's own units would make it), scattered isotropically.
+- **Phase.** Henyey-Greenstein with two lobes. The forward one (g 0.7, half the weight) makes the glow around the sun. The
+  broad one leans back (g -0.2): it lets beams show with the sun behind the camera, where a forward lobe alone would
+  give a hundredth as much.
+
+### The light, per frame
+
+Light scattered once toward the eye along a ray, with `T` the transmittance and `V` the sun's visibility, is
+
+    L = albedo x integral of sigma T (phase x sun x V + sky x A) dt = albedo x (1 - T) x (phase x sun x r + sky x A)
+
+since the integral of `sigma T` is `1 - T(end)` whatever the density's shape. Here `r` is the share of the fog's
+scattering along the ray that the sun reaches (`integral of sigma T V / (1 - T)`), and only `r` needs rays.
+
+1. `godrays_setup` (one threadgroup) writes this frame's fog and light into a 128-byte buffer. Both kernels and the
+   resolve read it, so the look's constants live in one place (godrays.metal, editable in lab mode).
+2. `godrays_trace` runs after RtShadows' shadow rays, on its instance structure (the LOD's geometry out to its edge, near
+   terrain included), depth and projection. It has one thread per 4 x 4 pixels, for the ray through the block's pixel
+   (2, 2) to its depth.
+   - `GODRAYS_STEPS` (2) points along the ray are importance-sampled by `sigma T` (the closed-form inverse, so every point
+     carries the same weight) and stratified, with a new set each frame (interleaved gradient noise across the screen,
+     the golden ratio over frames).
+   - From each point, one ray goes toward a point on the sun's disk (0.6 degrees, as the shadows'). The clouds' hook
+     (`godraysCloudTransmittance`) multiplies it: it's 1 until the clouds helper's `cloudTransmittanceToSun` merges, and
+     the call is already in place with the point's world position.
+   - The rays' mean is this frame's `r`. Rays whose fog can't scatter more than 0.0003 of sunlight toward the eye are
+     skipped (`r` 1).
+   - The end's sky light (lit mode's G-buffer, squared) stands in for how much of the sky the ray sees.
+   - The history is reprojected from the ray's end and the camera's motion (the sky by rotation only), its texels checked
+     by distance, and blended 10% new when still (35% when moving fast): a quarter-resolution RGBA16Float pair,
+     ping-ponged.
+3. The anti-aliasing's resolve applies it as it loads each pixel, after the aerial perspective (`godraysApply`). It works
+   out `T` per pixel from the closed form, takes `r` from the four texels around the pixel whose distance is like its own
+   (bilinear among them), and the phase per pixel. A ratio upsamples cleanly across depth edges where the light itself
+   wouldn't: a leaf 5 blocks off and the sky behind it differ a hundredfold in scattered light, not in `r`.
+
+### With the aerial perspective and the light shafts
+
+- **No light counted twice.** The fog is a medium of its own beside the atmosphere's. The atmosphere's Mie haze near the
+  ground is about 4e-6 per block, ten to a few hundred times thinner than the fog. The aerial perspective stays as it
+  was, and the fog sits in front of it (`c x T + L`, after `skyLevelColor`).
+- **No seam at distance.** The fog's far end is the same for terrain and the sky: `GODRAYS_REACH`, 32 km, about where the
+  planet's curve lifts a level ray out of a layer this thin. Terrain past it and the sky get the same fog. Terrain that
+  the render distance's fade takes into the sky's color counts as far as the sky does (`godraysDistance`, the fade
+  measured as `skyFadeAmount` measures it). So the horizon and the LOD's edge fade into one fog.
+- **The light shafts are off with it** (`METALMC_GODRAYS_SHAFTS=1` keeps them, for an A/B). Over terrain they add the air
+  in front lit where the sun gets through: that's this fog's light, done in 3D with real shadows, so both would count it
+  twice. Their other half, the sky darkened where something between it and the sun shadows the air, is the only shadow
+  the atmosphere's own light gets, and the only way vanilla's clouds cast rays. It goes too: SEUS's sunset is a soft glow
+  with little beaming where ours had strong fans of rays (census 1), and the clouds helper's clouds replace vanilla's
+  (their `cloudTransmittanceToSun` in the trace makes the rays under them for real).
+
+### In game (2026-10-10, lab session godrays1: 3456 x 2234 fullscreen, TAA, vsync, LOD 8192, the full look with `godrays`)
+
+`bench_out/agents/godrays/lab1/` in the main checkout: `board-<label>-<scene>.jpg` is census 1's ours (the same look
+without the fog, with the light shafts) | ours with the fog | SEUS. `g1-*` is the first tour, `g2-*` the final defaults;
+`off-*` and `mist-*` are the same session's fog off (density 0) and the morning series. In the 8-bit luma of the census
+(terrain the bottom 55%, sky the top 20%), the same session with the fog off and then on:
+
+| scene | terrain mean | terrain 10th percentile | terrain saturation | sky mean |
+|---|---|---|---|---|
+| forest (3000) | 49.0 -> 62.5 (SEUS 88.2) | 18 -> 37 (53) | 17.5 -> 14.0 (24.2) | 175 -> 170 (201) |
+| sunset_water | 73.5 -> 77.9 (92.4) | 34 -> 35 (41) | 28.0 -> 25.1 (13.9) | 149 -> 155 (142) |
+| mountain_view | 47.0 -> 50.1 (93.2) | 19 -> 20 (46) | 8.0 -> 8.0 (15.4) | 172 -> 153 (179) |
+| noon_overview | 82.4 -> 86.8 (116.7) | 38 -> 47 (64) | 21.9 -> 20.6 (25.8) | 167 -> 153 (177) |
+
+- **The first defaults were wrong in two places.**
+  - At sunset the evening haze (5 times noon's) washed the far shore pale under a whitish glow. SEUS keeps it a crisp dark
+    silhouette under a big warm glow. The evening is now 1.5 times noon's: the silhouette stays, the light shafts' fans
+    of rays are gone, and what's left is the sky's own glow (`board-g2-sunset_water.jpg`).
+  - In the caves no beam showed. At the haze's morning density (3-5e-4 per block at y 69-94) a beam a few blocks wide
+    scatters about 0.001 of light, invisible even against dark rock; a beam wants about 3e-3 where it crosses, a
+    morning mist's density. The morning is now 60 times noon's in a low layer (fall-off 10 blocks): a mist that fills the
+    lowlands at sunrise and lifts as the sun climbs.
+- **Beams where the sun isn't on screen.** cave_mouth (a new scene: out of a shallow cave at 1500 ticks, the sun about 35
+  degrees up behind the frame's top) shows the sun's shafts in the mist outside and the hill's shadow cast into the air
+  (`mist-cave2-t1500.png`; `mist-cave2-t1000.png`, `-t2500.png` for the sun lower and higher, `off-cave2-t1500.png`
+  without). The forest at 1000-1500 ticks is a misty morning with the light between the trees, lifting by 2000
+  (`mist-forest-t*.png`).
+- **The forest scene itself (3000 ticks, the sun 55 degrees up behind the camera, looking down at the canopy):** no beams
+  from up there. The hills 200-500 blocks off get a haze much like SEUS's (darker and grayer: ours is lit by the sun from
+  behind and by its ground, SEUS's looks like sky light), the mid-distance a lighter one; the near canopy turns a little
+  grayer. The terrain's mean and 10th percentile move toward SEUS's, its saturation away.
+- **Noon and the mountain view:** a light haze toward the horizon; the far terrain stays far less hazed than SEUS's,
+  whose distance turns blue (its haze reads as much denser, bluer air than our atmosphere's). The sky's mean falls (167 ->
+  153, 172 -> 153): the fog barely touches upward rays, so that's post's eye adaptation metering the brighter terrain.
+- **Rain:** the distance fades into gray (`g2-rain.png`). **Night:** a faint moonlit mist on the far terrain. **Caves**
+  (torch_cave, mineshaft): unchanged, below the fog's floor.
+- **After the tour** the tint went from (0.8, 1.0, 1.3) to (0.65, 1.0, 1.5) and the ground's bounce from 0.2 to 0.1, for
+  a bluer haze nearer SEUS's (the g2 tour has the old two).
+
+### Costs
+
+- **The trace** (`trace 5` at forest, sunset_water and noon_overview, `passes.py` on `bench_out/run_godrays1.log`): the
+  "volumetric light (godrays)" pass 0.41-0.51 ms a frame at the panel's resolution (864 x 559 threads, 2 rays each where
+  the fog is thick enough to show; the first traced frame of each group read 0.8-2.2 ms, as the shadows' pass did beside
+  it). Setup included (one threadgroup).
+- **The composite** rides in the anti-aliasing's resolve (its sky variant's load): a closed-form optical depth, four
+  RGBA16Float texel reads, the phase and a decode and re-encode per pixel the fog touches.
+- The 128-byte frame buffer and two 864 x 559 RGBA16Float textures (7.7 MB).
+
+### Not done, and next
+
+- **The clouds' shadows in the fog.** The hook is in place (`godraysCloudTransmittance(rel, p)`, 1 for now). The clouds
+  helper's `cloudTransmittanceToSun(float3 rel, constant CloudFrame& cf, texture2d<float> shadow)` takes the same
+  camera-relative point. Once Clouds.swift merges: prepend `cloudsShaderHeader` to `godraysSource` (after the sky's
+  header), give `godrays_trace` `constant CloudFrame& cf [[buffer(3)]]` and `texture2d<float> cloudShadow [[texture(4)]]`,
+  bind them from `Clouds.shadowBinding` in `Godrays.encode`, and return `cloudTransmittanceToSun(rel, cf, cloudShadow)`
+  from the hook. Both composite in the resolve's load right after `skyLevelColor`: the clouds first, then the fog in
+  front of them (their bindings, buffer 5 and textures 18-19, don't collide with the fog's, buffer 7 and texture 24).
+- **Light through leaves.** The rays take leaf blocks as opaque, so beams come only through gaps in the canopy. If the
+  leaves helper's transmittance through leaf hits lands as a function, the fog's rays should take it too: dappled light
+  in the air under thin foliage.
+- **Block light in the fog:** torches and lava don't light it (no halos at night, no glow in a cave's air). The colored
+  light volume has their light per cell; sampling it at the trace's points would give the fog their color.
+- **Mist that follows the ground.** The layer is in world height (sea level), so morning mist fills the lowlands and leaves
+  hills clear, but it can't lie in a valley that's above sea level. The LOD's height field could give each point its
+  height over the ground.
+- **Cost of the composite.** It decodes and re-encodes each pixel the fog touches (six powers), on top of the aerial
+  perspective's. Folding it into `skyLevelColor`, before its encode, would save that, but that function is shared and
+  the main session is changing it tonight.
+- **Under water, in the Nether and the End:** none (our sky isn't drawn there, so neither is the resolve's sky variant).
+- **Near the camera** a beam is as fine as a quarter-resolution texel (4 x 4 pixels), softened by the history and the
+  anti-aliasing.
