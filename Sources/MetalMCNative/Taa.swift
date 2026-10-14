@@ -206,7 +206,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
                         texture2d<uint, access::read> litGbuf [[texture(8), function_constant(taaLit)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
-                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]],\n                        texture2d<float> litWaterTrace [[texture(18), function_constant(taaLit)]],\n                        texture2d<float> litWavesDetail [[texture(19), function_constant(taaLit)]],\n                        texture2d<uint> litWaterTraceAS [[texture(20), function_constant(taaLit)]],\n                        texture2d<float, access::read> waterShaded [[texture(30), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
+                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]],\n                        texture2d<float> litWaterTrace [[texture(18), function_constant(taaLit)]],\n                        texture2d<float> litWavesDetail [[texture(19), function_constant(taaLit)]],\n                        texture2d<uint> litWaterTraceAS [[texture(20), function_constant(taaLit)]],\n                        texture2d<float, access::read> waterShaded [[texture(30), function_constant(taaLit)]],\n                        texture2d<float, access::write> hizOut [[texture(31), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
 #endif
 \(taaGodraysArgs)                        uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
@@ -216,6 +216,9 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
     // also left most of its threads idle for the last few). 16 x 16 threads, each resolving 4 pixels.
     threadgroup half4 tile[TAA_A * TAA_A];
     threadgroup float dtile[TAA_A * TAA_A];
+#if LIT_MODE
+    threadgroup float otile[TAA_A * TAA_A];   // the occluders' depth (LodHiZ): opaque lit terrain's, else 0
+#endif
     int2 size = int2(p.size);
     int2 base = int2(tgid) * TAA_T - 1;
     for (uint i = lid.y * 16 + lid.x; i < TAA_A * TAA_A; i += 256) {
@@ -232,6 +235,15 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         }
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
         dtile[i] = d;
+#if LIT_MODE
+        // The LOD's occlusion culling (LodHiZ, p.range.z): only opaque terrain at its own depth occludes (the G-buffer's
+        // key matches: not glass, water, entities or anything translucent drawn over it), so the culling never hides what
+        // shows through them.
+        if (taaLit && p.range.z > 0.5) {
+            uint2 go = litGbuf.read(q).rg;
+            otile[i] = ((go.x >> 29) != 0u && !litIsWater(go) && litDepthMatches(d, go.y & 0xFFFFu)) ? d : 0.0;
+        }
+#endif
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // The tile's 16 x 16 pieces in turn (one, or four for a 32 x 32 tile), so a SIMD group's pixels stay side by side.
@@ -282,6 +294,15 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
             }
         }
         nextHistory.write(float4(clamp(fromYCoCg(float3(result)), 0.0, p.range.x), 1.0), gid);
+#if LIT_MODE
+        // The occluders' pyramid's base (half resolution): the farthest occluder depth of each 2 x 2 block (reverse-Z: the
+        // least), 0 if any of the four isn't one. The tile's pixels pair up: TAA_T is even and the tile starts even.
+        if (taaLit && p.range.z > 0.5 && (gid.x & 1u) == 0u && (gid.y & 1u) == 0u) {
+            float o = min(min(otile[c0], otile[c0 + 1]), min(otile[c0 + TAA_A], otile[c0 + TAA_A + 1]));
+            uint2 hq = gid / 2u;
+            if (hq.x < hizOut.get_width() && hq.y < hizOut.get_height()) hizOut.write(float4(o), hq);
+        }
+#endif
     }
 }
 
@@ -596,12 +617,18 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         enc.setComputePipelineState(chosen!)
         params.range.y = 1
     }
+    // The LOD's occlusion culling (LodHiZ.swift): the occluders' pyramid's base, written as the resolve loads.
+    if relight, chosen != nil, let hz = LodHiZ.shared.target(width: color.width, height: color.height) {
+        enc.setTexture(hz, index: 31)
+        params.range.z = 1
+    }
     enc.setBytes(&params, length: MemoryLayout<TaaParams>.stride, index: 0)
     // Whole threadgroups of 16 x 16 threads, each over a tile of 16 x 16 pixels (the plain resolve) or 32 x 32 (TAA_T):
     // every thread helps load the tile, including those past the edge.
     enc.dispatchThreadgroups(MTLSize(width: (color.width + tile - 1) / tile, height: (color.height + tile - 1) / tile, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     enc.endEncoding()
+    if params.range.z > 0.5 { LodHiZ.shared.finish(cb: cb) }
     // The new history into the frame: a draw that waits to be the first of the next pass on the frame (the hand's) with
     // pass folding, else a pass of its own now (Backend.swift: runPending encodes it).
     let newHistory = t.history[1 - t.current]

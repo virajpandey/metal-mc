@@ -99,6 +99,8 @@ private let cloudMoonIllum = max(0, cloudSetting("METALMC_CLOUDMOON", 0.05))
 private let cloudWeatherTile: Double = 131_072
 /// Each texel of the cloud buffer is marched every cloudUpdate frames (the shader's CLOUD_UPDATE: 4 or 8).
 private let cloudUpdate = 8
+/// METALMC_CLOUDFASTREFRESH=0: inside the layer always two texels of each block a frame, as before 2026-10-13 (A/B).
+private let cloudFastRefresh = cloudEnv["METALMC_CLOUDFASTREFRESH"] != "0"
 /// The deep shadow map: texels a side per cascade, and the cascades' half widths (m).
 private let cloudShadowTexels = 256
 private let cloudCascadeHalf: [Double] = [8_192, 32_768, 131_072]
@@ -1623,7 +1625,7 @@ final class Clouds: @unchecked Sendable {
         // deck, which streaked), for the moments it lasts.
         if !still && height > Double(cloudBase) - 200 && height < Double(cloudTop) + 200 {
             let speed = simd_length(SIMD3(Double(delta.x), Double(delta.y), Double(delta.z)))
-            f.misc.w = speed > 1.5 ? Float(cloudUpdate) : (speed > 0.6 ? 4 : 2)
+            f.misc.w = cloudFastRefresh ? (speed > 1.5 ? Float(cloudUpdate) : (speed > 0.6 ? 4 : 2)) : 2
         }
         guard let menc = cb.makeComputeCommandEncoder(descriptor: profComputePass("clouds: march")) else { return false }
         menc.label = "MetalMC clouds: march"

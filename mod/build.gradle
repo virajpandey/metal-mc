@@ -155,6 +155,9 @@ loom {
 				environmentVariable "METALMC_SUNSIZE", project.findProperty("sunSize").toString()
 			}
 			// Clouds (-PmetalExp=clouds): -PcloudCover=clear|scattered|broken|overcast|<share of the sky> (METALMC_CLOUDCOVER).
+			if (project.hasProperty("cloudFastRefresh")) {
+				environmentVariable "METALMC_CLOUDFASTREFRESH", project.findProperty("cloudFastRefresh").toString()
+			}
 			if (project.hasProperty("cloudCover")) {
 				environmentVariable "METALMC_CLOUDCOVER", project.findProperty("cloudCover").toString()
 			}

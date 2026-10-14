@@ -8,6 +8,23 @@ import simd
 // out) and reverse-Z depth, so it depth-tests correctly against vanilla. It reproduces vanilla's fog
 // exactly, so it fades into the same sky and fog colors.
 
+/// The LOD library's source with this build's material numbers and settings put in (also the offline compile check's).
+func lodLibrarySource() -> String {
+    lodShaderSource
+        .replacingOccurrences(of: "MAT_WATER", with: "\(Mat.water.rawValue)u")
+        .replacingOccurrences(of: "MAT_LEAVES", with: "\(Mat.leaves.rawValue)u")
+        .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
+        .replacingOccurrences(of: "MAT_DIRT", with: "\(Mat.dirt.rawValue)u")
+        .replacingOccurrences(of: "MAT_LAVA", with: "\(Mat.lava.rawValue)u")
+        .replacingOccurrences(of: "MAT_MAGMA", with: "\(Mat.magma.rawValue)u")
+        .replacingOccurrences(of: "MAT_GLOW_FIRST", with: "\(Mat.glowstone.rawValue)u")
+        .replacingOccurrences(of: "MAT_GLOW_LAST", with: "\(Mat.froglight.rawValue)u")
+        .replacingOccurrences(of: "MESH_QUADS", with: "\(lodMeshQuads)")
+        .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
+        .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")
+        .replacingOccurrences(of: "TRANSPARENT_SHADE", with: "\(lodTransparentShade)f")
+}
+
 let lodShaderSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -206,8 +223,56 @@ struct LodCullParams {
     float minW;          // a corner with clip w under this keeps the quad (the near plane is at 0.05)
     uint jobs;           // lod_cull's job count
     uint pad[3];
+    float4x4 prevViewProj;   // occlusion (LodHiZ.swift): the frame the occluders' pyramid was made in, its proj * view
+    float4 camDelta;         // xyz: this frame's camera minus that frame's (blocks), w: 1 with a pyramid to test against
+    float4 hiz;              // xy: the pyramid's base size (texels), z: its levels, w: the margin (base texels)
 };
 static float lodL1(float2 v) { return abs(v.x) + abs(v.y); }
+// Occlusion (LodHiZ.swift): the quad as the pyramid's frame saw it (its corners through that frame's projection, the
+// camera's move added) lies behind the farthest occluder over its whole box, grown by the margin. Conservative: a corner
+// near or behind that frame's camera plane, or any of the box past the frame's edge, keeps the quad.
+// The quad's box as the pyramid's frame saw it (base texels, grown by the margin) and its nearest depth; false if a corner
+// lies near or behind that frame's camera plane (then it's kept).
+static bool lodQuadPrevBox(uint2 q, float4 xs, constant LodCullParams& cp, thread float2& lo, thread float2& hi, thread float& zNear) {
+    uint face = (q.x >> 25) & 7;
+    if (face > 5) return false;
+    float3 local = float3(q.x & 255, (q.x >> 16) & 511, (q.x >> 8) & 255);
+    float w = float(((q.y >> 8) & 255) + 1), h = float(((q.y >> 16) & 255) + 1);
+    float3 ext = extentScale(face, w, h) * xs.w;
+    uint m = q.y & 255;
+    bool water = (m >= 128u && m < 160u) || m == MAT_WATER;
+    float drop = water ? (xs.w < 1.5 ? kWaterSurfaceDrop0 : kWaterSurfaceDrop) : 0.0;
+    float4 cb = cp.prevViewProj * float4(xs.xyz + cp.camDelta.xyz + local * xs.w, 1.0);
+    float4 cx = cp.prevViewProj[0] * ext.x, cy = cp.prevViewProj[1] * (ext.y - drop), cz = cp.prevViewProj[2] * ext.z;
+    lo = float2(1e30); hi = float2(-1e30);
+    zNear = 0.0;   // reverse-Z: the largest is the nearest
+    for (uint c = 0; c < 4; c++) {
+        float3 k = kCorners[face][c];
+        float4 clip = cb + k.x * cx + k.y * cy + k.z * cz;
+        if (!(clip.w > cp.minW)) return false;
+        float2 t = (clip.xy / clip.w * 0.5 + 0.5) * cp.hiz.xy;   // base texels (rows from the bottom, as the targets)
+        lo = min(lo, t);
+        hi = max(hi, t);
+        zNear = max(zNear, clip.z / clip.w);
+    }
+    lo -= cp.hiz.w;
+    hi += cp.hiz.w;
+    return true;
+}
+// A box (base texels) with its nearest depth lies behind the farthest occluder over all of it. Any of it past the frame's
+// edge keeps it.
+static bool lodBoxOccluded(float2 lo, float2 hi, float zNear, constant LodCullParams& cp, texture2d<float, access::read> hiz) {
+    if (any(lo < float2(0.0)) || any(hi > cp.hiz.xy - 1.0)) return false;
+    float extent = max(max(hi.x - lo.x, hi.y - lo.y), 1.0);
+    uint L = min(uint(ceil(log2(extent))), uint(cp.hiz.z) - 1u);
+    uint2 t0 = uint2(lo) >> L, t1 = uint2(hi) >> L;
+    uint2 mx = uint2(max(int(cp.hiz.x) >> L, 1) - 1, max(int(cp.hiz.y) >> L, 1) - 1);
+    t1 = min(t1, mx);
+    float far = 1e30;
+    for (uint y = t0.y; y <= t1.y; y++)
+        for (uint x = t0.x; x <= t1.x; x++) far = min(far, hiz.read(uint2(x, y), L).r);
+    return zNear < far * (1.0 - 1e-4) - 1e-7;
+}
 static bool lodQuadCulled(uint2 q, float4 xs, constant LodCullParams& cp) {
     uint face = (q.x >> 25) & 7;
     if (face > 5 || cp.margin < 0.0) return false;
@@ -259,6 +324,7 @@ struct LodDrawArgs { uint indexCount; uint instanceCount; uint indexStart; int b
 kernel void lod_cull(const device LodCullJob* jobs [[buffer(0)]], constant LodCullParams& cp [[buffer(1)]],
                      const device Xform* xforms [[buffer(2)]], device uint2* outQuads [[buffer(3)]],
                      device uint* outAo [[buffer(4)]], device LodDrawArgs* args [[buffer(5)]],
+                     texture2d<float, access::read> hiz [[texture(0)]],
                      uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                      uint groups [[simdgroups_per_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     uint job = tg * groups + sg;
@@ -274,7 +340,26 @@ kernel void lod_cull(const device LodCullJob* jobs [[buffer(0)]], constant LodCu
         }
         for (uint r = 0; r < 4; r++) {
             uint i = base + 32 * r + lane;
-            bool keep = i < j.count && !lodQuadCulled(q[r], xs, cp);
+            bool cand = i < j.count && !lodQuadCulled(q[r], xs, cp);
+            // Occlusion (LodHiZ.swift): the SIMD group's quads (32 in a row of one draw, one sub-tile's mostly, close
+            // together on the screen) first as one box, tested once; only where that box isn't hidden, each quad's own.
+            bool occ = false;
+            if (cp.camDelta.w > 0.5 && simd_any(cand)) {
+                float2 lo, hi;
+                float zn;
+                bool ok = cand && lodQuadPrevBox(q[r], xs, cp, lo, hi, zn);
+                if (simd_all(!cand || ok)) {
+                    float2 ulo = simd_min(ok ? lo : float2(1e30)), uhi = simd_max(ok ? hi : float2(-1e30));
+                    float uz = simd_max(ok ? zn : 0.0);
+                    uint u = 0u;
+                    if (simd_is_first()) u = lodBoxOccluded(ulo, uhi, uz, cp, hiz) ? 1u : 0u;
+                    if (simd_broadcast_first(u) != 0u) occ = ok;
+                    else occ = ok && lodBoxOccluded(lo, hi, zn, cp, hiz);
+                } else {
+                    occ = ok && lodBoxOccluded(lo, hi, zn, cp, hiz);
+                }
+            }
+            bool keep = cand && !occ;
             uint rank = simd_prefix_exclusive_sum(uint(keep));   // every lane active
             if (keep) {
                 outQuads[j.outBase + total + rank] = q[r];
@@ -751,7 +836,8 @@ let lodMeshQuads = Int(ProcessInfo.processInfo.environment["METALMC_MESHQUADS"] 
 /// pass ahead of the frame writes each draw's surviving quads, in order, and the indirect draws that draw them
 /// (LodQuadCull). The picture is the same: only quads that would make no fragment are left out. The vertex path only
 /// (with meshshader the LOD draws as before).
-let lodQuadCullEnv = experiments.contains("quadcull")
+// On by default since 2026-10-13 with the occlusion test (LodHiZ.swift); METALMC_EXP=noquadcull draws every quad as before.
+let lodQuadCullEnv = !experiments.contains("noquadcull") && !lodMeshShaders
 /// The paths in use: the switches above, or an offline A/B's in one process (mmc_debug_lod_paths).
 nonisolated(unsafe) var lodQuadCullOn = lodQuadCullEnv
 nonisolated(unsafe) var lodMeshOn = lodMeshShaders
@@ -775,6 +861,9 @@ struct LodCullParams {
     var minW: Float
     var jobs: UInt32 = 0
     var pad0: UInt32 = 0, pad1: UInt32 = 0, pad2: UInt32 = 0
+    var prevViewProj = matrix_identity_float4x4
+    var camDelta = SIMD4<Float>.zero
+    var hiz = SIMD4<Float>.zero
 }
 /// Must match LodCullJob in the shaders: GPU addresses of the job's first quad and AO offset.
 struct LodCullJob {
@@ -917,6 +1006,24 @@ final class LodQuadCull: @unchecked Sendable {
         xforms.withUnsafeBytes { xformBuffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
         var params = LodCullParams(viewProj: viewProj, viewport: SIMD2(Float(width), Float(height)), margin: lodCullKeepAll ? -1 : lodCullMargin,
                                    minW: 0.05, jobs: UInt32(jobCount))
+        // Occlusion (LodHiZ.swift): last frame's occluders, with its projection; then this frame's noted for the resolve.
+        let cam = LodRenderer.shared.lastCamera
+        let prev = lodHiZEnabled && !lodCullKeepAll ? LodHiZ.shared.previous() : nil
+        if let prev, cam.x.isFinite, prev.cam.x.isFinite {
+            let d = cam - prev.cam
+            let move = Float(simd_length(d))
+            // The margin: 2 pixels (the rasterizer's snapping, the jitter), and the parallax the move can open behind an
+            // occluder 16 blocks away or more (the focal length in pixels: half the height times proj[1][1], which is the
+            // length of the matrix's y row since the view is a rotation). In base texels (half the pixels).
+            let focal = Float(height) * 0.5 * simd_length(SIMD3(viewProj[0][1], viewProj[1][1], viewProj[2][1]))
+            let marginPx = 2 + move * focal / 16
+            if move < 64 {
+                params.prevViewProj = prev.viewProj
+                params.camDelta = SIMD4(Float(d.x), Float(d.y), Float(d.z), 1)
+                params.hiz = SIMD4(Float(prev.tex.width), Float(prev.tex.height), Float(prev.tex.mipmapLevelCount), marginPx / 2)
+            }
+        }
+        if lodHiZEnabled { LodHiZ.shared.note(viewProj: viewProj, cam: cam) }
         cb.label = "MetalMC LOD quad culling"
         enc.label = "MetalMC LOD quad culling"
         enc.setComputePipelineState(pipe)
@@ -926,6 +1033,7 @@ final class LodQuadCull: @unchecked Sendable {
         enc.setBuffer(quads, offset: 0, index: 3)
         enc.setBuffer(ao, offset: 0, index: 4)
         enc.setBuffer(args, offset: 0, index: 5)
+        enc.setTexture(params.camDelta.w > 0.5 ? prev?.tex : LodHiZ.shared.standIn(), index: 0)
         // The jobs reach the nodes' buffers through their GPU addresses.
         enc.useResources(read, usage: .read)
         // A SIMD group per job, 8 to a threadgroup.
@@ -1110,19 +1218,7 @@ final class LodRenderer: @unchecked Sendable {
             libraryLock.lock()
             defer { libraryLock.unlock() }
             if library == nil {
-                let src = lodShaderSource
-                    .replacingOccurrences(of: "MAT_WATER", with: "\(Mat.water.rawValue)u")
-                    .replacingOccurrences(of: "MAT_LEAVES", with: "\(Mat.leaves.rawValue)u")
-                    .replacingOccurrences(of: "MAT_GRASS", with: "\(Mat.grass.rawValue)u")
-                    .replacingOccurrences(of: "MAT_DIRT", with: "\(Mat.dirt.rawValue)u")
-                    .replacingOccurrences(of: "MAT_LAVA", with: "\(Mat.lava.rawValue)u")
-                    .replacingOccurrences(of: "MAT_MAGMA", with: "\(Mat.magma.rawValue)u")
-                    .replacingOccurrences(of: "MAT_GLOW_FIRST", with: "\(Mat.glowstone.rawValue)u")
-                    .replacingOccurrences(of: "MAT_GLOW_LAST", with: "\(Mat.froglight.rawValue)u")
-                    .replacingOccurrences(of: "MESH_QUADS", with: "\(lodMeshQuads)")
-                    .replacingOccurrences(of: "GRASS_SIDE_SPRITE", with: "\(lodMaterialSprites.count - 1)u")
-                    .replacingOccurrences(of: "GRASS_GRAY", with: "\(lodGrassGray)f")
-                    .replacingOccurrences(of: "TRANSPARENT_SHADE", with: "\(lodTransparentShade)f")
+                let src = lodLibrarySource()
                 // Lab mode (ShaderLab.swift): after an edit, forget the library and every pipeline; the next frame compiles
                 // them again in the background from the new library.
                 library = try ShaderLab.library("lod", src) { [self] _ in

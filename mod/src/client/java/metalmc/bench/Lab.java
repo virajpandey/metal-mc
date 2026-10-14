@@ -37,7 +37,7 @@ import java.util.Map;
  *   reload            recompile every shader file now (-PshaderDir) and rebuild their pipelines
  *   wait TICKS        do nothing for TICKS ticks (20 a second)
  *   tour [PREFIX]     scene + shot for every scene: PREFIX-NAME.png (PREFIX: tour)
- *   pan DYAW [DX DZ]  turn and move the held pose every tick, smoothly (pan 0 stops; scene and tp keep it going)
+ *   pan DYAW [DX DZ [DY]]  turn and move the held pose every tick, smoothly (pan 0 stops; scene stops it)
  *   quit              stop the game
  *   time TICKS, weather clear|rain|thunder, tp X Y Z [YAW PITCH], free (stop holding the pose), cmd COMMAND (any server
  *   command), hud on|off, fov DEGREES, status, scenes, echo TEXT, trace [N] (per-pass GPU times of the next N frames into
@@ -92,7 +92,7 @@ final class Lab {
     /** Every tick in lab mode. Returns true once `quit` ran. */
     static boolean onTick(Minecraft mc, LocalPlayer player) {
         if (hold != null && pan != null) {
-            double[] next = {hold[0] + pan[1], hold[1], hold[2] + pan[2], hold[3] + pan[0], hold[4]};
+            double[] next = {hold[0] + pan[1], hold[1] + pan[3], hold[2] + pan[2], hold[3] + pan[0], hold[4]};
             glide(player, hold, next);
             hold = next;
         } else if (hold != null) place(player, hold);
@@ -164,11 +164,11 @@ final class Lab {
                 return "ok";
             }
             case "free": hold = null; pan = null; return "ok";
-            // pan DYAW [DX DZ]: turn (degrees) and move (blocks) the held pose every tick, smoothly; pan 0 stops.
+            // pan DYAW [DX DZ [DY]]: turn (degrees) and move (blocks) the held pose every tick, smoothly; pan 0 stops.
             case "pan": {
                 double[] v = Arrays.stream(arg.split("\\s+")).mapToDouble(Double::parseDouble).toArray();
                 if (hold == null) return "error: no pose held (scene or tp first)";
-                pan = v.length == 0 || (v.length == 1 && v[0] == 0) ? null : new double[]{v[0], v.length > 2 ? v[1] : 0, v.length > 2 ? v[2] : 0};
+                pan = v.length == 0 || (v.length == 1 && v[0] == 0) ? null : new double[]{v[0], v.length > 2 ? v[1] : 0, v.length > 2 ? v[2] : 0, v.length > 3 ? v[3] : 0};
                 return "ok";
             }
             case "cmd": server(mc, arg); return "ok (sent to the server)";
