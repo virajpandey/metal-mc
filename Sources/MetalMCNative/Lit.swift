@@ -99,7 +99,30 @@ static uint2 litPack(float3 albedo, float ao, uint face, float depth, float sky,
     return uint2(a.r | (a.g << 8) | (a.b << 16) | (uint(round(saturate(ao) * 31.0)) << 24) | (code << 29),
                  litDepthKey(depth) | (uint(round(clamp(sky, 0.0, 15.0) * 16.0)) << 16) | (uint(round(clamp(block, 0.0, 15.0) * 16.0)) << 24));
 }
-\(foliageLight ? foliagePackHeader : "")\(litWater ? litWaterPackHeader : "")#endif
+\(foliageLight ? foliagePackHeader : "")\(litWater ? litWaterPackHeader : "")// The traced visibility at pixel q (one texel per s x s pixels), dist blocks away: between the four nearest texels
+// (centers at the middle of their blocks: with the visibility's history, VisFilter.swift, each texel is its block's
+// mean), weighted by how near each one's sample was to dist (a holds it), so a shadow's edge follows the geometry
+// instead of the blocks; the texel itself where none is near (the raw visibility, whose a is 1, or a silhouette).
+static half4 litVisAt(texture2d<half, access::read> vis, uint2 q, uint s, float dist) {
+    int2 tmax = int2(vis.get_width() - 1, vis.get_height() - 1);
+    half4 own = vis.read(uint2(min(int2(q / s), tmax)));
+    float2 tc = (float2(q) + 0.5) / float(s) - 0.5;
+    int2 t0 = int2(floor(tc));
+    float2 fr = tc - float2(t0);
+    float4 acc = 0.0;
+    float wsum = 0.0;
+    float tol = 0.03 * dist + 0.2;
+    for (int k = 0; k < 4; k++) {
+        half4 v = vis.read(uint2(clamp(t0 + int2(k & 1, k >> 1), int2(0), tmax)));
+        float dd = abs(float(v.a) - dist);
+        if (float(v.a) < 0.0 || dd > 2.0 * tol) continue;
+        float wk = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y) * (1.0 - 0.5 * dd / tol) + 1e-4;
+        acc += float4(v) * wk;
+        wsum += wk;
+    }
+    return wsum > 0.02 ? half4(acc / wsum) : own;
+}
+#endif
 """
 
 /// With water (litWater only; spliced into litShaderHeader, so without it every shader is the same text as before): its
@@ -325,7 +348,7 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         float traced = open;
         if (f.size.z > 0.0) {
             uint s = uint(f.size.z);
-            traced = float(vis.read(min(q / s, uint2(vis.get_width() - 1, vis.get_height() - 1))).r) * saturate(sky / 2.0);
+            traced = float(litVisAt(vis, q, s, length(rel)).r) * saturate(sky / 2.0);
         }
         bool moonTraced = f.sunDir.w > 0.5;
         float vSun = moonTraced ? open : traced, vMoon = moonTraced ? traced : open;
@@ -827,7 +850,7 @@ final class Lit: @unchecked Sendable {
             // cotangent of half the vertical field of view).
             let t = waterTime >= 0 ? waterTime : ProcessInfo.processInfo.systemUptime.truncatingRemainder(dividingBy: 3600)
             let cam = LodRenderer.shared.lastCamera
-            func wrap(_ x: Double) -> Float { x.isFinite ? Float(x - (x / waterTile).rounded(.down) * waterTile) : 0 }
+            func wrap(_ x: Double) -> Float { x.isFinite ? Float(x - (x / waterWrap).rounded(.down) * waterWrap) : 0 }
             f.water = SIMD4(Float(t), wrap(cam.x), wrap(cam.z), waterOn ? 1 : 0)
             f.water2 = SIMD4(2 / max(abs(p[5]) * Float(color.height), 1e-6), atmosphere ? sky.frame.sunHoriz.w : 0,
                              atmosphere ? 1 - sky.frame.aerial.z : 0, atmosphere ? sky.frame.aerial.z : 0)   // z: the moon's glint (none in rain), w: rain (Water.swift)

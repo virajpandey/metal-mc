@@ -268,6 +268,10 @@ let worldWindDegrees = waterEnvFloat("METALMC_WIND", 18, -360, 360)
 /// METALMC_WATERRIPPLES scales the ripples' slopes (0: none).
 let waterRippleScale = waterEnvFloat("METALMC_WATERRIPPLES", 0.5, 0, 4)
 let waterDetailTile: Double = 8
+/// What the camera's x and z are taken modulo for the waves (f.water.yz): a multiple of both tiles, so the tiles go on
+/// without a seam, but far longer, so their rotated and scaled layers (litWaterNormal) jump only once every 4096 blocks
+/// (a float still holds a camera-relative point there to a two-thousandth of a block).
+let waterWrap: Double = 4096
 let waterDetailTexels = 256
 let waterDetailLevels = Int(log2(Double(waterDetailTexels))) + 1
 let waterDetailSet: [(lambda: Double, angle: Double, steep: Double, phase: Double)] = [
@@ -326,6 +330,10 @@ let waterCommonHeader: String = {
 #define WATER_TEAL 0.5
 #endif
 // The reflected rays on a checkerboard at half resolution (half the rays; the anti-aliasing averages the frames).
+// The traced reflection's history (flicker fix): the current frame's weight when the camera is still (1: no history).
+#ifndef WATER_HISTORY_BLEND
+#define WATER_HISTORY_BLEND 0.125
+#endif
 #ifndef WATER_CHECKER
 #define WATER_CHECKER \(waterChecker ? 1 : 0)
 #endif
@@ -334,6 +342,18 @@ let waterCommonHeader: String = {
 #define WATER_TILE \(Int(waterTile)).0
 #define WATER_TEXELS_PER_BLOCK \(String(format: "%.1f", Double(waterTexels) / waterTile))
 #define WATER_DETAIL_TILE \(Int(waterDetailTile)).0
+// The waves' layers (litWaterNormal): the wind's direction (x, z), how fast the gusts drift with it (blocks a second), how
+// much they change the ripples (0: not at all), how far the long waves' slope moves the ripples (blocks per unit slope).
+#define WATER_WIND_DIR float2(\(String(format: "%.5f", cos(worldWindDegrees * .pi / 180))), \(String(format: "%.5f", sin(worldWindDegrees * .pi / 180))))
+#ifndef WATER_GUST_SPEED
+#define WATER_GUST_SPEED 1.6
+#endif
+#ifndef WATER_GUSTS
+#define WATER_GUSTS 1.0
+#endif
+#ifndef WATER_RIPPLE_WARP
+#define WATER_RIPPLE_WARP 6.0
+#endif
 #define WATER_DETAIL_TEXELS_PER_BLOCK \(String(format: "%.1f", Double(waterDetailTexels) / waterDetailTile))
 #define WATER_PI 3.14159265
 constant float kWaterF0 = 0.02;
@@ -384,12 +404,58 @@ static bool litWaterIsTop(depth2d<float, access::read> depth, uint2 q, float d, 
 // over a footprint of `foot` blocks, the long waves' tile and the ripples' together: the mean slope there gives the
 // normal, the slopes' variance the roughness (LEAN mapping: the waves finer than the footprint, which would alias, widen
 // the lobe instead).
-static float3 litWaterNormal(texture2d<float> waves, texture2d<float> detail, float2 xz, float foot, thread float& rough2) {
+// The waves' layers (flicker and water fix, 2026-10-13). One tile read as it is repeats: the ripples' every 8 blocks, the
+// long waves' every 64, a grid the eye finds at once. Each tile is read two or three times, rotated by angles that share
+// no period and scaled by irrational ratios, the slopes added (each layer's turned back by its rotation and weighted), so
+// the sum doesn't repeat anywhere in view. A slow noise drifting with the wind (gusts: cat's paws) scales the ripples in
+// patches, and the long waves' slope moves the ripples' sample point a little (a domain warp), so the ripples ride the
+// swell instead of lying on it like a decal. The slopes' variances add (independent layers), for the LEAN roughness.
+// Per layer: rotation (cos, sin), the scale of its sample point (1: the tile as made; < 1: longer waves) and its weight.
+constant float4 kWaterSwellLayers[2] = { float4(1.0, 0.0, 1.0, 0.85), float4(0.4848, 0.8746, 0.6180, 0.55) };   // 0, 61 degrees
+constant float4 kWaterRippleLayers[3] = { float4(1.0, 0.0, 1.0, 0.62), float4(0.2924, 0.9563, 0.7071, 0.62),    // 0, 73
+                                          float4(-0.8746, 0.4848, 1.3700, 0.48) };                              // 151 degrees
+static float litWaterGustHash(int2 p) {
+    uint h = uint(p.x) * 0x8da6b343u ^ uint(p.y) * 0xd8163841u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    return float(h & 0xFFFFu) / 65535.0;
+}
+static float litWaterGustNoise(float2 p) {
+    float2 i = floor(p), u = p - i;
+    u = u * u * (3.0 - 2.0 * u);
+    int2 b = int2(i);
+    return mix(mix(litWaterGustHash(b), litWaterGustHash(b + int2(1, 0)), u.x),
+               mix(litWaterGustHash(b + int2(0, 1)), litWaterGustHash(b + int2(1, 1)), u.x), u.y);
+}
+// The gusts' strength at xz (world, modulo the wrap) at time t: about 0.35 (sheltered, glassy) to 1.3 (a squall's ruffle).
+static float litWaterGust(float2 xz, float t) {
+    float2 drift = WATER_WIND_DIR * (t * WATER_GUST_SPEED);
+    float n = 0.65 * litWaterGustNoise((xz - drift) * (1.0 / 37.0)) + 0.35 * litWaterGustNoise((xz - drift * 1.6) * (1.0 / 13.0) + 17.3);
+    return mix(1.0, mix(0.35, 1.3, smoothstep(0.2, 0.8, n)), WATER_GUSTS);
+}
+static float3 litWaterNormal(texture2d<float> waves, texture2d<float> detail, float2 xz, float foot, float t, thread float& rough2) {
     constexpr sampler ws(filter::linear, mip_filter::linear, address::repeat);
-    float4 w = waves.sample(ws, xz * (1.0 / WATER_TILE), level(log2(max(foot * WATER_TEXELS_PER_BLOCK, 1.0))));
-    float4 v = detail.sample(ws, xz * (1.0 / WATER_DETAIL_TILE), level(log2(max(foot * WATER_DETAIL_TEXELS_PER_BLOCK, 1.0))));
-    rough2 = kWaterRough2 + max(w.z - dot(w.xy, w.xy), 0.0) + max(v.z - dot(v.xy, v.xy), 0.0);
-    float2 s = w.xy + v.xy;
+    float2 s = 0.0;
+    float var = 0.0;
+    for (int i = 0; i < 2; i++) {
+        float4 L = kWaterSwellLayers[i];
+        float2 u = float2(L.x * xz.x + L.y * xz.y, -L.y * xz.x + L.x * xz.y) * L.z;
+        float4 w = waves.sample(ws, u * (1.0 / WATER_TILE), level(log2(max(foot * L.z * WATER_TEXELS_PER_BLOCK, 1.0))));
+        // The tile's slope is along u; back to the world's axes (u = R xz: the transpose), times the layer's scale.
+        float2 g = float2(L.x * w.x - L.y * w.y, L.y * w.x + L.x * w.y) * (L.z * L.w);
+        s += g;
+        var += L.z * L.z * L.w * L.w * max(w.z - dot(w.xy, w.xy), 0.0);
+    }
+    float2 warped = xz + s * WATER_RIPPLE_WARP;
+    float gust = litWaterGust(xz, t);
+    for (int i = 0; i < 3; i++) {
+        float4 L = kWaterRippleLayers[i];
+        float2 u = float2(L.x * warped.x + L.y * warped.y, -L.y * warped.x + L.x * warped.y) * L.z + float2(5.3, 2.9) * float(i);
+        float4 v = detail.sample(ws, u * (1.0 / WATER_DETAIL_TILE), level(log2(max(foot * L.z * WATER_DETAIL_TEXELS_PER_BLOCK, 1.0))));
+        float k = L.z * L.w * gust;
+        s += float2(L.x * v.x - L.y * v.y, L.y * v.x + L.x * v.y) * k;
+        var += k * k * max(v.z - dot(v.xy, v.xy), 0.0);
+    }
+    rough2 = kWaterRough2 + var;
     return normalize(float3(-s.x, 1.0, -s.y));
 }
 
@@ -571,6 +637,24 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
         uint2 t = min(q / uint(f.water3.x), uint2(trace.get_width() - 1, trace.get_height() - 1));
         tr = trace.read(t);
         tas = traceAS.read(t);
+        if (tr.w >= 0.0) {
+            // The reflection between the four nearest traced texels (each the mean of its block over the frames: centers at
+            // whole texels), only those with water: read as it was, one texel to a 4 x 4 block, it showed the blocks.
+            float2 tc = (float2(q) + 0.5) / f.water3.x - 0.5;
+            int2 t0 = int2(floor(tc));
+            float2 fr = tc - float2(t0);
+            int2 tmax = int2(trace.get_width() - 1, trace.get_height() - 1);
+            float4 acc = 0.0;
+            float wsum = 0.0;
+            for (int k = 0; k < 4; k++) {
+                float4 v = trace.read(uint2(clamp(t0 + int2(k & 1, k >> 1), int2(0), tmax)));
+                if (v.w < 0.0) continue;
+                float wk = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y) + 1e-4;
+                acc += v * wk;
+                wsum += wk;
+            }
+            if (wsum > 0.0) tr = acc / wsum;
+        }
     }
     float3 o;
     if (!top || V.y <= 0.0 || tr.w < 0.0) {
@@ -590,7 +674,7 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
         o = litWaterRelit(c, litWaterVanilla(lightmap, f.misc.x > 0.5, blockLevel, skyLevel), surfE);
         if (top && V.y > 0.0) {
             float rough2;
-            float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / max(V.y, 0.02), rough2);
+            float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / max(V.y, 0.02), f.water.x, rough2);
             float F = litWaterFresnel(max(dot(n, V), 1e-3));
             float open = skyLevel >= 15.0 ? 1.0 : skyDecode(float3(litWaterBrightness(skyLevel))).x;
             float3 R = reflect(-V, n);
@@ -603,7 +687,7 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
     } else {
         // The waves at the pixel's footprint on the surface (blocks, along the view, where it's longest).
         float rough2;
-        float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / max(V.y, 0.02), rough2);
+        float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / max(V.y, 0.02), f.water.x, rough2);
         float F = litWaterFresnel(max(dot(n, V), 1e-3));
         float3 A = litWaterUnpack(tas.x), seen = litWaterUnpack(tas.y), S = litWaterUnpack(tas.z);
         float thick = as_type<float>(tas.w);
@@ -873,6 +957,8 @@ struct WaterTraceParams {
     float4 limits;          // x: reflection rays' length, y: refraction rays' length, z: exposure, w: 1 with the lightmap
     float4 vis;             // x: pixels per traced shadow sample (0: none), y: 1 if traced toward the moon
     uint4 sample;           // x: pixels per traced texel along each axis, y-z: this frame's pixel of the block, w: the frame
+    float4x4 prevViewProj;  // the last frame's projection (jittered) times its view rotation: its camera-relative to clip
+    float4 camDelta;        // xyz: this frame's camera minus the last one's (blocks), w: 1 if the history holds the last frame's
 };
 
 static float3 wtRel(constant WaterTraceParams& p, uint2 q, float z) {
@@ -1013,6 +1099,7 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
                         texture2d<uint, access::write> outAS [[texture(9)]],
                         texture2d<half, access::read> vis [[texture(10)]],
                         texture2d<uint> gi [[texture(11)]],
+                        texture2d<float, access::read> history [[texture(12)]],
                         uint2 gid [[thread_position_in_grid]],
                         uint2 lid [[thread_position_in_threadgroup]],
                         ushort lane [[thread_index_in_simdgroup]]) {
@@ -1044,7 +1131,7 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     bool valid = found && V.y > 0.0;   // a water top seen from above
     float rough2 = kWaterRough2;
     float3 nrm = float3(0.0, 1.0, 0.0);
-    if (valid) nrm = litWaterNormal(waves, wavesDetail, rel.xz + p.water.yz, dist * p.water.w / max(V.y, 0.02), rough2);
+    if (valid) nrm = litWaterNormal(waves, wavesDetail, rel.xz + p.water.yz, dist * p.water.w / max(V.y, 0.02), p.water.x, rough2);
     float3 T = refract(-V, nrm, 1.0 / WATER_ETA);
     if (dot(T, T) < 1e-6) T = -V;
 
@@ -1073,13 +1160,43 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     // every frame, and the others take the reflection of the texel beside them in their row (the anti-aliasing averages
     // the frames).
     bool lm = p.limits.w > 0.5;
+    // The history (flicker fix, 2026-10-13): the texel's reflection as the last frames had it, reprojected through the
+    // surface point (rows of the last frame's traced texels around where it was; only those that had water). Each frame
+    // traces one pixel of the texel's block (the 16-frame pattern), so a reflection that flips between a hit and the sky
+    // within the block (grazing angles: the far shore or the sky, by a wave's slope) flipped the whole block from frame
+    // to frame; blended into the history it converges to the block's mean, the reflection filtered over its footprint.
+    float4 hist = float4(0.0, 0.0, 0.0, -1.0);
+    float histMotion = 0.0;
+    if (valid && p.camDelta.w > 0.5) {
+        float4 pc = p.prevViewProj * float4(rel + p.camDelta.xyz, 1.0);
+        if (pc.w > 1e-4) {
+            float2 pq = (pc.xy / pc.w * 0.5 + 0.5) * p.size.xy;   // the last frame's pixel coordinates
+            histMotion = length(pq - (float2(q) + 0.5));
+            float2 t = pq / float(sc) - 0.5;                       // its traced texels' (centers at whole numbers)
+            int2 t0 = int2(floor(t));
+            float2 fr = t - float2(t0);
+            float4 acc = 0.0;
+            float wsum = 0.0;
+            for (int k = 0; k < 4; k++) {
+                int2 tk = t0 + int2(k & 1, k >> 1);
+                if (any(tk < int2(0)) || tk.x >= int(p.size.z) || tk.y >= int(p.size.w)) continue;
+                float4 h = history.read(uint2(tk));
+                if (h.w < 0.0) continue;
+                float wk = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y) + 1e-4;
+                acc += h * wk;
+                wsum += wk;
+            }
+            if (wsum > 0.05) hist = acc / wsum;
+        }
+    }
     bool checker = WATER_CHECKER != 0 && sc == 2u;
     bool traceR = !checker || ((gid.x + gid.y + p.sample.w) & 1u) == 0u;
     float4 refl = float4(0.0, 0.0, 0.0, -1.0);
     if (valid && traceR) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm), 1.0);
     if (checker) {
+        // Texels that don't trace this frame keep their history; without one, the reflection of the texel beside them.
         float4 beside = simd_shuffle_xor(refl, ushort(1));
-        if (!traceR) refl = beside;
+        if (!traceR) refl = hist.w >= 0.0 ? float4(hist.rgb, 2.0) : beside;
     }
     if (!inside) return;
     if (!valid) {
@@ -1134,6 +1251,13 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     // bend (the per-pixel look-up, WATER_REFRACT).
     float vGlint = p.vis.x > 0.0 ? float(vis.read(min(q / uint(p.vis.x), uint2(vis.get_width() - 1, vis.get_height() - 1))).r) * saturate(skyLevel / 2.0)
                                  : saturate((skyLevel - 12.0) / 3.0);
+    // Into the history: an eighth of this frame's (more as the camera moves, the reprojection being only the surface's: a
+    // reflection's own parallax isn't followed); a checkerboard texel that didn't trace keeps its history as it was.
+    if (hist.w >= 0.0) {
+        float a = refl.w > 1.5 ? 0.0 : mix(WATER_HISTORY_BLEND, 0.5, saturate(histMotion / 12.0));
+        col = mix(hist.rgb, max(col, 0.0), a);
+        vGlint = mix(hist.w, vGlint, mix(WATER_HISTORY_BLEND, 0.5, saturate(histMotion / 12.0)));
+    }
     out.write(float4(max(col, 0.0), vGlint), gid);
     outAS.write(uint4(litWaterPack(A), litWaterPack(seen), litWaterPack(S), as_type<uint>(thick)), gid);
 }
@@ -1145,6 +1269,12 @@ final class WaterTrace: @unchecked Sendable {
     private var pipe: MTLComputePipelineState?
     private var failed = false
     private var out: MTLTexture?
+    /// The last frame's `out` (the reflection's history; swapped with `out` every frame), its projection and camera.
+    private var prevOut: MTLTexture?
+    private var prevViewProj: simd_float4x4?
+    private var prevCam = SIMD3<Double>.zero
+    /// Whether the last call traced (else the history is stale).
+    private var tracedLast = false
     private var outAS: MTLTexture?
     private var standIn: MTLTexture?
     private var standInAS: MTLTexture?
@@ -1212,6 +1342,8 @@ final class WaterTrace: @unchecked Sendable {
                vis: (texture: MTLTexture, scale: Float, moon: Bool), giLight: MTLTexture?, giStandIn: MTLTexture) -> Int {
         current = nil
         currentAS = nil
+        let hadLast = tracedLast
+        tracedLast = false
         let st = RtShadows.shared.takeWaterStructure()
         guard waterRtEnabled, ctx.device.supportsRaytracing, let st, let gi = st.gi, let cache = GiCache.shared,
               Sky.shared.ready, let apScatter = Sky.shared.apScatter, let apTrans = Sky.shared.apTrans, ensure(), let pipe else { return 0 }
@@ -1233,13 +1365,16 @@ final class WaterTrace: @unchecked Sendable {
             d.storageMode = .private
             out = ctx.device.makeTexture(descriptor: d)
             out?.label = "MetalMC water rays"
+            prevOut = ctx.device.makeTexture(descriptor: d)
+            prevOut?.label = "MetalMC water rays (history)"
+            prevViewProj = nil
             let d2 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Uint, width: tw, height: th, mipmapped: false)
             d2.usage = [.shaderRead, .shaderWrite]
             d2.storageMode = .private
             outAS = ctx.device.makeTexture(descriptor: d2)
             outAS?.label = "MetalMC water body"
         }
-        guard let out, let outAS else { return 0 }
+        guard let out, let outAS, let prevOut else { return 0 }
         frame &+= 1
         struct Params {
             var invViewProj: simd_float4x4
@@ -1251,6 +1386,8 @@ final class WaterTrace: @unchecked Sendable {
             var limits: SIMD4<Float>
             var vis: SIMD4<Float>
             var sample: SIMD4<UInt32>
+            var prevViewProj: simd_float4x4
+            var camDelta: SIMD4<Float>
         }
         let off = st.cam - st.origin
         let pat = waterPattern[Int(frame % 16)]
@@ -1258,7 +1395,10 @@ final class WaterTrace: @unchecked Sendable {
                        camOffset: SIMD4(Float(off.x), Float(off.y), Float(off.z), 0), sunDir: SIMD4(sunDir, 1),
                        moonDir: moonDir, water: SIMD4(water.x, water.y, water.z, radiansPerPixel),
                        limits: SIMD4(1024, 48, exposure, lightmap != nil ? 1 : 0), vis: SIMD4(vis.scale, vis.moon ? 1 : 0, 0, 0),
-                       sample: SIMD4(UInt32(sc), pat.x % UInt32(sc), pat.y % UInt32(sc), frame))
+                       sample: SIMD4(UInt32(sc), pat.x % UInt32(sc), pat.y % UInt32(sc), frame),
+                       prevViewProj: prevViewProj ?? matrix_identity_float4x4,
+                       camDelta: SIMD4(Float(st.cam.x - prevCam.x), Float(st.cam.y - prevCam.y), Float(st.cam.z - prevCam.z),
+                                       hadLast && prevViewProj != nil ? 1 : 0))
         // The cache's lookups: its parameters as its kernels have them this frame (the camera's block, the level-0 range,
         // the table's buckets, the structure's origin).
         var gp = GiParams()
@@ -1295,11 +1435,18 @@ final class WaterTrace: @unchecked Sendable {
         enc.setTexture(outAS, index: 9)
         enc.setTexture(vis.texture, index: 10)
         enc.setTexture(giLight ?? giStandIn, index: 11)
+        enc.setTexture(prevOut, index: 12)
         // Whole 8 x 8 threadgroups (the kernel's exchange of refracted rays counts on rows of 8 threads).
         enc.dispatchThreadgroups(MTLSize(width: (tw + 7) / 8, height: (th + 7) / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
         enc.endEncoding()
         current = out
         currentAS = outAS
+        // The history: this frame's rays are the next one's.
+        self.out = prevOut
+        self.prevOut = out
+        prevViewProj = invViewProj.inverse
+        prevCam = st.cam
+        tracedLast = true
         traces += 1
         if traces == 1 { log("water: reflection and refraction rays at \(tw)x\(th) (one per \(sc) x \(sc) pixels of water)") }
         return sc

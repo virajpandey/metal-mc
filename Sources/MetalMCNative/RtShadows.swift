@@ -576,7 +576,10 @@ final class RtShadows: @unchecked Sendable {
             // Clouds hook (Clouds.swift, METALMC_EXP=clouds): the clouds' shadows multiplied into the visibility the relight takes.
             let vis = cloudsEnabled ? Clouds.shared.shadeVisibility(cb: cb, depth: depth, vis: lit, invViewProj: params.invViewProj, towardMoon: towardMoon,
                                                                     scale: sc, sample: SIMD2(params.sample.y, params.sample.z), width: w, height: h) ?? lit : lit
-            litVisibility = (vis, sc, towardMoon, w, h)
+            // The visibility's history (VisFilter.swift, flicker fix): the blocks' samples averaged over the frames.
+            let filtered = VisFilter.shared.filter(cb: cb, raw: vis, depth: depth, invViewProj: params.invViewProj, cam: cam, moon: towardMoon,
+                                                   scale: sc, sample: SIMD2(params.sample.y, params.sample.z), frame: Int(frame)) ?? vis
+            litVisibility = (filtered, sc, towardMoon, w, h)
             return true
         }
         if deferToTaa {

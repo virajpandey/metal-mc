@@ -83,12 +83,27 @@ static half shadowShade(texture2d<half, access::read> lit, uint2 q, constant Taa
     return lit.read(min(q / uint(p.shadow.y), uint2(lit.get_width() - 1, lit.get_height() - 1))).r;
 }
 
+// The resolve works on c / (1 + max(c)) (Karis's tone weighting; flicker fix, 2026-10-13) and writes the inverse: a value
+// far above its neighbors (a glint on a wave, the sun through leaves, HDR highlights up to the display's headroom) no
+// longer stretches the neighborhood's box to its own size or outweighs the history, the fireflies that kept the box
+// jumping from frame to frame. TAA_TONEMAP 0: linear, as before.
+#ifndef TAA_TONEMAP
+#define TAA_TONEMAP 1
+#endif
 static float3 toYCoCg(float3 c) {
+#if TAA_TONEMAP
+    c = max(c, 0.0) / (1.0 + max(c.r, max(c.g, c.b)));
+#endif
     return float3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
 }
 
 static float3 fromYCoCg(float3 c) {
-    return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+    float3 o = float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+#if TAA_TONEMAP
+    o = max(o, 0.0);
+    o = o / max(1.0 - max(o.r, max(o.g, o.b)), 1.0 / 64.0);
+#endif
+    return o;
 }
 
 // Catmull-Rom filtered history in 5 bilinear taps (the 4 corner taps have tiny weights and are dropped). Sharper
