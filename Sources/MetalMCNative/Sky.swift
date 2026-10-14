@@ -411,7 +411,7 @@ static float3 skyPixel(constant SkyFrame& f, float3 dir, texture2d<float> skyVie
 // broad darker patches for the maria (a fixed noise over the disk), seen through the atmosphere, in rain dimmed behind
 // the haze. Its radius is SKY_MOON_SIZE times the sun's (vanilla's moon is drawn large too).
 #ifndef SKY_MOON_SIZE
-#define SKY_MOON_SIZE 1.6
+#define SKY_MOON_SIZE 2.0
 #endif
 #ifndef SKY_MOON_GAIN
 #define SKY_MOON_GAIN 90.0
@@ -878,8 +878,9 @@ final class Sky: @unchecked Sendable {
                                   planet: SIMD4(6360, 6460, 15, 0.3))
         // Vanilla's sun: rotated -90 degrees about y, then by the sun angle about x, from straight up.
         let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
-        // Vanilla's moon: the same rotation by its own angle, drawn below (opposite the sun when the angles agree).
-        f.moon = moonAngle.isFinite && moonPhase >= 0 ? SIMD4(sin(moonAngle), -cos(moonAngle), 0, moonPhase) : SIMD4(0, -1, 0, -1)
+        // Vanilla's moon: drawn as the sun is (applyCelestialBodyTransform, the same height), rotated by its own angle,
+        // which is the sun's plus a half turn: opposite the sun.
+        f.moon = moonAngle.isFinite && moonPhase >= 0 ? SIMD4(-sin(moonAngle), cos(moonAngle), 0, moonPhase) : SIMD4(0, -1, 0, -1)
         let hl = simd_length(SIMD2(sun.x, sun.z))
         let horiz = hl > 1e-4 ? SIMD2(sun.x, sun.z) / hl : SIMD2<Float>(1, 0)
         // Altitude above sea level, kept inside the atmosphere (underground, and past 95 km, the sky is the nearest one's).
