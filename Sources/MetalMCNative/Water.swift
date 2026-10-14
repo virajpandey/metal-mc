@@ -354,6 +354,13 @@ let waterCommonHeader: String = {
 #ifndef WATER_RIPPLE_WARP
 #define WATER_RIPPLE_WARP 6.0
 #endif
+// The long waves' and the ripples' steepness (their slopes' scale; 1: as the tiles were made).
+#ifndef WATER_SWELL_GAIN
+#define WATER_SWELL_GAIN 1.0
+#endif
+#ifndef WATER_RIPPLE_GAIN
+#define WATER_RIPPLE_GAIN 1.0
+#endif
 #define WATER_DETAIL_TEXELS_PER_BLOCK \(String(format: "%.1f", Double(waterDetailTexels) / waterDetailTile))
 #define WATER_PI 3.14159265
 constant float kWaterF0 = 0.02;
@@ -441,9 +448,9 @@ static float3 litWaterNormal(texture2d<float> waves, texture2d<float> detail, fl
         float2 u = float2(L.x * xz.x + L.y * xz.y, -L.y * xz.x + L.x * xz.y) * L.z;
         float4 w = waves.sample(ws, u * (1.0 / WATER_TILE), level(log2(max(foot * L.z * WATER_TEXELS_PER_BLOCK, 1.0))));
         // The tile's slope is along u; back to the world's axes (u = R xz: the transpose), times the layer's scale.
-        float2 g = float2(L.x * w.x - L.y * w.y, L.y * w.x + L.x * w.y) * (L.z * L.w);
+        float2 g = float2(L.x * w.x - L.y * w.y, L.y * w.x + L.x * w.y) * (L.z * L.w * WATER_SWELL_GAIN);
         s += g;
-        var += L.z * L.z * L.w * L.w * max(w.z - dot(w.xy, w.xy), 0.0);
+        var += L.z * L.z * L.w * L.w * (WATER_SWELL_GAIN * WATER_SWELL_GAIN) * max(w.z - dot(w.xy, w.xy), 0.0);
     }
     float2 warped = xz + s * WATER_RIPPLE_WARP;
     float gust = litWaterGust(xz, t);
@@ -451,7 +458,7 @@ static float3 litWaterNormal(texture2d<float> waves, texture2d<float> detail, fl
         float4 L = kWaterRippleLayers[i];
         float2 u = float2(L.x * warped.x + L.y * warped.y, -L.y * warped.x + L.x * warped.y) * L.z + float2(5.3, 2.9) * float(i);
         float4 v = detail.sample(ws, u * (1.0 / WATER_DETAIL_TILE), level(log2(max(foot * L.z * WATER_DETAIL_TEXELS_PER_BLOCK, 1.0))));
-        float k = L.z * L.w * gust;
+        float k = L.z * L.w * gust * WATER_RIPPLE_GAIN;
         s += float2(L.x * v.x - L.y * v.y, L.y * v.x + L.x * v.y) * k;
         var += k * k * max(v.z - dot(v.xy, v.xy), 0.0);
     }

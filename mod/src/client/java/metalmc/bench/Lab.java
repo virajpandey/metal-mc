@@ -37,6 +37,7 @@ import java.util.Map;
  *   reload            recompile every shader file now (-PshaderDir) and rebuild their pipelines
  *   wait TICKS        do nothing for TICKS ticks (20 a second)
  *   tour [PREFIX]     scene + shot for every scene: PREFIX-NAME.png (PREFIX: tour)
+ *   pan DYAW [DX DZ]  turn and move the held pose every tick, smoothly (pan 0 stops; scene and tp keep it going)
  *   quit              stop the game
  *   time TICKS, weather clear|rain|thunder, tp X Y Z [YAW PITCH], free (stop holding the pose), cmd COMMAND (any server
  *   command), hud on|off, fov DEGREES, status, scenes, echo TEXT, trace [N] (per-pass GPU times of the next N frames into
@@ -62,6 +63,8 @@ final class Lab {
     private static int count;
     /** The pose held every tick (scene, tp), until `free`. */
     private static double[] hold;
+    /** `pan`: the held pose's change per tick (yaw, x, z), applied smoothly (the frames interpolate between ticks). */
+    private static double[] pan;
     private static boolean quit;
 
     /** A command that takes ticks: tick() returns its result once done, null until then. */
@@ -88,7 +91,11 @@ final class Lab {
 
     /** Every tick in lab mode. Returns true once `quit` ran. */
     static boolean onTick(Minecraft mc, LocalPlayer player) {
-        if (hold != null) place(player, hold);
+        if (hold != null && pan != null) {
+            double[] next = {hold[0] + pan[1], hold[1], hold[2] + pan[2], hold[3] + pan[0], hold[4]};
+            glide(player, hold, next);
+            hold = next;
+        } else if (hold != null) place(player, hold);
         if (quit) return true;
         take();
         for (int i = 0; i < 32; i++) {   // commands that finish at once run back to back
@@ -156,7 +163,14 @@ final class Lab {
                 server(mc, String.format(Locale.ROOT, "tp @a %.3f %.3f %.3f %.2f %.2f", hold[0], hold[1], hold[2], hold[3], hold[4]));
                 return "ok";
             }
-            case "free": hold = null; return "ok";
+            case "free": hold = null; pan = null; return "ok";
+            // pan DYAW [DX DZ]: turn (degrees) and move (blocks) the held pose every tick, smoothly; pan 0 stops.
+            case "pan": {
+                double[] v = Arrays.stream(arg.split("\\s+")).mapToDouble(Double::parseDouble).toArray();
+                if (hold == null) return "error: no pose held (scene or tp first)";
+                pan = v.length == 0 || (v.length == 1 && v[0] == 0) ? null : new double[]{v[0], v.length > 2 ? v[1] : 0, v.length > 2 ? v[2] : 0};
+                return "ok";
+            }
             case "cmd": server(mc, arg); return "ok (sent to the server)";
             case "hud": {
                 boolean on = arg.equals("on");
@@ -173,11 +187,12 @@ final class Lab {
             // Per-pass GPU timestamps of the next N frames (3) into the game log, for tools/bench/passes.py.
             case "trace": metalmc.backend.MetalStats.traceFrames(arg.isEmpty() ? 3 : Integer.parseInt(arg)); return "ok";
             case "quit": quit = true; mc.stop(); return "ok";
-            default: return "error: unknown command (scene, shot, mask, burst, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo, trace)";
+            default: return "error: unknown command (scene, shot, mask, burst, pan, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo, trace)";
         }
     }
 
     private static String scene(Minecraft mc, String name) {
+        pan = null;
         Map<String, JsonObject> scenes = scenes();
         if (scenes == null) return "error: no scenes file at " + SCENES;
         JsonObject s = scenes.get(name);
@@ -320,6 +335,18 @@ final class Lab {
             say("scenes file " + SCENES + ": " + e);
             return null;
         }
+    }
+
+    /** One tick of a pan: from pose a to b, with the last tick's fields at a so the frames between interpolate. */
+    private static void glide(LocalPlayer p, double[] a, double[] b) {
+        p.getAbilities().mayfly = true;
+        p.getAbilities().flying = true;
+        p.setPos(b[0], b[1], b[2]);
+        p.xo = a[0]; p.yo = a[1]; p.zo = a[2];
+        p.xOld = a[0]; p.yOld = a[1]; p.zOld = a[2];
+        p.setYRot((float) b[3]); p.setXRot((float) b[4]);
+        p.yRotO = (float) a[3]; p.xRotO = (float) a[4];
+        p.setDeltaMovement(0, 0, 0);
     }
 
     private static void place(LocalPlayer p, double[] pose) {
