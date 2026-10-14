@@ -1253,14 +1253,17 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     }
     if (refl.w < 0.0) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm, hitDist), 1.0);   // the texel beside had no water
     // A reflection moves with what it shows, not with the water: for this frame's ray, the history at its mirror image
-    // (the hit point mirrored under the surface's plane, or for the sky the mirrored direction), where the reflection
-    // was on the screen last frame. (With the camera only turning both are the same point; moving, the reflection's own
-    // parallax smeared it.) Texels that didn't trace keep the surface's.
+    // (the hit point mirrored in the mirror it bounced off: the plane through the surface point with the wave's normal;
+    // for the sky, the direction of the camera's ray), where the reflection was on the screen last frame. Still or only
+    // turning, that's the surface point's pixel; moving, the reflection's own parallax smeared it. (Mirrored in the flat
+    // water plane instead, the image left the camera's ray by the wave's tilt times the distance, and the history came
+    // from the wrong texels.) Texels that didn't trace keep the surface's.
     if (hitDist > -1.5 && p.camDelta.w > 0.5) {
         float3 Rr = reflect(-V, nrm);
-        Rr.y = max(Rr.y, 0.002);
-        float4 pc = hitDist >= 0.0 ? p.prevViewProj * float4(float3(rel.x, rel.y, rel.z) + normalize(Rr) * hitDist * float3(1.0, -1.0, 1.0) + p.camDelta.xyz, 1.0)
-                                   : p.prevViewProj * float4(normalize(Rr) * float3(1.0, -1.0, 1.0), 0.0);
+        float3 Hm = Rr * hitDist;
+        Hm -= 2.0 * dot(Hm, nrm) * nrm;
+        float4 pc = hitDist >= 0.0 ? p.prevViewProj * float4(rel + Hm + p.camDelta.xyz, 1.0)
+                                   : p.prevViewProj * float4(-V, 0.0);
         float mv = 0.0;
         float4 hv = wtHistoryAt(p, history, pc, q, sc, mv);
         if (hv.w >= 0.0) { hist = hv; histMotion = mv; }
