@@ -82,6 +82,7 @@ struct SkyFrame {
     float4 aerial;         // x: the aerial perspective volume's range (km), y: distance scale (haze), z: rain (0-1), w: frame (mod 64)
     float4 fade;           // x, y: render-distance fade start and end (blocks, cylindrical like vanilla's fog), z: 1 = on, w: unused
     float4 horizon;        // x: the planet's horizon's zenith angle, y: its depression below the horizontal, z: angle per pixel at the screen's center (rad), w: unused
+    float4 moon;           // xyz: direction to the moon (vanilla's moon angle), w: its phase (vanilla's, 0 full .. 4 new .. 7), < 0: no moon
 };
 
 struct SkyAerial {
@@ -404,6 +405,54 @@ static float3 skyPixel(constant SkyFrame& f, float3 dir, texture2d<float> skyVie
     }
     return L;
 }
+
+// The moon (2026-10-13; vanilla's square moon used to draw over our sky): a sphere lit from the phase's side (Lommel-
+// Seeliger, the regolith's flat look: no darkening toward the limb at full moon), the dark side's earthshine, and
+// broad darker patches for the maria (a fixed noise over the disk), seen through the atmosphere, in rain dimmed behind
+// the haze. Its radius is SKY_MOON_SIZE times the sun's (vanilla's moon is drawn large too).
+#ifndef SKY_MOON_SIZE
+#define SKY_MOON_SIZE 1.6
+#endif
+#ifndef SKY_MOON_GAIN
+#define SKY_MOON_GAIN 90.0
+#endif
+static float skyMoonHash(float2 p) {
+    uint2 i = uint2(int2(floor(p)) + 1024);
+    uint h = i.x * 0x8da6b343u ^ i.y * 0xd8163841u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    return float(h & 0xFFFFu) / 65535.0;
+}
+static float skyMoonNoise(float2 p) {
+    float2 i = floor(p), u = p - i;
+    u = u * u * (3.0 - 2.0 * u);
+    return mix(mix(skyMoonHash(i), skyMoonHash(i + float2(1, 0)), u.x), mix(skyMoonHash(i + float2(0, 1)), skyMoonHash(i + float2(1, 1)), u.x), u.y);
+}
+static bool skyNearMoon(constant SkyFrame& f, float3 dir) {
+    return f.moon.w >= 0.0 && length(dir - f.moon.xyz) < 2.0 * (f.sunHoriz.z * SKY_MOON_SIZE + f.horizon.z);
+}
+static float3 skyMoon(constant SkyFrame& f, float3 dir, texture2d<float> trans, float pixelAngle) {
+    float R = f.sunHoriz.z * SKY_MOON_SIZE;
+    float3 m = f.moon.xyz;
+    float3 right = normalize(cross(m, abs(m.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)));
+    float3 up = cross(right, m);
+    float3 off = dir - m * dot(dir, m);
+    float2 uv = float2(dot(off, right), dot(off, up)) / R;
+    float rr = dot(uv, uv);
+    if (dot(dir, m) <= 0.0 || rr > (1.0 + pixelAngle / R) * (1.0 + pixelAngle / R)) return 0.0;
+    float edge = saturate((1.0 - sqrt(rr)) * R / max(pixelAngle, 1e-6) + 0.5);
+    float3 n = float3(uv, sqrt(max(1.0 - rr, 0.0)));          // z toward the camera
+    float ph = f.moon.w * (2.0 * SKY_PI / 8.0);                  // 0: full (lit from the camera's side), pi: new
+    float3 Ls = float3(-sin(ph), 0.0, cos(ph));
+    float mu0 = max(dot(n, Ls), 0.0), mu = max(n.z, 1e-3);
+    float lit = 2.0 * mu0 / (mu0 + mu) + 0.012;
+    float maria = skyMoonNoise(uv * 2.2 + 3.1) * 0.65 + skyMoonNoise(uv * 5.3 + 7.7) * 0.35;
+    float albedo = mix(1.0, 0.62, smoothstep(0.45, 0.7, maria));
+    float r = f.view.y;
+    float3 T = skyRaySphere(float3(0.0, r, 0.0), dir, f.atmo.planet.x) > 0.0 ? float3(0.0)
+             : skyTransmittanceToSpace(trans, f.atmo, r, dir.y);
+    float night = max(f.tone.w, 0.004);
+    return T * float3(1.0, 0.97, 0.92) * (lit * albedo * edge * SKY_MOON_GAIN * night * (1.0 - 0.85 * f.aerial.z));
+}
 """
 
 private let skyShaderSource = skyShaderHeader + """
@@ -568,7 +617,9 @@ fragment float4 sky_fs(SkyVOut in [[stage_in]],
                        texture2d<float> skyView [[texture(25)]],
                        texture2d<float> trans [[texture(26)]]) {
     float3 dir = skyViewDir(f, in.pos.xy / f.view.zw);
-    return float4(skyDither(skyOutput(skyPixel(f, dir, skyView, trans, f.horizon.z), f), uint2(in.pos.xy), f), 1.0);
+    float3 L = skyPixel(f, dir, skyView, trans, f.horizon.z);
+    if (skyNearMoon(f, dir)) L += skyMoon(f, dir, trans, f.horizon.z);
+    return float4(skyDither(skyOutput(L, f), uint2(in.pos.xy), f), 1.0);
 }
 
 // The sky at a quarter of the resolution on each axis, as it goes in the target (tone mapped, encoded), without the
@@ -593,8 +644,11 @@ fragment float4 sky_upsample_fs(SkyVOut in [[stage_in]],
     float2 uv = in.pos.xy / f.view.zw;
     float3 dir = skyViewDir(f, uv);
     float3 o;
-    if (length(dir - f.sun.xyz) < 2.0 * (f.sunHoriz.z + f.horizon.z) && f.sunHoriz.w > 0.0) {
-        o = skyOutput(skyPixel(f, dir, skyView, trans, f.horizon.z), f);
+    bool moon = skyNearMoon(f, dir);
+    if ((length(dir - f.sun.xyz) < 2.0 * (f.sunHoriz.z + f.horizon.z) && f.sunHoriz.w > 0.0) || moon) {
+        float3 L = skyPixel(f, dir, skyView, trans, f.horizon.z);
+        if (moon) L += skyMoon(f, dir, trans, f.horizon.z);
+        o = skyOutput(L, f);
     } else {
         o = lowres.sample(s, uv).rgb;
     }
@@ -704,6 +758,7 @@ struct SkyFrameGPU {
     var aerial = SIMD4<Float>.zero
     var fade = SIMD4<Float>.zero
     var horizon = SIMD4<Float>.zero
+    var moon = SIMD4<Float>(0, -1, 0, -1)
 }
 
 /// The aerial perspective volume's range (km): past it, terrain gets its last slice.
@@ -805,7 +860,7 @@ final class Sky: @unchecked Sendable {
     /// camera's height above sea level (blocks), and the render-distance fade (end <= start: none), and encodes the
     /// table rebuilds that changed into `cb`.
     func prepare(cb: MTLCommandBuffer, sunAngle: Float, rainBrightness: Float, height: Float,
-                 fadeStart: Float, fadeEnd: Float, headroom: Float) {
+                 fadeStart: Float, fadeEnd: Float, headroom: Float, moonAngle: Float = .nan, moonPhase: Float = -1) {
         deferredAerial = nil
         guard ensure(), let transPipe, let msPipe, let viewPipe, let aerialPipe,
               let transmittance, let multiScatter, let skyView, let apScatter, let apTrans else { ready = false; return }
@@ -823,6 +878,8 @@ final class Sky: @unchecked Sendable {
                                   planet: SIMD4(6360, 6460, 15, 0.3))
         // Vanilla's sun: rotated -90 degrees about y, then by the sun angle about x, from straight up.
         let sun = SIMD3<Float>(-sin(sunAngle), cos(sunAngle), 0)
+        // Vanilla's moon: the same rotation by its own angle, drawn below (opposite the sun when the angles agree).
+        f.moon = moonAngle.isFinite && moonPhase >= 0 ? SIMD4(sin(moonAngle), -cos(moonAngle), 0, moonPhase) : SIMD4(0, -1, 0, -1)
         let hl = simd_length(SIMD2(sun.x, sun.z))
         let horiz = hl > 1e-4 ? SIMD2(sun.x, sun.z) / hl : SIMD2<Float>(1, 0)
         // Altitude above sea level, kept inside the atmosphere (underground, and past 95 km, the sky is the nearest one's).
@@ -1300,8 +1357,9 @@ public func mmc_sky_enabled() -> Int32 { skyEnabled ? 1 : 0 }
 @_cdecl("mmc_sky_prepare")
 public func mmc_sky_prepare(_ p: UnsafePointer<Float>) -> Int32 {
     guard skyEnabled, ctx.pass == nil else { return 0 }
+    // p[5], p[6]: vanilla's moon angle and phase (an older Java side sends 5: no moon of ours, vanilla's draws).
     Sky.shared.prepare(cb: ctx.ensureCB(), sunAngle: p[0], rainBrightness: p[1], height: p[2],
-                       fadeStart: p[3], fadeEnd: p[4], headroom: Hdr.shared.headroom)
+                       fadeStart: p[3], fadeEnd: p[4], headroom: Hdr.shared.headroom, moonAngle: p[5], moonPhase: p[6])
     return Sky.shared.ready ? 1 : 0
 }
 

@@ -19,8 +19,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Our sky (metalmc.sky.Sky) in vanilla's sky pass: drawn in place of the sky disc, first in the pass, so vanilla's moon
- * and stars still draw over it. Its sun and sunset glow are part of it, so vanilla's sunrise fan and sun aren't drawn.
+ * Our sky (metalmc.sky.Sky) in vanilla's sky pass: drawn in place of the sky disc, first in the pass, so vanilla's stars
+ * still draw over it. Its sun, moon and sunset glow are part of it, so vanilla's sunrise fan, sun and moon aren't drawn.
  * If it didn't draw, vanilla's sky stays as it is.
  */
 @Mixin(SkyRenderer.class)
@@ -49,6 +49,11 @@ abstract class SkyRendererMixin {
 
     @Inject(method = "renderSun", at = @At("HEAD"), cancellable = true)
     private void metalmc$noSun(RenderPass renderPass, float rainBrightness, PoseStack poseStack, CallbackInfo ci) {
+        if (Sky.drawn) ci.cancel();
+    }
+
+    @Inject(method = "renderMoon", at = @At("HEAD"), cancellable = true)
+    private void metalmc$noMoon(RenderPass renderPass, net.minecraft.world.level.MoonPhase phase, float rainBrightness, PoseStack poseStack, CallbackInfo ci) {
         if (Sky.drawn) ci.cancel();
     }
 }

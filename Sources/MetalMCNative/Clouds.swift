@@ -1021,11 +1021,13 @@ kernel void clouds_march(texture2d<float, access::write> outColor [[texture(0)]]
                          device const float4* env [[buffer(2)]],
                          uint2 tid [[thread_position_in_grid]]) {
     uint frame = uint(cf.misc.x);
-    // With the camera moving inside the layer (misc.w 2), the texel due four frames on as well: the clouds around it are
-    // near and cross the screen fast, so their history (reprojected at one depth for a cloud's whole depth) holds half as
-    // long and their edges speckle and comb less.
-    for (uint pass = 0; pass < (cf.misc.w > 1.5 ? 2u : 1u); pass++) {
-        uint f = frame + pass * uint(CLOUD_UPDATE / 2);
+    // With the camera moving inside the layer (misc.w 2, 4 or 8 texels of each block: more the faster it goes), the
+    // texels due the next frames on as well: the clouds around it are near and cross the screen fast, so their history
+    // (reprojected at one depth for a cloud's whole depth) holds that much less long and their edges speckle, comb and
+    // (climbing fast through them, 2026-10-13) streak less.
+    uint passes = clamp(uint(cf.misc.w + 0.5), 1u, uint(CLOUD_UPDATE));
+    for (uint pass = 0; pass < passes; pass++) {
+        uint f = frame + pass * uint(CLOUD_UPDATE) / passes;
         uint2 gid = tid * cloudsBlock() + cloudsDueOffset(f);
         if (gid.x >= uint(cf.size.z) || gid.y >= uint(cf.size.w)) continue;
         CloudsTexel x = cloudsTexel(gid, cf, depth);
@@ -1075,8 +1077,9 @@ kernel void clouds_carry(texture2d<float, access::write> outColor [[texture(0)]]
                          uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(cf.size.z) || gid.y >= uint(cf.size.w)) return;
     uint frame = uint(cf.misc.x);
-    if (all(gid % cloudsBlock() == cloudsDueOffset(frame))) return;   // clouds_march writes it
-    if (cf.misc.w > 1.5 && all(gid % cloudsBlock() == cloudsDueOffset(frame + uint(CLOUD_UPDATE / 2)))) return;   // and this one
+    uint passes = clamp(uint(cf.misc.w + 0.5), 1u, uint(CLOUD_UPDATE));
+    for (uint pass = 0; pass < passes; pass++)   // clouds_march writes these
+        if (all(gid % cloudsBlock() == cloudsDueOffset(frame + pass * uint(CLOUD_UPDATE) / passes))) return;
     // Without the terrain test (it reads the whole depth buffer): a texel terrain has newly covered keeps its cloud until
     // its turn (sky pixels beside it want that), one it has uncovered finds no history (its texels were terrain) and is
     // marched now.
@@ -1613,8 +1616,13 @@ final class Clouds: @unchecked Sendable {
         let still = valid && viewProj == prevViewProj && delta == .zero
         let next = still ? current : 1 - current
         f.misc.z = cloudHistoryWeight
-        // Moving inside the layer (or within 200 m of it): two texels of each block a frame (clouds_march, misc.w 2).
-        if !still && height > Double(cloudBase) - 200 && height < Double(cloudTop) + 200 { f.misc.w = 2 }
+        // Moving inside the layer (or within 200 m of it): two texels of each block a frame (clouds_march, misc.w 2); four
+        // from 0.6 blocks a frame (72 a second at 120 Hz: fast flight), all eight from 1.5 (a fall or a climb through the
+        // deck, which streaked), for the moments it lasts.
+        if !still && height > Double(cloudBase) - 200 && height < Double(cloudTop) + 200 {
+            let speed = simd_length(SIMD3(Double(delta.x), Double(delta.y), Double(delta.z)))
+            f.misc.w = speed > 1.5 ? Float(cloudUpdate) : (speed > 0.6 ? 4 : 2)
+        }
         guard let menc = cb.makeComputeCommandEncoder(descriptor: profComputePass("clouds: march")) else { return false }
         menc.label = "MetalMC clouds: march"
         menc.setComputePipelineState(still ? pStill : pMarch)

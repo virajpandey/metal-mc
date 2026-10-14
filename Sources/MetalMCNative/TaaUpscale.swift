@@ -88,7 +88,7 @@ kernel void taa_upscale(texture2d<float, access::read> color [[texture(0)]],
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
             float haze;
-            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")\(taaGodraysLoad)
+            c.rgb = skyLevelColor(c.rgb, q, d, sky, apScatter, apTrans, skyView, haze);\(cloudsEnabled ? "\n            c.rgb = cloudsComposite(c.rgb, q, d, sky, clouds, cloudTex, cloudDepth);" : "")\(taaGodraysLoad)\(rainLook && cloudsEnabled ? "\n#if LIT_MODE\n            // Rain over the sky (Entities.swift), in front of the clouds, as the resolve at full size has it (it was missing here).\n            if (taaLit) c.rgb = litRainOverSky(c.rgb, litGbuf.read(q).rg);\n#endif" : "")
         }
         tile[i] = half4(half3(toYCoCg(c.rgb)), half(c.a));
         dtile[i] = d;

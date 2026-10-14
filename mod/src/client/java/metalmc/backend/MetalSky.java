@@ -45,13 +45,13 @@ public final class MetalSky {
 
     /**
      * Start of a level frame with the sky on, before any render pass: this frame's sun (vanilla's sun angle, radians),
-     * rain brightness (1 clear), the camera's height above sea level, and the render distance's edge (fade start and
-     * end, blocks; end <= start for none). Rebuilds the tables that changed. Returns true if the sky is ready to draw.
+     * rain brightness (1 clear), the camera's height above sea level, the render distance's edge (fade start and
+     * end, blocks; end <= start for none), and vanilla's moon angle and phase (our sky draws the moon). Rebuilds the tables that changed. Returns true if the sky is ready to draw.
      */
-    public static boolean prepare(float sunAngle, float rainBrightness, float height, float fadeStart, float fadeEnd) {
+    public static boolean prepare(float sunAngle, float rainBrightness, float height, float fadeStart, float fadeEnd, float moonAngle, int moonPhase) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            FloatBuffer p = stack.mallocFloat(5);
-            p.put(0, sunAngle).put(1, rainBrightness).put(2, height).put(3, fadeStart).put(4, fadeEnd);
+            FloatBuffer p = stack.mallocFloat(7);
+            p.put(0, sunAngle).put(1, rainBrightness).put(2, height).put(3, fadeStart).put(4, fadeEnd).put(5, moonAngle).put(6, moonPhase);
             return Mtl.skyPrepare(MemoryUtil.memAddress(p)) == 1;
         }
     }

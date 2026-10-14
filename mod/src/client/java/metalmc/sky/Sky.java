@@ -54,7 +54,8 @@ public final class Sky {
             || mc.gui.hud.getBossOverlay().shouldCreateWorldFog()) return;
         FogData fog = cam.fogData;
         float height = (float) (cam.pos.y - mc.level.getSeaLevel());
-        if (!MetalSky.prepare(sky.sunAngle, sky.rainBrightness, height, fog.renderDistanceStart, fog.renderDistanceEnd)) return;
+        if (!MetalSky.prepare(sky.sunAngle, sky.rainBrightness, height, fog.renderDistanceStart, fog.renderDistanceEnd,
+                sky.moonAngle, sky.moonPhase == null ? -1 : sky.moonPhase.index())) return;
         VIEW_ROTATION.set(cam.viewRotationMatrix);
         fog.environmentalStart = NO_FOG - 1;
         fog.environmentalEnd = NO_FOG;

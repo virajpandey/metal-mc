@@ -1213,6 +1213,17 @@ final class FarField: @unchecked Sendable {
 
     /// Before the LOD draws: rewrites the rings if the camera moved far enough, the nodes changed or the area drawn by
     /// quads changed. Returns true if the far field draws this frame (then the LOD skips its levels' quads).
+    /// Whether the rings hold this node's columns (as of their last fill), so the march draws it. A node they don't hold
+    /// yet (right after a jump, or while the LOD streams in: one ring refills per frame, from the nodes built by then) is
+    /// drawn as quads instead (flicker fix, 2026-10-13: every level from the far field's up used to stop drawing as quads
+    /// once the rings had been filled once, so after a jump the terrain vanished for many frames, and the rings' edges
+    /// against cells nothing had filled stood up as walls).
+    func holds(_ n: LodMeshNode) -> Bool {
+        let r = n.level - lodFarFieldLevel
+        guard r >= 0, r < filled.count, filled[r] else { return false }
+        return filledNodes[r][SIMD2(n.x0 >> n.level, n.z0 >> n.level)] != nil
+    }
+
     func prepare(meshes: [LodNodeKey: LodMeshNode], generation: Int, chosen: [(LodMeshNode, UInt16)], maxLevel: Int,
                  cx: Double, cz: Double) -> Bool {
         let k = lodFarFieldLevel

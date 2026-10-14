@@ -154,6 +154,10 @@ loom {
 			if (project.hasProperty("sunSize")) {
 				environmentVariable "METALMC_SUNSIZE", project.findProperty("sunSize").toString()
 			}
+			// Clouds (-PmetalExp=clouds): -PcloudCover=clear|scattered|broken|overcast|<share of the sky> (METALMC_CLOUDCOVER).
+			if (project.hasProperty("cloudCover")) {
+				environmentVariable "METALMC_CLOUDCOVER", project.findProperty("cloudCover").toString()
+			}
 			if (project.hasProperty("hdrSpace")) {
 				environmentVariable "METALMC_HDRSPACE", project.findProperty("hdrSpace").toString()
 			}

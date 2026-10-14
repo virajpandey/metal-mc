@@ -1757,7 +1757,7 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
         && FarField.shared.prepare(meshes: snap.meshes, generation: snap.generation, chosen: chosen, maxLevel: w.maxLevel, cx: cx, cz: cz)
     var farNearest = Double.infinity   // horizontal distance to the nearest tile the far field draws
     if farOn {
-        for (n, mask) in chosen where n.level >= lodFarFieldLevel {
+        for (n, mask) in chosen where n.level >= lodFarFieldLevel && FarField.shared.holds(n) {
             let tb = Double(lodTileVoxels << n.level)
             for t in 0..<16 where mask & (1 << UInt16(t)) != 0 {
                 let x0 = Double(n.x0) + Double(t % 4) * tb, z0 = Double(n.z0) + Double(t / 4) * tb
@@ -1766,9 +1766,11 @@ public func mmc_lod_draw(_ p: UnsafePointer<Float>, _ cam: UnsafePointer<Double>
             }
         }
     }
-    for (n, tileMask) in chosen where !(farOn && n.level >= lodFarFieldLevel) { addTiles(n, tileMask, fadeOutStart: nil) }
+    // (Nodes the rings don't hold yet are drawn as quads: FarField.holds.)
+    let far = FarField.shared
+    for (n, tileMask) in chosen where !(farOn && n.level >= lodFarFieldLevel && far.holds(n)) { addTiles(n, tileMask, fadeOutStart: nil) }
     if lodRtShadows { RtShadows.shared.chosen = chosen }
-    for f in r.fadeOut where !(farOn && f.node.level >= lodFarFieldLevel) { addTiles(f.node, f.mask, fadeOutStart: f.start) }
+    for f in r.fadeOut where !(farOn && f.node.level >= lodFarFieldLevel && far.holds(f.node)) { addTiles(f.node, f.mask, fadeOutStart: f.start) }
     if r.frame % 1000 == 0 {
         var perLevel = [Int](repeating: 0, count: 9), quadsPerLevel = [Int](repeating: 0, count: 9)
         for c in chosen { perLevel[min(8, c.0.level)] += 1 }

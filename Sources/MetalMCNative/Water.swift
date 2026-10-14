@@ -364,6 +364,9 @@ let waterCommonHeader: String = {
 #ifndef WATER_FOOT_ANISO
 #define WATER_FOOT_ANISO 0.5
 #endif
+#ifndef WATER_CAUSTICS_GAIN
+#define WATER_CAUSTICS_GAIN 1.8
+#endif
 #ifndef WATER_SWELL_GAIN
 #define WATER_SWELL_GAIN 0.45
 #endif
@@ -553,12 +556,27 @@ static float litWaterDiv(texture2d<float> t, float2 ps, float tile, float texels
     float sz1 = t.sample(ws, uv + float2(0.0, e), level(lod)).y, sz0 = t.sample(ws, uv - float2(0.0, e), level(lod)).y;
     return (sx1 - sx0 + sz1 - sz0) / (2.0 * e * tile);   // per block
 }
-static float litWaterCaustic(texture2d<float> waves, texture2d<float> detail, float2 tileOff, float3 pf, float D, float3 sunUp) {
+static float litWaterCaustic(texture2d<float> waves, texture2d<float> detail, float2 tileOff, float3 pf, float D, float3 sunUp, float t) {
     if (WATER_CAUSTICS <= 0.0 || D <= 0.05) return 1.0;
     float2 ps = pf.xz + sunUp.xz * (D / max(sunUp.y, 0.2)) + tileOff;
-    float div = litWaterDiv(waves, ps, WATER_TILE, WATER_TEXELS_PER_BLOCK, clamp(log2(1.0 + 0.35 * D), 0.0, 4.0))
-              + litWaterDiv(detail, ps, WATER_DETAIL_TILE, WATER_DETAIL_TEXELS_PER_BLOCK, clamp(log2(1.0 + 2.0 * D), 0.0, 6.0));
-    float k = 1.0 + WATER_CAUSTICS * min(D, 6.0) * (1.0 - 1.0 / WATER_ETA) * div;
+    // The surface's layers as litWaterNormal has them (2026-10-13: the two tiles read as they are made a grid): the
+    // divergence doesn't change under a rotation, and a layer read at scale L.z with weight w adds w L.z^2 times its
+    // tile's divergence at the layer's point.
+    float lodS = clamp(log2(1.0 + 0.35 * D), 0.0, 4.0), lodR = clamp(log2(1.0 + 2.0 * D), 0.0, 6.0);
+    float div = 0.0;
+    for (int i = 0; i < 2; i++) {
+        float4 L = kWaterSwellLayers[i];
+        float2 u = float2(L.x * ps.x + L.y * ps.y, -L.y * ps.x + L.x * ps.y) * L.z;
+        div += L.z * L.z * L.w * WATER_SWELL_GAIN * litWaterDiv(waves, u, WATER_TILE, WATER_TEXELS_PER_BLOCK, lodS);
+    }
+    float gust = litWaterGust(ps, t);
+    for (int i = 0; i < 3; i++) {
+        float4 L = kWaterRippleLayers[i];
+        float2 u = float2(L.x * ps.x + L.y * ps.y, -L.y * ps.x + L.x * ps.y) * L.z + float2(5.3, 2.9) * float(i);
+        div += L.z * L.z * L.w * WATER_RIPPLE_GAIN * gust * litWaterDiv(detail, u, WATER_DETAIL_TILE, WATER_DETAIL_TEXELS_PER_BLOCK, lodR);
+    }
+    // (The calmer surface since 2026-10-13 focuses less: WATER_CAUSTICS_GAIN keeps the floor's net about as strong.)
+    float k = 1.0 + WATER_CAUSTICS * WATER_CAUSTICS_GAIN * min(D, 6.0) * (1.0 - 1.0 / WATER_ETA) * div;
     float c = 1.0 / max(k, 0.2);
     return mix(c * c, 1.0, saturate(D / 24.0));
 }
@@ -822,7 +840,7 @@ static float3 litWaterFog(float3 c, uint2 q, float d, uint2 g, constant LitFrame
             }
             float sinSun2 = 1.0 - f.sunDir.y * f.sunDir.y;
             float3 sunUp = normalize(float3(f.sunDir.x, sqrt(max(WATER_ETA * WATER_ETA - sinSun2, 0.0)), f.sunDir.z));
-            float caustic = litWaterCaustic(waves, detail, f.water.yz, rel, D, sunUp);
+            float caustic = litWaterCaustic(waves, detail, f.water.yz, rel, D, sunUp, f.water.x);
             float3 sunT = exp(-WATER_ABSORB * (D / max(sunUp.y, 0.2)));
             // The sunlit share of a top's light, about: the sun's against the sun's and the sky's.
             float share = vSun * saturate(f.sunDir.y) * 0.8;
@@ -1032,7 +1050,7 @@ static float3 wtReflect(instance_acceleration_structure accel, constant WaterTra
                         const device uint* check, const device half4* value, constant float4* mats, constant GiLight& L,
                         constant float4* env, const device GiTile* tiles, constant SkyFrame& sf, texture2d<float> sky,
                         texture2d<float> lightmap, texture3d<float> apScatter, texture3d<float> apTrans, float3 rel, float dist,
-                        float3 V, float3 nrm, bool lm) {
+                        float3 V, float3 nrm, bool lm, thread float& hitDist) {
     float3 R = reflect(-V, nrm);
     if (R.y < 0.002) R = normalize(float3(R.x, 0.002, R.z));
     // From just over the surface (further with distance: depth precision); not the first stretch (a coarse level's coast
@@ -1044,10 +1062,12 @@ static float3 wtReflect(instance_acceleration_structure accel, constant WaterTra
     auto hit = isect.intersect(r, accel, 0xFF);
     constexpr sampler ss(filter::linear, address::clamp_to_edge);
     float3 col;
+    hitDist = -1.0;
     if (hit.type == intersection_type::none || !hit.triangle_front_facing) {
         // Escaped; or the back of a surface: the ray started inside terrain (a coarse level's coast): the sky.
         col = sky.sample(ss, litWaterSkyUV(R), level(0.0)).rgb;
     } else {
+        hitDist = hit.distance;
         uint pd = GI_HIT(hit);
         uint m = pd & 255u, hf = min((pd >> 8) & 7u, 5u), bl = (pd >> 11) & 15u, cover = (pd >> 15) & 15u;
         float3 hrel = o + R * hit.distance;
@@ -1091,6 +1111,30 @@ static float3 wtReflect(instance_acceleration_structure accel, constant WaterTra
         col = col * ap.transmittance + skyOvercast(sf, ap.inscatter) + skyNight(sf, R) * (1.0 - ap.transmittance);
     }
     return max(col, 0.0);
+}
+
+// The history at the last frame's clip position pc of a point (or a direction, w 0): the four traced texels around it
+// that had water, bilinear; w < 0 if none. motion: how far it moved on the screen (pixels).
+static float4 wtHistoryAt(constant WaterTraceParams& p, texture2d<float, access::read> history, float4 pc, uint2 q, uint sc,
+                          thread float& motion) {
+    if (pc.w <= 1e-4) return float4(0.0, 0.0, 0.0, -1.0);
+    float2 pq = (pc.xy / pc.w * 0.5 + 0.5) * p.size.xy;
+    motion = length(pq - (float2(q) + 0.5));
+    float2 t = pq / float(sc) - 0.5;
+    int2 t0 = int2(floor(t));
+    float2 fr = t - float2(t0);
+    float4 acc = 0.0;
+    float wsum = 0.0;
+    for (int k = 0; k < 4; k++) {
+        int2 tk = t0 + int2(k & 1, k >> 1);
+        if (any(tk < int2(0)) || tk.x >= int(p.size.z) || tk.y >= int(p.size.w)) continue;
+        float4 h = history.read(uint2(tk));
+        if (h.w < 0.0) continue;
+        float wk = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y) + 1e-4;
+        acc += h * wk;
+        wsum += wk;
+    }
+    return wsum > 0.05 ? acc / wsum : float4(0.0, 0.0, 0.0, -1.0);
 }
 
 kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
@@ -1183,32 +1227,12 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     // to frame; blended into the history it converges to the block's mean, the reflection filtered over its footprint.
     float4 hist = float4(0.0, 0.0, 0.0, -1.0);
     float histMotion = 0.0;
-    if (valid && p.camDelta.w > 0.5) {
-        float4 pc = p.prevViewProj * float4(rel + p.camDelta.xyz, 1.0);
-        if (pc.w > 1e-4) {
-            float2 pq = (pc.xy / pc.w * 0.5 + 0.5) * p.size.xy;   // the last frame's pixel coordinates
-            histMotion = length(pq - (float2(q) + 0.5));
-            float2 t = pq / float(sc) - 0.5;                       // its traced texels' (centers at whole numbers)
-            int2 t0 = int2(floor(t));
-            float2 fr = t - float2(t0);
-            float4 acc = 0.0;
-            float wsum = 0.0;
-            for (int k = 0; k < 4; k++) {
-                int2 tk = t0 + int2(k & 1, k >> 1);
-                if (any(tk < int2(0)) || tk.x >= int(p.size.z) || tk.y >= int(p.size.w)) continue;
-                float4 h = history.read(uint2(tk));
-                if (h.w < 0.0) continue;
-                float wk = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y) + 1e-4;
-                acc += h * wk;
-                wsum += wk;
-            }
-            if (wsum > 0.05) hist = acc / wsum;
-        }
-    }
+    if (valid && p.camDelta.w > 0.5) hist = wtHistoryAt(p, history, p.prevViewProj * float4(rel + p.camDelta.xyz, 1.0), q, sc, histMotion);
     bool checker = WATER_CHECKER != 0 && sc == 2u;
     bool traceR = !checker || ((gid.x + gid.y + p.sample.w) & 1u) == 0u;
     float4 refl = float4(0.0, 0.0, 0.0, -1.0);
-    if (valid && traceR) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm), 1.0);
+    float hitDist = -2.0;   // this frame's reflected ray: how far it went (-1 the sky; -2 no ray)
+    if (valid && traceR) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm, hitDist), 1.0);
     if (checker) {
         // Texels that don't trace this frame keep their history; without one, the reflection of the texel beside them.
         float4 beside = simd_shuffle_xor(refl, ushort(1));
@@ -1227,7 +1251,20 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
         auto th = floorRay.intersect(tray, accel, 0xFF);
         if (th.type != intersection_type::none) thick = th.distance;
     }
-    if (refl.w < 0.0) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm), 1.0);   // the texel beside had no water
+    if (refl.w < 0.0) refl = float4(wtReflect(accel, p, gp, check, value, mats, L, env, tiles, sf, sky, lightmap, apScatter, apTrans, rel, dist, V, nrm, lm, hitDist), 1.0);   // the texel beside had no water
+    // A reflection moves with what it shows, not with the water: for this frame's ray, the history at its mirror image
+    // (the hit point mirrored under the surface's plane, or for the sky the mirrored direction), where the reflection
+    // was on the screen last frame. (With the camera only turning both are the same point; moving, the reflection's own
+    // parallax smeared it.) Texels that didn't trace keep the surface's.
+    if (hitDist > -1.5 && p.camDelta.w > 0.5) {
+        float3 Rr = reflect(-V, nrm);
+        Rr.y = max(Rr.y, 0.002);
+        float4 pc = hitDist >= 0.0 ? p.prevViewProj * float4(float3(rel.x, rel.y, rel.z) + normalize(Rr) * hitDist * float3(1.0, -1.0, 1.0) + p.camDelta.xyz, 1.0)
+                                   : p.prevViewProj * float4(normalize(Rr) * float3(1.0, -1.0, 1.0), 0.0);
+        float mv = 0.0;
+        float4 hv = wtHistoryAt(p, history, pc, q, sc, mv);
+        if (hv.w >= 0.0) { hist = hv; histMotion = mv; }
+    }
     float3 col = refl.rgb;
     float4 layer = litWaterLayer(g);
     float skyLevel = float((g.y >> 24) & 15u), blockLevel = float(g.y >> 28);
@@ -1248,7 +1285,7 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     float D = thick * max(-T.y, 0.05);
     float sinSun2 = 1.0 - p.sunDir.y * p.sunDir.y;
     float3 sunUp = normalize(float3(p.sunDir.x, sqrt(max(WATER_ETA * WATER_ETA - sinSun2, 0.0)), p.sunDir.z));
-    float caustic = p.sunDir.y > 0.0 ? litWaterCaustic(waves, wavesDetail, p.water.yz, rel + T * thick, D, sunUp) : 1.0;
+    float caustic = p.sunDir.y > 0.0 ? litWaterCaustic(waves, wavesDetail, p.water.yz, rel + T * thick, D, sunUp, p.water.x) : 1.0;
     // The floor's own shadow (water fix, 2026-10-13): what stands between the floor and the sun under the water (seagrass,
     // the shore's rocks, a pier) shades the floor, as in SEUS; the surface's visibility alone (Lw.sun) left the floor lit
     // under everything that didn't also shade the surface. One ray from the floor toward the sun (the water isn't in the
