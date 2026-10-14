@@ -48,6 +48,8 @@ commands would run at once).
 | `scene NAME` | go to a scene of `tools/bench/scenes.json`: pose, time of day, weather, its setup commands; done once its `settle` ticks (100) have passed, the LOD is built and its quad count has held for 3 s (after a jump of more than 256 blocks, only once it has changed: the LOD updates every 2 s), and the terrain around has compiled (at most 60 s) |
 | `shot LABEL` | screenshot of the main target (the panel's resolution, no HUD) into `mod/run/screenshots/LABEL.png`; done when the file is written |
 | `mask LABEL` | the class mask of the same view into `mod/run/screenshots/LABEL-mask.png` (lit mode; see "The class mask" below); done when the file is written, and the result lists the classes' shares |
+| `burst LABEL [N] [SAVE]` | the flicker meter (below): the next N presented frames (32) tracked per pixel into `LABEL-flicker.png`, `-motion.png`, `-flicker.bin`, the first SAVE (0, at most 16) kept as `LABEL-fNN.png`; the result has the frame's numbers |
+| `pan DYAW [DX DZ]` | turn (degrees) and move (blocks) the held pose every tick, smoothly (the frames interpolate between ticks); `pan 0`, `scene` or `free` stop it |
 | `reload` | recompile every shader file now, changed or not, and rebuild their pipelines (normally the watcher does it on save) |
 | `wait TICKS` | 20 ticks a second |
 | `tour [PREFIX]` | `scene` + `shot PREFIX-NAME` for every scene (PREFIX: tour) |
@@ -169,3 +171,32 @@ summary, the screenshot count, and validity flags: `screen_locked` (run_mc.sh no
 `fps_pinned_120` (uncapped but averaging 120.0: paced by something), `lod_still_building` (lodready.py), `windowed` (not
 the panel's 3456 x 2234 fullscreen), `dialogs`; `valid` is all clear for a timed run, and fullscreen for a screenshot
 run. `python3 tools/bench/ledger.py --show 20` lists the last runs.
+
+## The flicker meter
+
+`burst LABEL [N] [SAVE]` (`Sources/MetalMCNative/Flicker.swift`, 2026-10-13) sees what a screenshot can't: the next N frames
+the present blit sends out, every pixel's luma (0-255, the stored values) tracked through them.
+
+- **d1**: mean |l(t) - l(t-1)|, any change.
+- **d2**: mean |l(t) - 2 l(t-1) + l(t-2)|, change that reverses. Smooth motion has almost none; a pixel alternating
+  between two values has twice its d1. With the camera held still (lab mode), d2 is the flicker.
+- The summary: mean d1 and d2, d2's p99, and the share of pixels with d2 over 2 and over 6 levels. **The HDR frame's
+  dither (RG11B10, moving every frame) puts the floor at d2 about 2-2.5**, so read d2 > 6 as the visible part.
+- `tools/flickstat.swift` (`swiftc -O tools/flickstat.swift -o bench_out/flickstat`): `flickstat LABEL-flicker.bin
+  [LABEL-mask.png] [--json out.json] [--hot N]` splits it by the class mask (`mask LABEL` on the same view) and lists
+  the hottest 64 x 64 tiles, for cropping the kept frames.
+- Under `pan`, d2 isn't flicker any more: fine texture sliding across pixels reverses too. Judge motion by the kept
+  frames (ghosting, smearing).
+
+What it found on the Claude edition (main 34ac2e6), d2 > 6: water_closeup 30.4%, sunset_water 23.8%, forest 13.2%,
+noon_overview 7.7%. An ablation (one session per switch off) put it on two causes, both the same pattern, a 1-in-16
+stochastic sample per 4 x 4 block read back nearest with no history (the anti-aliasing can't average a block that flips
+whole: its neighborhood clip flips with it):
+
+- the traced sun visibility (rtshadows off: forest 13.2% -> 2.5%): every shadow edge flipped 4 x 4 blocks;
+- the water's reflection rays (at grazing angles a hit on the far shore or the sky by a wave's slope; the checkerboard's
+  copy of the texel beside made horizontal bars).
+
+Fixed (branch flicker): the visibility's history (`VisFilter.swift`) and a depth-aware upsample (`litVisAt`), the
+reflection's history and a bilinear upsample (Water.swift), the resolve on tone-weighted colors (`TAA_TONEMAP`). After:
+water_closeup 2.7%, sunset_water 1.9%, forest 2.8%, noon_overview 2.7%: the dither's floor.
