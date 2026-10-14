@@ -1537,6 +1537,8 @@ public func mmc_surface2_blit(_ h: Int64, _ srcTex: Int64) {
     autoreleasepool {
         ctx.endBlit()
         let src = (from(srcTex) as TextureBox).texture
+        // Lab mode's `burst` (Flicker.swift): the frames as they go out.
+        if Flicker.shared.pending { Flicker.shared.frame(cb: ctx.ensureCB(), src: src) }
         let d = MTLRenderPassDescriptor()
         d.colorAttachments[0].texture = drawable.texture
         d.colorAttachments[0].loadAction = .clear

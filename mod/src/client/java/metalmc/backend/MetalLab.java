@@ -13,7 +13,7 @@ public final class MetalLab {
     private MetalLab() {
     }
 
-    private static MethodHandle reload, mask, maskStatus;
+    private static MethodHandle reload, mask, maskStatus, burst, burstStatus;
     private static boolean looked;
 
     private static void look() {
@@ -25,6 +25,10 @@ public final class MetalLab {
         mask = lib.find("mmc_lab_mask").map(a -> Linker.nativeLinker().downcallHandle(a,
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_FLOAT))).orElse(null);
         maskStatus = lib.find("mmc_lab_mask_status").map(a -> Linker.nativeLinker().downcallHandle(a,
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT))).orElse(null);
+        burst = lib.find("mmc_lab_burst").map(a -> Linker.nativeLinker().downcallHandle(a,
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT))).orElse(null);
+        burstStatus = lib.find("mmc_lab_burst_status").map(a -> Linker.nativeLinker().downcallHandle(a,
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT))).orElse(null);
     }
 
@@ -54,6 +58,37 @@ public final class MetalLab {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment buf = arena.allocate(1024);
             int s = (int) maskStatus.invokeExact(buf, 1024);
+            return new Object[]{s, buf.getString(0)};
+        } catch (Throwable t) {
+            return new Object[]{-1, t.toString()};
+        }
+    }
+
+    /**
+     * Lab mode's `burst` (Sources/MetalMCNative/Flicker.swift): the next {@code frames} presented frames' flicker into
+     * {@code base}-flicker.png and the rest, the first {@code save} frames kept. Returns null if it was taken, else why not.
+     */
+    public static synchronized String requestBurst(String base, int frames, int save) {
+        try {
+            look();
+        } catch (RuntimeException e) {
+            return "no native library (" + e.getMessage() + ")";
+        }
+        if (burst == null) return "the native library has no flicker meter (an older build)";
+        try (Arena arena = Arena.ofConfined()) {
+            int ok = (int) burst.invokeExact(arena.allocateFrom(base), frames, save);
+            return ok != 0 ? null : "not taken";
+        } catch (Throwable t) {
+            return t.toString();
+        }
+    }
+
+    /** The burst's state: 2 idle, 0 working, 1 written, -1 failed; and its summary (the numbers, or the error). */
+    public static synchronized Object[] burstStatus() {
+        if (burstStatus == null) return new Object[]{-1, "the native library has no flicker meter"};
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment buf = arena.allocate(2048);
+            int s = (int) burstStatus.invokeExact(buf, 2048);
             return new Object[]{s, buf.getString(0)};
         } catch (Throwable t) {
             return new Object[]{-1, t.toString()};

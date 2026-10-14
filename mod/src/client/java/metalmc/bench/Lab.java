@@ -32,6 +32,8 @@ import java.util.Map;
  *                     the terrain around it has loaded and the LOD has settled
  *   shot LABEL        screenshot into run/screenshots/LABEL.png (done once the file is written)
  *   mask LABEL        the class mask of the same view into run/screenshots/LABEL-mask.png (lit mode; done once written)
+ *   burst LABEL [N] [SAVE]  the flicker meter: the next N presented frames (32) into run/screenshots/LABEL-flicker.png,
+ *                     -motion.png and -flicker.bin, the first SAVE (0) kept as LABEL-fNN.png (Flicker.swift)
  *   reload            recompile every shader file now (-PshaderDir) and rebuild their pipelines
  *   wait TICKS        do nothing for TICKS ticks (20 a second)
  *   tour [PREFIX]     scene + shot for every scene: PREFIX-NAME.png (PREFIX: tour)
@@ -124,6 +126,7 @@ final class Lab {
             case "scene": return scene(mc, arg);
             case "shot": return shot(mc, arg);
             case "mask": return mask(mc, arg);
+            case "burst": return burst(mc, arg);
             case "reload": return metalmc.backend.MetalLab.reloadShaders();
             case "wait": {
                 int[] left = {Math.max(0, Integer.parseInt(arg))};
@@ -170,7 +173,7 @@ final class Lab {
             // Per-pass GPU timestamps of the next N frames (3) into the game log, for tools/bench/passes.py.
             case "trace": metalmc.backend.MetalStats.traceFrames(arg.isEmpty() ? 3 : Integer.parseInt(arg)); return "ok";
             case "quit": quit = true; mc.stop(); return "ok";
-            default: return "error: unknown command (scene, shot, mask, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo, trace)";
+            default: return "error: unknown command (scene, shot, mask, burst, reload, wait, tour, quit, time, weather, tp, free, cmd, hud, fov, status, scenes, echo, trace)";
         }
     }
 
@@ -264,6 +267,29 @@ final class Lab {
             if (state == 1) return "ok: " + s[1];
             if (state < 0) return "error: " + s[1];
             return ++t[0] > 400 ? "error: no mask after 20 s (" + s[1] + ")" : null;
+        };
+        return null;
+    }
+
+    /**
+     * The flicker meter (Sources/MetalMCNative/Flicker.swift; docs/lab-mode.md, "The flicker meter"): the next N presented
+     * frames tracked per pixel; done once the files are written. The result has the frame's numbers.
+     */
+    private static String burst(Minecraft mc, String arg) {
+        String[] a = arg.split("\\s+");
+        String name = a[0].replaceAll("[^A-Za-z0-9._-]", "_");
+        if (name.isEmpty()) return "error: burst LABEL [N] [SAVE]";
+        int frames = a.length > 1 ? Integer.parseInt(a[1]) : 32, save = a.length > 2 ? Integer.parseInt(a[2]) : 0;
+        Path base = mc.gameDirectory.toPath().resolve("screenshots").resolve(name).toAbsolutePath().normalize();
+        String err = metalmc.backend.MetalLab.requestBurst(base.toString(), frames, save);
+        if (err != null) return "error: " + err;
+        int[] t = {0};
+        current = m -> {
+            Object[] s = metalmc.backend.MetalLab.burstStatus();
+            int state = (Integer) s[0];
+            if (state == 1) return "ok: " + s[1];
+            if (state < 0) return "error: " + s[1];
+            return ++t[0] > 1200 ? "error: no burst after 60 s (" + s[1] + ")" : null;
         };
         return null;
     }
