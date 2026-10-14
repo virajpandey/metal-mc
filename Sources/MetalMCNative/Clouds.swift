@@ -42,18 +42,20 @@ private func cloudSetting(_ name: String, _ fallback: Float) -> Float {
     guard let v = Float(cloudEnv[name] ?? ""), v.isFinite else { return fallback }
     return v
 }
-/// METALMC_CLOUDCOVER: clear (0.03), scattered (0.5, the default), broken (0.8), overcast (1), or a number: about the
-/// share of the sky overhead the clouds cover. The shader's coverage is steep (0.3 a few puffs, 0.5 nearly closed), so
+/// METALMC_CLOUDCOVER: clear (0.03), fair (0.3, the default since 2026-10-13), scattered (0.5, the default before: its
+/// white deck turned the water's reflection gray next to SEUS's blue; A/B at noon_overview and water_closeup against the
+/// twins, 0.3 nearest), broken (0.8), overcast (1), or a number: about the share of the sky overhead the clouds cover. The shader's coverage is steep (0.3 a few puffs, 0.5 nearly closed), so
 /// the knob goes through its measured curve (cloudShareCurve), and the default sits in the middle. Above 1 the deck
 /// thickens. The weather map moves the shader's coverage about +-0.05 locally; rain and thunder push it up from there.
 let cloudCoverDefault: Float = {
     let k: Float
-    switch cloudEnv["METALMC_CLOUDCOVER"] ?? "scattered" {
+    switch cloudEnv["METALMC_CLOUDCOVER"] ?? "fair" {
     case "clear": k = 0.03
+    case "fair": k = 0.3
     case "scattered": k = 0.5
     case "broken": k = 0.8
     case "overcast": k = 1
-    case let s: k = Float(s) ?? 0.5
+    case let s: k = Float(s) ?? 0.3
     }
     return cloudCoverFromShare(k)
 }()
