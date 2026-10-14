@@ -38,6 +38,49 @@ let taaWaterLoad = """
         }
 """
 
+// The water pass (speed, 2026-10-13; with lit and water): water's shading (litWaterPixel, litWaterFog: the traced
+// reflections, the floor, refraction, caustics, underwater fog) is a lot of code that the resolve ran for every pixel it
+// loaded, in its main loop: even where no pixel was water, its registers cost the whole resolve occupancy (0.45 ms in
+// the forest, 0.2% water, measured). A pass before the resolve (taa_water, same encoder and bindings) shades the water
+// pixels, and every pixel with the camera under water, into texture 30; the resolve's load takes those from it and
+// relights the rest. p.range.y: 1 when the pass ran this frame (else the water is loaded unshaded).
+let taaWaterSplitLoad = """
+        if (taaLit) {
+            uint2 g = litGbuf.read(q).rg;
+            if (p.range.y > 0.5 && ((litFrame.water3.y > 0.5 && litFrame.water.w > 0.0) || litIsWater(g))) {
+                c = waterShaded.read(q);
+            } else {
+                c.rgb = litRelightPixel(c.rgb, q, d, g, litVis, litLm, litFrame, litEnv\(litGi ? ", litGiIrr, litGiCode" : "")\(clEnabled ? ", litClRGB, litClAux, litClFrame, litClSh" : ""));
+                c.rgb = litWaterWet(c.rgb, q, d, g, litFrame, litWaterSky);
+            }
+        }
+"""
+let taaWaterKernel = """
+
+kernel void taa_water(texture2d<float, access::read> color [[texture(0)]],
+                      depth2d<float, access::read> depth [[texture(1)]],
+                      constant LitFrame& litFrame [[buffer(2)]],
+                      constant float4* litEnv [[buffer(3)]],
+                      texture2d<uint, access::read> litGbuf [[texture(8)]],
+                      texture2d<half, access::read> litVis [[texture(9)]],
+                      texture2d<float> litLm [[texture(10)]],\(litGi ? "\n                      texture2d<float> litGiIrr [[texture(11)]],\n                      texture2d<uint> litGiCode [[texture(12)]]," : "")
+                      texture2d<float> litWaves [[texture(13)]],
+                      texture2d<float> litWaterSky [[texture(14)]],
+                      texture2d<float> litWaterTrace [[texture(18)]],
+                      texture2d<float> litWavesDetail [[texture(19)]],
+                      texture2d<uint> litWaterTraceAS [[texture(20)]],\(clEnabled ? "\n                      texture3d<float> litClRGB [[texture(15)]],\n                      texture3d<float> litClAux [[texture(16)]],\n                      constant ClFrame& litClFrame [[buffer(4)]],\n                      texture2d<half> litClSh [[texture(17)]]," : "")
+                      texture2d<float, access::write> waterShaded [[texture(30)]],
+                      uint2 q [[thread_position_in_grid]]) {
+    if (q.x >= color.get_width() || q.y >= color.get_height()) return;
+    uint2 g0 = litGbuf.read(q).rg;
+    if (!((litFrame.water3.y > 0.5 && litFrame.water.w > 0.0) || litIsWater(g0))) return;
+    float4 c = color.read(q);
+    float d = depth.read(q);
+\(taaWaterLoad.replacingOccurrences(of: "if (taaLit) {", with: "{"))
+    waterShaded.write(c, q);
+}
+"""
+
 // Sky hook (Sky.swift): the atmosphere's shared functions, for the aerial perspective the resolve can apply as it loads.
 // Lit hook (Lit.swift, METALMC_EXP=lit only): the relight's, likewise. Clouds hook (Clouds.swift, METALMC_EXP=clouds only):
 // their composite, after the aerial perspective in the sky variant. (These and the lets below are the upscaling resolve's
@@ -163,7 +206,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
                         constant float4* litEnv [[buffer(3), function_constant(taaLit)]],
                         texture2d<uint, access::read> litGbuf [[texture(8), function_constant(taaLit)]],
                         texture2d<half, access::read> litVis [[texture(9), function_constant(taaLit)]],
-                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]],\n                        texture2d<float> litWaterTrace [[texture(18), function_constant(taaLit)]],\n                        texture2d<float> litWavesDetail [[texture(19), function_constant(taaLit)]],\n                        texture2d<uint> litWaterTraceAS [[texture(20), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
+                        texture2d<float> litLm [[texture(10), function_constant(taaLit)]],\(litGi ? "\n                        texture2d<float> litGiIrr [[texture(11), function_constant(taaLit)]],\n                        texture2d<uint> litGiCode [[texture(12), function_constant(taaLit)]]," : "")\(litWater ? "\n                        texture2d<float> litWaves [[texture(13), function_constant(taaLit)]],\n                        texture2d<float> litWaterSky [[texture(14), function_constant(taaLit)]],\n                        texture2d<float> litWaterTrace [[texture(18), function_constant(taaLit)]],\n                        texture2d<float> litWavesDetail [[texture(19), function_constant(taaLit)]],\n                        texture2d<uint> litWaterTraceAS [[texture(20), function_constant(taaLit)]],\n                        texture2d<float, access::read> waterShaded [[texture(30), function_constant(taaLit)]]," : "")\(clEnabled ? "\n                        texture3d<float> litClRGB [[texture(15), function_constant(taaLit)]],\n                        texture3d<float> litClAux [[texture(16), function_constant(taaLit)]],\n                        constant ClFrame& litClFrame [[buffer(4), function_constant(taaLit)]],\n                        texture2d<half> litClSh [[texture(17), function_constant(taaLit)]]," : "")
 #endif
 \(taaGodraysArgs)                        uint2 lid [[thread_position_in_threadgroup]],
                         uint2 tgid [[threadgroup_position_in_grid]]) {
@@ -180,7 +223,7 @@ kernel void taa_resolve(texture2d<float, access::read> color [[texture(0)]],
         float4 c = color.read(q);
         float d = depth.read(q);
 #if LIT_MODE
-\(litWater ? taaWaterLoad : taaRelightLoad)
+\(litWater ? taaWaterSplitLoad : taaRelightLoad)
 #endif
         c.rgb *= float(shadowShade(lit, q, p));
         if (taaSky) {
@@ -284,6 +327,9 @@ fragment float4 taa_copy_fs(CopyVOut in [[stage_in]], texture2d<float, access::r
     float3 wt = -amp * (0.2 * sharpen);
     return float4(taaDither(clamp((c + (n + s + w + e) * wt) / (1.0 + 4.0 * wt), 0.0, sc.y), g, sc), 1.0);
 }
+#if LIT_MODE
+\(litWater ? taaWaterKernel : "")
+#endif
 """
 
 private struct TaaParams {
@@ -349,7 +395,7 @@ final class Taa: @unchecked Sendable {
                 // Lab mode (ShaderLab.swift): after an edit, forget both libraries and their pipelines; the next frame
                 // builds them again (and restarts the history).
                 let lib = try ShaderLab.library("taa", taaShaderSource) { [self] _ in
-                    library = nil; pipe = nil; skyPipe = nil; litPipes = [:]; copyPipes = [:]; foldedCopyPipes = [:]
+                    library = nil; pipe = nil; skyPipe = nil; litPipes = [:]; copyPipes = [:]; foldedCopyPipes = [:]; waterPipe = nil; waterFailed = false
                     skyFailed = false; litFailed = false; failed = false; self.key = ""
                 }
                 // The plain resolve from a library with 16 x 16 tiles (TAA_T); the variants with a heavy load use 32.
@@ -406,6 +452,33 @@ final class Taa: @unchecked Sendable {
     /// perspective after it (nil if it failed to build: the plain resolve runs, without the relight).
     private var litPipes: [Bool: MTLComputePipelineState] = [:]
     private var litFailed = false
+
+    /// The water pass (taa_water, lit and water): its pipeline and the frame-sized texture it shades the water into.
+    private var waterPipe: MTLComputePipelineState?
+    private var waterFailed = false
+    private var waterTex: MTLTexture?
+    func waterPass(width: Int, height: Int) -> (MTLComputePipelineState, MTLTexture)? {
+        guard litWater, let library, !waterFailed else { return nil }
+        if waterPipe == nil {
+            do {
+                guard let f = library.makeFunction(name: "taa_water") else { throw NSError(domain: "metalmc", code: 1) }
+                waterPipe = try ctx.device.makeComputePipelineState(function: f)
+            } catch {
+                log("TAA: the water pass failed: \(error)")
+                waterFailed = true
+                return nil
+            }
+        }
+        if waterTex == nil || waterTex!.width != width || waterTex!.height != height {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            waterTex = ctx.device.makeTexture(descriptor: d)
+            waterTex?.label = "MetalMC water shaded"
+        }
+        guard let waterPipe, let waterTex else { return nil }
+        return (waterPipe, waterTex)
+    }
     func litResolve(sky: Bool) -> MTLComputePipelineState? {
         if let p = litPipes[sky] { return p }
         guard let library, !litFailed else { return nil }
@@ -484,10 +557,12 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     // applied as the color is loaded, after the shadows' shade; on an 8-bit frame, dithered as it's written back.
     var skyDither: Float = 0
     var tile = 16   // the plain resolve's tile; the variants with a heavy load use 32 (TAA_T in taa_resolve)
+    var chosen: MTLComputePipelineState? = nil
     if let sky = Sky.shared.takeDeferredAerial(width: color.width, height: color.height),
        let skyPipe = relight ? t.litResolve(sky: true) : t.skyResolve() {
         var frame = sky.frame
         enc.setComputePipelineState(skyPipe)
+        chosen = skyPipe
         enc.setBytes(&frame, length: MemoryLayout<SkyFrameGPU>.stride, index: 1)
         enc.setTexture(sky.apScatter, index: 5)
         enc.setTexture(sky.apTrans, index: 6)
@@ -500,9 +575,11 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
         tile = 32
     } else if relight, let litPipe = t.litResolve(sky: false) {
         enc.setComputePipelineState(litPipe)
+        chosen = litPipe
         tile = 32
     } else {
         enc.setComputePipelineState(pipe)
+        chosen = pipe
     }
     if relight { Lit.shared.bindDeferred(enc) }
     enc.setTexture(color, index: 0)
@@ -510,6 +587,15 @@ public func mmc_taa_apply(_ colorHandle: Int64, _ depthHandle: Int64, _ p: Unsaf
     enc.setTexture(t.history[t.current], index: 2)
     enc.setTexture(t.history[1 - t.current], index: 3)
     enc.setTexture(shadows?.lit ?? RtShadows.shared.dummyLit(), index: 4)
+    // The water pass (taa_water): the water pixels shaded into texture 30 before the resolve loads them.
+    if relight, chosen != nil, let (wp, wt) = t.waterPass(width: color.width, height: color.height) {
+        enc.setTexture(wt, index: 30)
+        enc.setComputePipelineState(wp)
+        enc.dispatchThreads(MTLSize(width: color.width, height: color.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+        enc.memoryBarrier(resources: [wt])
+        enc.setComputePipelineState(chosen!)
+        params.range.y = 1
+    }
     enc.setBytes(&params, length: MemoryLayout<TaaParams>.stride, index: 0)
     // Whole threadgroups of 16 x 16 threads, each over a tile of 16 x 16 pixels (the plain resolve) or 32 x 32 (TAA_T):
     // every thread helps load the tile, including those past the edge.
