@@ -40,6 +40,9 @@ final class LodHiZ: @unchecked Sendable {
     private let lock = NSLock()
     private var pipe: MTLComputePipelineState?
     private var failed = false
+    /// A ring of three: the culling pass reads the newest pyramid whose frame the GPU has finished (usually two frames
+    /// old), so it never waits for the frame before it to finish writing (a stall that cost the pass about 0.7 ms and
+    /// the frames their overlap, measured); the margin follows the camera's move since whichever frame that was.
     private var tex: [MTLTexture] = []
     private var views: [[MTLTexture]] = []
     private var writing = 0
@@ -47,6 +50,7 @@ final class LodHiZ: @unchecked Sendable {
     private var noted: (viewProj: simd_float4x4, cam: SIMD3<Double>, frame: UInt64)?
     /// The last pyramid made, with the frame it was made from: what the next frame's culling tests against.
     private var ready: (tex: MTLTexture, viewProj: simd_float4x4, cam: SIMD3<Double>, frame: UInt64)?
+    private var reading = -1   // the texture the culling pass last took
     private var frameCounter: UInt64 = 0
 
     private func ensurePipe() -> MTLComputePipelineState? {
@@ -81,7 +85,7 @@ final class LodHiZ: @unchecked Sendable {
         if tex.isEmpty || tex[0].width != w || tex[0].height != h {
             tex = []; views = []
             let levels = Int(log2(Double(max(w, h)))) + 1
-            for k in 0..<2 {
+            for k in 0..<3 {
                 let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: w, height: h, mipmapped: true)
                 d.usage = [.shaderRead, .shaderWrite]
                 d.storageMode = .private
@@ -110,10 +114,26 @@ final class LodHiZ: @unchecked Sendable {
         }
         enc.endEncoding()
         lock.lock()
-        if let n = noted { ready = (tex[writing], n.viewProj, n.cam, n.frame) }
+        let n = noted
         noted = nil
         lock.unlock()
-        writing = 1 - writing
+        // Ready for the culling once the GPU has finished this frame.
+        let t = tex[writing]
+        if let n {
+            cb.addCompletedHandler { [self] done in
+                guard done.status == .completed else { return }
+                lock.lock()
+                if ready == nil || ready!.frame < n.frame { ready = (t, n.viewProj, n.cam, n.frame) }
+                lock.unlock()
+            }
+        }
+        // The next frame writes the oldest: not the newest finished one (which the culling reads).
+        // (Neither the one the culling last took nor the newest finished, which the next culling takes: with three, one
+        // is always left.)
+        lock.lock(); let r = reading, rd = ready.flatMap { x in tex.firstIndex { $0 === x.tex } } ?? -1; lock.unlock()
+        var next = (writing + 1) % 3
+        while next == r || next == rd { next = (next + 1) % 3 }
+        writing = next
     }
 
     private var stand: MTLTexture?
@@ -129,7 +149,9 @@ final class LodHiZ: @unchecked Sendable {
     /// The culling pass: the pyramid of the frame before this one (nil if there's none: the frame before made none).
     func previous() -> (tex: MTLTexture, viewProj: simd_float4x4, cam: SIMD3<Double>)? {
         lock.lock(); defer { lock.unlock() }
-        guard let r = ready, r.frame == frameCounter else { return nil }
+        // The newest finished, if it's recent (a pause, a menu or a dimension change in between: none).
+        guard let r = ready, frameCounter &- r.frame <= 4 else { return nil }
+        reading = tex.firstIndex { $0 === r.tex } ?? -1
         return (r.tex, r.viewProj, r.cam)
     }
 }

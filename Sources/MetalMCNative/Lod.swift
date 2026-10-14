@@ -233,6 +233,11 @@ static float lodL1(float2 v) { return abs(v.x) + abs(v.y); }
 // near or behind that frame's camera plane, or any of the box past the frame's edge, keeps the quad.
 // The quad's box as the pyramid's frame saw it (base texels, grown by the margin) and its nearest depth; false if a corner
 // lies near or behind that frame's camera plane (then it's kept).
+// LOD_HIZ_PER_QUAD 1: where a SIMD group's box isn't hidden, each quad's own box is tested too (more culled, a slower
+// pass: 1.3 ms against 0.4 without occlusion, measured); 0 (METALMC_EXP=hizgroup): the groups' boxes only.
+#ifndef LOD_HIZ_PER_QUAD
+#define LOD_HIZ_PER_QUAD \(experiments.contains("hizgroup") ? 0 : 1)
+#endif
 static bool lodQuadPrevBox(uint2 q, float4 xs, constant LodCullParams& cp, thread float2& lo, thread float2& hi, thread float& zNear) {
     uint face = (q.x >> 25) & 7;
     if (face > 5) return false;
@@ -354,8 +359,8 @@ kernel void lod_cull(const device LodCullJob* jobs [[buffer(0)]], constant LodCu
                     uint u = 0u;
                     if (simd_is_first()) u = lodBoxOccluded(ulo, uhi, uz, cp, hiz) ? 1u : 0u;
                     if (simd_broadcast_first(u) != 0u) occ = ok;
-                    else occ = ok && lodBoxOccluded(lo, hi, zn, cp, hiz);
-                } else {
+                    else if (LOD_HIZ_PER_QUAD) occ = ok && lodBoxOccluded(lo, hi, zn, cp, hiz);
+                } else if (LOD_HIZ_PER_QUAD) {
                     occ = ok && lodBoxOccluded(lo, hi, zn, cp, hiz);
                 }
             }

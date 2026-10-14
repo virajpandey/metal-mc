@@ -76,7 +76,7 @@ public final class FarTerrain {
             DensitySampler density = rs.getSampler(noise.generatorSettings().value().noiseRouter().finalDensity());
             int endBiome = Math.max(0, MetalLod.farBiome(worldId, "minecraft:the_end"));
             MetalLod.farCache(worldId, cache.toAbsolutePath().toString());
-            launch(() -> run(worldId, (lv, nx, nz) -> generateEnd(worldId, lv, nx, nz, density, endBiome)));
+            launch(() -> run(worldId, (lv, nx, nz, stride) -> { if (stride == 1) generateEnd(worldId, lv, nx, nz, density, endBiome); }));
             System.out.println("[metalmc-lod] far terrain: generating End islands from the world's noise");
             return;
         }
@@ -93,13 +93,21 @@ public final class FarTerrain {
         int minY = level.getMinY(), maxY = level.getMaxY();
         MetalLod.farCache(worldId, cache.toAbsolutePath().toString());
         ThreadLocal<BiomeResolver> resolvers = ThreadLocal.withInitial(() -> gen.getBiomeSource().createUncachedResolver(rs));
-        launch(() -> run(worldId, (lv, nx, nz) -> generate(worldId, lv, nx, nz, surface, cheese, resolvers.get(), minY, maxY)));
+        launch(() -> run(worldId, (lv, nx, nz, stride) -> generate(worldId, lv, nx, nz, stride, surface, cheese, resolvers.get(), minY, maxY)));
         System.out.println("[metalmc-lod] far terrain: generating from the world's noise");
     }
 
     private interface NodeJob {
-        void generate(int level, int nx, int nz);
+        /** stride 1: the node's full columns; PREVIEW: a quick preview first (overworld only). */
+        void generate(int level, int nx, int nz, int stride);
     }
+
+    /**
+     * The preview's spacing: a column every 4 x 4, spread over its block, so a node's land shows in a sixteenth of the
+     * time (after a jump, or flying fast into land nothing generated: the full pass takes about 7 s a node on three
+     * threads, and until then the levels near the camera had no land at all, only the edges of what had). Never cached.
+     */
+    private static final int PREVIEW = 4;
 
     private static void launch(Runnable body) {
         running = true;
@@ -134,13 +142,17 @@ public final class FarTerrain {
                 }
                 long t0 = System.nanoTime();
                 java.util.List<Future<?>> jobs = new java.util.ArrayList<>();
-                for (int i = 0; i + 2 < wanted.length; i += 3) {
-                    int lv = wanted[i], nx = wanted[i + 1], nz = wanted[i + 2];
-                    jobs.add(pool.submit(() -> job.generate(lv, nx, nz)));
+                // The batch's previews first, all of them, then the full columns.
+                for (int stride : new int[]{PREVIEW, 1}) {
+                    for (int i = 0; i + 2 < wanted.length; i += 3) {
+                        int lv = wanted[i], nx = wanted[i + 1], nz = wanted[i + 2];
+                        jobs.add(pool.submit(() -> job.generate(lv, nx, nz, stride)));
+                    }
+                    for (Future<?> f : jobs) f.get();
+                    jobs.clear();
                 }
-                for (Future<?> f : jobs) f.get();
-                nodes += jobs.size();
-                columns += (long) jobs.size() * COLUMNS * COLUMNS;
+                nodes += (wanted.length / 3);
+                columns += (long) (wanted.length / 3) * COLUMNS * COLUMNS;
                 nanos += System.nanoTime() - t0;
                 System.out.println(String.format("[metalmc-lod] far terrain: %d nodes (%d columns) in %.1f s, %.0f us per column per thread",
                     nodes, columns, nanos / 1e9, nanos / 1e3 * THREADS / columns));
@@ -154,7 +166,7 @@ public final class FarTerrain {
         }
     }
 
-    private static void generate(long worldId, int level, int nx, int nz, DensitySampler surface, DensitySampler cheese,
+    private static void generate(long worldId, int level, int nx, int nz, int stride, DensitySampler surface, DensitySampler cheese,
                                  BiomeResolver biomes, int minY, int maxY) {
         if (!running) return;
         SamplerContext ctx = SamplerContext.EMPTY_UNCACHED;
@@ -165,10 +177,11 @@ public final class FarTerrain {
         int step = Math.max(8, s / 2), precision = Math.max(1, s / 4);
         short[] heights = new short[COLUMNS * COLUMNS];
         short[] ids = new short[COLUMNS * COLUMNS];
-        for (int j = 0; j < COLUMNS; j++) {
+        for (int j = 0; j < COLUMNS; j += stride) {
             if (!running || world != worldId) return;
-            for (int i = 0; i < COLUMNS; i++) {
-                int x = x0 + i * s + s / 2, z = z0 + j * s + s / 2;
+            for (int i = 0; i < COLUMNS; i += stride) {
+                // (A preview samples the middle of its stride x stride block.)
+                int x = x0 + i * s + (stride * s) / 2, z = z0 + j * s + (stride * s) / 2;
                 int est = (int) surface.sampleValue(ctx, x, 0, z);
                 int y = Math.min(maxY - 1, est + 96);
                 while (y > minY && cheese.sampleValue(ctx, x, y, z) <= 0) y -= step;
@@ -178,12 +191,19 @@ public final class FarTerrain {
                     if (cheese.sampleValue(ctx, x, mid, z) > 0) lo = mid; else hi = mid;
                 }
                 int h = Math.max(minY, lo + 1);
-                heights[j * COLUMNS + i] = (short) h;
                 Holder<Biome> b = biomes.getNoiseBiome(x >> 2, Math.min(maxY - 1, h) >> 2, z >> 2);
-                ids[j * COLUMNS + i] = (short) biomeId(worldId, b).intValue();
+                short id = (short) biomeId(worldId, b).intValue();
+                for (int jj = j; jj < Math.min(COLUMNS, j + stride); jj++) {
+                    for (int ii = i; ii < Math.min(COLUMNS, i + stride); ii++) {
+                        heights[jj * COLUMNS + ii] = (short) h;
+                        ids[jj * COLUMNS + ii] = id;
+                    }
+                }
             }
         }
-        if (running && world == worldId) MetalLod.farPut(worldId, level, nx, nz, heights, null, ids);
+        if (!running || world != worldId) return;
+        if (stride == 1) MetalLod.farPut(worldId, level, nx, nz, heights, null, ids);
+        else MetalLod.farPutPreview(worldId, level, nx, nz, heights, ids);
     }
 
     /**

@@ -116,6 +116,7 @@ final class Mtl {
     private static final MethodHandle LOD_FAR_BIOME = h("mmc_lod_far_biome", false, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle LOD_FAR_CACHE = h("mmc_lod_far_cache", false, null, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle LOD_FAR_PUT = h("mmc_lod_far_put", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG);
+    private static final MethodHandle LOD_FAR_PUT_PREVIEW = h("mmc_lod_far_put_preview", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle COMPLETED_SUBMIT = h("mmc_completed_submit", true, JAVA_LONG);
     private static final MethodHandle SURFACE_CREATE = h("mmc_surface2_create", false, JAVA_LONG, JAVA_LONG);
     private static final MethodHandle SURFACE_CONFIGURE = h("mmc_surface2_configure", false, null, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -426,6 +427,10 @@ final class Mtl {
 
     static void lodFarPut(long world, int level, int x, int z, long heights, long bottoms, long biomes) {
         try { LOD_FAR_PUT.invokeExact(world, level, x, z, heights, bottoms, biomes); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    static void lodFarPutPreview(long world, int level, int x, int z, long heights, long biomes) {
+        try { LOD_FAR_PUT_PREVIEW.invokeExact(world, level, x, z, heights, biomes); } catch (Throwable t) { throw rethrow(t); }
     }
 
     static void lodSetLightmap(long view) {

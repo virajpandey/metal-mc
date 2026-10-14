@@ -478,6 +478,30 @@ public func mmc_lod_far_cache(_ id: Int64, _ dir: UnsafePointer<CChar>) {
 /// Generated columns for node (level, x, z): 256 x 256 ground heights (first block above the ground) and
 /// biome ids, x fastest, and for floating terrain (the End) each column's lowest block (else null). The node
 /// is rebuilt with them on the next update pass.
+/// A quick preview of a node's generated columns (FarTerrain's first pass, a column of every 4 x 4 spread over them):
+/// drawn until the full columns come (the node stays requested), never cached to disk. Ignored once the node has its
+/// full columns.
+/// METALMC_EXP=farlog: log the far terrain's previews and puts, and each update pass's status line.
+let lodFarLog = experiments.contains("farlog")
+
+@_cdecl("mmc_lod_far_put_preview")
+public func mmc_lod_far_put_preview(_ id: Int64, _ level: Int32, _ x: Int32, _ z: Int32, _ heights: UnsafePointer<Int16>,
+                                    _ biomes: UnsafePointer<UInt16>) {
+    guard let w = lodWorld(id) else { return }
+    let n = lodNodeVoxels * lodNodeVoxels
+    let key = LodNodeKey(level: Int(level), x: Int(x), z: Int(z))
+    let cols = LodFarColumns(height: Array(UnsafeBufferPointer(start: heights, count: n)), biome: Array(UnsafeBufferPointer(start: biomes, count: n)),
+                             bottom: nil)
+    w.far.lock.lock()
+    let took = w.far.columns[key] == nil && w.far.requested.contains(key)
+    if took {
+        w.far.columns[key] = cols
+        w.far.dirty.insert(key)
+    }
+    w.far.lock.unlock()
+    if lodFarLog { log("LOD far: preview \(key.level) \(key.x) \(key.z) \(took ? "taken" : "ignored")") }
+}
+
 @_cdecl("mmc_lod_far_put")
 public func mmc_lod_far_put(_ id: Int64, _ level: Int32, _ x: Int32, _ z: Int32, _ heights: UnsafePointer<Int16>,
                             _ bottoms: UnsafePointer<Int16>?, _ biomes: UnsafePointer<UInt16>) {

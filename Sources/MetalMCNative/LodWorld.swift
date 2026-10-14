@@ -201,6 +201,8 @@ final class LodWorld: @unchecked Sendable {
     // The queue's own priority is a floor (a block can only raise it), so it's background and later passes
     // raise themselves to utility.
     private let queue = DispatchQueue(label: "metalmc.lod.update", qos: .background)
+    /// Generated nodes with no real chunks, built as their columns (or their previews) arrive: farFast.
+    private let farQueue = DispatchQueue(label: "metalmc.lod.far-fast", qos: .utility)
     /// The first pass (every region of the save, 20+ s on the 8 km test world) runs at background priority: macOS
     /// keeps it on the efficiency cores, so the game keeps the performance cores while the player starts playing.
     /// Joining that world and flying at once gave 24 frames over 8.33 ms in the first minute instead of 155 at
@@ -260,6 +262,40 @@ final class LodWorld: @unchecked Sendable {
         queue.async { [self] in
             if live.saveDir != nil { log("LOD: loaded \(live.load()) saved regions from \(live.saveDir!.path)") }
             schedule(after: 0)
+        }
+        farFast()
+    }
+
+    /// Every 0.4 s, outside the update pass: nodes whose generated columns (FarTerrain's previews first) arrived and
+    /// that hold no real chunks, built and installed at once. They need nothing the update pass makes, which after a
+    /// jump spends 15 s and more on the new chunks around the player first: until then far land waited (flicker and
+    /// loading fix, 2026-10-13). Nodes with real chunks under them wait for the pass, which rebuilds them from those.
+    private func farFast() {
+        farQueue.asyncAfter(deadline: .now() + 0.4) { [self] in
+            lock.lock(); let go = running, idle = paused; lock.unlock()
+            if !go { return }
+            if !idle {
+                far.lock.lock(); let dirty = Array(far.dirty); far.lock.unlock()
+                let pure = dirty.filter { $0.level >= 2 && !hasRealData(level: $0.level, x: $0.x, z: $0.z) }
+                if !pure.isEmpty {
+                    far.lock.lock(); far.dirty.subtract(pure); far.lock.unlock()
+                    var built = [LodNode?](repeating: nil, count: pure.count)
+                    built.withUnsafeMutableBufferPointer { out in
+                        let outp = out.baseAddress!
+                        DispatchQueue.concurrentPerform(iterations: pure.count) { i in
+                            let k = pure[i]
+                            var g = LodGrid(level: k.level)
+                            _ = self.far.fill(&g, key: k)
+                            self.fillHidden(&g)
+                            let size = lodNodeVoxels << k.level
+                            outp[i] = LodNode(level: k.level, x0: k.x * size, z0: k.z * size, mesh: self.meshNode(g))
+                        }
+                    }
+                    for (i, k) in pure.enumerated() { install(k, built[i]) }
+                    if lodFarLog { log("LOD far: built \(pure.count) generated nodes outside the pass") }
+                }
+            }
+            farFast()
         }
     }
 
@@ -489,6 +525,7 @@ final class LodWorld: @unchecked Sendable {
         let cacheMB = quadrants.values.reduce(0) { $0 + $1.bytes } / 1_000_000
         let timing = phases.filter { $0.1 >= 0.05 }.map { "\($0.0) \(String(format: "%.1f", $0.1))" }.joined(separator: ", ")
         status = "\(changed.count) changed regions, moved \(moved), \(farKeys.count) generated: \(count) nodes, \(quads) quads, quadrant cache \(cacheMB) MB, \(live.chunkCount) live chunks [\(timing) s]"
+        if lodFarLog { log("LOD pass: " + status + ", center \(center), max level \(maxLevel)") }
         return true
     }
 

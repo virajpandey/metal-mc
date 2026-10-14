@@ -267,6 +267,20 @@ public final class MetalLod {
         }
     }
 
+    /** A quick preview of a node's generated columns, drawn until farPut brings the full ones; never cached. Any thread. */
+    public static void farPutPreview(long world, int level, int x, int z, short[] heights, short[] biomes) {
+        if (!available()) return;
+        long h = MemoryUtil.nmemAlloc(2L * heights.length), b = MemoryUtil.nmemAlloc(2L * biomes.length);
+        try {
+            for (int i = 0; i < heights.length; i++) MemoryUtil.memPutShort(h + 2L * i, heights[i]);
+            for (int i = 0; i < biomes.length; i++) MemoryUtil.memPutShort(b + 2L * i, biomes[i]);
+            Mtl.lodFarPutPreview(world, level, x, z, h, b);
+        } finally {
+            MemoryUtil.nmemFree(h);
+            MemoryUtil.nmemFree(b);
+        }
+    }
+
     /** Stops streaming and releases the LOD (the player left the world). */
     public static void close() {
         if (available()) Mtl.lodClose();
