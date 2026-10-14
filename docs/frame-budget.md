@@ -332,3 +332,22 @@ done; done
 Then read `fps_mean`, `ms_p50`, `ms_p99`, `frames_over_8ms`, `frames_over_16ms` and `metal_gpu_own_ms_p50`/`p99` from
 the `METALMC_BENCH` line of each `bench_out/run_fl-*.log`, and the governor's `render scale: now ...` lines for `auto`.
 Three runs of each, alternating, would make them more than one sample.
+
+## 2026-10-13: the flicker fix's cost, and the water pass
+
+The resolve (anti-aliasing + relight + aerial perspective; the water pass counts in it, same encoder), lab trace of 10
+frames, the Claude edition's switches, native resolution:
+
+| Build | forest | water_closeup |
+|---|---|---|
+| main 34ac2e6 (before) | 5.95 ms | 3.51 ms |
+| flicker fix, first cut (visibility read three times a pixel) | 8.44 | 6.43 |
+| visibility read once (`visPx`) | 7.27 | |
+| water in its own pass (`taa_water`) | **5.51** | **4.56** |
+
+Profiled live in the forest (0.2% water), each change undone in the shader files: the depth-aware visibility upsample
+0.45 ms, refraction's code 0.23 (register pressure: no pixel ran it), the layered waves 0.20, the tone-weighted clip 0.06.
+Water's code in the resolve's load cost every pixel occupancy; in its own pass (texture 30, p.range.y) the forest's
+resolve is under the old build's. water_closeup's +1.05 is the new water: refraction (0.8), the seabed's shadow ray,
+five wave layers, layered caustics, the reflection's history. Whole frame (median command buffer span): 28.8-29.1 ms,
+the old build 27.7-29.1.
