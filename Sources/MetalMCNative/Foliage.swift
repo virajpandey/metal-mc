@@ -254,7 +254,7 @@ static float litFoliageCloud(texture2d<half, access::read> vis, uint2 q, constan
 }
 
 """ : "\n")
-static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, texture2d<half, access::read> vis,
+static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, half4 visPx,
                               constant LitFrame& f, constant float4* env, float sky, float ao, float3 skyAmb, float3 albedo) {
     if (cls == 0u) return float3(0.0);
     float3 add = float3(0.0);
@@ -264,7 +264,7 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
     float3 tint = alin / max(max(alin.r, max(alin.g, alin.b)), 1e-4);
     float3 falloff2 = (LEAF_FALLOFF_MAX - (LEAF_FALLOFF_MAX - LEAF_FALLOFF_MIN) * tint) * 1.44269504;
     // The sun (not the moon: at night the rays went toward it, and its light through leaves is too faint to matter).
-    float2 v = litFoliageVis(vis, q, f, sky, length(rel));
+    float2 v = f.size.z > 0.0 ? float2(visPx.rg) : float2(saturate((sky - 12.0) / 3.0), exp(-RT_LEAF_K * max(15.0 - sky, 0.0)));
     float3 L = f.sunDir.xyz;
     float3 toCam = -rel * rsqrt(max(dot(rel, rel), 1e-8));
     if (f.sunDir.w < 0.5 && v.y > 0.0) {
@@ -279,7 +279,7 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
         // shades it from a low sun.
         float facing = fi < 6u ? saturate(0.5 - 0.5 * dot(n, L)) : 0.5;   // 1: the face turned away from the sun
         float through = cls == LIT_LEAF ? mix(LEAF_FRONT, LEAF_BACK, facing) + LEAF_FWD * hg : PLANT_TRANS;
-        add += env[0].rgb * T * through\(cloudsEnabled ? " * litFoliageCloud(vis, q, f, length(rel))" : "");
+        add += env[0].rgb * T * through\(cloudsEnabled ? " * (f.size.z > 0.0 ? 1.0 - float(visPx.b) : 1.0)" : "");
     }
     // A soft sheen (LEAF_SHEEN): a leaf's or a blade's waxy surface reflects the sun, most at grazing angles: a broad GGX
     // lobe (LEAF_ROUGH) with Schlick's Fresnel (F0 0.04) on the face (a plant: on the vertical), times the direct sun's
@@ -314,7 +314,7 @@ static float3 litFoliageLight(uint cls, uint fi, float3 n, float3 rel, uint2 q, 
 /// The relight's call (with leaflight only), after the light E is made: what leaves and plants pass on.
 /// METALMC_LEAFTERM=0 leaves it out (offline A/B: the relight's cost without the term, the rest of leaflight as it is).
 let foliageRelightCall = ProcessInfo.processInfo.environment["METALMC_LEAFTERM"] == "0" ? "" :
-    "        E += litFoliageLight(litFoliageClass(g), fi, n, rel, q, vis, f, env, sky, ao, skyAmb, albedo) * (dayScale * f.misc.w);\n"
+    "        E += litFoliageLight(litFoliageClass(g), fi, n, rel, q, visPx, f, env, sky, ao, skyAmb, albedo) * (dayScale * f.misc.w);\n"
 /// The sheen's strength (LEAF_SHEEN, 0.5; METALMC_LEAFSHEEN for an offline A/B: 0 drops its code).
 private let foliageSheenText: String = {
     guard let v = ProcessInfo.processInfo.environment["METALMC_LEAFSHEEN"], let x = Double(v), x >= 0 else { return "0.5" }

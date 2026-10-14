@@ -346,9 +346,10 @@ static float3 litRelightPixel(float3 dst, uint2 q, float d, uint2 g, texture2d<h
         // 15; 12 or less, under trees or an overhang, counts as shade). Enclosed spaces never see either.
         float open = saturate((sky - 12.0) / 3.0);
         float traced = open;
+        half4 visPx = half4(1.0h, 1.0h, 0.0h, -1.0h);   // the visibility at the pixel, read once (the light through leaves takes it too)
         if (f.size.z > 0.0) {
-            uint s = uint(f.size.z);
-            traced = float(litVisAt(vis, q, s, length(rel)).r) * saturate(sky / 2.0);
+            visPx = litVisAt(vis, q, uint(f.size.z), length(rel));
+            traced = float(visPx.r) * saturate(sky / 2.0);
         }
         bool moonTraced = f.sunDir.w > 0.5;
         float vSun = moonTraced ? open : traced, vMoon = moonTraced ? traced : open;
