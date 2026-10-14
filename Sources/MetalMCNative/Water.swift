@@ -234,17 +234,17 @@ private func waterEnvFloat(_ key: String, _ def: Double, _ lo: Double, _ hi: Dou
 /// blue, then dark with depth).
 let waterAbsorb: SIMD3<Double> = {
     let p = (waterEnv("METALMC_WATERABSORB") ?? "").split(separator: ",").compactMap { Double($0) }
-    return p.count == 3 ? SIMD3(p[0], p[1], p[2]) : SIMD3(0.35, 0.10, 0.07)
+    return p.count == 3 ? SIMD3(p[0], p[1], p[2]) : SIMD3(0.70, 0.09, 0.075)
 }()
 /// METALMC_WATERSCATTER: the water body's own light, as a share of the light falling on it (its color is the water's:
 /// the biome's tint).
-let waterScatter = waterEnvFloat("METALMC_WATERSCATTER", 0.035, 0, 1)
+let waterScatter = waterEnvFloat("METALMC_WATERSCATTER", 0.02, 0, 1)
 /// METALMC_WATERCAUSTICS: the caustics' strength on sunlit floors under water (0: none).
 let waterCaustics = waterEnvFloat("METALMC_WATERCAUSTICS", 1, 0, 8)
-/// METALMC_WATERREFRACT: how far the floor seen through the water is bent by the waves (0, the default: not at all, as
+/// METALMC_WATERREFRACT: how far the floor seen through the water is bent by the waves (0.8, the default since 2026-10-13, as SEUS bends it; 0: not at all, as
 /// vanilla drew it; 1: Snell's law). The look-up of the floor where the refracted ray meets it cost 0.5 ms at water_closeup
 /// (85% water, measured).
-let waterRefract = waterEnvFloat("METALMC_WATERREFRACT", 0, 0, 4)
+let waterRefract = waterEnvFloat("METALMC_WATERREFRACT", 0.8, 0, 4)
 /// METALMC_WATERRT: 0 turns the traced reflections off (the sky's map alone, as in round 1). METALMC_WATERRTSCALE: pixels
 /// per traced texel along each axis (4, the default; 2: four times the texels, a sharper reflection, about 1.5 ms more at
 /// water_closeup, measured).
@@ -327,10 +327,14 @@ let waterCommonHeader: String = {
 #endif
 // How far the water's own color goes toward a clear sea's teal from the biome's (vanilla's blue is saturated).
 #ifndef WATER_TEAL
-#define WATER_TEAL 0.5
+#define WATER_TEAL 0.8
 #endif
 // The reflected rays on a checkerboard at half resolution (half the rays; the anti-aliasing averages the frames).
 // The traced reflection's history (flicker fix): the current frame's weight when the camera is still (1: no history).
+// The floor's shadow toward the sun (one ray per traced texel; 0: none, the floor lit wherever the surface is).
+#ifndef WATER_FLOOR_SHADOW
+#define WATER_FLOOR_SHADOW 1
+#endif
 #ifndef WATER_HISTORY_BLEND
 #define WATER_HISTORY_BLEND 0.125
 #endif
@@ -355,11 +359,16 @@ let waterCommonHeader: String = {
 #define WATER_RIPPLE_WARP 6.0
 #endif
 // The long waves' and the ripples' steepness (their slopes' scale; 1: as the tiles were made).
+// How much of the footprint's stretch along the view (1 / V.y) the waves are filtered over: 1 its long axis (smooth,
+// broad glints), 0.5 the geometric mean of its two (the ripples' detail stays a little longer: a tighter glint).
+#ifndef WATER_FOOT_ANISO
+#define WATER_FOOT_ANISO 0.5
+#endif
 #ifndef WATER_SWELL_GAIN
-#define WATER_SWELL_GAIN 1.0
+#define WATER_SWELL_GAIN 0.45
 #endif
 #ifndef WATER_RIPPLE_GAIN
-#define WATER_RIPPLE_GAIN 1.0
+#define WATER_RIPPLE_GAIN 0.55
 #endif
 #define WATER_DETAIL_TEXELS_PER_BLOCK \(String(format: "%.1f", Double(waterDetailTexels) / waterDetailTile))
 #define WATER_PI 3.14159265
@@ -681,7 +690,7 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
         o = litWaterRelit(c, litWaterVanilla(lightmap, f.misc.x > 0.5, blockLevel, skyLevel), surfE);
         if (top && V.y > 0.0) {
             float rough2;
-            float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / max(V.y, 0.02), f.water.x, rough2);
+            float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / pow(max(V.y, 0.02), WATER_FOOT_ANISO), f.water.x, rough2);
             float F = litWaterFresnel(max(dot(n, V), 1e-3));
             float open = skyLevel >= 15.0 ? 1.0 : skyDecode(float3(litWaterBrightness(skyLevel))).x;
             float3 R = reflect(-V, n);
@@ -694,7 +703,7 @@ static float3 litWaterPixel(float3 c, uint2 q, float d, uint2 g, texture2d<half,
     } else {
         // The waves at the pixel's footprint on the surface (blocks, along the view, where it's longest).
         float rough2;
-        float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / max(V.y, 0.02), f.water.x, rough2);
+        float3 n = litWaterNormal(waves, detail, rel.xz + f.water.yz, dist * f.water2.x / pow(max(V.y, 0.02), WATER_FOOT_ANISO), f.water.x, rough2);
         float F = litWaterFresnel(max(dot(n, V), 1e-3));
         float3 A = litWaterUnpack(tas.x), seen = litWaterUnpack(tas.y), S = litWaterUnpack(tas.z);
         float thick = as_type<float>(tas.w);
@@ -1138,7 +1147,7 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     bool valid = found && V.y > 0.0;   // a water top seen from above
     float rough2 = kWaterRough2;
     float3 nrm = float3(0.0, 1.0, 0.0);
-    if (valid) nrm = litWaterNormal(waves, wavesDetail, rel.xz + p.water.yz, dist * p.water.w / max(V.y, 0.02), p.water.x, rough2);
+    if (valid) nrm = litWaterNormal(waves, wavesDetail, rel.xz + p.water.yz, dist * p.water.w / pow(max(V.y, 0.02), WATER_FOOT_ANISO), p.water.x, rough2);
     float3 T = refract(-V, nrm, 1.0 / WATER_ETA);
     if (dot(T, T) < 1e-6) T = -V;
 
@@ -1240,7 +1249,19 @@ kernel void water_trace(instance_acceleration_structure accel [[buffer(0)]],
     float sinSun2 = 1.0 - p.sunDir.y * p.sunDir.y;
     float3 sunUp = normalize(float3(p.sunDir.x, sqrt(max(WATER_ETA * WATER_ETA - sinSun2, 0.0)), p.sunDir.z));
     float caustic = p.sunDir.y > 0.0 ? litWaterCaustic(waves, wavesDetail, p.water.yz, rel + T * thick, D, sunUp) : 1.0;
-    float3 floorE = Lw.sun * (saturate(p.sunDir.y) * caustic) * exp(-WATER_ABSORB * (D / max(sunUp.y, 0.2))) + Lw.amb * exp(-WATER_ABSORB * D);
+    // The floor's own shadow (water fix, 2026-10-13): what stands between the floor and the sun under the water (seagrass,
+    // the shore's rocks, a pier) shades the floor, as in SEUS; the surface's visibility alone (Lw.sun) left the floor lit
+    // under everything that didn't also shade the surface. One ray from the floor toward the sun (the water isn't in the
+    // structure; its bend at the surface is left out), averaged over the frames by the history like the reflections.
+    float floorSun = 1.0;
+    if (WATER_FLOOR_SHADOW != 0 && p.sunDir.y > 0.0 && thick < p.limits.y - 0.01) {
+        intersector<instancing> sunRay;
+        sunRay.assume_geometry_type(geometry_type::triangle);
+        sunRay.accept_any_intersection(true);
+        ray sr(rel + T * thick + p.camOffset.xyz + float3(0.0, 0.06, 0.0), p.sunDir.xyz, 0.02, 96.0);
+        if (sunRay.intersect(sr, accel, 0xFF).type != intersection_type::none) floorSun = 0.0;
+    }
+    float3 floorE = Lw.sun * (saturate(p.sunDir.y) * caustic * floorSun) * exp(-WATER_ABSORB * (D / max(sunUp.y, 0.2))) + Lw.amb * exp(-WATER_ABSORB * D);
     float3 viewT = exp(-WATER_ABSORB * thick);
     float3 S = litWaterTint(layer.rgb) * (WATER_SCATTER * (1.0 - viewT)) * surfE;
     float3 A = 0.0;
