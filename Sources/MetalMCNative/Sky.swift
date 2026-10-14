@@ -881,6 +881,7 @@ final class Sky: @unchecked Sendable {
         // Vanilla's moon: drawn as the sun is (applyCelestialBodyTransform, the same height), rotated by its own angle,
         // which is the sun's plus a half turn: opposite the sun.
         f.moon = moonAngle.isFinite && moonPhase >= 0 ? SIMD4(-sin(moonAngle), cos(moonAngle), 0, moonPhase) : SIMD4(0, -1, 0, -1)
+        if frames == 1 { log(String(format: "sky: sun angle %.3f, moon angle %.3f, phase %.0f, toward the sun (%.2f %.2f), the moon (%.2f %.2f)", sunAngle, moonAngle, moonPhase, sun.x, sun.y, f.moon.x, f.moon.y)) }
         let hl = simd_length(SIMD2(sun.x, sun.z))
         let horiz = hl > 1e-4 ? SIMD2(sun.x, sun.z) / hl : SIMD2<Float>(1, 0)
         // Altitude above sea level, kept inside the atmosphere (underground, and past 95 km, the sky is the nearest one's).
