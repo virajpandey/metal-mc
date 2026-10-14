@@ -351,3 +351,21 @@ Water's code in the resolve's load cost every pixel occupancy; in its own pass (
 resolve is under the old build's. water_closeup's +1.05 is the new water: refraction (0.8), the seabed's shadow ray,
 five wave layers, layered caustics, the reflection's history. Whole frame (median command buffer span): 28.8-29.1 ms,
 the old build 27.7-29.1.
+
+## 2026-10-14: the LOD's occlusion culling (on by default)
+
+`LodHiZ.swift` + `lod_cull`: last finished frame's opaque-terrain depth pyramid (the resolve writes its base; only pixels
+whose G-buffer key matches their depth occlude, so nothing behind glass, water or entities is culled), each quad tested in
+that frame's clip space with a margin of 2 px plus the parallax of the camera's move at 16 blocks. Lab traces, the Claude
+edition's switches, native:
+
+| View | Quads issued (quadcull only -> + occlusion) | Main pass vertex | Main pass |
+|---|---|---|---|
+| mountain_view | 71% -> 30-39% | 3.77 -> 2.37 ms | 6.05 -> 4.29-4.59 ms |
+| forest | 76% -> 42% | 1.26 -> 0.91-0.98 | 3.37 -> 2.95 |
+| noon_overview | 75% -> 28-31% | 2.08 -> 1.38 | 5.76 -> 5.11-5.42 |
+
+The culling pass: 0.22-0.38 ms without occlusion, 1.1-1.4 with it reading the frame just before (a stall on that frame's
+writes), 0.63-0.73 reading the newest finished one (a ring of three). The SIMD group's box first (`hizgroup` alone culls
+only to 65-72%: per-quad stays the default). Flicker meter: unchanged, still and panning. Screenshot diffs show no culled
+terrain.
